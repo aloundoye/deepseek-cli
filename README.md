@@ -88,12 +88,18 @@ cargo run --bin deepseek -- autopilot "Implement and verify the refactor" --hour
 - `deepseek autopilot status [--run-id <uuid>]`
 - `deepseek autopilot stop [--run-id <uuid>]`
 - `deepseek autopilot resume [--run-id <uuid>]`
-- `deepseek run`
+- `deepseek run [session-id]`
 - `deepseek diff`
 - `deepseek apply [--patch-id <uuid>] --yes`
 - `deepseek rewind [--to-checkpoint <uuid>] --yes`
 - `deepseek export [--session <uuid>] [--format json|md] [--output <path>]`
 - `deepseek memory show|edit|sync`
+- `deepseek git status|history|branch|checkout|commit|pr|resolve`
+- `deepseek skills list|install|remove|run|reload`
+- `deepseek replay run --session-id <uuid> --deterministic`
+- `deepseek background list|attach|stop`
+- `deepseek teleport [--session-id <uuid>] [--output <path>] [--import <path>]`
+- `deepseek remote-env list|add|remove|check`
 - `deepseek status`
 - `deepseek usage [--session] [--day]`
 - `deepseek compact [--from-turn N] [--yes]`
@@ -180,6 +186,15 @@ Additional config contracts:
 - `~/.deepseek/mcp.local.json`
 - `.mcp.json`
 - `~/.deepseek/keybindings.json`
+
+Notable config keys:
+- `llm.provider` (`deepseek` default, optional `openai`)
+- `llm.fast_mode`, `llm.language`, `llm.prompt_cache_enabled`
+- `scheduling.off_peak`
+- `skills.paths`, `skills.hot_reload`
+- `ui.enable_tui`, `ui.keybindings_path`
+- `replay.strict_mode`
+- `experiments.visual_verification`, `experiments.wasm_hooks`
 
 Example JSON config:
 

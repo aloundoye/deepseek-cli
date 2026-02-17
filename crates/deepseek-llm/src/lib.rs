@@ -42,15 +42,7 @@ impl DeepSeekClient {
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: &str) -> Result<LlmResponse> {
-        let payload = json!({
-            "model": req.model,
-            "messages": [
-                {"role": "user", "content": req.prompt}
-            ],
-            "temperature": self.cfg.temperature,
-            "stream": self.cfg.stream,
-            "max_tokens": req.max_tokens,
-        });
+        let payload = self.build_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
 
@@ -108,10 +100,55 @@ impl DeepSeekClient {
 
         Err(last_err.unwrap_or_else(|| anyhow!("deepseek request failed without detailed error")))
     }
+
+    fn build_payload(&self, req: &LlmRequest) -> Value {
+        let fast_mode = self.cfg.fast_mode;
+        let max_tokens = if fast_mode {
+            req.max_tokens.min(2048)
+        } else {
+            req.max_tokens
+        };
+        let temperature = if fast_mode {
+            self.cfg.temperature.min(0.2)
+        } else {
+            self.cfg.temperature
+        };
+
+        match self.cfg.provider.to_ascii_lowercase().as_str() {
+            "openai" => json!({
+                "model": req.model,
+                "messages": [
+                    {"role": "user", "content": req.prompt}
+                ],
+                "temperature": temperature,
+                "stream": self.cfg.stream,
+                "max_tokens": max_tokens
+            }),
+            _ => json!({
+                "model": req.model,
+                "messages": [
+                    {"role": "user", "content": req.prompt}
+                ],
+                "temperature": temperature,
+                "stream": self.cfg.stream,
+                "max_tokens": max_tokens
+            }),
+        }
+    }
 }
 
 impl LlmClient for DeepSeekClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
+        let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" && provider != "openai" {
+            if self.cfg.offline_fallback {
+                return OfflineDeepSeek.complete(req);
+            }
+            return Err(anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai)",
+                self.cfg.provider
+            ));
+        }
         let key = std::env::var(&self.cfg.api_key_env).ok();
         if let Some(key) = key {
             return self.complete_inner(req, &key);
@@ -250,5 +287,40 @@ mod tests {
         let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step1\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step2\"}}]}\n\ndata: [DONE]";
         let got = parse_streaming_payload(body).expect("stream parse");
         assert_eq!(got, "step1step2");
+    }
+
+    #[test]
+    fn fast_mode_caps_max_tokens_in_payload() {
+        let cfg = LlmConfig {
+            fast_mode: true,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let payload = client.build_payload(&LlmRequest {
+            unit: deepseek_core::LlmUnit::Planner,
+            prompt: "hello".to_string(),
+            model: "deepseek-chat".to_string(),
+            max_tokens: 16_000,
+        });
+        assert_eq!(payload["max_tokens"], 2048);
+    }
+
+    #[test]
+    fn unsupported_provider_uses_offline_fallback_when_enabled() {
+        let cfg = LlmConfig {
+            provider: "custom".to_string(),
+            offline_fallback: true,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let out = client
+            .complete(&LlmRequest {
+                unit: deepseek_core::LlmUnit::Planner,
+                prompt: "hello".to_string(),
+                model: "any".to_string(),
+                max_tokens: 128,
+            })
+            .expect("fallback");
+        assert!(out.text.contains("Offline response"));
     }
 }

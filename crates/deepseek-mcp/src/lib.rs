@@ -3,6 +3,8 @@ use chrono::Utc;
 use deepseek_store::{McpServerRecord, McpToolCacheRecord, Store};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,6 +56,20 @@ pub struct McpTool {
     pub server_id: String,
     pub name: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolRefresh {
+    pub server_id: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolChangeNotice {
+    pub fingerprint: String,
+    pub changed_servers: Vec<String>,
 }
 
 pub struct McpManager {
@@ -158,7 +174,20 @@ impl McpManager {
     }
 
     pub fn discover_tools(&self) -> Result<Vec<McpTool>> {
+        Ok(self.refresh_tools()?.0)
+    }
+
+    pub fn refresh_tools(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
         let mut tools = Vec::new();
+        let mut refreshes = Vec::new();
+        let existing = self.store.list_mcp_tool_cache()?.into_iter().fold(
+            BTreeMap::<String, BTreeSet<String>>::new(),
+            |mut acc, row| {
+                acc.entry(row.server_id).or_default().insert(row.tool_name);
+                acc
+            },
+        );
+
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
             let discovered = discover_server_tools(&server)
                 .with_context(|| format!("failed to discover MCP tools for {}", server.id))
@@ -169,19 +198,69 @@ impl McpManager {
                         description: "fallback tool".to_string(),
                     }]
                 });
+            let previous = existing.get(&server.id).cloned().unwrap_or_default();
+            let mut current = BTreeSet::new();
+            let mut replacement_rows = Vec::new();
             for tool in discovered {
-                self.store.upsert_mcp_tool_cache(&McpToolCacheRecord {
+                current.insert(tool.name.clone());
+                replacement_rows.push(McpToolCacheRecord {
                     server_id: tool.server_id.clone(),
                     tool_name: tool.name.clone(),
                     description: tool.description.clone(),
                     schema_json: "{}".to_string(),
                     updated_at: Utc::now().to_rfc3339(),
-                })?;
+                });
                 tools.push(tool);
             }
+            self.store
+                .replace_mcp_tool_cache_for_server(&server.id, &replacement_rows)?;
+            let added = current
+                .difference(&previous)
+                .cloned()
+                .collect::<Vec<String>>();
+            let removed = previous
+                .difference(&current)
+                .cloned()
+                .collect::<Vec<String>>();
+            refreshes.push(McpToolRefresh {
+                server_id: server.id,
+                added,
+                removed,
+                total: current.len(),
+            });
         }
-        Ok(tools)
+        Ok((tools, refreshes))
     }
+
+    pub fn discover_tools_with_notice(
+        &self,
+        previous_fingerprint: Option<&str>,
+    ) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>, McpToolChangeNotice)> {
+        let (tools, refreshes) = self.refresh_tools()?;
+        let fingerprint = tool_fingerprint(&tools)?;
+        let changed_servers = if previous_fingerprint.is_some_and(|value| value == fingerprint) {
+            Vec::new()
+        } else {
+            refreshes
+                .iter()
+                .filter(|refresh| !(refresh.added.is_empty() && refresh.removed.is_empty()))
+                .map(|refresh| refresh.server_id.clone())
+                .collect::<Vec<_>>()
+        };
+        Ok((
+            tools,
+            refreshes,
+            McpToolChangeNotice {
+                fingerprint,
+                changed_servers,
+            },
+        ))
+    }
+}
+
+fn tool_fingerprint(tools: &[McpTool]) -> Result<String> {
+    let serialized = serde_json::to_vec(tools)?;
+    Ok(format!("{:x}", Sha256::digest(serialized)))
 }
 
 fn load_config_if_exists(path: &Path) -> Result<McpConfig> {
@@ -292,5 +371,65 @@ mod tests {
 
         let removed = manager.remove_server("local").expect("remove");
         assert!(removed);
+    }
+
+    #[test]
+    fn detects_toolset_changes_and_emits_notice_fingerprint() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "notify".to_string(),
+                name: "Notify".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec!["ok".to_string()],
+                url: None,
+                enabled: true,
+                metadata: serde_json::json!({"tools": [{"name":"a"},{"name":"b"}]}),
+            })
+            .expect("add");
+
+        let (_, first_refreshes, first_notice) = manager
+            .discover_tools_with_notice(None)
+            .expect("first refresh");
+        let first = first_refreshes
+            .iter()
+            .find(|refresh| refresh.server_id == "notify")
+            .expect("refresh");
+        assert!(first.added.contains(&"a".to_string()));
+        assert!(first.added.contains(&"b".to_string()));
+        assert!(!first_notice.fingerprint.is_empty());
+
+        manager
+            .add_server(McpServer {
+                id: "notify".to_string(),
+                name: "Notify".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec!["ok".to_string()],
+                url: None,
+                enabled: true,
+                metadata: serde_json::json!({"tools": [{"name":"b"},{"name":"c"}]}),
+            })
+            .expect("replace");
+
+        let (_, second_refreshes, second_notice) = manager
+            .discover_tools_with_notice(Some(&first_notice.fingerprint))
+            .expect("second refresh");
+        let second = second_refreshes
+            .iter()
+            .find(|refresh| refresh.server_id == "notify")
+            .expect("refresh");
+        assert!(second.added.contains(&"c".to_string()));
+        assert!(second.removed.contains(&"a".to_string()));
+        assert_ne!(second_notice.fingerprint, first_notice.fingerprint);
+        assert!(
+            second_notice
+                .changed_servers
+                .contains(&"notify".to_string())
+        );
     }
 }

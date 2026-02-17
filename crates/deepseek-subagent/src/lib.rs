@@ -4,11 +4,20 @@ use std::sync::Arc;
 use std::thread;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubagentRole {
+    Explore,
+    Plan,
+    Task,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentTask {
     pub run_id: Uuid,
     pub name: String,
     pub goal: String,
+    pub role: SubagentRole,
+    pub team: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +103,8 @@ mod tests {
                 run_id: Uuid::now_v7(),
                 name: format!("task-{i}"),
                 goal: "analyze".to_string(),
+                role: SubagentRole::Task,
+                team: "default".to_string(),
             })
             .collect::<Vec<_>>();
 

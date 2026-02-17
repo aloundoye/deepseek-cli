@@ -16,6 +16,8 @@ members = [
   "crates/deepseek-memory",
   "crates/deepseek-mcp",
   "crates/deepseek-subagent",
+  "crates/deepseek-skills",
+  "crates/deepseek-hooks",
 ]
 resolver = "2"
 
@@ -44,3 +46,4 @@ walkdir = "2"
 ratatui = "0.30"
 crossterm = "0.29"
 notify = "8"
+glob = "0.3"

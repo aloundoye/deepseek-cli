@@ -589,7 +589,9 @@ dependencies = [
  "deepseek-tools",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -608,6 +610,7 @@ dependencies = [
  "deepseek-memory",
  "deepseek-policy",
  "deepseek-router",
+ "deepseek-skills",
  "deepseek-store",
  "deepseek-tools",
  "deepseek-ui",
@@ -641,6 +644,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "deepseek-hooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -679,6 +694,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 
@@ -729,6 +745,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepseek-skills"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deepseek-core",
+ "deepseek-store",
+ "glob",
+ "serde",
+ "serde_json",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "deepseek-store"
 version = "0.1.0"
 dependencies = [
@@ -768,9 +798,12 @@ dependencies = [
  "chrono",
  "deepseek-core",
  "deepseek-diff",
+ "deepseek-hooks",
  "deepseek-index",
  "deepseek-policy",
  "deepseek-store",
+ "glob",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -1133,6 +1166,12 @@ dependencies = [
  "wasip2",
  "wasip3",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "hashbrown"
