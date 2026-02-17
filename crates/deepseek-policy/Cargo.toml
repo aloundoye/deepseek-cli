@@ -1,0 +1,15 @@
+[package]
+name = "deepseek-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+deepseek-core = { path = "../deepseek-core" }
+
+[dev-dependencies]
+serde_json.workspace = true

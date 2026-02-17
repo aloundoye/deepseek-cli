@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    name: quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: tests
+        run: cargo test --workspace --all-targets
+
+      - name: build
+        run: cargo build --workspace
+
+      - name: cli json smoke
+        run: cargo run --bin deepseek -- --json plan "CI smoke"
+
+      - name: installer dry-run (unix)
+        if: runner.os != 'Windows'
+        run: bash scripts/install.sh --dry-run --version v0.0.0 --repo example/example
+
+      - name: installer dry-run (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install.ps1 -DryRun -Version v0.0.0 -Repo example/example

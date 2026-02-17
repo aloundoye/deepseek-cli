@@ -1,0 +1,30 @@
+[package]
+name = "deepseek-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "deepseek"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+deepseek-agent = { path = "../deepseek-agent" }
+deepseek-core = { path = "../deepseek-core" }
+deepseek-diff = { path = "../deepseek-diff" }
+deepseek-index = { path = "../deepseek-index" }
+deepseek-policy = { path = "../deepseek-policy" }
+deepseek-router = { path = "../deepseek-router" }
+deepseek-store = { path = "../deepseek-store" }
+deepseek-tools = { path = "../deepseek-tools" }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

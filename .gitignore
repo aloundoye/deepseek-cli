@@ -1,0 +1,8 @@
+# Build/runtime artifacts
+/target/
+/.deepseek/
+**/.deepseek/
+
+# Safety: nested repos should never be committed
+**/.git/
+.agent/

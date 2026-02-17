@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          target: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin deepseek --target ${{ matrix.target }}
+
+      - name: Package artifact (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/deepseek dist/deepseek
+          tar -C dist -czf dist/deepseek-${{ matrix.target }}.tar.gz deepseek
+          rm dist/deepseek
+
+      - name: Package artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/deepseek.exe dist/deepseek.exe
+          Compress-Archive -Path dist/deepseek.exe -DestinationPath dist/deepseek-${{ matrix.target }}.zip -Force
+          Remove-Item dist/deepseek.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-${{ matrix.target }}
+          path: dist/deepseek-${{ matrix.target }}.${{ matrix.archive_ext }}
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          find dist -mindepth 2 -type f -name 'deepseek-*' -exec cp {} dist/ \;
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          shopt -s nullglob
+          files=(deepseek-*.tar.gz deepseek-*.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no release artifacts found" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > checksums.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/deepseek-*.tar.gz
+            dist/deepseek-*.zip
+            dist/checksums.txt
