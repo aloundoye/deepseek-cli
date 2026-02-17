@@ -3,14 +3,20 @@
 ## Goals
 - Produce immutable binaries for Linux, macOS, and Windows.
 - Publish checksums for every artifact.
+- Generate SBOM per release.
+- Publish package-manager update paths (Homebrew + Winget).
 - Keep downgrade path available through versioned release assets.
 
 ## Artifact contract
 Each tagged release (`vX.Y.Z`) publishes:
 - `deepseek-x86_64-unknown-linux-gnu.tar.gz`
+- `deepseek-aarch64-unknown-linux-gnu.tar.gz`
 - `deepseek-x86_64-apple-darwin.tar.gz`
+- `deepseek-aarch64-apple-darwin.tar.gz`
 - `deepseek-x86_64-pc-windows-msvc.zip`
+- `deepseek-aarch64-pc-windows-msvc.zip`
 - `checksums.txt`
+- `sbom.spdx.json`
 
 All assets are generated from `cargo build --release --bin deepseek`.
 
@@ -22,6 +28,8 @@ All assets are generated from `cargo build --release --bin deepseek`.
    - `git push origin vX.Y.Z`
 4. GitHub Actions `release.yml` builds artifacts and creates the release.
 5. Validate checksums and run installer smoke checks.
+6. Homebrew tap update workflow (`homebrew.yml`) publishes formula update.
+7. Winget update workflow (`winget.yml`) publishes manifest update.
 
 ## Installer smoke checks
 macOS/Linux:
@@ -34,6 +42,18 @@ Windows:
 
 ```powershell
 ./scripts/install.ps1 -DryRun -Version vX.Y.Z
+```
+
+Package manager smoke checks:
+
+```bash
+brew install deepseek
+brew uninstall deepseek
+```
+
+```powershell
+winget install DeepSeek.DeepSeekCLI
+winget uninstall DeepSeek.DeepSeekCLI
 ```
 
 ## Manual local packaging (fallback)

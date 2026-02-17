@@ -172,6 +172,198 @@ fn autopilot_respects_stop_file_and_writes_heartbeat() {
     assert_eq!(heartbeat["status"], "stopped");
 }
 
+#[test]
+fn status_usage_compact_and_doctor_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+    let _ = run_json(
+        workspace.path(),
+        &["--json", "ask", "Create baseline session for status checks"],
+    );
+
+    let status = run_json(workspace.path(), &["--json", "status"]);
+    assert!(status["session_id"].as_str().is_some());
+    assert!(status["model"]["base"].as_str().is_some());
+
+    let usage = run_json(workspace.path(), &["--json", "usage", "--session"]);
+    assert!(usage["records"].as_u64().unwrap_or(0) >= 1);
+
+    let compact = run_json(workspace.path(), &["--json", "compact", "--yes"]);
+    assert_eq!(compact["persisted"], true);
+    assert!(compact["result"]["summary_id"].as_str().is_some());
+
+    let doctor = run_json(workspace.path(), &["--json", "doctor"]);
+    assert!(doctor["os"].as_str().is_some());
+    assert!(doctor["checks"]["cargo"].as_bool().is_some());
+}
+
+#[test]
+fn autopilot_status_stop_resume_commands_work() {
+    let workspace = TempDir::new().expect("workspace");
+    let run = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "autopilot",
+            "Control command smoke test",
+            "--max-iterations",
+            "1",
+            "--duration-seconds",
+            "30",
+            "--tools",
+            "false",
+        ],
+    );
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    let status = run_json(
+        workspace.path(),
+        &["--json", "autopilot", "status", "--run-id", &run_id],
+    );
+    assert_eq!(status["run_id"], run_id);
+
+    let stop = run_json(
+        workspace.path(),
+        &["--json", "autopilot", "stop", "--run-id", &run_id],
+    );
+    assert_eq!(stop["stop_requested"], true);
+
+    let resumed = run_json(
+        workspace.path(),
+        &["--json", "autopilot", "resume", "--run-id", &run_id],
+    );
+    assert!(resumed["run_id"].as_str().is_some());
+    assert!(resumed["stop_reason"].as_str().is_some());
+}
+
+#[test]
+fn plugins_catalog_search_and_verify_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+    let catalog_root = workspace.path().join(".deepseek/plugins");
+    fs::create_dir_all(&catalog_root).expect("catalog dir");
+    fs::write(
+        catalog_root.join("catalog.json"),
+        r#"{
+  "plugins": [
+    {
+      "id": "demo-plugin",
+      "name": "Demo Plugin",
+      "version": "0.1.0",
+      "description": "catalog fixture",
+      "source": "https://example.com/demo"
+    }
+  ]
+}"#,
+    )
+    .expect("catalog file");
+
+    let catalog = run_json(workspace.path(), &["--json", "plugins", "catalog"]);
+    assert_eq!(catalog.as_array().map(|a| a.len()).unwrap_or_default(), 1);
+
+    let search = run_json(
+        workspace.path(),
+        &["--json", "plugins", "search", "demo-plugin"],
+    );
+    assert_eq!(search.as_array().map(|a| a.len()).unwrap_or_default(), 1);
+
+    let verify = run_json(
+        workspace.path(),
+        &["--json", "plugins", "verify", "demo-plugin"],
+    );
+    assert_eq!(verify["plugin_id"], "demo-plugin");
+    assert_eq!(verify["verified"], false);
+}
+
+#[test]
+fn mcp_memory_export_and_profile_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+
+    let memory = run_json(workspace.path(), &["--json", "memory", "show"]);
+    assert!(
+        memory["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("DEEPSEEK.md"))
+    );
+
+    let sync = run_json(
+        workspace.path(),
+        &["--json", "memory", "sync", "--note", "test-sync"],
+    );
+    assert_eq!(sync["synced"], true);
+    assert_eq!(sync["note"], "test-sync");
+
+    let added = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "mcp",
+            "add",
+            "local",
+            "--name",
+            "Local MCP",
+            "--transport",
+            "stdio",
+            "--command",
+            "echo",
+            "--arg",
+            "ok",
+            "--metadata",
+            r#"{"tools":[{"name":"ping","description":"health"}]}"#,
+        ],
+    );
+    assert_eq!(added["added"]["id"], "local");
+
+    let listed = run_json(workspace.path(), &["--json", "mcp", "list"]);
+    assert!(listed.as_array().is_some_and(|servers| !servers.is_empty()));
+
+    let got = run_json(workspace.path(), &["--json", "mcp", "get", "local"]);
+    assert_eq!(got["id"], "local");
+
+    let _ = run_json(
+        workspace.path(),
+        &["--json", "ask", "Generate transcript for export command"],
+    );
+    let exported = run_json(workspace.path(), &["--json", "export", "--format", "md"]);
+    assert_eq!(exported["format"], "md");
+    assert!(exported["output_path"].as_str().is_some());
+
+    let profile = run_json(workspace.path(), &["--json", "profile"]);
+    assert!(profile["profile_id"].as_str().is_some());
+    assert!(profile["elapsed_ms"].as_u64().is_some());
+
+    let removed = run_json(workspace.path(), &["--json", "mcp", "remove", "local"]);
+    assert_eq!(removed["removed"], true);
+}
+
+#[test]
+fn rewind_uses_checkpoint_id_from_apply() {
+    let workspace = TempDir::new().expect("workspace");
+    let _ = run_json(
+        workspace.path(),
+        &["--json", "ask", "Create patch so apply can checkpoint"],
+    );
+
+    let applied = run_json(workspace.path(), &["--json", "apply", "--yes"]);
+    let checkpoint_id = applied["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint id from apply")
+        .to_string();
+
+    fs::write(workspace.path().join("scratch.txt"), "modified").expect("write");
+
+    let rewound = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "rewind",
+            "--to-checkpoint",
+            &checkpoint_id,
+            "--yes",
+        ],
+    );
+    assert_eq!(rewound["rewound"], true);
+    assert_eq!(rewound["checkpoint_id"], checkpoint_id);
+}
+
 fn run_json(workspace: &Path, args: &[&str]) -> Value {
     let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
         .current_dir(workspace)

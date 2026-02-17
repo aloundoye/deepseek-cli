@@ -1,0 +1,85 @@
+name: Publish Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' && secrets.HOMEBREW_TAP_REPO != '' }}
+    steps:
+      - name: Compute formula metadata
+        id: meta
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          base_url="https://github.com/${REPO}/releases/download/${TAG}"
+          curl -fsSL "${base_url}/checksums.txt" -o checksums.txt
+          sha_x64="$(awk '$2=="deepseek-x86_64-apple-darwin.tar.gz"{print $1}' checksums.txt)"
+          sha_arm64="$(awk '$2=="deepseek-aarch64-apple-darwin.tar.gz"{print $1}' checksums.txt)"
+          if [[ -z "${sha_x64}" || -z "${sha_arm64}" ]]; then
+            echo "missing macOS checksums for Homebrew formula" >&2
+            exit 1
+          fi
+          {
+            echo "base_url=${base_url}"
+            echo "sha_x64=${sha_x64}"
+            echo "sha_arm64=${sha_arm64}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap repository
+        env:
+          TAP_REPO: ${{ secrets.HOMEBREW_TAP_REPO }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+
+      - name: Generate Formula
+        working-directory: tap
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          BASE_URL: ${{ steps.meta.outputs.base_url }}
+          SHA_X64: ${{ steps.meta.outputs.sha_x64 }}
+          SHA_ARM64: ${{ steps.meta.outputs.sha_arm64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p Formula
+          cat > Formula/deepseek.rb <<EOF
+          class Deepseek < Formula
+            desc "DeepSeek CLI coding agent"
+            homepage "https://github.com/${{ github.repository }}"
+            version "${TAG#v}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/deepseek-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_ARM64}"
+              else
+                url "${BASE_URL}/deepseek-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X64}"
+              end
+            end
+
+            def install
+              bin.install "deepseek"
+            end
+
+            test do
+              assert_match "deepseek", shell_output("#{bin}/deepseek --help")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula update
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/deepseek.rb
+          git commit -m "deepseek: update to ${{ github.event.release.tag_name }}" || exit 0
+          git push

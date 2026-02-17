@@ -278,6 +278,64 @@ pub enum EventKind {
         verified: bool,
         reason: String,
     },
+    CheckpointCreatedV1 {
+        checkpoint_id: Uuid,
+        reason: String,
+        files_count: u64,
+        snapshot_path: String,
+    },
+    CheckpointRewoundV1 {
+        checkpoint_id: Uuid,
+        reason: String,
+    },
+    TranscriptExportedV1 {
+        export_id: Uuid,
+        format: String,
+        output_path: String,
+    },
+    McpServerAddedV1 {
+        server_id: String,
+        transport: String,
+        endpoint: String,
+    },
+    McpServerRemovedV1 {
+        server_id: String,
+    },
+    McpToolDiscoveredV1 {
+        server_id: String,
+        tool_name: String,
+    },
+    SubagentSpawnedV1 {
+        run_id: Uuid,
+        name: String,
+        goal: String,
+    },
+    SubagentCompletedV1 {
+        run_id: Uuid,
+        output: String,
+    },
+    SubagentFailedV1 {
+        run_id: Uuid,
+        error: String,
+    },
+    CostUpdatedV1 {
+        input_tokens: u64,
+        output_tokens: u64,
+        estimated_cost_usd: f64,
+    },
+    EffortChangedV1 {
+        level: String,
+    },
+    ProfileCapturedV1 {
+        profile_id: Uuid,
+        summary: String,
+        elapsed_ms: u64,
+    },
+    MemorySyncedV1 {
+        version_id: Uuid,
+        path: String,
+        note: String,
+    },
     HookExecutedV1 {
         phase: String,
         hook_path: String,
@@ -343,22 +401,72 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    pub fn user_settings_path() -> Option<PathBuf> {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        Some(Path::new(&home).join(".deepseek/settings.json"))
+    }
+
+    pub fn project_settings_path(workspace: &Path) -> PathBuf {
+        runtime_dir(workspace).join("settings.json")
+    }
+
+    pub fn project_local_settings_path(workspace: &Path) -> PathBuf {
+        runtime_dir(workspace).join("settings.local.json")
+    }
+
+    pub fn keybindings_path() -> Option<PathBuf> {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        Some(Path::new(&home).join(".deepseek/keybindings.json"))
+    }
+
     pub fn config_path(workspace: &Path) -> PathBuf {
+        Self::project_settings_path(workspace)
+    }
+
+    pub fn legacy_toml_path(workspace: &Path) -> PathBuf {
         runtime_dir(workspace).join("config.toml")
     }
 
     pub fn load(workspace: &Path) -> Result<Self> {
-        let path = Self::config_path(workspace);
-        if !path.exists() {
-            return Ok(Self::default());
+        let mut merged = serde_json::to_value(Self::default())?;
+
+        let legacy = Self::legacy_toml_path(workspace);
+        if legacy.exists() {
+            let raw = fs::read_to_string(legacy)?;
+            let legacy_cfg: AppConfig = toml::from_str(&raw)?;
+            merge_json_value(&mut merged, &serde_json::to_value(legacy_cfg)?);
         }
-        let raw = fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+
+        let mut paths = Vec::new();
+        if let Some(user) = Self::user_settings_path() {
+            paths.push(user);
+        }
+        paths.push(Self::project_settings_path(workspace));
+        paths.push(Self::project_local_settings_path(workspace));
+
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
+            let raw = fs::read_to_string(path)?;
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            merge_json_value(&mut merged, &value);
+        }
+
+        Ok(serde_json::from_value(merged)?)
     }
 
     pub fn ensure(workspace: &Path) -> Result<Self> {
-        let path = Self::config_path(workspace);
-        if path.exists() {
+        let path = Self::project_settings_path(workspace);
+        if path.exists()
+            || Self::project_local_settings_path(workspace).exists()
+            || Self::legacy_toml_path(workspace).exists()
+            || Self::user_settings_path().is_some_and(|p| p.exists())
+        {
             return Self::load(workspace);
         }
         fs::create_dir_all(
@@ -371,13 +479,30 @@ impl AppConfig {
     }
 
     pub fn save(&self, workspace: &Path) -> Result<()> {
-        let path = Self::config_path(workspace);
+        let path = Self::project_settings_path(workspace);
         fs::create_dir_all(
             path.parent()
                 .ok_or_else(|| anyhow::anyhow!("invalid config path"))?,
         )?;
-        fs::write(path, toml::to_string_pretty(self)?)?;
+        fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
+    }
+}
+
+fn merge_json_value(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_obj), serde_json::Value::Object(overlay_obj)) => {
+            for (key, overlay_value) in overlay_obj {
+                if let Some(base_value) = base_obj.get_mut(key) {
+                    merge_json_value(base_value, overlay_value);
+                } else {
+                    base_obj.insert(key.clone(), overlay_value.clone());
+                }
+            }
+        }
+        (base_slot, overlay_value) => {
+            *base_slot = overlay_value.clone();
+        }
     }
 }
 

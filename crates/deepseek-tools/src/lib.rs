@@ -2,6 +2,7 @@ mod plugins;
 mod shell;
 
 use anyhow::{Result, anyhow};
+use chrono::Utc;
 use deepseek_core::{
     AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ToolCall, ToolHost, ToolProposal,
     ToolResult,
@@ -10,7 +11,9 @@ use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
 use deepseek_policy::PolicyEngine;
 use deepseek_store::Store;
-pub use plugins::{CatalogPlugin, PluginCommandPrompt, PluginInfo, PluginManager, PluginVerifyResult};
+pub use plugins::{
+    CatalogPlugin, PluginCommandPrompt, PluginInfo, PluginManager, PluginVerifyResult,
+};
 use serde_json::json;
 use sha2::Digest;
 pub use shell::{PlatformShellRunner, ShellRunResult, ShellRunner};
@@ -318,14 +321,14 @@ impl LocalToolHost {
             return Ok(HookRunOutcome {
                 success: false,
                 timed_out: true,
-                exit_code: output.code(),
+                exit_code: output.status.code(),
             });
         }
         let output = child.wait_with_output()?;
         Ok(HookRunOutcome {
-            success: output.success(),
+            success: output.status.success(),
             timed_out: false,
-            exit_code: output.code(),
+            exit_code: output.status.code(),
         })
     }
 
@@ -345,7 +348,7 @@ impl LocalToolHost {
         };
         let event = EventEnvelope {
             seq_no,
-            at: chrono::Utc::now(),
+            at: Utc::now(),
             session_id: session.session_id,
             kind: EventKind::HookExecutedV1 {
                 phase: phase.to_string(),

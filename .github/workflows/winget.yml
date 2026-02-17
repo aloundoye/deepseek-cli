@@ -1,0 +1,102 @@
+name: Publish Winget Manifests
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-winget:
+    runs-on: ubuntu-latest
+    if: ${{ secrets.WINGET_TOKEN != '' && secrets.WINGET_REPO != '' }}
+    steps:
+      - name: Prepare manifest metadata
+        id: meta
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          base_url="https://github.com/${REPO}/releases/download/${TAG}"
+          curl -fsSL "${base_url}/checksums.txt" -o checksums.txt
+          sha_x64="$(awk '$2=="deepseek-x86_64-pc-windows-msvc.zip"{print $1}' checksums.txt)"
+          sha_arm64="$(awk '$2=="deepseek-aarch64-pc-windows-msvc.zip"{print $1}' checksums.txt)"
+          if [[ -z "${sha_x64}" || -z "${sha_arm64}" ]]; then
+            echo "missing Windows checksums for winget manifests" >&2
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "base_url=${base_url}"
+            echo "sha_x64=${sha_x64}"
+            echo "sha_arm64=${sha_arm64}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout winget repository
+        env:
+          WINGET_REPO: ${{ secrets.WINGET_REPO }}
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${WINGET_TOKEN}@github.com/${WINGET_REPO}.git" winget
+
+      - name: Generate manifests
+        working-directory: winget
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          BASE_URL: ${{ steps.meta.outputs.base_url }}
+          SHA_X64: ${{ steps.meta.outputs.sha_x64 }}
+          SHA_ARM64: ${{ steps.meta.outputs.sha_arm64 }}
+        run: |
+          set -euo pipefail
+          pkg_id="DeepSeek.DeepSeekCLI"
+          root="manifests/d/DeepSeek/DeepSeekCLI/${VERSION}"
+          mkdir -p "${root}"
+          cat > "${root}/${pkg_id}.yaml" <<EOF
+          PackageIdentifier: ${pkg_id}
+          PackageVersion: ${VERSION}
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.6.0
+          EOF
+
+          cat > "${root}/${pkg_id}.locale.en-US.yaml" <<EOF
+          PackageIdentifier: ${pkg_id}
+          PackageVersion: ${VERSION}
+          PackageLocale: en-US
+          Publisher: DeepSeek
+          PackageName: DeepSeek CLI
+          ShortDescription: DeepSeek CLI coding agent
+          License: MIT
+          ManifestType: defaultLocale
+          ManifestVersion: 1.6.0
+          EOF
+
+          cat > "${root}/${pkg_id}.installer.yaml" <<EOF
+          PackageIdentifier: ${pkg_id}
+          PackageVersion: ${VERSION}
+          InstallerType: zip
+          NestedInstallerType: portable
+          NestedInstallerFiles:
+            - RelativeFilePath: deepseek.exe
+              PortableCommandAlias: deepseek
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${BASE_URL}/deepseek-x86_64-pc-windows-msvc.zip
+              InstallerSha256: ${SHA_X64}
+            - Architecture: arm64
+              InstallerUrl: ${BASE_URL}/deepseek-aarch64-pc-windows-msvc.zip
+              InstallerSha256: ${SHA_ARM64}
+          ManifestType: installer
+          ManifestVersion: 1.6.0
+          EOF
+
+      - name: Commit and push manifest update
+        working-directory: winget
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifests/d/DeepSeek/DeepSeekCLI
+          git commit -m "DeepSeek CLI: update to ${{ steps.meta.outputs.version }}" || exit 0
+          git push

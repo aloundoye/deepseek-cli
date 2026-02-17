@@ -9,10 +9,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($Target)) {
-  if ($env:PROCESSOR_ARCHITECTURE -match "ARM64") {
-    Write-Host "warning: using x86_64 Windows binary on ARM; emulation may be required."
+  $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+  if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+    $Target = "aarch64-pc-windows-msvc"
+  } elseif ($arch -eq [System.Runtime.InteropServices.Architecture]::X64) {
+    $Target = "x86_64-pc-windows-msvc"
+  } else {
+    throw "unsupported architecture for prebuilt binaries: $arch"
   }
-  $Target = "x86_64-pc-windows-msvc"
 }
 $asset = "deepseek-$Target.zip"
 

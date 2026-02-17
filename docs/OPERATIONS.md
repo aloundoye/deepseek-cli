@@ -31,6 +31,9 @@
 - Downgrade by reinstalling a previous tag:
   - macOS/Linux: `bash scripts/install.sh --version vPREVIOUS`
   - Windows: `./scripts/install.ps1 -Version vPREVIOUS`
+- Package manager rollback:
+  - Homebrew: `brew install deepseek@<version>` (or pin tap formula commit)
+  - Winget: `winget install DeepSeek.DeepSeekCLI --version <version>`
 - Verify rollback with:
   - `deepseek --json plan "rollback validation"`
   - `cargo test --workspace --all-targets`
