@@ -1,0 +1,80 @@
+{
+  "llm": {
+    "base_model": "deepseek-chat",
+    "max_think_model": "deepseek-reasoner",
+    "temperature": 0.2,
+    "endpoint": "https://api.deepseek.com/chat/completions",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "timeout_seconds": 60,
+    "max_retries": 3,
+    "retry_base_ms": 400,
+    "stream": true,
+    "offline_fallback": true
+  },
+  "router": {
+    "auto_max_think": true,
+    "threshold_high": 0.72,
+    "escalate_on_invalid_plan": true,
+    "max_escalations_per_unit": 1,
+    "w1": 0.2,
+    "w2": 0.15,
+    "w3": 0.2,
+    "w4": 0.15,
+    "w5": 0.2,
+    "w6": 0.1
+  },
+  "policy": {
+    "approve_edits": "ask",
+    "approve_bash": "ask",
+    "allowlist": [
+      "rg",
+      "git status",
+      "git diff",
+      "git show",
+      "cargo test",
+      "cargo fmt --check",
+      "cargo clippy"
+    ],
+    "sandbox_mode": "allowlist"
+  },
+  "plugins": {
+    "enabled": true,
+    "search_paths": [
+      ".deepseek/plugins",
+      ".plugins"
+    ],
+    "enable_hooks": false,
+    "catalog": {
+      "enabled": true,
+      "index_url": ".deepseek/plugins/catalog.json",
+      "signature_key": "deepseek-local-dev-key",
+      "refresh_hours": 24
+    }
+  },
+  "usage": {
+    "show_statusline": true,
+    "cost_per_million_input": 0.27,
+    "cost_per_million_output": 1.1
+  },
+  "context": {
+    "auto_compact_threshold": 0.86,
+    "compact_preview": true
+  },
+  "autopilot": {
+    "default_max_consecutive_failures": 10,
+    "heartbeat_interval_seconds": 5,
+    "persist_checkpoints": true
+  },
+  "ui": {
+    "reduced_motion": false,
+    "statusline_mode": "minimal"
+  },
+  "telemetry": {
+    "enabled": false,
+    "endpoint": null
+  },
+  "index": {
+    "enabled": true,
+    "engine": "tantivy"
+  }
+}

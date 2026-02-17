@@ -7,8 +7,11 @@ use deepseek_core::{
 };
 use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
-use deepseek_store::Store;
+use deepseek_mcp::{McpManager, McpServer, McpTransport};
+use deepseek_memory::{ExportFormat, MemoryManager};
+use deepseek_store::{AutopilotRunRecord, Store};
 use deepseek_tools::PluginManager;
+use deepseek_ui::{SlashCommand, UiStatus, render_statusline};
 use serde::Serialize;
 use serde_json::json;
 use std::fs;
@@ -37,6 +40,21 @@ enum Commands {
     Run,
     Diff,
     Apply(ApplyArgs),
+    Profile(ProfileArgs),
+    Rewind(RewindArgs),
+    Export(ExportArgs),
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCmd,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCmd,
+    },
+    Status,
+    Usage(UsageArgs),
+    Compact(CompactArgs),
+    Doctor(DoctorArgs),
     Index {
         #[command(subcommand)]
         command: IndexCmd,
@@ -67,7 +85,9 @@ struct ChatArgs {
 
 #[derive(Args)]
 struct AutopilotArgs {
-    prompt: String,
+    #[command(subcommand)]
+    command: Option<AutopilotCmd>,
+    prompt: Option<String>,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     tools: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -94,10 +114,38 @@ struct AutopilotArgs {
     max_consecutive_failures: u64,
 }
 
+#[derive(Subcommand)]
+enum AutopilotCmd {
+    Status(AutopilotStatusArgs),
+    Stop(AutopilotStopArgs),
+    Resume(AutopilotResumeArgs),
+}
+
+#[derive(Args)]
+struct AutopilotStatusArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
+#[derive(Args)]
+struct AutopilotStopArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
+#[derive(Args)]
+struct AutopilotResumeArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
 #[derive(Args)]
 struct PromptArg {
     prompt: String,
 }
+
+#[derive(Args, Default)]
+struct ProfileArgs {}
 
 #[derive(Args)]
 struct ApplyArgs {
@@ -107,10 +155,118 @@ struct ApplyArgs {
     yes: bool,
 }
 
+#[derive(Args, Default)]
+struct RewindArgs {
+    #[arg(long)]
+    to_checkpoint: Option<String>,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args, Default)]
+struct ExportArgs {
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long, default_value = "json")]
+    format: String,
+    #[arg(long)]
+    output: Option<String>,
+}
+
 #[derive(Args)]
 struct CleanArgs {
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Args, Default)]
+struct UsageArgs {
+    #[arg(long)]
+    session: bool,
+    #[arg(long)]
+    day: bool,
+}
+
+#[derive(Args, Default)]
+struct CompactArgs {
+    #[arg(long)]
+    from_turn: Option<u64>,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args, Default)]
+struct DoctorArgs {}
+
+#[derive(Subcommand)]
+enum MemoryCmd {
+    Show(MemoryShowArgs),
+    Edit(MemoryEditArgs),
+    Sync(MemorySyncArgs),
+}
+
+#[derive(Args, Default)]
+struct MemoryShowArgs {}
+
+#[derive(Args, Default)]
+struct MemoryEditArgs {}
+
+#[derive(Args, Default)]
+struct MemorySyncArgs {
+    #[arg(long)]
+    note: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    Add(McpAddArgs),
+    List,
+    Get(McpGetArgs),
+    Remove(McpRemoveArgs),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum McpTransportArg {
+    Stdio,
+    Http,
+}
+
+impl McpTransportArg {
+    fn into_transport(self) -> McpTransport {
+        match self {
+            Self::Stdio => McpTransport::Stdio,
+            Self::Http => McpTransport::Http,
+        }
+    }
+}
+
+#[derive(Args)]
+struct McpAddArgs {
+    id: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, value_enum, default_value_t = McpTransportArg::Stdio)]
+    transport: McpTransportArg,
+    #[arg(long)]
+    command: Option<String>,
+    #[arg(long = "arg")]
+    args: Vec<String>,
+    #[arg(long)]
+    url: Option<String>,
+    #[arg(long)]
+    metadata: Option<String>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    enabled: bool,
+}
+
+#[derive(Args)]
+struct McpGetArgs {
+    server_id: String,
+}
+
+#[derive(Args)]
+struct McpRemoveArgs {
+    server_id: String,
 }
 
 #[derive(Subcommand)]
@@ -118,6 +274,12 @@ enum IndexCmd {
     Build,
     Update,
     Status,
+    Watch {
+        #[arg(long, default_value_t = 1)]
+        events: usize,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
     Query {
         q: String,
         #[arg(long, default_value_t = 10)]
@@ -139,6 +301,9 @@ enum PluginCmd {
     Enable(PluginIdArgs),
     Disable(PluginIdArgs),
     Inspect(PluginIdArgs),
+    Catalog,
+    Search(PluginSearchArgs),
+    Verify(PluginIdArgs),
     Run(PluginRunArgs),
 }
 
@@ -156,6 +321,11 @@ struct PluginInstallArgs {
 #[derive(Args)]
 struct PluginIdArgs {
     plugin_id: String,
+}
+
+#[derive(Args)]
+struct PluginSearchArgs {
+    query: String,
 }
 
 #[derive(Args)]
@@ -177,7 +347,7 @@ fn main() -> Result<()> {
 
     match command {
         Commands::Chat(args) => run_chat(&cwd, cli.json, args.tools),
-        Commands::Autopilot(args) => run_autopilot(&cwd, args, cli.json),
+        Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),
         Commands::Ask(args) => {
             let engine = AgentEngine::new(&cwd)?;
             let output = engine.run_once(&args.prompt, args.tools)?;
@@ -210,6 +380,15 @@ fn main() -> Result<()> {
         }
         Commands::Diff => run_diff(&cwd, cli.json),
         Commands::Apply(args) => run_apply(&cwd, args, cli.json),
+        Commands::Profile(args) => run_profile(&cwd, args, cli.json),
+        Commands::Rewind(args) => run_rewind(&cwd, args, cli.json),
+        Commands::Export(args) => run_export(&cwd, args, cli.json),
+        Commands::Memory { command } => run_memory(&cwd, command, cli.json),
+        Commands::Mcp { command } => run_mcp(&cwd, command, cli.json),
+        Commands::Status => run_status(&cwd, cli.json),
+        Commands::Usage(args) => run_usage(&cwd, args, cli.json),
+        Commands::Compact(args) => run_compact(&cwd, args, cli.json),
+        Commands::Doctor(args) => run_doctor(&cwd, args, cli.json),
         Commands::Index { command } => run_index(&cwd, command, cli.json),
         Commands::Config { command } => run_config(&cwd, command, cli.json),
         Commands::Plugins { command } => run_plugins(&cwd, command, cli.json),
@@ -217,7 +396,55 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()> {
+fn run_autopilot_cmd(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()> {
+    match args.command {
+        Some(AutopilotCmd::Status(status)) => run_autopilot_status(cwd, status, json_mode),
+        Some(AutopilotCmd::Stop(stop)) => run_autopilot_stop(cwd, stop, json_mode),
+        Some(AutopilotCmd::Resume(resume)) => run_autopilot_resume(cwd, resume, json_mode),
+        None => {
+            let prompt = args.prompt.ok_or_else(|| {
+                anyhow!("missing autopilot prompt; use `deepseek autopilot \"<prompt>\"`")
+            })?;
+            run_autopilot(
+                cwd,
+                AutopilotStartArgs {
+                    prompt,
+                    tools: args.tools,
+                    max_think: args.max_think,
+                    continue_on_error: args.continue_on_error,
+                    max_iterations: args.max_iterations,
+                    duration_seconds: args.duration_seconds,
+                    hours: args.hours,
+                    forever: args.forever,
+                    sleep_seconds: args.sleep_seconds,
+                    retry_delay_seconds: args.retry_delay_seconds,
+                    stop_file: args.stop_file,
+                    heartbeat_file: args.heartbeat_file,
+                    max_consecutive_failures: args.max_consecutive_failures,
+                },
+                json_mode,
+            )
+        }
+    }
+}
+
+struct AutopilotStartArgs {
+    prompt: String,
+    tools: bool,
+    max_think: bool,
+    continue_on_error: bool,
+    max_iterations: Option<u64>,
+    duration_seconds: Option<u64>,
+    hours: Option<f64>,
+    forever: bool,
+    sleep_seconds: u64,
+    retry_delay_seconds: u64,
+    stop_file: Option<String>,
+    heartbeat_file: Option<String>,
+    max_consecutive_failures: u64,
+}
+
+fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Result<()> {
     if let Some(max_iterations) = args.max_iterations
         && max_iterations == 0
     {
@@ -233,6 +460,9 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
     }
 
     let engine = AgentEngine::new(cwd)?;
+    let store = Store::new(cwd)?;
+    let session = ensure_session_record(cwd, &store)?;
+    let run_id = Uuid::now_v7();
     let started = Instant::now();
     let deadline = autopilot_deadline(&args)?;
     let stop_file = args
@@ -245,6 +475,34 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| runtime_dir(cwd).join("autopilot.heartbeat.json"));
+
+    let started_at = Utc::now().to_rfc3339();
+    store.upsert_autopilot_run(&AutopilotRunRecord {
+        run_id,
+        session_id: session.session_id,
+        prompt: args.prompt.clone(),
+        status: "running".to_string(),
+        stop_reason: None,
+        completed_iterations: 0,
+        failed_iterations: 0,
+        consecutive_failures: 0,
+        last_error: None,
+        stop_file: stop_file.to_string_lossy().to_string(),
+        heartbeat_file: heartbeat_file.to_string_lossy().to_string(),
+        tools: args.tools,
+        max_think: args.max_think,
+        started_at: started_at.clone(),
+        updated_at: started_at.clone(),
+    })?;
+    store.append_event(&EventEnvelope {
+        seq_no: store.next_seq_no(session.session_id)?,
+        at: Utc::now(),
+        session_id: session.session_id,
+        kind: EventKind::AutopilotRunStartedV1 {
+            run_id,
+            prompt: args.prompt.clone(),
+        },
+    })?;
 
     if !json_mode {
         let runtime = if args.forever {
@@ -271,9 +529,11 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
     let mut failed_iterations = 0_u64;
     let mut consecutive_failures = 0_u64;
     let mut last_error: Option<String> = None;
+
     write_autopilot_heartbeat(
         &heartbeat_file,
         &json!({
+            "run_id": run_id,
             "status": "started",
             "at": Utc::now().to_rfc3339(),
             "completed_iterations": completed_iterations,
@@ -282,6 +542,20 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
             "stop_file": stop_file,
         }),
     )?;
+
+    store.append_event(&EventEnvelope {
+        seq_no: store.next_seq_no(session.session_id)?,
+        at: Utc::now(),
+        session_id: session.session_id,
+        kind: EventKind::AutopilotRunHeartbeatV1 {
+            run_id,
+            completed_iterations,
+            failed_iterations,
+            consecutive_failures,
+            last_error: last_error.clone(),
+        },
+    })?;
+
     let stop_reason = loop {
         if let Some(max_iterations) = args.max_iterations
             && completed_iterations + failed_iterations >= max_iterations
@@ -335,6 +609,7 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
         write_autopilot_heartbeat(
             &heartbeat_file,
             &json!({
+                "run_id": run_id,
                 "status": "running",
                 "at": Utc::now().to_rfc3339(),
                 "completed_iterations": completed_iterations,
@@ -343,9 +618,39 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
                 "last_error": last_error,
             }),
         )?;
+        store.upsert_autopilot_run(&AutopilotRunRecord {
+            run_id,
+            session_id: session.session_id,
+            prompt: args.prompt.clone(),
+            status: "running".to_string(),
+            stop_reason: None,
+            completed_iterations,
+            failed_iterations,
+            consecutive_failures,
+            last_error: last_error.clone(),
+            stop_file: stop_file.to_string_lossy().to_string(),
+            heartbeat_file: heartbeat_file.to_string_lossy().to_string(),
+            tools: args.tools,
+            max_think: args.max_think,
+            started_at: started_at.clone(),
+            updated_at: Utc::now().to_rfc3339(),
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::AutopilotRunHeartbeatV1 {
+                run_id,
+                completed_iterations,
+                failed_iterations,
+                consecutive_failures,
+                last_error: last_error.clone(),
+            },
+        })?;
     };
 
     let summary = json!({
+        "run_id": run_id,
         "stop_reason": stop_reason,
         "elapsed_seconds": started.elapsed().as_secs(),
         "completed_iterations": completed_iterations,
@@ -361,11 +666,40 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
     write_autopilot_heartbeat(
         &heartbeat_file,
         &json!({
+            "run_id": run_id,
             "status": "stopped",
             "at": Utc::now().to_rfc3339(),
             "summary": summary,
         }),
     )?;
+    store.upsert_autopilot_run(&AutopilotRunRecord {
+        run_id,
+        session_id: session.session_id,
+        prompt: args.prompt,
+        status: "stopped".to_string(),
+        stop_reason: Some(stop_reason.clone()),
+        completed_iterations,
+        failed_iterations,
+        consecutive_failures,
+        last_error: last_error.clone(),
+        stop_file: stop_file.to_string_lossy().to_string(),
+        heartbeat_file: heartbeat_file.to_string_lossy().to_string(),
+        tools: args.tools,
+        max_think: args.max_think,
+        started_at,
+        updated_at: Utc::now().to_rfc3339(),
+    })?;
+    store.append_event(&EventEnvelope {
+        seq_no: store.next_seq_no(session.session_id)?,
+        at: Utc::now(),
+        session_id: session.session_id,
+        kind: EventKind::AutopilotRunStoppedV1 {
+            run_id,
+            stop_reason: stop_reason.clone(),
+            completed_iterations,
+            failed_iterations,
+        },
+    })?;
 
     if json_mode {
         print_json(&summary)?;
@@ -390,7 +724,149 @@ fn run_autopilot(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()>
     Ok(())
 }
 
-fn autopilot_deadline(args: &AutopilotArgs) -> Result<Option<Instant>> {
+fn run_autopilot_status(cwd: &Path, args: AutopilotStatusArgs, json_mode: bool) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let Some(run) = find_autopilot_run(&store, args.run_id.as_deref())? else {
+        let payload = json!({
+            "status": "none",
+            "run_id": null,
+            "session_id": null,
+            "completed_iterations": 0,
+            "failed_iterations": 0,
+            "consecutive_failures": 0,
+        });
+        if json_mode {
+            print_json(&payload)?;
+        } else {
+            println!("no autopilot runs found");
+        }
+        return Ok(());
+    };
+    let heartbeat = if run.heartbeat_file.is_empty() {
+        None
+    } else {
+        fs::read_to_string(&run.heartbeat_file)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    };
+    let payload = json!({
+        "run_id": run.run_id,
+        "session_id": run.session_id,
+        "status": run.status,
+        "stop_reason": run.stop_reason,
+        "completed_iterations": run.completed_iterations,
+        "failed_iterations": run.failed_iterations,
+        "consecutive_failures": run.consecutive_failures,
+        "last_error": run.last_error,
+        "stop_file": run.stop_file,
+        "heartbeat_file": run.heartbeat_file,
+        "tools": run.tools,
+        "max_think": run.max_think,
+        "heartbeat": heartbeat,
+    });
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "run={} status={} completed={} failed={} consecutive_failures={}",
+            run.run_id,
+            run.status,
+            run.completed_iterations,
+            run.failed_iterations,
+            run.consecutive_failures
+        );
+        if let Some(reason) = run.stop_reason {
+            println!("stop_reason={reason}");
+        }
+        if let Some(err) = run.last_error {
+            println!("last_error={err}");
+        }
+        println!("stop_file={}", run.stop_file);
+        println!("heartbeat_file={}", run.heartbeat_file);
+    }
+    Ok(())
+}
+
+fn run_autopilot_stop(cwd: &Path, args: AutopilotStopArgs, json_mode: bool) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let run = find_autopilot_run(&store, args.run_id.as_deref())?
+        .ok_or_else(|| anyhow!("no autopilot runs found"))?;
+    let stop_path = if run.stop_file.trim().is_empty() {
+        runtime_dir(cwd).join("autopilot.stop")
+    } else {
+        PathBuf::from(run.stop_file.clone())
+    };
+    if let Some(parent) = stop_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &stop_path,
+        format!("stop requested at {}\n", Utc::now().to_rfc3339()),
+    )?;
+    if json_mode {
+        print_json(&json!({
+            "run_id": run.run_id,
+            "stop_requested": true,
+            "stop_file": stop_path,
+        }))?;
+    } else {
+        println!(
+            "stop requested for run {} via {}",
+            run.run_id,
+            stop_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_autopilot_resume(cwd: &Path, args: AutopilotResumeArgs, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let store = Store::new(cwd)?;
+    let run = find_autopilot_run(&store, args.run_id.as_deref())?
+        .ok_or_else(|| anyhow!("no autopilot runs found"))?;
+    if run.status == "running" {
+        return Err(anyhow!("autopilot run is already marked as running"));
+    }
+
+    run_autopilot(
+        cwd,
+        AutopilotStartArgs {
+            prompt: run.prompt.clone(),
+            tools: run.tools,
+            max_think: run.max_think,
+            continue_on_error: true,
+            max_iterations: None,
+            duration_seconds: None,
+            hours: None,
+            forever: false,
+            sleep_seconds: 0,
+            retry_delay_seconds: 2,
+            stop_file: if run.stop_file.trim().is_empty() {
+                None
+            } else {
+                Some(run.stop_file.clone())
+            },
+            heartbeat_file: if run.heartbeat_file.trim().is_empty() {
+                None
+            } else {
+                Some(run.heartbeat_file.clone())
+            },
+            max_consecutive_failures: cfg.autopilot.default_max_consecutive_failures.max(1),
+        },
+        json_mode,
+    )
+}
+
+fn find_autopilot_run(store: &Store, run_id: Option<&str>) -> Result<Option<AutopilotRunRecord>> {
+    if let Some(run_id) = run_id {
+        let uid = Uuid::parse_str(run_id)?;
+        return store.load_autopilot_run(uid);
+    }
+    store.load_latest_autopilot_run()
+}
+
+fn autopilot_deadline(args: &AutopilotStartArgs) -> Result<Option<Instant>> {
     if args.forever {
         return Ok(None);
     }
@@ -422,6 +898,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool) -> Result<()> {
 
     let engine = AgentEngine::new(cwd)?;
     let cfg = AppConfig::ensure(cwd)?;
+    let mut force_max_think = false;
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -451,15 +928,263 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool) -> Result<()> {
         if prompt.is_empty() {
             continue;
         }
-        let output = engine.run_once(prompt, allow_tools)?;
+
+        if let Some(cmd) = SlashCommand::parse(prompt) {
+            match cmd {
+                SlashCommand::Help => {
+                    let message = json!({
+                        "commands": [
+                            "/help",
+                            "/init",
+                            "/clear",
+                            "/compact",
+                            "/memory",
+                            "/config",
+                            "/model",
+                            "/cost",
+                            "/mcp",
+                            "/rewind",
+                            "/export",
+                            "/plan",
+                            "/teleport",
+                            "/remote-env",
+                            "/status",
+                            "/effort",
+                        ],
+                    });
+                    if json_mode {
+                        print_json(&message)?;
+                    } else {
+                        println!("slash commands:");
+                        for command in message["commands"].as_array().into_iter().flatten() {
+                            if let Some(name) = command.as_str() {
+                                println!("- {name}");
+                            }
+                        }
+                    }
+                }
+                SlashCommand::Init => {
+                    let manager = MemoryManager::new(cwd)?;
+                    let path = manager.ensure_initialized()?;
+                    let version_id = manager.sync_memory_version("init")?;
+                    append_control_event(
+                        cwd,
+                        EventKind::MemorySyncedV1 {
+                            version_id,
+                            path: path.to_string_lossy().to_string(),
+                            note: "init".to_string(),
+                        },
+                    )?;
+                    if json_mode {
+                        print_json(&json!({
+                            "initialized": true,
+                            "path": path,
+                            "version_id": version_id,
+                        }))?;
+                    } else {
+                        println!("initialized memory at {}", path.display());
+                    }
+                }
+                SlashCommand::Clear => {
+                    if json_mode {
+                        print_json(&json!({"cleared": true}))?;
+                    } else {
+                        println!("chat buffer cleared");
+                    }
+                }
+                SlashCommand::Compact => {
+                    run_compact(
+                        cwd,
+                        CompactArgs {
+                            from_turn: None,
+                            yes: false,
+                        },
+                        json_mode,
+                    )?;
+                }
+                SlashCommand::Memory(args) => {
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("show") {
+                        run_memory(cwd, MemoryCmd::Show(MemoryShowArgs {}), json_mode)?;
+                    } else if args[0].eq_ignore_ascii_case("edit") {
+                        run_memory(cwd, MemoryCmd::Edit(MemoryEditArgs {}), json_mode)?;
+                    } else if args[0].eq_ignore_ascii_case("sync") {
+                        let note = args.get(1).cloned();
+                        run_memory(cwd, MemoryCmd::Sync(MemorySyncArgs { note }), json_mode)?;
+                    } else if json_mode {
+                        print_json(&json!({"error":"unknown /memory subcommand"}))?;
+                    } else {
+                        println!("unknown /memory subcommand");
+                    }
+                }
+                SlashCommand::Config => {
+                    run_config(cwd, ConfigCmd::Show, json_mode)?;
+                }
+                SlashCommand::Model(model) => {
+                    if let Some(model) = model {
+                        let lower = model.to_ascii_lowercase();
+                        force_max_think = lower.contains("reasoner")
+                            || lower.contains("max")
+                            || lower.contains("high");
+                    }
+                    if json_mode {
+                        print_json(&json!({
+                            "force_max_think": force_max_think,
+                            "base_model": cfg.llm.base_model,
+                            "max_think_model": cfg.llm.max_think_model,
+                        }))?;
+                    } else if force_max_think {
+                        println!("model mode: max-think ({})", cfg.llm.max_think_model);
+                    } else {
+                        println!("model mode: base ({})", cfg.llm.base_model);
+                    }
+                }
+                SlashCommand::Cost => {
+                    run_usage(
+                        cwd,
+                        UsageArgs {
+                            session: true,
+                            day: false,
+                        },
+                        json_mode,
+                    )?;
+                }
+                SlashCommand::Mcp(args) => {
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+                        run_mcp(cwd, McpCmd::List, json_mode)?;
+                    } else if args[0].eq_ignore_ascii_case("get") && args.len() > 1 {
+                        run_mcp(
+                            cwd,
+                            McpCmd::Get(McpGetArgs {
+                                server_id: args[1].clone(),
+                            }),
+                            json_mode,
+                        )?;
+                    } else if args[0].eq_ignore_ascii_case("remove") && args.len() > 1 {
+                        run_mcp(
+                            cwd,
+                            McpCmd::Remove(McpRemoveArgs {
+                                server_id: args[1].clone(),
+                            }),
+                            json_mode,
+                        )?;
+                    } else if json_mode {
+                        print_json(&json!({"error":"use /mcp list|get <id>|remove <id>"}))?;
+                    } else {
+                        println!("use /mcp list|get <id>|remove <id>");
+                    }
+                }
+                SlashCommand::Rewind(args) => {
+                    let to_checkpoint = args
+                        .iter()
+                        .find(|arg| !arg.starts_with('-'))
+                        .map(ToString::to_string);
+                    let yes = true;
+                    run_rewind(cwd, RewindArgs { to_checkpoint, yes }, json_mode)?;
+                }
+                SlashCommand::Export(args) => {
+                    let format = args.first().cloned().unwrap_or_else(|| "json".to_string());
+                    let output = args.get(1).cloned();
+                    run_export(
+                        cwd,
+                        ExportArgs {
+                            session: None,
+                            format,
+                            output,
+                        },
+                        json_mode,
+                    )?;
+                }
+                SlashCommand::Plan => {
+                    if json_mode {
+                        print_json(&json!({"plan_mode": true}))?;
+                    } else {
+                        println!("plan mode active; prompts will prefer structured planning.");
+                    }
+                }
+                SlashCommand::Teleport | SlashCommand::RemoteEnv => {
+                    if json_mode {
+                        print_json(&json!({"status":"not_implemented"}))?;
+                    } else {
+                        println!("not implemented in local CLI yet");
+                    }
+                }
+                SlashCommand::Status => run_status(cwd, json_mode)?,
+                SlashCommand::Effort(level) => {
+                    let level = level.unwrap_or_else(|| "medium".to_string());
+                    let normalized = level.to_ascii_lowercase();
+                    force_max_think = matches!(normalized.as_str(), "high" | "max");
+                    append_control_event(
+                        cwd,
+                        EventKind::EffortChangedV1 {
+                            level: normalized.clone(),
+                        },
+                    )?;
+                    if json_mode {
+                        print_json(&json!({
+                            "effort": normalized,
+                            "force_max_think": force_max_think
+                        }))?;
+                    } else {
+                        println!(
+                            "effort={} model_mode={}",
+                            normalized,
+                            if force_max_think { "max-think" } else { "base" }
+                        );
+                    }
+                }
+                SlashCommand::Unknown { name, .. } => {
+                    if json_mode {
+                        print_json(&json!({"error": format!("unknown slash command: /{name}")}))?;
+                    } else {
+                        println!("unknown slash command: /{name}");
+                    }
+                }
+            }
+            continue;
+        }
+
+        let output = engine.run_once_with_mode(prompt, allow_tools, force_max_think)?;
+        let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
-            print_json(&json!({"output": output, "router_hint": "auto-max-think"}))?;
+            print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
         } else {
-            println!("[status] router=auto-max-think");
+            println!("[status] {}", render_statusline(&ui_status));
             println!("{output}");
         }
     }
     Ok(())
+}
+
+fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Result<UiStatus> {
+    let store = Store::new(cwd)?;
+    let session = store.load_latest_session()?;
+    let projection = if let Some(session) = &session {
+        store.rebuild_from_events(session.session_id)?
+    } else {
+        Default::default()
+    };
+    let usage = store.usage_summary(session.map(|s| s.session_id), None)?;
+    let autopilot_running = store
+        .load_latest_autopilot_run()?
+        .is_some_and(|run| run.status == "running");
+    let pending_approvals = projection
+        .tool_invocations
+        .len()
+        .saturating_sub(projection.approved_invocations.len());
+    let estimated_cost_usd = (usage.input_tokens as f64 / 1_000_000.0)
+        * cfg.usage.cost_per_million_input
+        + (usage.output_tokens as f64 / 1_000_000.0) * cfg.usage.cost_per_million_output;
+    Ok(UiStatus {
+        model: if force_max_think {
+            cfg.llm.max_think_model.clone()
+        } else {
+            cfg.llm.base_model.clone()
+        },
+        pending_approvals,
+        estimated_cost_usd,
+        background_jobs: 0,
+        autopilot_running,
+    })
 }
 
 fn run_diff(cwd: &Path, json_mode: bool) -> Result<()> {
@@ -502,11 +1227,25 @@ fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<()> {
         return Err(anyhow!("approval required: pass --yes to apply"));
     }
 
+    let checkpoint = MemoryManager::new(cwd)?.create_checkpoint("patch_apply")?;
+    append_control_event(
+        cwd,
+        EventKind::CheckpointCreatedV1 {
+            checkpoint_id: checkpoint.checkpoint_id,
+            reason: checkpoint.reason.clone(),
+            files_count: checkpoint.files_count,
+            snapshot_path: checkpoint.snapshot_path.clone(),
+        },
+    )?;
+
     let (applied, conflicts) = store.apply(cwd, patch.patch_id)?;
     if json_mode {
-        print_json(
-            &json!({"patch_id": patch.patch_id, "applied": applied, "conflicts": conflicts}),
-        )?;
+        print_json(&json!({
+            "patch_id": patch.patch_id,
+            "applied": applied,
+            "conflicts": conflicts,
+            "checkpoint_id": checkpoint.checkpoint_id
+        }))?;
         return Ok(());
     }
     if applied {
@@ -517,6 +1256,747 @@ fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<()> {
             println!("conflict: {c}");
         }
     }
+    Ok(())
+}
+
+fn run_profile(cwd: &Path, _args: ProfileArgs, json_mode: bool) -> Result<()> {
+    let started = Instant::now();
+    let cfg = AppConfig::ensure(cwd)?;
+    let store = Store::new(cwd)?;
+    let session = ensure_session_record(cwd, &store)?;
+    let usage = store.usage_summary(Some(session.session_id), Some(24))?;
+    let compactions = store.list_context_compactions(Some(session.session_id))?;
+    let autopilot = store.load_latest_autopilot_run()?;
+    let index = IndexService::new(cwd)?.status()?;
+    let estimated_cost_usd = (usage.input_tokens as f64 / 1_000_000.0)
+        * cfg.usage.cost_per_million_input
+        + (usage.output_tokens as f64 / 1_000_000.0) * cfg.usage.cost_per_million_output;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let profile_id = Uuid::now_v7();
+    let summary = format!(
+        "tokens={} cost_usd={:.6} compactions={} index_fresh={} autopilot={}",
+        usage.input_tokens + usage.output_tokens,
+        estimated_cost_usd,
+        compactions.len(),
+        index.as_ref().is_some_and(|m| m.fresh),
+        autopilot
+            .as_ref()
+            .map(|run| run.status.as_str())
+            .unwrap_or("none")
+    );
+    store.insert_profile_run(&deepseek_store::ProfileRunRecord {
+        profile_id,
+        session_id: session.session_id,
+        summary: summary.clone(),
+        elapsed_ms,
+        created_at: Utc::now().to_rfc3339(),
+    })?;
+    append_control_event(
+        cwd,
+        EventKind::ProfileCapturedV1 {
+            profile_id,
+            summary: summary.clone(),
+            elapsed_ms,
+        },
+    )?;
+
+    let payload = json!({
+        "profile_id": profile_id,
+        "session_id": session.session_id,
+        "summary": summary,
+        "elapsed_ms": elapsed_ms,
+        "usage": usage,
+        "estimated_cost_usd": estimated_cost_usd,
+        "compactions": compactions.len(),
+        "autopilot": autopilot.map(|run| json!({
+            "run_id": run.run_id,
+            "status": run.status,
+            "completed_iterations": run.completed_iterations,
+            "failed_iterations": run.failed_iterations,
+        })),
+        "index": index,
+    });
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "profile={} elapsed_ms={} cost_usd={:.6} tokens={} compactions={}",
+            profile_id,
+            elapsed_ms,
+            estimated_cost_usd,
+            usage.input_tokens + usage.output_tokens,
+            compactions.len()
+        );
+    }
+    Ok(())
+}
+
+fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Result<()> {
+    let memory = MemoryManager::new(cwd)?;
+    let checkpoint_id = if let Some(value) = args.to_checkpoint.as_deref() {
+        Uuid::parse_str(value)?
+    } else {
+        let checkpoints = memory.list_checkpoints()?;
+        if checkpoints.is_empty() {
+            let payload = json!({"rewound": false, "reason": "no_checkpoints"});
+            if json_mode {
+                print_json(&payload)?;
+            } else {
+                println!("no checkpoints available");
+            }
+            return Ok(());
+        }
+        checkpoints
+            .into_iter()
+            .next()
+            .expect("non-empty checkpoints")
+            .checkpoint_id
+    };
+    if !args.yes {
+        return Err(anyhow!(
+            "rewind requires --yes to confirm (target checkpoint: {})",
+            checkpoint_id
+        ));
+    }
+    let checkpoint = memory.rewind_to_checkpoint(checkpoint_id)?;
+    append_control_event(
+        cwd,
+        EventKind::CheckpointRewoundV1 {
+            checkpoint_id: checkpoint.checkpoint_id,
+            reason: checkpoint.reason.clone(),
+        },
+    )?;
+    let payload = json!({
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "reason": checkpoint.reason,
+        "snapshot_path": checkpoint.snapshot_path,
+        "files_count": checkpoint.files_count,
+        "created_at": checkpoint.created_at,
+        "rewound": true,
+    });
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "rewound to checkpoint {} (files={})",
+            payload["checkpoint_id"].as_str().unwrap_or_default(),
+            payload["files_count"].as_u64().unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+fn run_export(cwd: &Path, args: ExportArgs, json_mode: bool) -> Result<()> {
+    let format = ExportFormat::parse(&args.format)
+        .ok_or_else(|| anyhow!("unsupported format '{}'; expected json|md", args.format))?;
+    let explicit_session = args.session.as_deref().map(Uuid::parse_str).transpose()?;
+    let session = if explicit_session.is_none() {
+        let store = Store::new(cwd)?;
+        Some(ensure_session_record(cwd, &store)?.session_id)
+    } else {
+        explicit_session
+    };
+    let output = args.output.as_deref().map(PathBuf::from);
+    let memory = MemoryManager::new(cwd)?;
+    let record = memory.export_transcript(format, output.as_deref(), session)?;
+    append_control_event(
+        cwd,
+        EventKind::TranscriptExportedV1 {
+            export_id: record.export_id,
+            format: record.format.clone(),
+            output_path: record.output_path.clone(),
+        },
+    )?;
+    if json_mode {
+        print_json(&record)?;
+    } else {
+        println!(
+            "exported transcript {} ({}) to {}",
+            record.export_id, record.format, record.output_path
+        );
+    }
+    Ok(())
+}
+
+fn run_memory(cwd: &Path, cmd: MemoryCmd, json_mode: bool) -> Result<()> {
+    let manager = MemoryManager::new(cwd)?;
+    match cmd {
+        MemoryCmd::Show(_) => {
+            let path = manager.ensure_initialized()?;
+            let content = manager.read_memory()?;
+            if json_mode {
+                print_json(&json!({
+                    "path": path,
+                    "content": content,
+                }))?;
+            } else {
+                println!("{}", content);
+            }
+        }
+        MemoryCmd::Edit(_) => {
+            let path = manager.ensure_initialized()?;
+            let checkpoint = manager.create_checkpoint("memory_edit")?;
+            append_control_event(
+                cwd,
+                EventKind::CheckpointCreatedV1 {
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    reason: checkpoint.reason.clone(),
+                    files_count: checkpoint.files_count,
+                    snapshot_path: checkpoint.snapshot_path.clone(),
+                },
+            )?;
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| default_editor().to_string());
+            let status = Command::new(editor).arg(&path).status()?;
+            if !status.success() {
+                return Err(anyhow!("editor exited with non-zero status"));
+            }
+            let version_id = manager.sync_memory_version("edit")?;
+            append_control_event(
+                cwd,
+                EventKind::MemorySyncedV1 {
+                    version_id,
+                    path: path.to_string_lossy().to_string(),
+                    note: "edit".to_string(),
+                },
+            )?;
+            if json_mode {
+                print_json(&json!({
+                    "edited": true,
+                    "path": path,
+                    "version_id": version_id,
+                    "checkpoint_id": checkpoint.checkpoint_id
+                }))?;
+            } else {
+                println!("updated {}", path.display());
+            }
+        }
+        MemoryCmd::Sync(args) => {
+            let path = manager.ensure_initialized()?;
+            let note = args.note.unwrap_or_else(|| "sync".to_string());
+            let version_id = manager.sync_memory_version(&note)?;
+            append_control_event(
+                cwd,
+                EventKind::MemorySyncedV1 {
+                    version_id,
+                    path: path.to_string_lossy().to_string(),
+                    note: note.clone(),
+                },
+            )?;
+            if json_mode {
+                print_json(&json!({
+                    "synced": true,
+                    "path": path,
+                    "version_id": version_id,
+                    "note": note,
+                }))?;
+            } else {
+                println!("memory synced version={} note={}", version_id, note);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
+    let manager = McpManager::new(cwd)?;
+    match cmd {
+        McpCmd::Add(args) => {
+            let metadata = if let Some(metadata) = args.metadata.as_deref() {
+                serde_json::from_str(metadata)?
+            } else {
+                serde_json::Value::Null
+            };
+            let server = McpServer {
+                id: args.id.clone(),
+                name: args.name.unwrap_or_else(|| args.id.clone()),
+                transport: args.transport.into_transport(),
+                command: args.command,
+                args: args.args,
+                url: args.url,
+                enabled: args.enabled,
+                metadata,
+            };
+            let endpoint = server
+                .command
+                .clone()
+                .or_else(|| server.url.clone())
+                .unwrap_or_default();
+            let transport = match server.transport {
+                McpTransport::Stdio => "stdio",
+                McpTransport::Http => "http",
+            };
+            manager.add_server(server.clone())?;
+            append_control_event(
+                cwd,
+                EventKind::McpServerAddedV1 {
+                    server_id: server.id.clone(),
+                    transport: transport.to_string(),
+                    endpoint,
+                },
+            )?;
+
+            let discovered = manager.discover_tools()?;
+            let discovered_for_server = discovered
+                .iter()
+                .filter(|tool| tool.server_id == server.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for tool in &discovered_for_server {
+                append_control_event(
+                    cwd,
+                    EventKind::McpToolDiscoveredV1 {
+                        server_id: tool.server_id.clone(),
+                        tool_name: tool.name.clone(),
+                    },
+                )?;
+            }
+
+            if json_mode {
+                print_json(&json!({
+                    "added": server,
+                    "discovered_tools": discovered_for_server,
+                }))?;
+            } else {
+                println!("added mcp server {} (transport={})", args.id, transport);
+            }
+        }
+        McpCmd::List => {
+            let servers = manager.list_servers()?;
+            if json_mode {
+                print_json(&servers)?;
+            } else if servers.is_empty() {
+                println!("no mcp servers configured");
+            } else {
+                for server in servers {
+                    println!(
+                        "{} {} enabled={} endpoint={}",
+                        server.id,
+                        match server.transport {
+                            McpTransport::Stdio => "stdio",
+                            McpTransport::Http => "http",
+                        },
+                        server.enabled,
+                        server
+                            .command
+                            .as_deref()
+                            .or(server.url.as_deref())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+        McpCmd::Get(args) => {
+            let server = manager
+                .get_server(&args.server_id)?
+                .ok_or_else(|| anyhow!("mcp server not found: {}", args.server_id))?;
+            if json_mode {
+                print_json(&server)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&server)?);
+            }
+        }
+        McpCmd::Remove(args) => {
+            let removed = manager.remove_server(&args.server_id)?;
+            if removed {
+                append_control_event(
+                    cwd,
+                    EventKind::McpServerRemovedV1 {
+                        server_id: args.server_id.clone(),
+                    },
+                )?;
+            }
+            if json_mode {
+                print_json(&json!({
+                    "server_id": args.server_id,
+                    "removed": removed,
+                }))?;
+            } else if removed {
+                println!("removed mcp server {}", args.server_id);
+            } else {
+                println!("mcp server not found: {}", args.server_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let store = Store::new(cwd)?;
+    let session = store.load_latest_session()?;
+    let plugin_manager = PluginManager::new(cwd)?;
+    let plugins = plugin_manager.list().unwrap_or_default();
+    let mcp_servers = McpManager::new(cwd)
+        .and_then(|manager| manager.list_servers())
+        .unwrap_or_default();
+
+    let payload = if let Some(session) = session {
+        let projection = store.rebuild_from_events(session.session_id)?;
+        let usage = store.usage_summary(Some(session.session_id), None)?;
+        let max_tokens = session.budgets.max_think_tokens.max(1) as f64;
+        let context_usage_pct =
+            (((usage.input_tokens + usage.output_tokens) as f64 / max_tokens) * 100.0).min(100.0);
+        let pending_approvals = projection
+            .tool_invocations
+            .len()
+            .saturating_sub(projection.approved_invocations.len());
+        let latest_autopilot = store.load_latest_autopilot_run()?;
+        json!({
+            "session_id": session.session_id,
+            "state": session.status,
+            "active_plan_id": session.active_plan_id,
+            "model": {
+                "base": cfg.llm.base_model,
+                "max_think": cfg.llm.max_think_model,
+            },
+            "context_usage_percent": context_usage_pct,
+            "pending_approvals": pending_approvals,
+            "plugins": {
+                "installed": plugins.len(),
+                "enabled": plugins.iter().filter(|p| p.enabled).count(),
+            },
+            "mcp_servers": mcp_servers.len(),
+            "autopilot": latest_autopilot.map(|run| json!({
+                "run_id": run.run_id,
+                "status": run.status,
+                "completed_iterations": run.completed_iterations,
+                "failed_iterations": run.failed_iterations,
+            })),
+        })
+    } else {
+        json!({
+            "session_id": null,
+            "state": "none",
+            "model": {
+                "base": cfg.llm.base_model,
+                "max_think": cfg.llm.max_think_model,
+            },
+            "context_usage_percent": 0.0,
+            "pending_approvals": 0,
+            "plugins": {
+                "installed": plugins.len(),
+                "enabled": plugins.iter().filter(|p| p.enabled).count(),
+            },
+            "mcp_servers": mcp_servers.len(),
+            "autopilot": null,
+        })
+    };
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "session={} state={} model={}/{} context={:.1}% pending_approvals={} plugins={}/{}",
+            payload["session_id"].as_str().unwrap_or("none"),
+            payload["state"].as_str().unwrap_or("unknown"),
+            payload["model"]["base"].as_str().unwrap_or_default(),
+            payload["model"]["max_think"].as_str().unwrap_or_default(),
+            payload["context_usage_percent"].as_f64().unwrap_or(0.0),
+            payload["pending_approvals"].as_u64().unwrap_or(0),
+            payload["plugins"]["enabled"].as_u64().unwrap_or(0),
+            payload["plugins"]["installed"].as_u64().unwrap_or(0),
+        );
+        println!(
+            "mcp_servers={}",
+            payload["mcp_servers"].as_u64().unwrap_or(0)
+        );
+        if !payload["autopilot"].is_null() {
+            println!(
+                "autopilot run={} status={} completed={} failed={}",
+                payload["autopilot"]["run_id"].as_str().unwrap_or_default(),
+                payload["autopilot"]["status"].as_str().unwrap_or_default(),
+                payload["autopilot"]["completed_iterations"]
+                    .as_u64()
+                    .unwrap_or(0),
+                payload["autopilot"]["failed_iterations"]
+                    .as_u64()
+                    .unwrap_or(0),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn run_usage(cwd: &Path, args: UsageArgs, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let store = Store::new(cwd)?;
+    let session_id = if args.session {
+        store.load_latest_session()?.map(|s| s.session_id)
+    } else {
+        None
+    };
+    let lookback_hours = if args.day { Some(24) } else { None };
+    let usage = store.usage_summary(session_id, lookback_hours)?;
+    let compactions = store.list_context_compactions(session_id)?;
+    let input_cost = (usage.input_tokens as f64 / 1_000_000.0) * cfg.usage.cost_per_million_input;
+    let output_cost =
+        (usage.output_tokens as f64 / 1_000_000.0) * cfg.usage.cost_per_million_output;
+    let rate_limit_events = estimate_rate_limit_events(cwd);
+    let payload = json!({
+        "scope": {
+            "session": session_id,
+            "last_hours": lookback_hours,
+        },
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "records": usage.records,
+        "estimated_cost_usd": input_cost + output_cost,
+        "compactions": compactions.len(),
+        "rate_limit_events": rate_limit_events,
+    });
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "input_tokens={} output_tokens={} estimated_cost_usd={:.6} compactions={} rate_limits={}",
+            usage.input_tokens,
+            usage.output_tokens,
+            input_cost + output_cost,
+            compactions.len(),
+            rate_limit_events,
+        );
+    }
+
+    Ok(())
+}
+
+fn run_compact(cwd: &Path, args: CompactArgs, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let store = Store::new(cwd)?;
+    let session = store
+        .load_latest_session()?
+        .ok_or_else(|| anyhow!("no session found to compact"))?;
+    let projection = store.rebuild_from_events(session.session_id)?;
+    if projection.transcript.is_empty() {
+        let payload = json!({"status":"no_op", "reason":"empty_transcript"});
+        if json_mode {
+            print_json(&payload)?;
+        } else {
+            println!("no transcript to compact");
+        }
+        return Ok(());
+    }
+
+    let from_turn = args.from_turn.unwrap_or(1).max(1);
+    let transcript_len = projection.transcript.len() as u64;
+    if from_turn > transcript_len {
+        return Err(anyhow!(
+            "--from-turn {} exceeds transcript length {}",
+            from_turn,
+            transcript_len
+        ));
+    }
+
+    let selected = projection
+        .transcript
+        .iter()
+        .skip((from_turn - 1) as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    let summary_id = Uuid::now_v7();
+    let full_text = selected.join("\n");
+    let before_tokens = estimate_tokens(&full_text);
+    let summary_lines = selected
+        .iter()
+        .take(12)
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.len() > 200 {
+                format!("- {}...", &trimmed[..200])
+            } else {
+                format!("- {trimmed}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let summary = format!(
+        "Compaction summary {}\nfrom_turn: {}\nto_turn: {}\n\n{}",
+        summary_id,
+        from_turn,
+        transcript_len,
+        summary_lines.join("\n")
+    );
+    let after_tokens = estimate_tokens(&summary);
+    let token_delta_estimate = before_tokens as i64 - after_tokens as i64;
+    let replay_pointer = format!(".deepseek/compactions/{summary_id}.md");
+    let payload = json!({
+        "summary_id": summary_id,
+        "from_turn": from_turn,
+        "to_turn": transcript_len,
+        "token_delta_estimate": token_delta_estimate,
+        "replay_pointer": replay_pointer,
+    });
+
+    if cfg.context.compact_preview && !args.yes {
+        if json_mode {
+            print_json(&json!({
+                "preview": true,
+                "persisted": false,
+                "summary": summary,
+                "result": payload,
+            }))?;
+        } else {
+            println!("compaction preview (not persisted):");
+            println!("{summary}");
+            println!("rerun with --yes to persist");
+        }
+        return Ok(());
+    }
+
+    let summary_path = cwd.join(&replay_pointer);
+    if let Some(parent) = summary_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&summary_path, summary)?;
+    append_control_event(
+        cwd,
+        EventKind::ContextCompactedV1 {
+            summary_id,
+            from_turn,
+            to_turn: transcript_len,
+            token_delta_estimate,
+            replay_pointer: replay_pointer.clone(),
+        },
+    )?;
+
+    if json_mode {
+        print_json(&json!({
+            "preview": false,
+            "persisted": true,
+            "result": payload,
+        }))?;
+    } else {
+        println!(
+            "compacted turns {}..{} summary_id={} token_delta_estimate={} replay_pointer={}",
+            from_turn, transcript_len, summary_id, token_delta_estimate, replay_pointer
+        );
+    }
+
+    Ok(())
+}
+
+fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let plugin_manager = PluginManager::new(cwd)?;
+    let plugins = plugin_manager.list().unwrap_or_default();
+
+    let runtime = runtime_dir(cwd);
+    fs::create_dir_all(&runtime)?;
+    let rustc = run_capture("rustc", &["--version"]);
+    let cargo = run_capture("cargo", &["--version"]);
+    let shell = std::env::var("SHELL")
+        .ok()
+        .or_else(|| std::env::var("ComSpec").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let api_key_set = std::env::var(&cfg.llm.api_key_env)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let checks = json!({
+        "git": command_exists("git"),
+        "rg": command_exists("rg"),
+        "cargo": command_exists("cargo"),
+        "shell": command_exists(shell.split(std::path::MAIN_SEPARATOR).next_back().unwrap_or("sh")),
+    });
+
+    let mut warnings = Vec::new();
+    if !api_key_set && !cfg.llm.offline_fallback {
+        warnings.push(format!(
+            "{} not set and offline_fallback=false",
+            cfg.llm.api_key_env
+        ));
+    }
+    if checks["git"].as_bool() != Some(true) {
+        warnings.push("git not found in PATH".to_string());
+    }
+    if checks["cargo"].as_bool() != Some(true) {
+        warnings.push("cargo not found in PATH".to_string());
+    }
+
+    let payload = json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "shell": shell,
+        "workspace": cwd,
+        "runtime_dir": runtime,
+        "config_path": AppConfig::config_path(cwd),
+        "config_paths": {
+            "user": AppConfig::user_settings_path(),
+            "project": AppConfig::project_settings_path(cwd),
+            "project_local": AppConfig::project_local_settings_path(cwd),
+            "legacy_toml": AppConfig::legacy_toml_path(cwd),
+            "keybindings": AppConfig::keybindings_path(),
+        },
+        "binary_path": std::env::current_exe().ok(),
+        "toolchain": {
+            "rustc": rustc,
+            "cargo": cargo,
+        },
+        "llm": {
+            "endpoint": cfg.llm.endpoint,
+            "api_key_env": cfg.llm.api_key_env,
+            "api_key_set": api_key_set,
+            "offline_fallback": cfg.llm.offline_fallback,
+            "base_model": cfg.llm.base_model,
+            "max_think_model": cfg.llm.max_think_model,
+        },
+        "plugins": {
+            "installed": plugins.len(),
+            "enabled": plugins.iter().filter(|p| p.enabled).count(),
+        },
+        "checks": checks,
+        "warnings": warnings,
+    });
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "doctor: os={} arch={} shell={}",
+            payload["os"].as_str().unwrap_or_default(),
+            payload["arch"].as_str().unwrap_or_default(),
+            payload["shell"].as_str().unwrap_or_default()
+        );
+        println!(
+            "toolchain: {} | {}",
+            payload["toolchain"]["rustc"]
+                .as_str()
+                .unwrap_or("unavailable"),
+            payload["toolchain"]["cargo"]
+                .as_str()
+                .unwrap_or("unavailable")
+        );
+        println!(
+            "llm: base={} max={} endpoint={} api_key_set={} offline_fallback={}",
+            payload["llm"]["base_model"].as_str().unwrap_or_default(),
+            payload["llm"]["max_think_model"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["llm"]["endpoint"].as_str().unwrap_or_default(),
+            payload["llm"]["api_key_set"].as_bool().unwrap_or(false),
+            payload["llm"]["offline_fallback"]
+                .as_bool()
+                .unwrap_or(false)
+        );
+        println!(
+            "plugins: enabled={} installed={}",
+            payload["plugins"]["enabled"].as_u64().unwrap_or(0),
+            payload["plugins"]["installed"].as_u64().unwrap_or(0)
+        );
+        if let Some(warnings) = payload["warnings"].as_array()
+            && !warnings.is_empty()
+        {
+            println!("warnings:");
+            for warning in warnings {
+                if let Some(text) = warning.as_str() {
+                    println!("- {text}");
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -557,6 +2037,21 @@ fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()> {
                 print_json(&status)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&status)?);
+            }
+        }
+        IndexCmd::Watch {
+            events,
+            timeout_seconds,
+        } => {
+            let manifest = service.watch_and_update(
+                &session,
+                events.max(1),
+                Duration::from_secs(timeout_seconds.max(1)),
+            )?;
+            if json_mode {
+                print_json(&manifest)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
             }
         }
         IndexCmd::Query { q, top_k } => {
@@ -702,6 +2197,80 @@ fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
                 );
             }
         }
+        PluginCmd::Catalog => {
+            let cfg = AppConfig::load(cwd)?;
+            let catalog = manager
+                .sync_catalog(&cfg.plugins.catalog)
+                .or_else(|_| manager.search_catalog("", &cfg.plugins.catalog))?;
+            append_control_event(
+                cwd,
+                EventKind::PluginCatalogSyncedV1 {
+                    source: cfg.plugins.catalog.index_url,
+                    total: catalog.len(),
+                    verified_count: catalog.iter().filter(|p| p.verified).count(),
+                },
+            )?;
+            if json_mode {
+                print_json(&catalog)?;
+            } else {
+                for item in catalog {
+                    println!(
+                        "{} {} ({}) {}",
+                        item.plugin_id,
+                        item.version,
+                        if item.verified {
+                            "verified"
+                        } else {
+                            "unverified"
+                        },
+                        item.source
+                    );
+                }
+            }
+        }
+        PluginCmd::Search(args) => {
+            let cfg = AppConfig::load(cwd)?;
+            let matches = manager.search_catalog(&args.query, &cfg.plugins.catalog)?;
+            if json_mode {
+                print_json(&matches)?;
+            } else if matches.is_empty() {
+                println!("no catalog results for '{}'", args.query);
+            } else {
+                for item in matches {
+                    println!(
+                        "{} {} ({}) - {}",
+                        item.plugin_id,
+                        item.version,
+                        if item.verified {
+                            "verified"
+                        } else {
+                            "unverified"
+                        },
+                        item.description
+                    );
+                }
+            }
+        }
+        PluginCmd::Verify(args) => {
+            let cfg = AppConfig::load(cwd)?;
+            let result = manager.verify_catalog_plugin(&args.plugin_id, &cfg.plugins.catalog)?;
+            append_control_event(
+                cwd,
+                EventKind::PluginVerifiedV1 {
+                    plugin_id: result.plugin_id.clone(),
+                    verified: result.verified,
+                    reason: result.reason.clone(),
+                },
+            )?;
+            if json_mode {
+                print_json(&result)?;
+            } else {
+                println!(
+                    "{} verified={} reason={} source={}",
+                    result.plugin_id, result.verified, result.reason, result.source
+                );
+            }
+        }
         PluginCmd::Run(args) => {
             let rendered = manager.render_command_prompt(
                 &args.plugin_id,
@@ -779,23 +2348,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 fn append_control_event(cwd: &Path, kind: EventKind) -> Result<()> {
     let store = Store::new(cwd)?;
-    let session = if let Some(existing) = store.load_latest_session()? {
-        existing
-    } else {
-        let session = Session {
-            session_id: Uuid::now_v7(),
-            workspace_root: cwd.to_string_lossy().to_string(),
-            baseline_commit: None,
-            status: SessionState::Idle,
-            budgets: SessionBudgets {
-                per_turn_seconds: 120,
-                max_think_tokens: 8192,
-            },
-            active_plan_id: None,
-        };
-        store.save_session(&session)?;
-        session
-    };
+    let session = ensure_session_record(cwd, &store)?;
     let event = EventEnvelope {
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
@@ -804,4 +2357,68 @@ fn append_control_event(cwd: &Path, kind: EventKind) -> Result<()> {
     };
     store.append_event(&event)?;
     Ok(())
+}
+
+fn ensure_session_record(cwd: &Path, store: &Store) -> Result<Session> {
+    if let Some(existing) = store.load_latest_session()? {
+        return Ok(existing);
+    }
+    let session = Session {
+        session_id: Uuid::now_v7(),
+        workspace_root: cwd.to_string_lossy().to_string(),
+        baseline_commit: None,
+        status: SessionState::Idle,
+        budgets: SessionBudgets {
+            per_turn_seconds: 120,
+            max_think_tokens: 8192,
+        },
+        active_plan_id: None,
+    };
+    store.save_session(&session)?;
+    Ok(session)
+}
+
+fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(4)
+}
+
+fn estimate_rate_limit_events(cwd: &Path) -> u64 {
+    let path = runtime_dir(cwd).join("observe.log");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return 0;
+    };
+    raw.lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("429") || lower.contains("rate limit")
+        })
+        .count() as u64
+}
+
+fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
+    Command::new(cmd).args(args).output().ok().and_then(|out| {
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn command_exists(name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    let checker = if cfg!(target_os = "windows") {
+        ("where", vec![name])
+    } else {
+        ("which", vec![name])
+    };
+    Command::new(checker.0)
+        .args(checker.1)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }

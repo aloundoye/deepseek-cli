@@ -1,519 +1,443 @@
-# RFC: DeepSeek CLI Agent in Rust (Plan-first + Auto Max-Think)
+# RFC (Comprehensive): DeepSeek CLI Agent in Rust – A Full-Featured Coding Assistant to Match and Surpass Claude Code
 
-**Status:** Draft
-**Date:** 2026-02-13
-**Goal:** A production-grade coding-agent CLI powered by DeepSeek, with **explicit planning**, **safe tool use**, and **automatic escalation to “max thinking”** (DeepSeek Reasoner) when needed—without the user manually switching models.
-
----
-
-## 1) Product behavior requirements
-
-### 1.1 Interaction loop
-
-The CLI must natively support these behaviors:
-
-* **Plan-first:** For most user requests, the agent produces a *Plan* (steps, file targets, tool usage), then executes step-by-step.
-* **Two-phase cognition:**
-
-  * **Planner**: makes/updates the plan, chooses which context to fetch, decides on tools.
-  * **Executor**: performs actions (search/read/patch/test), guided by the plan.
-* **Continuous verification:** After edits, the agent runs checks (tests/build/lint) if allowed, and iterates until goals met.
-* **Approval gates:** file writes and shell commands require approval by default.
-* **“Max thinking” automatically:** the agent escalates to DeepSeek Reasoner when tasks exceed a complexity threshold.
-
-### 1.2 CLI commands (v1)
-
-* `deepseek chat` — interactive session (default)
-* `deepseek ask "<prompt>"` — one-shot response (no tools unless `--tools`)
-* `deepseek plan "<prompt>"` — plan only
-* `deepseek autopilot "<prompt>"` — long-running autonomous loop (hours or indefinite)
-* `deepseek run` — resume session
-* `deepseek diff` — show staged changes
-* `deepseek apply` — apply staged patch sets (with approvals)
-* `deepseek index build|update|status|query`
-* `deepseek config edit|show`
-
-### 1.3 “Max thinking” requirement
-
-* Default model is **fast** (`deepseek-chat`).
-* When “max thinking” is triggered, the agent transparently switches to **deepseek-reasoner** for that turn (or subtask), then may switch back.
-* Escalation must be **observable** (log + UI hint), **auditable** (event log), and **bounded** (budget/time limits).
+**Status:** Draft  
+**Date:** 2026-02-17  
+**Goal:** A production-grade, open-source coding agent CLI powered by DeepSeek, designed to **match and surpass Claude Code** in feature completeness, developer experience, safety, and cost-effectiveness. This RFC defines the complete feature set, system architecture, and implementation roadmap.
 
 ---
 
-## 2) Architecture: modular monolith with Planner/Executor split
+## 1. Introduction
 
-### 2.1 Module boundaries (crates)
+Claude Code has set a high bar for terminal-based AI coding assistants. DeepSeek’s models offer compelling advantages: significantly lower cost, a dedicated reasoning model (`deepseek-reasoner`), and an open ecosystem. By combining a thoughtful architecture with DeepSeek’s unique strengths, we can build a tool that not only replicates Claude Code’s capabilities but also introduces innovations like **automatic model escalation**, **deterministic replay**, and **aggressive cost optimization**.
+
+This RFC outlines the complete feature set, system design, and incremental implementation plan for the **DeepSeek CLI Agent** (codename: `deepseek`). It incorporates every feature from Claude Code as of February 2026, plus DeepSeek-specific enhancements, ensuring a truly competitive offering.
+
+---
+
+## 2. Complete Feature Set
+
+The following features are derived from Claude Code’s current (2026) capabilities, extended with DeepSeek-specific improvements.
+
+### 2.1 Core Runtime & Environment
+
+| Feature | Description |
+|---------|-------------|
+| **Terminal-native CLI** | Full shell integration, interactive REPL with rich TUI. |
+| **Cross-platform** | macOS 13.0+, Ubuntu 20.04+/Debian 10+, Windows 10+ (WSL/Git Bash). |
+| **Multiple installation methods** | Native binary, Homebrew, Winget, direct download. |
+| **Session persistence** | Resume sessions with `deepseek run`; checkpointing via event log. |
+| **Large context** | 1M token window, automatic context compression when nearing limits. |
+| **Project-wide awareness** | Indexes entire codebase; understands file structure and dependencies. |
+| **Checkpointing** | Auto-saves file edits; reversible via `/rewind` or keyboard shortcut. |
+| **Fast Mode** | Optimized API parameters for lower latency (configurable). |
+| **Parallel tool calls** | Execute multiple independent tool calls in a single LLM response. |
+| **Background execution** | Long-running tasks can be backgrounded (Ctrl+B) and resumed. |
+
+### 2.2 File System Operations
+
+| Tool | Description |
+|------|-------------|
+| `fs.read` | View file contents with line numbers; supports images/PDFs. |
+| `fs.write` | Create/overwrite files (safer than bash redirection; checkpointed). |
+| `fs.edit` | Targeted modifications (string replacement, line edits). |
+| `fs.glob` | Pattern-based file search. |
+| `fs.grep` | Content search with regex. |
+| `@file` references | Mention files directly: `@src/auth.ts:42-58`. |
+| `@dir` references | Include whole directories. |
+
+### 2.3 Git Integration
+
+- Commit creation, branch management, pull requests from CLI.
+- Git history search.
+- Merge conflict resolution assistance.
+- Checkpointing note: Only file edits (via dedicated tools) are auto-checkpointed; bash operations are not tracked.
+
+### 2.4 Slash Commands (REPL)
+
+| Command | Purpose |
+|---------|---------|
+| `/help` | Show all commands. |
+| `/init` | Scan project and create `DEEPSEEK.md` (memory file). |
+| `/clear` | Clear conversation history. |
+| `/compact` | Summarize conversation to save context. |
+| `/memory` | Edit `DEEPSEEK.md` memory files. |
+| `/config` | Open configuration interface. |
+| `/model` | Switch between models (chat/reasoner) manually. |
+| `/cost` | Show token usage and estimated cost. |
+| `/mcp` | Manage MCP server connections. |
+| `/rewind` | Rewind to previous checkpoint. |
+| `/export` | Export conversation to file. |
+| `/plan` | Enable plan mode for complex tasks. |
+| `/teleport` | Resume sessions at (future) web interface. |
+| `/remote-env` | Configure remote sessions. |
+| `/status` | Current model, mode, and configuration. |
+| `/effort` | Control thinking depth (low/medium/high/max). |
+
+### 2.5 MCP (Model Context Protocol) Extensibility
+
+- **Transports:** HTTP (remote servers), Stdio (local processes).
+- **Installation scopes:** user (`~/.deepseek/mcp.json`), project (`.mcp.json`), local (`~/.deepseek/mcp.local.json`).
+- **Management commands:** `deepseek mcp add/list/get/remove`.
+- **Dynamic updates:** Servers can notify of tool changes.
+- **Community integrations:** GitHub, Notion, PostgreSQL, Sentry, Slack, etc.
+- **Xcode integration (future):** Capture previews for visual verification.
+
+### 2.6 Subagent System
+
+- **Parallel agents:** Up to 7 subagents running simultaneously.
+- **Agent types:**
+  - *Explore*: Research and gather information.
+  - *Plan*: Break down tasks into steps.
+  - *Task*: Execute specific subtasks (e.g., refactor a module).
+- **Isolated contexts:** Subagents operate in clean contexts, preventing state pollution.
+- **Agent Teams:** Multiple agents coordinate on different components (frontend, backend, testing).
+- **Resilience:** Agents continue after permission denials, trying alternative approaches.
+
+### 2.7 User Experience & Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| Escape | Stop current response. |
+| Escape + Escape | Open rewind menu. |
+| ↑ | Navigate past commands. |
+| Ctrl+V | Paste images (where supported). |
+| Tab | Autocomplete file paths and commands. |
+| Shift+Enter | Multi-line input. |
+| Ctrl+B | Background agents and shell commands. |
+| Ctrl+O | Toggle transcript mode (show raw thinking). |
+| Ctrl+C | Cancel current operation. |
+
+### 2.8 Configuration System
+
+| File | Purpose |
+|------|---------|
+| `~/.deepseek/settings.json` | User-level settings. |
+| `.deepseek/settings.json` | Project-specific settings (shared). |
+| `.deepseek/settings.local.json` | Per-machine overrides (gitignored). |
+| `~/.deepseek/mcp.json` | MCP server configurations. |
+| `.mcp.json` | Project-scoped MCP servers. |
+| `~/.deepseek/keybindings.json` | Custom keyboard shortcuts. |
+| `DEEPSEEK.md` | Project memory, conventions, workflows. |
+
+### 2.9 Customization & Skills
+
+- **Skills:** Reusable prompt templates stored in `~/.deepseek/skills/` or `.deepseek/skills/`; appear in slash command menu.
+- **Hot reload:** Skills available immediately without restart.
+- **Hooks:** `PreToolUse`, `PostToolUse`, `Stop` logic for fine-grained control.
+- **Wildcard permissions:** e.g., `Bash(npm *)` to allow any npm command without approval.
+- **`respectGitignore`:** Control @-mention file picker behavior.
+
+### 2.10 Advanced Capabilities
+
+| Feature | Description |
+|---------|-------------|
+| **Visual verification** | Capture and analyze UI previews (Xcode, Flutter, etc.) – *future*. |
+| **Multilingual output** | `language` setting for responses in Japanese, Spanish, etc. |
+| **Adaptive thinking** | Model adjusts reasoning depth based on complexity. |
+| **max effort parameter** | Highest level of reasoning for complex tasks. |
+| **Terminal command sandboxing** | Experimental safety for command execution. |
+| **Auto-approval rules** | Configurable permissions to reduce prompts. |
+| **Memory across projects** | Enterprise-wide `DEEPSEEK.md` for consistent conventions. |
+
+### 2.11 Permission & Safety System
+
+- **User approval:** Destructive operations require confirmation (delete, force-push, etc.).
+- **Scope awareness:** Authorization matches requested scope only.
+- **Blast radius consideration:** Checks reversibility before acting.
+- **Security hardening:** No command injection, XSS, SQL injection.
+- **Team permissions:** Managed permissions that cannot be overwritten locally.
+
+### 2.12 DeepSeek-Specific Enhancements
+
+| Enhancement | Description |
+|--------------|-------------|
+| **Cost efficiency** | ~16–20x cheaper than Claude; highlight in `/cost` command. |
+| **Automatic “max thinking”** | Seamlessly escalate to `deepseek-reasoner` when complexity requires it. |
+| **Prompt caching** | 90% discount on repeated input tokens; implement aggressive caching. |
+| **Off-peak scheduling** | Option to defer non-urgent tasks to cheaper rate periods. |
+| **Multi-provider support** | Pluggable backends: DeepSeek, OpenAI, local models (via MCP). |
+| **Performance monitoring** | `/profile` command showing time breakdown. |
+| **Integration marketplace** | Community repository of MCP plugins. |
+
+---
+
+## 3. System Architecture
+
+The architecture is a modular monolith with clear separation of concerns, designed to support the above features while remaining maintainable and testable.
 
 ```
 crates/
-  cli/          # clap + TUI/REPL
-  core/         # agent runtime, session loop, scheduling
-  agent/        # planner+executor logic, state machines
-  llm/          # DeepSeek client, streaming, retries
-  router/       # model routing + auto max-think policy
-  tools/        # tool registry + sandboxed tool host
-  diff/         # patch staging, apply, conflict resolution
-  index/        # tantivy index + manifest
-  store/        # sqlite + event log; projections; migrations
-  policy/       # approvals, allowlists, redaction
-  observe/      # logs/metrics/tracing
-  testkit/      # replay harness, fake LLM, golden tests
+  cli/          # Entry point, TUI (ratatui), command parsing
+  core/         # Agent runtime, session loop, scheduling
+  agent/        # Planner, Executor, Subagent orchestration
+  llm/          # DeepSeek client, streaming, retries, caching
+  router/       # Model routing + auto max-think policy
+  tools/        # Tool registry, sandboxed execution, MCP client
+  mcp/          # MCP server management and protocol handling
+  subagent/     # Parallel subagent lifecycle and communication
+  diff/         # Patch staging, application, conflict resolution
+  index/        # Tantivy code index + manifest + file watcher
+  store/        # SQLite + event log; projections; migrations
+  policy/       # Approvals, allowlists, redaction, permissions
+  observe/      # Logs, metrics, tracing, cost tracking
+  testkit/      # Replay harness, fake LLM, golden tests
+  skills/       # Skill management and execution
+  hooks/        # Pre/post tool hooks
 ```
 
-### 2.2 Core runtime components
+### 3.1 Core Components
 
-* **Agent Runtime (core):** owns the session loop + persistence boundaries.
-* **Planner (agent):** produces plan artifacts + chooses tools.
-* **Executor (agent):** executes plan steps via tools; stages patches.
-* **Model Router (router):** decides **deepseek-chat vs deepseek-reasoner** per turn/subtask.
-* **Tool Host (tools):** executes tools with policy + journaling.
-* **Index Service (index):** deterministic code search + repo map.
-
----
-
-## 3) Session model & artifacts
-
-### 3.1 Entities
-
-* **Session**: `{session_id, workspace_root, baseline_commit?, status, budgets, active_plan_id?}`
-* **Turn**: user/assistant/tool messages + structured tool calls
-* **Plan**: structured plan object (steps, dependencies, verification steps)
-* **Step**: `{step_id, title, intent, required_tools, target_files?, done=false}`
-* **PatchSet**: staged diffs + metadata; never write directly from the model
-* **ToolInvocation**: request/approval/result with timestamps
-* **RouterDecision**: `{decision_id, reason_codes[], selected_model, confidence}`
-
-### 3.2 Plan artifact contract (v1)
-
-Stored as JSON:
-
-```json
-{
-  "plan_id": "uuidv7",
-  "version": 1,
-  "goal": "string",
-  "assumptions": ["..."],
-  "steps": [
-    {
-      "step_id": "uuidv7",
-      "title": "Locate relevant modules",
-      "intent": "search",
-      "tools": ["index.query", "fs.search_rg", "fs.read"],
-      "files": [],
-      "done": false
-    }
-  ],
-  "verification": ["cargo test", "cargo fmt --check"],
-  "risk_notes": ["..."]
-}
-```
-
-Rules:
-
-* Planner may **revise** a plan (new plan version); old plan is preserved.
-* Executor must mark steps done/failed with event emissions.
+| Component | Responsibility |
+|-----------|----------------|
+| **Agent Runtime** | Owns the session loop, manages state machine, persists events. |
+| **Planner** | Creates/revises plans using LLM; may spawn subagents for exploration. |
+| **Executor** | Executes plan steps via tools; requests plan refinement when needed. |
+| **Subagent Manager** | Spawns, monitors, and communicates with parallel subagents. |
+| **Model Router** | Decides which model (chat vs reasoner) to use per call; logs decisions. |
+| **Tool Host** | Executes tools with policy enforcement, journaling, and sandboxing. |
+| **MCP Client** | Discovers and invokes tools from MCP servers. |
+| **Index Service** | Provides deterministic code search and repo snapshots. |
+| **Event Store** | Append-only log of all events; source of truth for replay. |
+| **Policy Engine** | Evaluates tool calls against allowlists, redaction rules, and user approvals. |
 
 ---
 
-## 4) State machines
+## 4. Detailed Design
 
-### 4.1 Session state machine
+### 4.1 Session Lifecycle and State Machine
 
-States:
+The session state machine (as defined in the revised RFC) governs the overall flow. States: `Idle`, `Planning`, `ExecutingStep`, `AwaitingApproval`, `Verifying`, `Completed`, `Paused`, `Failed`. All transitions are recorded as events.
 
-* `Idle`
-* `Planning`
-* `ExecutingStep`
-* `AwaitingApproval`
-* `Verifying`
-* `Completed`
-* `Paused`
-* `Failed`
+### 4.2 Planner and Executor
 
-Transitions:
+- **Planner** generates a JSON plan (see Section 3.2 of revised RFC). It may use the reasoner for complex planning tasks.
+- **Executor** follows the plan, but can request **refinement** mid-step if ambiguity arises (e.g., search returns multiple candidates). Refinement requests go back to the planner with current context.
 
-* `Idle -> Planning` on first user input
-* `Planning -> ExecutingStep` when plan created and accepted (implicit or explicit)
-* `ExecutingStep -> AwaitingApproval` if tool/write needs user approval
-* `ExecutingStep -> Planning` if plan must be revised (missing files, unexpected failures)
-* `ExecutingStep -> Verifying` after patch staged/applied
-* `Verifying -> ExecutingStep` if verification fails and fix is needed
-* `Verifying -> Completed` when goals met
-* Any -> `Failed` on unrecoverable errors
+### 4.3 Subagent System
 
-Invariants:
+Subagents are lightweight agent instances running in parallel. Each has its own context fork (isolated from the main session). Communication happens via the subagent manager, which can merge results back into the main plan.
 
-* Every transition emits `SessionStateChanged@v1` with monotonic `seq_no`
-* Tool execution cannot occur in `Planning` unless it’s read-only context gathering
+**Design:**
 
-### 4.2 Planner/Executor sub-state machines
+- Subagents are spawned with a specific goal (e.g., “explore API usage in module X”).
+- They execute using the same tool set but with a clean context.
+- Results are returned as structured data (e.g., findings, plan fragments).
+- The main agent can incorporate these results into the next planning step.
 
-**Planner**
+**Agent Teams:** Multiple subagents can be coordinated as a team (e.g., frontend, backend, testing agents working on different parts of a feature). The manager ensures they don’t step on each other’s toes.
 
-* `DraftPlan -> (Optional) GatherContext -> FinalizePlan -> EmitPlan`
-* If context is insufficient, planner requests read-only tools
+### 4.4 Model Router with Auto Max-Think
 
-**Executor**
+The router computes a complexity score based on:
 
-* `SelectNextStep -> ExecuteTools -> StagePatch -> (Optional) Apply -> Verify -> MarkStepDone`
-* On failure: `RecordFailure -> ProposeRecovery -> (Optional) RevisePlan`
+- Prompt complexity (length, keywords).
+- Repo complexity (touched files, index breadth).
+- Failure history (consecutive tool failures, test failures).
+- Planner confidence (self-reported).
+- User intent hints (`/plan`, `/effort high`).
+- Latency budget (interactive vs batch).
 
-### 4.3 Model router state machine
+Thresholds and weights are configurable. The router logs each decision (including the feature vector snapshot) to the event log, enabling post-hoc analysis and tuning.
 
-States per “LLM call unit”:
+**Escalation retry:** If the chat model produces an invalid plan or stalls, the router automatically retries with the reasoner once.
 
-* `Assess -> SelectModel -> CallLLM -> EvaluateOutcome -> (Optional) EscalateAndRetry`
+### 4.5 Tool System
 
-Escalation rule: Only one automatic escalation retry per unit (prevents loops).
+Tools are categorized as:
 
----
+- **Built-in Rust tools:** `fs.read`, `fs.edit`, `fs.grep`, `git.*`, `index.query`, etc.
+- **MCP tools:** Dynamically loaded from MCP servers.
+- **Shell commands:** Restricted via `bash.run` with allowlist and approval.
 
-## 5) Automatic “Max Thinking” (deepseek-reasoner) design
+All tool calls are journaled (proposal, approval, result) in the event log. For `fs.edit`, we provide a high-level interface that accepts search/replace pairs and generates a unified diff internally.
 
-### 5.1 Objectives
+### 4.6 Patch Staging and Application
 
-* Use fast model by default for responsiveness and cost.
-* Automatically switch to reasoner for tasks requiring deeper reasoning:
+- Model never writes files directly.
+- All edits go through `patch.stage` (or `fs.edit` which calls it).
+- Staged patches are stored as unified diffs against a known file SHA.
+- Applying a patch requires SHA match or merge strategy (3-way merge if git repo).
+- Conflicts are presented to the user for resolution.
 
-  * multi-file architectural change
-  * complex bug diagnosis
-  * ambiguous requirements
-  * repeated failure / low-confidence plan
-  * tool errors that require strategy change
+### 4.7 Indexing and Deterministic Snapshots
 
-### 5.2 Router inputs (signals)
+- Uses Tantivy for fast search.
+- Manifest stores baseline commit (if git) or list of file SHAs.
+- For non-git projects, initial index is built by walking the FS; a file watcher (`notify`) can incrementally update the index.
+- Queries are tagged `fresh` or `stale` based on manifest staleness.
 
-The router evaluates a **Feature Vector** `F` computed from:
+### 4.8 Event Store and Deterministic Replay
 
-* **Prompt complexity**
+- All session events are appended to `events.jsonl` (canonical log).
+- SQLite stores projections for fast querying (current state, conversation, etc.).
+- **Replay mode:** Given a session ID, the system reads the event log and replays all LLM calls and tool results from stored events, **without re-executing** tools or calling the LLM again. This enables deterministic testing and debugging.
 
-  * size of user request (tokens)
-  * number of constraints (“must”, “guarantee”, “deterministic”, etc.)
-* **Repo complexity**
+### 4.9 Permission and Policy Engine
 
-  * number of touched files in last N steps
-  * index results breadth
-* **Failure history**
+- Policy rules are defined in TOML (see config example).
+- For each tool call, the policy engine checks:
+  - Is the tool allowed? (allowlist)
+  - Are the arguments safe? (path traversal checks, secret patterns)
+  - Does the tool require approval? (ask/allow/deny)
+- Approvals are collected via TUI prompts (or auto-approved if configured).
+- Redaction: before sending prompts to LLM, the system scans for secrets (API keys, tokens) based on regex patterns and redacts them (configurable).
 
-  * consecutive tool failures
-  * verification failures (tests/lint) count
-* **Uncertainty signals**
+### 4.10 Skills and Hooks
 
-  * planner confidence score (self-reported numeric)
-  * presence of unresolved questions
-* **Latency budget**
+- Skills are stored as Markdown files with frontmatter (similar to Claude Code). They can include tool usage patterns.
+- Hooks: PreToolUse and PostToolUse allow custom logic (e.g., logging, modifying arguments) written in Rust or via WASM (future).
 
-  * interactive mode vs batch mode
-* **User config**
+### 4.11 MCP Integration
 
-  * `auto_max_think = on|off`
-  * `max_think_threshold`
+- MCP servers are managed via `deepseek mcp` commands.
+- The MCP client discovers tools from servers and makes them available in the tool registry.
+- Supports stdio and HTTP transports.
+- Dynamic tool list updates via server notifications.
 
-### 5.3 Router decision algorithm (explicit)
+### 4.12 User Interface (TUI)
 
-Compute score `S`:
+- Built with `ratatui` and `crossterm`.
+- Layout:
+  - Main conversation pane (scrollable, syntax highlighting).
+  - Plan pane (collapsible) showing current plan and step progress.
+  - Tool output pane (real-time logs from subagents or tool executions).
+  - Status bar: model, cost, pending approvals, background jobs.
+- Keyboard shortcuts as listed in section 2.7.
+- Multi-line input with Shift+Enter.
+- Autocomplete for commands and file paths.
 
-```
-S = w1*PromptComplexity
-  + w2*RepoBreadth
-  + w3*FailureStreak
-  + w4*VerificationFailures
-  + w5*LowConfidence
-  + w6*AmbiguityFlags
-```
+### 4.13 CLI Commands (Non-Interactive)
 
-Decision:
+In addition to the REPL, the CLI supports one-shot commands:
 
-* if `S >= THRESHOLD_HIGH` => use `deepseek-reasoner`
-* else use `deepseek-chat`
-
-Retry escalation:
-
-* If `deepseek-chat` output fails schema validation, produces an invalid plan, or stalls (no actionable steps), then:
-
-  * escalate once to `deepseek-reasoner`
-  * store `RouterEscalation@v1` event with reason codes
-
-### 5.4 Planner/executor routing policy
-
-* Planner is more likely to run on reasoner than executor.
-
-  * Planning call uses `deepseek-reasoner` when:
-
-    * user asks for “design”, “architecture”, “RFC”, “state machines”, “guarantees”
-    * change spans > K files
-* Executor typically uses chat, except:
-
-  * repeated patch conflicts
-  * repeated test failures
-  * complex refactors requiring higher-level reasoning
-
-### 5.5 Determinism & auditability
-
-Each LLM call records:
-
-* selected model
-* router score + reasons
-* budgets (token/time)
-* prompt hash + tool schema hash
-  So replays can explain “why max thinking triggered”.
+- `deepseek ask "<prompt>"` – single response (no tools by default).
+- `deepseek plan "<prompt>"` – generate a plan and exit.
+- `deepseek autopilot "<prompt>"` – run autonomous mode (may continue in background).
+- `deepseek run <session-id>` – resume a session.
+- `deepseek diff` – show staged changes.
+- `deepseek apply` – apply staged patches.
+- `deepseek index build|update|status|query` – manage index.
+- `deepseek config edit|show` – edit configuration.
 
 ---
 
-## 6) Tools, patch staging, and safety (production-grade)
+## 5. Implementation Milestones
 
-### 6.1 Tool set (v1)
+### M1: Core REPL + Basic Tools (Weeks 1–4)
+- Project setup, workspace structure.
+- Basic REPL with chat (no tools) using `deepseek-chat`.
+- Session persistence (event log, SQLite).
+- Read-only tools: `fs.list`, `fs.read`, `git.status`.
+- Manual model switching via `/model`.
 
-Read-only:
+### M2: Plan-First Mode + Patch Staging (Weeks 5–8)
+- Planner generates JSON plans (using chat model).
+- Patch staging with `fs.edit` and `patch.apply`.
+- Approval flow for writes.
+- Simple router with fixed thresholds.
+- Add `/plan`, `/clear`, `/help` commands.
 
-* `fs.list(dir|glob)`
-* `fs.read(path) -> {content, sha256}`
-* `fs.search_rg(query, paths?, limit)`
-* `git.status`, `git.diff`, `git.show(commit:path)`
-* `index.query(q, top_k, filters)`
+### M3: Verification Loops & Subagents (Weeks 9–12)
+- Integration with test/lint tools (`run_tests`, `run_linter`).
+- Verification step in plan execution.
+- Basic subagent support: spawn, isolate, collect results.
+- `/compact` command to summarize conversation.
+- Background execution (Ctrl+B).
 
-Write/stage:
+### M4: Auto Max-Think & Router Tuning (Weeks 13–16)
+- Full router with feature vector and escalation logic.
+- Router event logging and `/cost` command.
+- Configurable thresholds; feedback collection.
+- Add `/effort` command to influence router.
 
-* `patch.stage(unified_diff) -> {patch_id}`
-* `patch.apply(patch_id) -> {applied, conflicts[]}`
-* `fs.write(path, content, expected_sha256)` **(optional)**, but prefer patch apply
+### M5: MCP Integration (Weeks 17–20)
+- MCP client with stdio and HTTP support.
+- `deepseek mcp` commands for server management.
+- Dynamic tool discovery.
+- Example MCP servers (GitHub, filesystem).
 
-Exec (restricted):
+### M6: Skills, Hooks & Advanced Features (Weeks 21–24)
+- Skill loading and execution.
+- Pre/Post tool hooks.
+- Wildcard permissions.
+- `/memory` and `DEEPSEEK.md` support.
+- Deterministic replay test harness.
+- Performance monitoring (`/profile`).
 
-* `bash.run(cmd, timeout, cwd)` allowlisted; approval gated
-
-### 6.2 Patch staging contract
-
-* Model never writes files directly.
-* All edits must be represented as **unified diff** against a known base sha.
-* Apply requires:
-
-  * sha match (or a merge strategy)
-  * policy approval
-  * journaling of applied hunks
-
-Conflict handling:
-
-* If git available: attempt 3-way merge (`merge-base`, `apply --3way`).
-* Else: mark conflict and require user.
-
-### 6.3 Sandbox & policy
-
-* Default: approvals for `bash.run`, `patch.apply`
-* Allowlist patterns (configurable):
-
-  * `rg`, `git status/diff/show`
-  * `cargo test`, `cargo fmt`, `cargo clippy`
-  * `npm test`, `pnpm test`, `pytest` (optional)
-* Path constraints:
-
-  * deny `..` escapes
-  * deny reading common secret locations
-* Secret redaction:
-
-  * scan prompt payloads for key patterns; redact before sending
+### M7: Polishing & Ecosystem (Weeks 25–28)
+- Cross-platform testing and packaging.
+- Community plugin registry website.
+- Documentation and tutorials.
+- Auto-approval rules and team permissions.
+- Visual verification (experimental).
 
 ---
 
-## 7) Storage contracts & deterministic rebuild
-
-### 7.1 Storage tech
-
-* SQLite (WAL) + append-only `events.jsonl`
-* FS for artifacts (patches/blobs)
-* Tantivy for index
-
-### 7.2 Canonical event log
-
-`events.jsonl` is the source of truth; projections rebuildable.
-
-Event kinds (examples):
-
-* `TurnAdded@v1`
-* `PlanCreated@v1`, `PlanRevised@v1`, `StepMarked@v1`
-* `RouterDecision@v1`, `RouterEscalation@v1`
-* `ToolProposed@v1`, `ToolApproved@v1`, `ToolResult@v1`
-* `PatchStaged@v1`, `PatchApplied@v1`
-* `VerificationRun@v1`
-
-### 7.3 Deterministic rebuild procedure
-
-Given `session_id`:
-
-1. Read `events.jsonl` sequentially; validate schema.
-2. Rebuild projections:
-
-   * conversation transcript
-   * current plan state
-   * staged patches and apply history
-   * tool invocation table
-   * router decisions timeline
-3. **Replay mode (deterministic):**
-
-   * tools are NOT re-run; results come from `ToolResult@v1`
-   * LLM responses replay from stored streaming chunks if present
-4. Produce deterministic outputs:
-
-   * same plan
-   * same staged diffs
-   * same “why max thinking triggered” trail
-
----
-
-## 8) Indexing guarantees & deterministic snapshotting
-
-### 8.1 Manifest-bound index
-
-`manifest.json` stores:
-
-* baseline commit (if git)
-* list of `(path, sha256)` or merkle root
-* index schema version
-* ignore rules hash
-
-Guarantees:
-
-* Queries declare whether results are `fresh` vs `stale`.
-* If mismatch detected, index transitions to `Corrupt` and rebuild/update is triggered.
-
-### 8.2 Deterministic index build algorithm (explicit)
-
-If git repo:
-
-1. Identify `baseline_commit` at session start.
-2. Enumerate files via `git ls-tree -r --name-only baseline_commit`.
-3. Read file blobs via `git show baseline_commit:path`.
-4. Hash and index in stable path order.
-
-Else:
-
-1. Walk FS with ignore rules.
-2. Read file bytes and compute sha.
-3. If changes detected mid-build (sha mismatch), restart build.
-
----
-
-## 9) Failure modes & recovery (with planner/executor behavior)
-
-### 9.1 LLM failures
-
-* retry on 429/5xx/timeouts with backoff
-* if malformed plan/tool schema:
-
-  * re-ask once with stricter schema instruction
-  * escalate to reasoner if still invalid
-
-### 9.2 Tool / verification failures
-
-* executor records failure and proposes recovery step
-* router may escalate planning for diagnosis:
-
-  * “test failures 2x” => reasoner used for next planning call
-* never silently keep retrying; bounded retries + require user awareness
-
-### 9.3 Patch conflicts
-
-* if conflict:
-
-  * planner revises plan: “resolve conflicts” step
-  * reasoner may be triggered for merge strategy
-
----
-
-## 10) Performance targets
-
-Interactive UX targets:
-
-* first token streaming: p95 < 2s (network dependent)
-* `rg` searches: p95 < 250ms (medium repo)
-* index query: p95 < 50ms
-* event append overhead: < 5ms per event
-
-Budgets:
-
-* per-turn time budget (configurable)
-* “max thinking” token budget (hard cap) to prevent runaway usage
-
----
-
-## 11) Implementation blueprint (key Rust traits)
-
-### 11.1 Planner / Executor interfaces
-
-```rust
-pub trait Planner {
-  fn create_plan(&self, ctx: PlanContext) -> Result<Plan>;
-  fn revise_plan(&self, ctx: PlanContext, last_plan: &Plan, failure: Failure) -> Result<Plan>;
-}
-
-pub trait Executor {
-  fn run_step(&self, ctx: ExecContext, step: &PlanStep) -> Result<StepOutcome>;
-}
-```
-
-### 11.2 Router interface
-
-```rust
-pub trait ModelRouter {
-  fn select(&self, unit: LlmUnit, signals: RouterSignals) -> RouterDecision;
-}
-```
-
-### 11.3 Tool host interface
-
-```rust
-pub trait ToolHost {
-  fn propose(&self, call: ToolCall) -> ToolProposal;
-  fn execute(&self, approved: ApprovedToolCall) -> ToolResult;
-}
-```
-
----
-
-## 12) Rollout milestones
-
-### M1 — Plan-first + safe edits (foundational)
-
-* session log + plan artifacts + approvals
-* deepseek-chat streaming
-* planner/executor loop
-* patch stage/apply pipeline
-* basic router with explicit thresholds
-
-### M2 — Auto max-thinking + verification loops
-
-* router signals from failures + plan confidence
-* escalation retry (bounded)
-* build/test tool integration (allowlisted)
-
-### M3 — Deterministic indexing + replay
-
-* manifest-bound tantivy index
-* deterministic replay mode + golden tests
-
----
-
-## Appendix A: Config (TOML) including auto max-think
+## 6. Configuration Example (TOML)
 
 ```toml
 [llm]
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 temperature = 0.2
+api_key = "${DEEPSEEK_API_KEY}"  # or read from env
 
 [router]
 auto_max_think = true
 threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1
+weights = { prompt_complexity = 0.3, failure_streak = 0.25, ambiguity = 0.2, plan_confidence = 0.25 }
 
 [policy]
-approve_edits = "ask"
+approve_edits = "ask"          # ask, allow, deny
 approve_bash = "ask"
-allowlist = ["rg", "git", "cargo test", "cargo fmt --check"]
+allowlist = ["rg", "git", "cargo test", "cargo fmt --check", "npm test"]
+block_paths = [".env", "**/id_*", "**/secret"]
+redact_patterns = [
+    "(?i)(api[_-]?key|token|secret)\\s*[:=]\\s*['\"]?[a-z0-9_\\-]{16,}['\"]?"
+]
 
 [index]
 enabled = true
 engine = "tantivy"
+watch_files = true
+
+[budgets]
+max_reasoner_tokens_per_session = 1000000
+max_turn_duration_secs = 300
+
+[theme]
+# ratatui color theme
+primary = "Cyan"
+secondary = "Yellow"
+error = "Red"
 ```
+
+---
+
+## 7. Testing Strategy
+
+### 7.1 Unit & Integration Tests
+- Test each crate in isolation.
+- Integration tests for end-to-end flows using fake LLM and tool mocks.
+
+### 7.2 Deterministic Replay Tests
+- Record real sessions (with user permission) into cassettes.
+- Replay cassettes in CI to ensure changes don't break existing behavior.
+- Golden files for expected plans and diffs.
+
+### 7.3 Property-Based Testing
+- Use `proptest` to generate sequences of user inputs and tool responses; verify state machine invariants.
+
+### 7.4 Performance Benchmarks
+- Benchmark index queries, tool execution, and LLM streaming latency.
+- Set performance targets: p95 index query < 50ms, first token < 2s.
+
+---
+
+## 8. Conclusion
+
+This RFC presents a complete blueprint for building a DeepSeek-powered coding agent that not only replicates every feature of Claude Code but also introduces DeepSeek-specific innovations. The modular architecture, emphasis on safety, deterministic replay, and incremental milestones ensure a path to a production-quality tool that can become the go-to open-source alternative.
+
+With the Rust ecosystem’s maturity and the DeepSeek API’s cost advantage, we are well-positioned to deliver a tool that developers will love. Let’s build it.

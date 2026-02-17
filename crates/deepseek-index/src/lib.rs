@@ -1,11 +1,17 @@
 use anyhow::Result;
 use deepseek_core::{Session, runtime_dir};
+use notify::{
+    Config as NotifyConfig, EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode,
+    Watcher,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
+use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{STORED, STRING, Schema, TEXT, Value};
@@ -89,6 +95,67 @@ impl IndexService {
 
     pub fn update(&self, session: &Session) -> Result<Manifest> {
         self.build(session)
+    }
+
+    pub fn watch_and_update(
+        &self,
+        session: &Session,
+        max_events: usize,
+        timeout: Duration,
+    ) -> Result<Manifest> {
+        if self.status()?.is_none() {
+            self.build(session)?;
+        }
+
+        let (tx, rx) = channel();
+        let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())?;
+        watcher.watch(&self.workspace, RecursiveMode::Recursive)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut seen = 0usize;
+        let mut should_update = false;
+
+        while seen < max_events {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(event)) => {
+                    let relevant_kind = matches!(
+                        event.kind,
+                        NotifyEventKind::Create(_)
+                            | NotifyEventKind::Modify(_)
+                            | NotifyEventKind::Remove(_)
+                            | NotifyEventKind::Any
+                    );
+                    if !relevant_kind {
+                        continue;
+                    }
+                    if event.paths.iter().any(|path| {
+                        path.strip_prefix(&self.workspace)
+                            .ok()
+                            .is_none_or(|rel| !has_ignored_component(rel))
+                    }) {
+                        seen += 1;
+                        should_update = true;
+                    }
+                }
+                Ok(Err(_)) => continue,
+                Err(_) => break,
+            }
+        }
+
+        if should_update {
+            return self.update(session);
+        }
+
+        match self.status()? {
+            Some(manifest) if manifest.fresh => Ok(manifest),
+            Some(_) => self.update(session),
+            None => self.build(session),
+        }
     }
 
     pub fn status(&self) -> Result<Option<Manifest>> {
@@ -278,6 +345,8 @@ fn extract_match_line(path: &Path, needle: &str) -> Option<(usize, String)> {
 mod tests {
     use super::*;
     use deepseek_core::{SessionBudgets, SessionState};
+    use std::thread;
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[test]
@@ -327,5 +396,40 @@ mod tests {
         svc.build(&session).expect("build");
         let result = svc.query("router_decision", 5).expect("query");
         assert!(!result.results.is_empty());
+    }
+
+    #[test]
+    fn watcher_rebuilds_after_file_change() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-index-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("watched.txt"), "before").expect("seed file");
+
+        let svc = IndexService::new(&workspace).expect("svc");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 10,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        svc.build(&session).expect("build");
+
+        let workspace_for_write = workspace.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            fs::write(workspace_for_write.join("watched.txt"), "after").expect("mutate");
+        });
+
+        let manifest = svc
+            .watch_and_update(&session, 1, Duration::from_secs(3))
+            .expect("watch");
+        assert!(manifest.fresh);
+        let status = svc.status().expect("status").expect("manifest");
+        assert!(status.fresh);
     }
 }

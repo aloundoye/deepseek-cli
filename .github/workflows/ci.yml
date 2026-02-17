@@ -40,6 +40,16 @@ jobs:
       - name: cli json smoke
         run: cargo run --bin deepseek -- --json plan "CI smoke"
 
+      - name: extended cli smoke
+        shell: bash
+        run: |
+          cargo run --bin deepseek -- --json memory show
+          cargo run --bin deepseek -- --json mcp add ci-local --command echo --arg ok
+          cargo run --bin deepseek -- --json mcp list
+          cargo run --bin deepseek -- --json profile
+          cargo run --bin deepseek -- --json export --format json
+          cargo run --bin deepseek -- --json mcp remove ci-local
+
       - name: installer dry-run (unix)
         if: runner.os != 'Windows'
         run: bash scripts/install.sh --dry-run --version v0.0.0 --repo example/example

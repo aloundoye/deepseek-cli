@@ -284,8 +284,9 @@ impl PluginManager {
             } else {
                 self.workspace.join(path)
             };
-            fs::read_to_string(&resolved)
-                .with_context(|| format!("failed to read plugin catalog at {}", resolved.display()))?
+            fs::read_to_string(&resolved).with_context(|| {
+                format!("failed to read plugin catalog at {}", resolved.display())
+            })?
         };
 
         let parsed: CatalogIndexShape = serde_json::from_str(&raw)
@@ -323,7 +324,8 @@ impl PluginManager {
             });
         }
 
-        self.store.set_plugin_catalog_entries(source, &cache_records)?;
+        self.store
+            .set_plugin_catalog_entries(source, &cache_records)?;
         Ok(out)
     }
 

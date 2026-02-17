@@ -133,6 +133,72 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (plugin_id, version)
          );",
     ),
+    (
+        4,
+        "CREATE TABLE IF NOT EXISTS checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            snapshot_path TEXT NOT NULL,
+            files_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS transcript_exports (
+            export_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            format TEXT NOT NULL,
+            output_path TEXT NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS mcp_servers (
+            server_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS mcp_tools_cache (
+            server_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            schema_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (server_id, tool_name)
+         );
+         CREATE TABLE IF NOT EXISTS subagent_runs (
+            run_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS cost_ledger (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            estimated_cost_usd REAL NOT NULL,
+            recorded_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS profile_runs (
+            profile_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            elapsed_ms INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS memory_versions (
+            version_id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            note TEXT NOT NULL,
+            created_at TEXT NOT NULL
+         );",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -193,6 +259,65 @@ pub struct PluginCatalogEntryRecord {
     pub verified: bool,
     pub metadata_json: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRecord {
+    pub checkpoint_id: Uuid,
+    pub reason: String,
+    pub snapshot_path: String,
+    pub files_count: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptExportRecord {
+    pub export_id: Uuid,
+    pub session_id: Uuid,
+    pub format: String,
+    pub output_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerRecord {
+    pub server_id: String,
+    pub name: String,
+    pub transport: String,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub metadata_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolCacheRecord {
+    pub server_id: String,
+    pub tool_name: String,
+    pub description: String,
+    pub schema_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentRunRecord {
+    pub run_id: Uuid,
+    pub name: String,
+    pub goal: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileRunRecord {
+    pub profile_id: Uuid,
+    pub session_id: Uuid,
+    pub summary: String,
+    pub elapsed_ms: u64,
+    pub created_at: String,
 }
 
 pub struct Store {
@@ -565,8 +690,10 @@ impl Store {
         if let Some(session_id) = session_id {
             let rows = stmt.query_map([session_id.to_string()], |r| {
                 Ok(ContextCompactionRecord {
-                    summary_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str()).unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str()).unwrap_or_else(|_| Uuid::nil()),
+                    summary_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
                     from_turn: r.get::<_, i64>(2)? as u64,
                     to_turn: r.get::<_, i64>(3)? as u64,
                     token_delta_estimate: r.get(4)?,
@@ -580,8 +707,10 @@ impl Store {
         } else {
             let rows = stmt.query_map([], |r| {
                 Ok(ContextCompactionRecord {
-                    summary_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str()).unwrap_or_else(|_| Uuid::nil()),
-                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str()).unwrap_or_else(|_| Uuid::nil()),
+                    summary_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
                     from_turn: r.get::<_, i64>(2)? as u64,
                     to_turn: r.get::<_, i64>(3)? as u64,
                     token_delta_estimate: r.get(4)?,
@@ -594,6 +723,244 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn insert_checkpoint(&self, record: &CheckpointRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO checkpoints (checkpoint_id, reason, snapshot_path, files_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.checkpoint_id.to_string(),
+                record.reason,
+                record.snapshot_path,
+                record.files_count as i64,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_checkpoint(&self, checkpoint_id: Uuid) -> Result<Option<CheckpointRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id, reason, snapshot_path, files_count, created_at
+             FROM checkpoints WHERE checkpoint_id = ?1",
+        )?;
+        let mut rows = stmt.query([checkpoint_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(CheckpointRecord {
+                checkpoint_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                reason: row.get(1)?,
+                snapshot_path: row.get(2)?,
+                files_count: row.get::<_, i64>(3)? as u64,
+                created_at: row.get(4)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id, reason, snapshot_path, files_count, created_at
+             FROM checkpoints ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CheckpointRecord {
+                checkpoint_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                reason: r.get(1)?,
+                snapshot_path: r.get(2)?,
+                files_count: r.get::<_, i64>(3)? as u64,
+                created_at: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn insert_transcript_export(&self, record: &TranscriptExportRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO transcript_exports (export_id, session_id, format, output_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.export_id.to_string(),
+                record.session_id.to_string(),
+                record.format,
+                record.output_path,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_mcp_server(&self, record: &McpServerRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO mcp_servers (server_id, name, transport, endpoint, enabled, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.server_id,
+                record.name,
+                record.transport,
+                record.endpoint,
+                if record.enabled { 1 } else { 0 },
+                record.metadata_json,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_mcp_server(&self, server_id: &str) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute("DELETE FROM mcp_servers WHERE server_id = ?1", [server_id])?;
+        conn.execute(
+            "DELETE FROM mcp_tools_cache WHERE server_id = ?1",
+            [server_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServerRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT server_id, name, transport, endpoint, enabled, metadata_json, updated_at
+             FROM mcp_servers ORDER BY server_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(McpServerRecord {
+                server_id: r.get(0)?,
+                name: r.get(1)?,
+                transport: r.get(2)?,
+                endpoint: r.get(3)?,
+                enabled: r.get::<_, i64>(4)? != 0,
+                metadata_json: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_mcp_tool_cache(&self, record: &McpToolCacheRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO mcp_tools_cache (server_id, tool_name, description, schema_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.server_id,
+                record.tool_name,
+                record.description,
+                record.schema_json,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_mcp_tool_cache(&self) -> Result<Vec<McpToolCacheRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT server_id, tool_name, description, schema_json, updated_at
+             FROM mcp_tools_cache ORDER BY server_id ASC, tool_name ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(McpToolCacheRecord {
+                server_id: r.get(0)?,
+                tool_name: r.get(1)?,
+                description: r.get(2)?,
+                schema_json: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_subagent_run(&self, record: &SubagentRunRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO subagent_runs (run_id, name, goal, status, output, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.run_id.to_string(),
+                record.name,
+                record.goal,
+                record.status,
+                record.output,
+                record.error,
+                record.created_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_cost_ledger(
+        &self,
+        session_id: Uuid,
+        input_tokens: u64,
+        output_tokens: u64,
+        estimated_cost_usd: f64,
+    ) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT INTO cost_ledger (session_id, input_tokens, output_tokens, estimated_cost_usd, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id.to_string(),
+                input_tokens as i64,
+                output_tokens as i64,
+                estimated_cost_usd,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_profile_run(&self, record: &ProfileRunRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO profile_runs (profile_id, session_id, summary, elapsed_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.profile_id.to_string(),
+                record.session_id.to_string(),
+                record.summary,
+                record.elapsed_ms as i64,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_memory_version(
+        &self,
+        version_id: Uuid,
+        path: &str,
+        content: &str,
+        note: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_versions (version_id, path, content, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![version_id.to_string(), path, content, note, created_at],
+        )?;
+        Ok(())
     }
 
     pub fn rebuild_from_events(&self, session_id: Uuid) -> Result<RebuildProjection> {
@@ -814,6 +1181,161 @@ impl Store {
                     ],
                 )?;
             }
+            EventKind::CheckpointCreatedV1 {
+                checkpoint_id,
+                reason,
+                files_count,
+                snapshot_path,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO checkpoints (checkpoint_id, reason, snapshot_path, files_count, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        checkpoint_id.to_string(),
+                        reason,
+                        snapshot_path,
+                        *files_count as i64,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::CheckpointRewoundV1 {
+                checkpoint_id,
+                reason,
+            } => {
+                conn.execute(
+                    "UPDATE checkpoints SET reason = ?1 WHERE checkpoint_id = ?2",
+                    params![reason, checkpoint_id.to_string()],
+                )?;
+            }
+            EventKind::TranscriptExportedV1 {
+                export_id,
+                format,
+                output_path,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO transcript_exports (export_id, session_id, format, output_path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        export_id.to_string(),
+                        event.session_id.to_string(),
+                        format,
+                        output_path,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::McpServerAddedV1 {
+                server_id,
+                transport,
+                endpoint,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO mcp_servers (server_id, name, transport, endpoint, enabled, metadata_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 1, '{}', ?5)",
+                    params![
+                        server_id,
+                        server_id,
+                        transport,
+                        endpoint,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::McpServerRemovedV1 { server_id } => {
+                conn.execute("DELETE FROM mcp_servers WHERE server_id = ?1", [server_id])?;
+                conn.execute(
+                    "DELETE FROM mcp_tools_cache WHERE server_id = ?1",
+                    [server_id],
+                )?;
+            }
+            EventKind::McpToolDiscoveredV1 {
+                server_id,
+                tool_name,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO mcp_tools_cache (server_id, tool_name, description, schema_json, updated_at)
+                     VALUES (?1, ?2, '', '{}', ?3)",
+                    params![server_id, tool_name, Utc::now().to_rfc3339()],
+                )?;
+            }
+            EventKind::SubagentSpawnedV1 { run_id, name, goal } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO subagent_runs (run_id, name, goal, status, output, error, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'running', NULL, NULL, ?4, ?5)",
+                    params![
+                        run_id.to_string(),
+                        name,
+                        goal,
+                        Utc::now().to_rfc3339(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::SubagentCompletedV1 { run_id, output } => {
+                conn.execute(
+                    "UPDATE subagent_runs SET status='completed', output=?1, error=NULL, updated_at=?2 WHERE run_id=?3",
+                    params![output, Utc::now().to_rfc3339(), run_id.to_string()],
+                )?;
+            }
+            EventKind::SubagentFailedV1 { run_id, error } => {
+                conn.execute(
+                    "UPDATE subagent_runs SET status='failed', output=NULL, error=?1, updated_at=?2 WHERE run_id=?3",
+                    params![error, Utc::now().to_rfc3339(), run_id.to_string()],
+                )?;
+            }
+            EventKind::CostUpdatedV1 {
+                input_tokens,
+                output_tokens,
+                estimated_cost_usd,
+            } => {
+                conn.execute(
+                    "INSERT INTO cost_ledger (session_id, input_tokens, output_tokens, estimated_cost_usd, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        event.session_id.to_string(),
+                        *input_tokens as i64,
+                        *output_tokens as i64,
+                        *estimated_cost_usd,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::ProfileCapturedV1 {
+                profile_id,
+                summary,
+                elapsed_ms,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO profile_runs (profile_id, session_id, summary, elapsed_ms, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        profile_id.to_string(),
+                        event.session_id.to_string(),
+                        summary,
+                        *elapsed_ms as i64,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::MemorySyncedV1 {
+                version_id,
+                path,
+                note,
+            } => {
+                let content = fs::read_to_string(path).unwrap_or_default();
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory_versions (version_id, path, content, note, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        version_id.to_string(),
+                        path,
+                        content,
+                        note,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
             _ => {}
         }
         Ok(())
@@ -917,6 +1439,19 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::PluginVerifiedV1 { .. } => "PluginVerified@v1",
         EventKind::HookExecutedV1 { .. } => "HookExecuted@v1",
         EventKind::SessionForkedV1 { .. } => "SessionForked@v1",
+        EventKind::CheckpointCreatedV1 { .. } => "CheckpointCreated@v1",
+        EventKind::CheckpointRewoundV1 { .. } => "CheckpointRewound@v1",
+        EventKind::TranscriptExportedV1 { .. } => "TranscriptExported@v1",
+        EventKind::McpServerAddedV1 { .. } => "McpServerAdded@v1",
+        EventKind::McpServerRemovedV1 { .. } => "McpServerRemoved@v1",
+        EventKind::McpToolDiscoveredV1 { .. } => "McpToolDiscovered@v1",
+        EventKind::SubagentSpawnedV1 { .. } => "SubagentSpawned@v1",
+        EventKind::SubagentCompletedV1 { .. } => "SubagentCompleted@v1",
+        EventKind::SubagentFailedV1 { .. } => "SubagentFailed@v1",
+        EventKind::CostUpdatedV1 { .. } => "CostUpdated@v1",
+        EventKind::EffortChangedV1 { .. } => "EffortChanged@v1",
+        EventKind::ProfileCapturedV1 { .. } => "ProfileCaptured@v1",
+        EventKind::MemorySyncedV1 { .. } => "MemorySynced@v1",
         EventKind::TelemetryEventV1 { .. } => "TelemetryEvent@v1",
     }
 }

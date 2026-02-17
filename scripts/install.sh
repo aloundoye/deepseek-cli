@@ -63,20 +63,32 @@ arch="$(uname -m)"
 if [[ -z "$TARGET" ]]; then
   case "$os" in
     Linux)
-      if [[ "$arch" != "x86_64" && "$arch" != "amd64" ]]; then
-        echo "unsupported architecture for prebuilt binaries: $arch (linux). build from source or pass --target." >&2
-        exit 1
-      fi
-      TARGET="x86_64-unknown-linux-gnu"
+      case "$arch" in
+        x86_64|amd64)
+          TARGET="x86_64-unknown-linux-gnu"
+          ;;
+        arm64|aarch64)
+          TARGET="aarch64-unknown-linux-gnu"
+          ;;
+        *)
+          echo "unsupported architecture for prebuilt binaries: $arch (linux). build from source or pass --target." >&2
+          exit 1
+          ;;
+      esac
       ;;
     Darwin)
-      if [[ "$arch" == "arm64" || "$arch" == "aarch64" ]]; then
-        echo "warning: using x86_64 macOS binary on Apple Silicon; Rosetta may be required." >&2
-      elif [[ "$arch" != "x86_64" && "$arch" != "amd64" ]]; then
-        echo "unsupported architecture for prebuilt binaries: $arch (darwin). build from source or pass --target." >&2
-        exit 1
-      fi
-      TARGET="x86_64-apple-darwin"
+      case "$arch" in
+        x86_64|amd64)
+          TARGET="x86_64-apple-darwin"
+          ;;
+        arm64|aarch64)
+          TARGET="aarch64-apple-darwin"
+          ;;
+        *)
+          echo "unsupported architecture for prebuilt binaries: $arch (darwin). build from source or pass --target." >&2
+          exit 1
+          ;;
+      esac
       ;;
     *)
       echo "unsupported OS: $os" >&2

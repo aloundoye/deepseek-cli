@@ -9,10 +9,12 @@ use deepseek_llm::{DeepSeekClient, LlmClient};
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
-use deepseek_store::Store;
+use deepseek_store::{Store, SubagentRunRecord};
+use deepseek_subagent::{SubagentManager, SubagentTask};
 use deepseek_tools::LocalToolHost;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -160,6 +162,7 @@ pub struct AgentEngine {
     tool_host: Arc<LocalToolHost>,
     policy: PolicyEngine,
     cfg: AppConfig,
+    subagents: SubagentManager,
 }
 
 impl AgentEngine {
@@ -182,6 +185,7 @@ impl AgentEngine {
             tool_host,
             policy,
             cfg,
+            subagents: SubagentManager::default(),
         })
     }
 
@@ -263,6 +267,11 @@ impl AgentEngine {
                 output_tokens: estimate_tokens(&llm_response.text),
             },
         )?;
+        self.emit_cost_event(
+            session.session_id,
+            estimate_tokens(&planner_request),
+            estimate_tokens(&llm_response.text),
+        )?;
         let mut plan = parse_plan_from_llm(&llm_response.text, prompt);
         if plan.is_none()
             && self.cfg.router.auto_max_think
@@ -290,6 +299,11 @@ impl AgentEngine {
                     input_tokens: estimate_tokens(prompt),
                     output_tokens: estimate_tokens(&retry.text),
                 },
+            )?;
+            self.emit_cost_event(
+                session.session_id,
+                estimate_tokens(prompt),
+                estimate_tokens(&retry.text),
             )?;
             plan = parse_plan_from_llm(&retry.text, prompt);
         }
@@ -336,6 +350,7 @@ impl AgentEngine {
         let mut plan = self.plan_only_with_mode(prompt, force_max_think)?;
         session = self.ensure_session()?;
         self.transition(&mut session, SessionState::ExecutingStep)?;
+        let _subagent_notes = self.run_subagents(session.session_id, &plan)?;
         let mut failure_streak = 0_u32;
 
         for idx in 0..plan.steps.len() {
@@ -514,6 +529,129 @@ impl AgentEngine {
             projection.transcript.len(),
             projection.step_status.len()
         ))
+    }
+
+    fn run_subagents(&self, session_id: Uuid, plan: &Plan) -> Result<Vec<String>> {
+        let tasks = plan
+            .steps
+            .iter()
+            .take(self.subagents.max_concurrency)
+            .map(|step| SubagentTask {
+                run_id: Uuid::now_v7(),
+                name: step.title.clone(),
+                goal: step.intent.clone(),
+            })
+            .collect::<Vec<_>>();
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let task_by_id = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.run_id,
+                    (task.name.clone(), task.goal.clone(), now.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for task in &tasks {
+            self.emit(
+                session_id,
+                EventKind::SubagentSpawnedV1 {
+                    run_id: task.run_id,
+                    name: task.name.clone(),
+                    goal: task.goal.clone(),
+                },
+            )?;
+            self.store.upsert_subagent_run(&SubagentRunRecord {
+                run_id: task.run_id,
+                name: task.name.clone(),
+                goal: task.goal.clone(),
+                status: "running".to_string(),
+                output: None,
+                error: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })?;
+        }
+
+        let results = self.subagents.run_tasks(tasks, |task| {
+            Ok(format!(
+                "subagent '{}' analyzed intent '{}'",
+                task.name, task.goal
+            ))
+        });
+        let mut notes = Vec::new();
+        for result in results {
+            let updated_at = Utc::now().to_rfc3339();
+            let (name, goal, created_at) = task_by_id
+                .get(&result.run_id)
+                .cloned()
+                .unwrap_or_else(|| ("subagent".to_string(), String::new(), updated_at.clone()));
+            if result.success {
+                self.emit(
+                    session_id,
+                    EventKind::SubagentCompletedV1 {
+                        run_id: result.run_id,
+                        output: result.output.clone(),
+                    },
+                )?;
+                self.store.upsert_subagent_run(&SubagentRunRecord {
+                    run_id: result.run_id,
+                    name,
+                    goal,
+                    status: "completed".to_string(),
+                    output: Some(result.output.clone()),
+                    error: None,
+                    created_at,
+                    updated_at,
+                })?;
+                notes.push(result.output);
+            } else {
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "unknown subagent error".to_string());
+                self.emit(
+                    session_id,
+                    EventKind::SubagentFailedV1 {
+                        run_id: result.run_id,
+                        error: error.clone(),
+                    },
+                )?;
+                self.store.upsert_subagent_run(&SubagentRunRecord {
+                    run_id: result.run_id,
+                    name,
+                    goal,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some(error),
+                    created_at,
+                    updated_at,
+                })?;
+            }
+        }
+        Ok(notes)
+    }
+
+    fn emit_cost_event(
+        &self,
+        session_id: Uuid,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        let estimated_cost_usd = (input_tokens as f64 / 1_000_000.0)
+            * self.cfg.usage.cost_per_million_input
+            + (output_tokens as f64 / 1_000_000.0) * self.cfg.usage.cost_per_million_output;
+        self.emit(
+            session_id,
+            EventKind::CostUpdatedV1 {
+                input_tokens,
+                output_tokens,
+                estimated_cost_usd,
+            },
+        )
     }
 
     fn transition(&self, session: &mut Session, to: SessionState) -> Result<()> {
@@ -717,6 +855,11 @@ fn extract_json_snippet(text: &str) -> Option<&str> {
         return Some(text[start..=end].trim());
     }
     None
+}
+
+fn estimate_tokens(text: &str) -> u64 {
+    // Rough token estimate for local accounting and status reporting.
+    (text.chars().count() as u64).div_ceil(4)
 }
 
 fn is_valid_transition(from: &SessionState, to: &SessionState) -> bool {
