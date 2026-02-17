@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use deepseek_core::{
     AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ExecContext, Executor, Failure,
     LlmRequest, LlmUnit, ModelRouter, Plan, PlanContext, PlanStep, Planner, RouterSignals, Session,
@@ -9,15 +9,19 @@ use deepseek_llm::{DeepSeekClient, LlmClient};
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
-use deepseek_store::{Store, SubagentRunRecord};
-use deepseek_subagent::{SubagentManager, SubagentTask};
+use deepseek_store::{ProviderMetricRecord, Store, SubagentRunRecord};
+use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
 use deepseek_tools::LocalToolHost;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 pub struct SimplePlanner;
 
@@ -215,7 +219,9 @@ impl AgentEngine {
     fn plan_only_with_mode(&self, prompt: &str, force_max_think: bool) -> Result<Plan> {
         let mut session = self.ensure_session()?;
         self.transition(&mut session, SessionState::Planning)?;
-        let redacted_prompt = self.policy.redact(prompt);
+        let reference_expanded_prompt = expand_prompt_references(&self.workspace, prompt, true)
+            .unwrap_or_else(|_| prompt.to_string());
+        let redacted_prompt = self.policy.redact(&reference_expanded_prompt);
         let planner_request = build_planner_prompt(&redacted_prompt);
 
         let mut decision = self.router.select(
@@ -252,12 +258,15 @@ impl AgentEngine {
         )?;
         self.observer.record_router_decision(&decision)?;
 
-        let llm_response = self.llm.complete(&LlmRequest {
-            unit: LlmUnit::Planner,
-            prompt: planner_request.clone(),
-            model: decision.selected_model.clone(),
-            max_tokens: session.budgets.max_think_tokens,
-        })?;
+        let llm_response = self.complete_with_cache(
+            session.session_id,
+            &LlmRequest {
+                unit: LlmUnit::Planner,
+                prompt: planner_request.clone(),
+                model: decision.selected_model.clone(),
+                max_tokens: session.budgets.max_think_tokens,
+            },
+        )?;
         self.emit(
             session.session_id,
             EventKind::UsageUpdatedV1 {
@@ -285,12 +294,15 @@ impl AgentEngine {
                     reason_codes: vec!["invalid_or_empty_plan".to_string()],
                 },
             )?;
-            let retry = self.llm.complete(&LlmRequest {
-                unit: LlmUnit::Planner,
-                prompt: planner_request,
-                model: self.cfg.llm.max_think_model.clone(),
-                max_tokens: session.budgets.max_think_tokens,
-            })?;
+            let retry = self.complete_with_cache(
+                session.session_id,
+                &LlmRequest {
+                    unit: LlmUnit::Planner,
+                    prompt: planner_request,
+                    model: self.cfg.llm.max_think_model.clone(),
+                    max_tokens: session.budgets.max_think_tokens,
+                },
+            )?;
             self.emit(
                 session.session_id,
                 EventKind::UsageUpdatedV1 {
@@ -536,10 +548,24 @@ impl AgentEngine {
             .steps
             .iter()
             .take(self.subagents.max_concurrency)
-            .map(|step| SubagentTask {
-                run_id: Uuid::now_v7(),
-                name: step.title.clone(),
-                goal: step.intent.clone(),
+            .map(|step| {
+                let role = match step.intent.as_str() {
+                    "search" => SubagentRole::Explore,
+                    "plan" | "recover" => SubagentRole::Plan,
+                    _ => SubagentRole::Task,
+                };
+                let team = match role {
+                    SubagentRole::Explore => "explore",
+                    SubagentRole::Plan => "planning",
+                    SubagentRole::Task => "execution",
+                };
+                SubagentTask {
+                    run_id: Uuid::now_v7(),
+                    name: step.title.clone(),
+                    goal: step.intent.clone(),
+                    role,
+                    team: team.to_string(),
+                }
             })
             .collect::<Vec<_>>();
         if tasks.is_empty() {
@@ -579,10 +605,12 @@ impl AgentEngine {
 
         let results = self.subagents.run_tasks(tasks, |task| {
             Ok(format!(
-                "subagent '{}' analyzed intent '{}'",
-                task.name, task.goal
+                "subagent '{}' role={:?} team={} analyzed intent '{}'",
+                task.name, task.role, task.team, task.goal
             ))
         });
+        let mut results = results;
+        results.sort_by_key(|result| result.run_id);
         let mut notes = Vec::new();
         for result in results {
             let updated_at = Utc::now().to_rfc3339();
@@ -633,6 +661,108 @@ impl AgentEngine {
             }
         }
         Ok(notes)
+    }
+
+    fn complete_with_cache(
+        &self,
+        session_id: Uuid,
+        req: &LlmRequest,
+    ) -> Result<deepseek_core::LlmResponse> {
+        self.emit(
+            session_id,
+            EventKind::ProviderSelectedV1 {
+                provider: self.cfg.llm.provider.clone(),
+                model: req.model.clone(),
+            },
+        )?;
+
+        if self.cfg.scheduling.off_peak {
+            let hour = Utc::now().hour() as u8;
+            let start = self.cfg.scheduling.off_peak_start_hour;
+            let end = self.cfg.scheduling.off_peak_end_hour;
+            let in_window = if start <= end {
+                hour >= start && hour < end
+            } else {
+                hour >= start || hour < end
+            };
+            if !in_window {
+                let resume_after = next_off_peak_start(start);
+                self.emit(
+                    session_id,
+                    EventKind::OffPeakScheduledV1 {
+                        reason: "outside_off_peak_window".to_string(),
+                        resume_after,
+                    },
+                )?;
+            }
+        }
+
+        let cache_key = prompt_cache_key(&self.cfg.llm.provider, &req.model, &req.prompt);
+        if self.cfg.llm.prompt_cache_enabled
+            && let Some(cached) = self.read_prompt_cache(&cache_key)?
+        {
+            self.store.insert_provider_metric(&ProviderMetricRecord {
+                provider: self.cfg.llm.provider.clone(),
+                model: req.model.clone(),
+                cache_key: Some(cache_key.clone()),
+                cache_hit: true,
+                latency_ms: 0,
+                recorded_at: Utc::now().to_rfc3339(),
+            })?;
+            self.emit(
+                session_id,
+                EventKind::PromptCacheHitV1 {
+                    cache_key,
+                    model: req.model.clone(),
+                },
+            )?;
+            return Ok(cached);
+        }
+
+        let started = Instant::now();
+        let response = self.llm.complete(req)?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        self.store.insert_provider_metric(&ProviderMetricRecord {
+            provider: self.cfg.llm.provider.clone(),
+            model: req.model.clone(),
+            cache_key: Some(cache_key.clone()),
+            cache_hit: false,
+            latency_ms,
+            recorded_at: Utc::now().to_rfc3339(),
+        })?;
+
+        if self.cfg.llm.prompt_cache_enabled {
+            self.write_prompt_cache(&cache_key, &response)?;
+        }
+
+        Ok(response)
+    }
+
+    fn prompt_cache_dir(&self) -> PathBuf {
+        deepseek_core::runtime_dir(&self.workspace).join("prompt-cache")
+    }
+
+    fn read_prompt_cache(&self, cache_key: &str) -> Result<Option<deepseek_core::LlmResponse>> {
+        let path = self.prompt_cache_dir().join(format!("{cache_key}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(path)?;
+        Ok(Some(serde_json::from_str(&raw)?))
+    }
+
+    fn write_prompt_cache(
+        &self,
+        cache_key: &str,
+        response: &deepseek_core::LlmResponse,
+    ) -> Result<()> {
+        let dir = self.prompt_cache_dir();
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join(format!("{cache_key}.json")),
+            serde_json::to_vec(response)?,
+        )?;
+        Ok(())
     }
 
     fn emit_cost_event(
@@ -857,6 +987,206 @@ fn extract_json_snippet(text: &str) -> Option<&str> {
     None
 }
 
+#[derive(Debug, Clone)]
+struct PromptReference {
+    raw: String,
+    path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+}
+
+fn expand_prompt_references(
+    workspace: &Path,
+    prompt: &str,
+    respect_gitignore: bool,
+) -> Result<String> {
+    let refs = extract_prompt_references(prompt);
+    if refs.is_empty() {
+        return Ok(prompt.to_string());
+    }
+
+    let mut extra = String::new();
+    extra.push_str("\n\n[Resolved references]\n");
+    for reference in refs {
+        let full = workspace.join(&reference.path);
+        if !full.exists() {
+            extra.push_str(&format!(
+                "- {} -> missing ({})\n",
+                reference.raw, reference.path
+            ));
+            continue;
+        }
+
+        if full.is_dir() {
+            let mut shown = 0usize;
+            extra.push_str(&format!(
+                "- {} -> directory {}\n",
+                reference.raw, reference.path
+            ));
+            for entry in WalkDir::new(&full).into_iter().filter_map(Result::ok) {
+                let entry_path = entry.path();
+                let rel = match entry_path.strip_prefix(workspace) {
+                    Ok(rel) => rel,
+                    Err(_) => continue,
+                };
+                if respect_gitignore && has_ignored_component(rel) {
+                    continue;
+                }
+                if entry.file_type().is_file() {
+                    extra.push_str(&format!(
+                        "  - {}\n",
+                        rel.to_string_lossy().replace('\\', "/")
+                    ));
+                    shown += 1;
+                    if shown >= 50 {
+                        extra.push_str("  - ... (truncated)\n");
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let bytes = fs::read(&full)?;
+        if is_binary(&bytes) {
+            extra.push_str(&format!(
+                "- {} -> file {} (binary, {} bytes)\n",
+                reference.raw,
+                reference.path,
+                bytes.len()
+            ));
+            continue;
+        }
+
+        let text = String::from_utf8(bytes)?;
+        let rendered = render_referenced_lines(&text, reference.start_line, reference.end_line);
+        extra.push_str(&format!(
+            "```text\n# {}\n{}\n```\n",
+            reference.path, rendered
+        ));
+    }
+
+    Ok(format!("{prompt}{extra}"))
+}
+
+fn extract_prompt_references(prompt: &str) -> Vec<PromptReference> {
+    prompt
+        .split_whitespace()
+        .filter_map(parse_prompt_reference)
+        .collect()
+}
+
+fn parse_prompt_reference(token: &str) -> Option<PromptReference> {
+    let trimmed = token.trim();
+    if !trimmed.starts_with('@') {
+        return None;
+    }
+    let body = trimmed
+        .trim_start_matches('@')
+        .trim_end_matches(|ch: char| {
+            ch == ',' || ch == '.' || ch == ';' || ch == ')' || ch == ']' || ch == '>'
+        });
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut path = body.to_string();
+    let mut start_line = None;
+    let mut end_line = None;
+    if let Some(idx) = body.rfind(':') {
+        let (candidate_path, range) = body.split_at(idx);
+        let range = &range[1..];
+        if let Some((start, end)) = parse_line_range(range) {
+            path = candidate_path.to_string();
+            start_line = Some(start);
+            end_line = Some(end);
+        }
+    }
+
+    Some(PromptReference {
+        raw: trimmed.to_string(),
+        path,
+        start_line,
+        end_line,
+    })
+}
+
+fn parse_line_range(range: &str) -> Option<(usize, usize)> {
+    if range.is_empty() {
+        return None;
+    }
+    if let Some((start, end)) = range.split_once('-') {
+        let start = start.parse::<usize>().ok()?;
+        let end = end.parse::<usize>().ok()?;
+        if start == 0 || end < start {
+            return None;
+        }
+        return Some((start, end));
+    }
+    let line = range.parse::<usize>().ok()?;
+    if line == 0 {
+        return None;
+    }
+    Some((line, line))
+}
+
+fn render_referenced_lines(
+    content: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> String {
+    let start = start_line.unwrap_or(1).max(1);
+    let end = end_line.unwrap_or(start + 200).max(start);
+    let mut out = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        if line_no < start || line_no > end {
+            continue;
+        }
+        out.push(format!("{line_no:>5}: {line}"));
+        if out.len() >= 200 {
+            out.push("... (truncated)".to_string());
+            break;
+        }
+    }
+    out.join("\n")
+}
+
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
+fn has_ignored_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        let value = component.as_os_str();
+        value == ".git" || value == ".deepseek" || value == "target"
+    })
+}
+
+fn prompt_cache_key(provider: &str, model: &str, prompt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(provider.as_bytes());
+    hasher.update(b":");
+    hasher.update(model.as_bytes());
+    hasher.update(b":");
+    hasher.update(prompt.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn next_off_peak_start(start_hour: u8) -> String {
+    let now = Utc::now();
+    let current = now.hour() as u8;
+    let mut day_delta = 0_i64;
+    if current >= start_hour {
+        day_delta = 1;
+    }
+    let date = now.date_naive() + chrono::Duration::days(day_delta);
+    if let Some(dt) = date.and_hms_opt(start_hour as u32, 0, 0) {
+        return chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339();
+    }
+    now.to_rfc3339()
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     // Rough token estimate for local accounting and status reporting.
     (text.chars().count() as u64).div_ceil(4)
@@ -889,4 +1219,46 @@ fn is_valid_transition(from: &SessionState, to: &SessionState) -> bool {
             | (Paused, Completed)
             | (Paused, Failed)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_prompt_references_with_optional_line_ranges() {
+        let refs = extract_prompt_references("inspect @src/main.rs:10-20 and @README.md");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "src/main.rs");
+        assert_eq!(refs[0].start_line, Some(10));
+        assert_eq!(refs[0].end_line, Some(20));
+        assert_eq!(refs[1].path, "README.md");
+        assert_eq!(refs[1].start_line, None);
+    }
+
+    #[test]
+    fn expands_file_reference_context() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-agent-ref-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(workspace.join("src")).expect("workspace");
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "fn alpha() {}\nfn beta() {}\n",
+        )
+        .expect("seed");
+
+        let expanded =
+            expand_prompt_references(&workspace, "review @src/lib.rs:2-2", true).expect("expand");
+        assert!(expanded.contains("[Resolved references]"));
+        assert!(expanded.contains("2: fn beta() {}"));
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable() {
+        let a = prompt_cache_key("deepseek", "deepseek-chat", "hello");
+        let b = prompt_cache_key("deepseek", "deepseek-chat", "hello");
+        let c = prompt_cache_key("deepseek", "deepseek-chat", "hello!");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }

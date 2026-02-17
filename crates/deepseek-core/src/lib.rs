@@ -351,6 +351,54 @@ pub enum EventKind {
         name: String,
         properties: serde_json::Value,
     },
+    BackgroundJobStartedV1 {
+        job_id: Uuid,
+        kind: String,
+        reference: String,
+    },
+    BackgroundJobResumedV1 {
+        job_id: Uuid,
+        reference: String,
+    },
+    BackgroundJobStoppedV1 {
+        job_id: Uuid,
+        reason: String,
+    },
+    SkillLoadedV1 {
+        skill_id: String,
+        source_path: String,
+    },
+    ReplayExecutedV1 {
+        session_id: Uuid,
+        deterministic: bool,
+        events_replayed: u64,
+    },
+    ProviderSelectedV1 {
+        provider: String,
+        model: String,
+    },
+    PromptCacheHitV1 {
+        cache_key: String,
+        model: String,
+    },
+    OffPeakScheduledV1 {
+        reason: String,
+        resume_after: String,
+    },
+    VisualArtifactCapturedV1 {
+        artifact_id: Uuid,
+        path: String,
+        mime: String,
+    },
+    RemoteEnvConfiguredV1 {
+        profile_id: Uuid,
+        name: String,
+        endpoint: String,
+    },
+    TeleportBundleCreatedV1 {
+        bundle_id: Uuid,
+        path: String,
+    },
 }
 
 pub trait Planner {
@@ -392,10 +440,14 @@ pub struct AppConfig {
     pub router: RouterConfig,
     pub policy: PolicyConfig,
     pub plugins: PluginsConfig,
+    pub skills: SkillsConfig,
     pub usage: UsageConfig,
     pub context: ContextConfig,
     pub autopilot: AutopilotConfig,
+    pub scheduling: SchedulingConfig,
+    pub replay: ReplayConfig,
     pub ui: UiConfig,
+    pub experiments: ExperimentsConfig,
     pub telemetry: TelemetryConfig,
     pub index: IndexConfig,
 }
@@ -511,9 +563,13 @@ fn merge_json_value(base: &mut serde_json::Value, overlay: &serde_json::Value) {
 pub struct LlmConfig {
     pub base_model: String,
     pub max_think_model: String,
+    pub provider: String,
     pub temperature: f32,
     pub endpoint: String,
     pub api_key_env: String,
+    pub fast_mode: bool,
+    pub language: String,
+    pub prompt_cache_enabled: bool,
     pub timeout_seconds: u64,
     pub max_retries: u8,
     pub retry_base_ms: u64,
@@ -526,9 +582,13 @@ impl Default for LlmConfig {
         Self {
             base_model: DEEPSEEK_V32_CHAT_MODEL.to_string(),
             max_think_model: DEEPSEEK_V32_REASONER_MODEL.to_string(),
+            provider: "deepseek".to_string(),
             temperature: 0.2,
             endpoint: "https://api.deepseek.com/chat/completions".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
+            fast_mode: false,
+            language: "en".to_string(),
+            prompt_cache_enabled: true,
             timeout_seconds: 60,
             max_retries: 3,
             retry_base_ms: 400,
@@ -693,6 +753,8 @@ impl Default for AutopilotConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
+    pub enable_tui: bool,
+    pub keybindings_path: String,
     pub reduced_motion: bool,
     pub statusline_mode: String,
 }
@@ -700,10 +762,68 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            enable_tui: false,
+            keybindings_path: "~/.deepseek/keybindings.json".to_string(),
             reduced_motion: false,
             statusline_mode: "minimal".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub paths: Vec<String>,
+    pub hot_reload: bool,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            paths: vec![
+                ".deepseek/skills".to_string(),
+                "~/.deepseek/skills".to_string(),
+            ],
+            hot_reload: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulingConfig {
+    pub off_peak: bool,
+    pub off_peak_start_hour: u8,
+    pub off_peak_end_hour: u8,
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            off_peak: false,
+            off_peak_start_hour: 0,
+            off_peak_end_hour: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplayConfig {
+    pub strict_mode: bool,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self { strict_mode: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ExperimentsConfig {
+    pub visual_verification: bool,
+    pub wasm_hooks: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

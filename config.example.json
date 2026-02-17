@@ -2,9 +2,13 @@
   "llm": {
     "base_model": "deepseek-chat",
     "max_think_model": "deepseek-reasoner",
+    "provider": "deepseek",
     "temperature": 0.2,
     "endpoint": "https://api.deepseek.com/chat/completions",
     "api_key_env": "DEEPSEEK_API_KEY",
+    "fast_mode": false,
+    "language": "en",
+    "prompt_cache_enabled": true,
     "timeout_seconds": 60,
     "max_retries": 3,
     "retry_base_ms": 400,
@@ -51,6 +55,13 @@
       "refresh_hours": 24
     }
   },
+  "skills": {
+    "paths": [
+      ".deepseek/skills",
+      "~/.deepseek/skills"
+    ],
+    "hot_reload": true
+  },
   "usage": {
     "show_statusline": true,
     "cost_per_million_input": 0.27,
@@ -65,9 +76,23 @@
     "heartbeat_interval_seconds": 5,
     "persist_checkpoints": true
   },
+  "scheduling": {
+    "off_peak": false,
+    "off_peak_start_hour": 0,
+    "off_peak_end_hour": 6
+  },
+  "replay": {
+    "strict_mode": true
+  },
   "ui": {
+    "enable_tui": false,
+    "keybindings_path": "~/.deepseek/keybindings.json",
     "reduced_motion": false,
     "statusline_mode": "minimal"
+  },
+  "experiments": {
+    "visual_verification": false,
+    "wasm_hooks": false
   },
   "telemetry": {
     "enabled": false,

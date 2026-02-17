@@ -199,6 +199,66 @@ const MIGRATIONS: &[(i64, &str)] = &[
             created_at TEXT NOT NULL
          );",
     ),
+    (
+        5,
+        "CREATE TABLE IF NOT EXISTS background_jobs (
+            job_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            reference TEXT NOT NULL,
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS replay_cassettes (
+            cassette_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            deterministic INTEGER NOT NULL,
+            events_count INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS skill_registry (
+            skill_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS provider_metrics (
+            id INTEGER PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            cache_key TEXT,
+            cache_hit INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS marketplace_catalog (
+            plugin_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            source TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS visual_artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            mime TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS remote_env_profiles (
+            profile_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            auth_mode TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -318,6 +378,76 @@ pub struct ProfileRunRecord {
     pub summary: String,
     pub elapsed_ms: u64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundJobRecord {
+    pub job_id: Uuid,
+    pub kind: String,
+    pub reference: String,
+    pub status: String,
+    pub metadata_json: String,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayCassetteRecord {
+    pub cassette_id: Uuid,
+    pub session_id: Uuid,
+    pub deterministic: bool,
+    pub events_count: u64,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRegistryRecord {
+    pub skill_id: String,
+    pub name: String,
+    pub path: String,
+    pub enabled: bool,
+    pub metadata_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderMetricRecord {
+    pub provider: String,
+    pub model: String,
+    pub cache_key: Option<String>,
+    pub cache_hit: bool,
+    pub latency_ms: u64,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketplaceCatalogRecord {
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub metadata_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualArtifactRecord {
+    pub artifact_id: Uuid,
+    pub path: String,
+    pub mime: String,
+    pub metadata_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteEnvProfileRecord {
+    pub profile_id: Uuid,
+    pub name: String,
+    pub endpoint: String,
+    pub auth_mode: String,
+    pub metadata_json: String,
+    pub updated_at: String,
 }
 
 pub struct Store {
@@ -889,6 +1019,34 @@ impl Store {
         Ok(out)
     }
 
+    pub fn replace_mcp_tool_cache_for_server(
+        &self,
+        server_id: &str,
+        records: &[McpToolCacheRecord],
+    ) -> Result<()> {
+        let mut conn = self.db()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM mcp_tools_cache WHERE server_id = ?1",
+            [server_id],
+        )?;
+        for record in records {
+            tx.execute(
+                "INSERT OR REPLACE INTO mcp_tools_cache (server_id, tool_name, description, schema_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.server_id,
+                    record.tool_name,
+                    record.description,
+                    record.schema_json,
+                    record.updated_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_subagent_run(&self, record: &SubagentRunRecord) -> Result<()> {
         let conn = self.db()?;
         conn.execute(
@@ -959,6 +1117,279 @@ impl Store {
             "INSERT OR REPLACE INTO memory_versions (version_id, path, content, note, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![version_id.to_string(), path, content, note, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_background_job(&self, record: &BackgroundJobRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO background_jobs (job_id, kind, reference, status, metadata_json, started_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.job_id.to_string(),
+                record.kind,
+                record.reference,
+                record.status,
+                record.metadata_json,
+                record.started_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_background_job(&self, job_id: Uuid) -> Result<Option<BackgroundJobRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, kind, reference, status, metadata_json, started_at, updated_at
+             FROM background_jobs WHERE job_id = ?1",
+        )?;
+        let mut rows = stmt.query([job_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(BackgroundJobRecord {
+                job_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                kind: row.get(1)?,
+                reference: row.get(2)?,
+                status: row.get(3)?,
+                metadata_json: row.get(4)?,
+                started_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn list_background_jobs(&self) -> Result<Vec<BackgroundJobRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, kind, reference, status, metadata_json, started_at, updated_at
+             FROM background_jobs ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(BackgroundJobRecord {
+                job_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                kind: r.get(1)?,
+                reference: r.get(2)?,
+                status: r.get(3)?,
+                metadata_json: r.get(4)?,
+                started_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn insert_replay_cassette(&self, record: &ReplayCassetteRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO replay_cassettes (cassette_id, session_id, deterministic, events_count, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.cassette_id.to_string(),
+                record.session_id.to_string(),
+                if record.deterministic { 1 } else { 0 },
+                record.events_count as i64,
+                record.payload_json,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_skill_registry(&self, record: &SkillRegistryRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO skill_registry (skill_id, name, path, enabled, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.skill_id,
+                record.name,
+                record.path,
+                if record.enabled { 1 } else { 0 },
+                record.metadata_json,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_skill_registry(&self) -> Result<Vec<SkillRegistryRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT skill_id, name, path, enabled, metadata_json, updated_at
+             FROM skill_registry ORDER BY skill_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SkillRegistryRecord {
+                skill_id: r.get(0)?,
+                name: r.get(1)?,
+                path: r.get(2)?,
+                enabled: r.get::<_, i64>(3)? != 0,
+                metadata_json: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_skill_registry(&self, skill_id: &str) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute("DELETE FROM skill_registry WHERE skill_id = ?1", [skill_id])?;
+        Ok(())
+    }
+
+    pub fn insert_provider_metric(&self, record: &ProviderMetricRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.provider,
+                record.model,
+                record.cache_key,
+                if record.cache_hit { 1 } else { 0 },
+                record.latency_ms as i64,
+                record.recorded_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_marketplace_catalog(&self, record: &MarketplaceCatalogRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO marketplace_catalog (plugin_id, name, version, source, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.plugin_id,
+                record.name,
+                record.version,
+                record.source,
+                record.metadata_json,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_marketplace_catalog(&self) -> Result<Vec<MarketplaceCatalogRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT plugin_id, name, version, source, metadata_json, updated_at
+             FROM marketplace_catalog ORDER BY plugin_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MarketplaceCatalogRecord {
+                plugin_id: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                source: r.get(3)?,
+                metadata_json: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn insert_visual_artifact(&self, record: &VisualArtifactRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO visual_artifacts (artifact_id, path, mime, metadata_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.artifact_id.to_string(),
+                record.path,
+                record.mime,
+                record.metadata_json,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_remote_env_profile(&self, record: &RemoteEnvProfileRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO remote_env_profiles (profile_id, name, endpoint, auth_mode, metadata_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.profile_id.to_string(),
+                record.name,
+                record.endpoint,
+                record.auth_mode,
+                record.metadata_json,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_remote_env_profiles(&self) -> Result<Vec<RemoteEnvProfileRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT profile_id, name, endpoint, auth_mode, metadata_json, updated_at
+             FROM remote_env_profiles ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RemoteEnvProfileRecord {
+                profile_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                name: r.get(1)?,
+                endpoint: r.get(2)?,
+                auth_mode: r.get(3)?,
+                metadata_json: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn load_remote_env_profile(
+        &self,
+        profile_id: Uuid,
+    ) -> Result<Option<RemoteEnvProfileRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT profile_id, name, endpoint, auth_mode, metadata_json, updated_at
+             FROM remote_env_profiles WHERE profile_id = ?1",
+        )?;
+        let mut rows = stmt.query([profile_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(RemoteEnvProfileRecord {
+                profile_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                name: row.get(1)?,
+                endpoint: row.get(2)?,
+                auth_mode: row.get(3)?,
+                metadata_json: row.get(4)?,
+                updated_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn remove_remote_env_profile(&self, profile_id: Uuid) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "DELETE FROM remote_env_profiles WHERE profile_id = ?1",
+            [profile_id.to_string()],
         )?;
         Ok(())
     }
@@ -1336,6 +1767,135 @@ impl Store {
                     ],
                 )?;
             }
+            EventKind::BackgroundJobStartedV1 {
+                job_id,
+                kind,
+                reference,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO background_jobs (job_id, kind, reference, status, metadata_json, started_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'running', '{}', ?4, ?5)",
+                    params![
+                        job_id.to_string(),
+                        kind,
+                        reference,
+                        Utc::now().to_rfc3339(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::BackgroundJobResumedV1 { job_id, reference } => {
+                conn.execute(
+                    "UPDATE background_jobs SET status='running', reference=?1, updated_at=?2 WHERE job_id=?3",
+                    params![reference, Utc::now().to_rfc3339(), job_id.to_string()],
+                )?;
+            }
+            EventKind::BackgroundJobStoppedV1 { job_id, reason } => {
+                conn.execute(
+                    "UPDATE background_jobs SET status='stopped', metadata_json=?1, updated_at=?2 WHERE job_id=?3",
+                    params![
+                        serde_json::json!({"reason": reason}).to_string(),
+                        Utc::now().to_rfc3339(),
+                        job_id.to_string()
+                    ],
+                )?;
+            }
+            EventKind::SkillLoadedV1 {
+                skill_id,
+                source_path,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO skill_registry (skill_id, name, path, enabled, metadata_json, updated_at)
+                     VALUES (?1, ?2, ?3, 1, '{}', ?4)",
+                    params![skill_id, skill_id, source_path, Utc::now().to_rfc3339()],
+                )?;
+            }
+            EventKind::ReplayExecutedV1 {
+                session_id,
+                deterministic,
+                events_replayed,
+            } => {
+                conn.execute(
+                    "INSERT INTO replay_cassettes (cassette_id, session_id, deterministic, events_count, payload_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        session_id.to_string(),
+                        if *deterministic { 1 } else { 0 },
+                        *events_replayed as i64,
+                        "{}",
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::ProviderSelectedV1 { provider, model } => {
+                conn.execute(
+                    "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
+                     VALUES (?1, ?2, NULL, 0, 0, ?3)",
+                    params![provider, model, Utc::now().to_rfc3339()],
+                )?;
+            }
+            EventKind::PromptCacheHitV1 { cache_key, model } => {
+                conn.execute(
+                    "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
+                     VALUES ('deepseek', ?1, ?2, 1, 0, ?3)",
+                    params![model, cache_key, Utc::now().to_rfc3339()],
+                )?;
+            }
+            EventKind::OffPeakScheduledV1 {
+                reason,
+                resume_after,
+            } => {
+                conn.execute(
+                    "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
+                     VALUES ('scheduler', 'off_peak', ?1, 0, 0, ?2)",
+                    params![format!("{reason}:{resume_after}"), Utc::now().to_rfc3339()],
+                )?;
+            }
+            EventKind::VisualArtifactCapturedV1 {
+                artifact_id,
+                path,
+                mime,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO visual_artifacts (artifact_id, path, mime, metadata_json, created_at)
+                     VALUES (?1, ?2, ?3, '{}', ?4)",
+                    params![
+                        artifact_id.to_string(),
+                        path,
+                        mime,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::RemoteEnvConfiguredV1 {
+                profile_id,
+                name,
+                endpoint,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO remote_env_profiles (profile_id, name, endpoint, auth_mode, metadata_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'token', '{}', ?4)",
+                    params![
+                        profile_id.to_string(),
+                        name,
+                        endpoint,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::TeleportBundleCreatedV1 { bundle_id, path } => {
+                conn.execute(
+                    "INSERT INTO replay_cassettes (cassette_id, session_id, deterministic, events_count, payload_json, created_at)
+                     VALUES (?1, ?2, 1, 0, ?3, ?4)",
+                    params![
+                        bundle_id.to_string(),
+                        event.session_id.to_string(),
+                        serde_json::json!({"path": path}).to_string(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
             _ => {}
         }
         Ok(())
@@ -1452,6 +2012,17 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::EffortChangedV1 { .. } => "EffortChanged@v1",
         EventKind::ProfileCapturedV1 { .. } => "ProfileCaptured@v1",
         EventKind::MemorySyncedV1 { .. } => "MemorySynced@v1",
+        EventKind::BackgroundJobStartedV1 { .. } => "BackgroundJobStarted@v1",
+        EventKind::BackgroundJobResumedV1 { .. } => "BackgroundJobResumed@v1",
+        EventKind::BackgroundJobStoppedV1 { .. } => "BackgroundJobStopped@v1",
+        EventKind::SkillLoadedV1 { .. } => "SkillLoaded@v1",
+        EventKind::ReplayExecutedV1 { .. } => "ReplayExecuted@v1",
+        EventKind::ProviderSelectedV1 { .. } => "ProviderSelected@v1",
+        EventKind::PromptCacheHitV1 { .. } => "PromptCacheHit@v1",
+        EventKind::OffPeakScheduledV1 { .. } => "OffPeakScheduled@v1",
+        EventKind::VisualArtifactCapturedV1 { .. } => "VisualArtifactCaptured@v1",
+        EventKind::RemoteEnvConfiguredV1 { .. } => "RemoteEnvConfigured@v1",
+        EventKind::TeleportBundleCreatedV1 { .. } => "TeleportBundleCreated@v1",
         EventKind::TelemetryEventV1 { .. } => "TelemetryEvent@v1",
     }
 }

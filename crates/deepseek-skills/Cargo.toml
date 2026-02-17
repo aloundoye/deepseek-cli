@@ -1,5 +1,5 @@
 [package]
-name = "deepseek-mcp"
+name = "deepseek-skills"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,10 +7,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
+walkdir.workspace = true
+glob.workspace = true
 uuid.workspace = true
+deepseek-core = { path = "../deepseek-core" }
 deepseek-store = { path = "../deepseek-store" }

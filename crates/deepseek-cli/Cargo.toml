@@ -27,6 +27,7 @@ deepseek-tools = { path = "../deepseek-tools" }
 deepseek-ui = { path = "../deepseek-ui" }
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-mcp = { path = "../deepseek-mcp" }
+deepseek-skills = { path = "../deepseek-skills" }
 
 [dev-dependencies]
 assert_cmd = "2"

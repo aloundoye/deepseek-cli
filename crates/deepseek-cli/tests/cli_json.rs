@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
 #[test]
@@ -362,6 +363,136 @@ fn rewind_uses_checkpoint_id_from_apply() {
     );
     assert_eq!(rewound["rewound"], true);
     assert_eq!(rewound["checkpoint_id"], checkpoint_id);
+}
+
+#[test]
+fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
+    if StdCommand::new("git").arg("--version").output().is_err() {
+        return;
+    }
+
+    let workspace = TempDir::new().expect("workspace");
+    let init_status = StdCommand::new("git")
+        .current_dir(workspace.path())
+        .arg("init")
+        .status()
+        .expect("git init");
+    assert!(init_status.success());
+
+    let git_status = run_json(workspace.path(), &["--json", "git", "status"]);
+    assert!(git_status["output"].as_str().is_some());
+
+    let skill_src = workspace.path().join("demo-skill");
+    fs::create_dir_all(&skill_src).expect("skill source");
+    fs::write(
+        skill_src.join("SKILL.md"),
+        "# Demo Skill\n\nAnalyze {{input}} in {{workspace}}.",
+    )
+    .expect("skill");
+
+    let skill_install = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "skills",
+            "install",
+            skill_src.to_string_lossy().as_ref(),
+        ],
+    );
+    assert_eq!(skill_install["id"], "demo-skill");
+
+    let skill_run = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "skills",
+            "run",
+            "demo-skill",
+            "--input",
+            "routing",
+        ],
+    );
+    assert_eq!(skill_run["skill_id"], "demo-skill");
+
+    let _ = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "autopilot",
+            "create replay fixture",
+            "--max-iterations",
+            "1",
+            "--duration-seconds",
+            "30",
+            "--tools",
+            "false",
+        ],
+    );
+    let jobs = run_json(workspace.path(), &["--json", "background", "list"]);
+    let first_job = jobs
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("background job");
+    let job_id = first_job["job_id"].as_str().expect("job id");
+
+    let attached = run_json(
+        workspace.path(),
+        &["--json", "background", "attach", job_id],
+    );
+    assert_eq!(attached["job_id"], job_id);
+
+    let stopped = run_json(workspace.path(), &["--json", "background", "stop", job_id]);
+    assert_eq!(stopped["stopped"], true);
+
+    let status = run_json(workspace.path(), &["--json", "status"]);
+    let session_id = status["session_id"].as_str().expect("session id");
+    let replay = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "replay",
+            "run",
+            "--session-id",
+            session_id,
+            "--deterministic",
+            "true",
+        ],
+    );
+    assert_eq!(replay["deterministic"], true);
+    assert!(replay["tool_results_replayed"].as_u64().is_some());
+
+    let teleport = run_json(workspace.path(), &["--json", "teleport"]);
+    assert!(teleport["bundle_id"].as_str().is_some());
+    let teleport_path = teleport["path"].as_str().expect("teleport path");
+    let imported = run_json(
+        workspace.path(),
+        &["--json", "teleport", "--import", teleport_path],
+    );
+    assert_eq!(imported["imported"], true);
+
+    let added = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "remote-env",
+            "add",
+            "devbox",
+            "https://example.invalid",
+        ],
+    );
+    let profile_id = added["profile_id"].as_str().expect("profile id");
+
+    let checked = run_json(
+        workspace.path(),
+        &["--json", "remote-env", "check", profile_id],
+    );
+    assert_eq!(checked["profile_id"], profile_id);
+
+    let removed = run_json(
+        workspace.path(),
+        &["--json", "remote-env", "remove", profile_id],
+    );
+    assert_eq!(removed["removed"], true);
 }
 
 fn run_json(workspace: &Path, args: &[&str]) -> Value {
