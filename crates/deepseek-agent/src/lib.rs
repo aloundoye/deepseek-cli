@@ -807,13 +807,21 @@ impl AgentEngine {
             )?;
         }
 
-        if execution_failed || verification_failures > 0 {
+        let run_succeeded = !(execution_failed || verification_failures > 0);
+        if !run_succeeded {
             self.transition(&mut session, SessionState::Failed)?;
             self.remember_failed_strategy(prompt, &plan, failure_streak, verification_failures)?;
         } else {
             self.transition(&mut session, SessionState::Completed)?;
             self.remember_successful_strategy(prompt, &plan)?;
         }
+        self.remember_objective_outcome(
+            prompt,
+            &plan,
+            failure_streak,
+            verification_failures,
+            run_succeeded,
+        )?;
 
         let projection = self.store.rebuild_from_events(session.session_id)?;
         Ok(format!(
@@ -1259,6 +1267,15 @@ impl AgentEngine {
                 format_strategy_entries(&strategy_entries)
             ));
         }
+        let objective_entries = self
+            .load_matching_objective_outcomes(prompt, 4)
+            .unwrap_or_default();
+        if !objective_entries.is_empty() {
+            blocks.push(format!(
+                "[objective_outcomes]\n{}",
+                format_objective_outcomes(&objective_entries)
+            ));
+        }
         let verification_feedback = self
             .store
             .list_recent_verification_runs(session_id, 10)
@@ -1454,6 +1471,155 @@ impl AgentEngine {
         }
         sort_and_prune_strategy_entries(&mut memory.entries);
         self.write_planner_strategy_memory(&memory)
+    }
+
+    fn objective_outcome_memory_path(&self) -> PathBuf {
+        deepseek_core::runtime_dir(&self.workspace).join("objective-outcomes.json")
+    }
+
+    fn read_objective_outcome_memory(&self) -> Result<ObjectiveOutcomeMemory> {
+        let path = self.objective_outcome_memory_path();
+        if !path.exists() {
+            return Ok(ObjectiveOutcomeMemory::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        let mut memory = serde_json::from_str(&raw).unwrap_or_default();
+        normalize_objective_outcome_memory(&mut memory);
+        Ok(memory)
+    }
+
+    fn write_objective_outcome_memory(&self, memory: &ObjectiveOutcomeMemory) -> Result<()> {
+        let path = self.objective_outcome_memory_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_vec_pretty(memory)?)?;
+        Ok(())
+    }
+
+    fn load_matching_objective_outcomes(
+        &self,
+        prompt: &str,
+        limit: usize,
+    ) -> Result<Vec<ObjectiveOutcomeEntry>> {
+        let key = plan_goal_pattern(prompt);
+        let key_terms = key
+            .split('|')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        let memory = self.read_objective_outcome_memory()?;
+        let mut matches = memory
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                if entry.key == key {
+                    return true;
+                }
+                key_terms
+                    .iter()
+                    .any(|term| entry.key.contains(term) || entry.goal_excerpt.contains(term))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then(b.success_count.cmp(&a.success_count))
+                .then(a.failure_count.cmp(&b.failure_count))
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        matches.truncate(limit.max(1));
+        Ok(matches)
+    }
+
+    fn remember_objective_outcome(
+        &self,
+        prompt: &str,
+        plan: &Plan,
+        failure_streak: u32,
+        verification_failures: u32,
+        success: bool,
+    ) -> Result<()> {
+        let mut memory = self.read_objective_outcome_memory()?;
+        let key = plan_goal_pattern(prompt);
+        let goal_excerpt = truncate_strategy_prompt(prompt);
+        let now = Utc::now().to_rfc3339();
+        let observed_step_count = plan.steps.len() as f32;
+        let observed_failure_count = failure_streak as f32 + verification_failures as f32;
+        let execution_failures = failure_streak.saturating_sub(verification_failures) as u64;
+        let verification_failures = verification_failures as u64;
+        let failure_summary = if success {
+            "none".to_string()
+        } else if failure_streak > 0 && verification_failures > 0 {
+            format!(
+                "execution_failures={} verification_failures={}",
+                execution_failures, verification_failures
+            )
+        } else if verification_failures > 0 {
+            format!("verification_failures={verification_failures}")
+        } else {
+            format!("execution_failures={execution_failures}")
+        };
+
+        if let Some(entry) = memory.entries.iter_mut().find(|entry| entry.key == key) {
+            let prior_observations = entry.success_count.saturating_add(entry.failure_count);
+            let next_observations = prior_observations.saturating_add(1);
+            entry.goal_excerpt = goal_excerpt;
+            entry.avg_step_count = rolling_average(
+                entry.avg_step_count,
+                prior_observations,
+                observed_step_count,
+                next_observations,
+            );
+            entry.avg_failure_count = rolling_average(
+                entry.avg_failure_count,
+                prior_observations,
+                observed_failure_count,
+                next_observations,
+            );
+            if success {
+                entry.success_count = entry.success_count.saturating_add(1);
+                entry.last_outcome = "success".to_string();
+            } else {
+                entry.failure_count = entry.failure_count.saturating_add(1);
+                entry.execution_failure_count = entry
+                    .execution_failure_count
+                    .saturating_add(execution_failures);
+                entry.verification_failure_count = entry
+                    .verification_failure_count
+                    .saturating_add(verification_failures);
+                entry.last_outcome = "failure".to_string();
+            }
+            entry.last_failure_summary = failure_summary;
+            entry.next_focus = objective_next_focus(entry);
+            entry.confidence = compute_objective_confidence(entry);
+            entry.updated_at = now;
+        } else {
+            let mut entry = ObjectiveOutcomeEntry {
+                key,
+                goal_excerpt,
+                success_count: if success { 1 } else { 0 },
+                failure_count: if success { 0 } else { 1 },
+                execution_failure_count: if success { 0 } else { execution_failures },
+                verification_failure_count: if success { 0 } else { verification_failures },
+                avg_step_count: observed_step_count,
+                avg_failure_count: observed_failure_count,
+                confidence: 0.5,
+                last_outcome: if success {
+                    "success".to_string()
+                } else {
+                    "failure".to_string()
+                },
+                last_failure_summary: failure_summary,
+                next_focus: String::new(),
+                updated_at: now,
+            };
+            entry.next_focus = objective_next_focus(&entry);
+            entry.confidence = compute_objective_confidence(&entry);
+            memory.entries.push(entry);
+        }
+        sort_and_prune_objective_entries(&mut memory.entries);
+        self.write_objective_outcome_memory(&memory)
     }
 
     fn emit_cost_event(
@@ -1822,6 +1988,41 @@ struct PlannerStrategyEntry {
 }
 
 fn default_strategy_score() -> f32 {
+    0.5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ObjectiveOutcomeMemory {
+    entries: Vec<ObjectiveOutcomeEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectiveOutcomeEntry {
+    key: String,
+    goal_excerpt: String,
+    success_count: u64,
+    #[serde(default)]
+    failure_count: u64,
+    #[serde(default)]
+    execution_failure_count: u64,
+    #[serde(default)]
+    verification_failure_count: u64,
+    #[serde(default)]
+    avg_step_count: f32,
+    #[serde(default)]
+    avg_failure_count: f32,
+    #[serde(default = "default_objective_confidence")]
+    confidence: f32,
+    #[serde(default)]
+    last_outcome: String,
+    #[serde(default)]
+    last_failure_summary: String,
+    #[serde(default)]
+    next_focus: String,
+    updated_at: String,
+}
+
+fn default_objective_confidence() -> f32 {
     0.5
 }
 
@@ -2223,6 +2424,125 @@ fn sort_and_prune_strategy_entries(entries: &mut Vec<PlannerStrategyEntry>) {
             .then(b.updated_at.cmp(&a.updated_at))
     });
     entries.truncate(64);
+}
+
+fn rolling_average(previous: f32, prior_count: u64, observed: f32, next_count: u64) -> f32 {
+    if prior_count == 0 || next_count == 0 {
+        return observed;
+    }
+    ((previous * prior_count as f32) + observed) / next_count as f32
+}
+
+fn compute_objective_confidence(entry: &ObjectiveOutcomeEntry) -> f32 {
+    let observations = entry.success_count.saturating_add(entry.failure_count);
+    if observations == 0 {
+        return 0.5;
+    }
+    let success_rate = entry.success_count as f32 / observations as f32;
+    let verification_penalty = if observations == 0 {
+        0.0
+    } else {
+        (entry.verification_failure_count as f32 / observations as f32).min(1.0) * 0.25
+    };
+    let failure_penalty = (entry.avg_failure_count / 3.0).min(1.0) * 0.20;
+    let sample_confidence = (observations as f32 / 10.0).min(1.0);
+    let posterior = (entry.success_count as f32 + 1.0) / (observations as f32 + 2.0);
+    let blended = ((1.0 - sample_confidence) * 0.5) + (sample_confidence * posterior);
+    (blended + success_rate * 0.15 - verification_penalty - failure_penalty).clamp(0.0, 1.0)
+}
+
+fn objective_next_focus(entry: &ObjectiveOutcomeEntry) -> String {
+    let verification_heavy = entry.verification_failure_count > entry.execution_failure_count;
+    if entry.last_outcome.eq_ignore_ascii_case("success") {
+        return "preserve successful decomposition and keep verification breadth".to_string();
+    }
+    if verification_heavy {
+        return "expand verification coverage and map prior failing checks into plan steps"
+            .to_string();
+    }
+    if entry.execution_failure_count > 0 {
+        return "reduce plan branching and add explicit recovery checkpoints for execution failures"
+            .to_string();
+    }
+    "stabilize plan ordering and retain explicit validation gates".to_string()
+}
+
+fn format_objective_outcomes(entries: &[ObjectiveOutcomeEntry]) -> String {
+    entries
+        .iter()
+        .take(6)
+        .map(|entry| {
+            let observations = entry.success_count.saturating_add(entry.failure_count);
+            let success_rate = if observations == 0 {
+                0.0
+            } else {
+                entry.success_count as f32 / observations as f32
+            };
+            format!(
+                "- key={} confidence={:.3} success_rate={:.3} avg_steps={:.2} avg_failures={:.2} last_outcome={} focus=\"{}\" last_failure=\"{}\"",
+                entry.key,
+                entry.confidence,
+                success_rate,
+                entry.avg_step_count,
+                entry.avg_failure_count,
+                if entry.last_outcome.is_empty() {
+                    "unknown"
+                } else {
+                    entry.last_outcome.as_str()
+                },
+                if entry.next_focus.is_empty() {
+                    "none"
+                } else {
+                    entry.next_focus.as_str()
+                },
+                if entry.last_failure_summary.is_empty() {
+                    "none"
+                } else {
+                    entry.last_failure_summary.as_str()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_objective_outcome_memory(memory: &mut ObjectiveOutcomeMemory) {
+    for entry in &mut memory.entries {
+        if !entry.confidence.is_finite() || entry.confidence <= 0.0 {
+            entry.confidence = compute_objective_confidence(entry);
+        }
+        if entry.last_outcome.trim().is_empty() {
+            entry.last_outcome = if entry.success_count >= entry.failure_count {
+                "success".to_string()
+            } else {
+                "failure".to_string()
+            };
+        }
+        if entry.next_focus.trim().is_empty() {
+            entry.next_focus = objective_next_focus(entry);
+        }
+        if entry.avg_step_count <= 0.0 {
+            entry.avg_step_count = 1.0;
+        }
+    }
+    sort_and_prune_objective_entries(&mut memory.entries);
+}
+
+fn sort_and_prune_objective_entries(entries: &mut Vec<ObjectiveOutcomeEntry>) {
+    entries.retain(|entry| {
+        let observations = entry.success_count.saturating_add(entry.failure_count);
+        !(observations >= 4
+            && entry.failure_count > entry.success_count.saturating_add(2)
+            && entry.confidence < 0.30)
+    });
+    entries.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then(b.success_count.cmp(&a.success_count))
+            .then(a.failure_count.cmp(&b.failure_count))
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    entries.truncate(96);
 }
 
 fn parse_plan_from_llm(text: &str, fallback_goal: &str) -> Option<Plan> {
@@ -3786,5 +4106,101 @@ mod tests {
         assert!(
             subagent_arbitration_score(&strong, target) > subagent_arbitration_score(&weak, target)
         );
+    }
+
+    #[test]
+    fn objective_confidence_tracks_success_and_failures() {
+        let high = ObjectiveOutcomeEntry {
+            key: "router|retry".to_string(),
+            goal_excerpt: "stabilize router retries".to_string(),
+            success_count: 7,
+            failure_count: 1,
+            execution_failure_count: 1,
+            verification_failure_count: 0,
+            avg_step_count: 4.0,
+            avg_failure_count: 0.2,
+            confidence: 0.0,
+            last_outcome: "success".to_string(),
+            last_failure_summary: "none".to_string(),
+            next_focus: String::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let low = ObjectiveOutcomeEntry {
+            key: "router|retry".to_string(),
+            goal_excerpt: "stabilize router retries".to_string(),
+            success_count: 1,
+            failure_count: 6,
+            execution_failure_count: 4,
+            verification_failure_count: 3,
+            avg_step_count: 2.0,
+            avg_failure_count: 2.2,
+            confidence: 0.0,
+            last_outcome: "failure".to_string(),
+            last_failure_summary: "verification".to_string(),
+            next_focus: String::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        assert!(compute_objective_confidence(&high) > compute_objective_confidence(&low));
+    }
+
+    #[test]
+    fn objective_entries_prune_chronic_low_confidence_items() {
+        let mut entries = vec![
+            ObjectiveOutcomeEntry {
+                key: "stable".to_string(),
+                goal_excerpt: "stable objective".to_string(),
+                success_count: 5,
+                failure_count: 1,
+                execution_failure_count: 1,
+                verification_failure_count: 0,
+                avg_step_count: 4.0,
+                avg_failure_count: 0.5,
+                confidence: 0.9,
+                last_outcome: "success".to_string(),
+                last_failure_summary: "none".to_string(),
+                next_focus: "keep".to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+            ObjectiveOutcomeEntry {
+                key: "noisy".to_string(),
+                goal_excerpt: "noisy objective".to_string(),
+                success_count: 0,
+                failure_count: 6,
+                execution_failure_count: 4,
+                verification_failure_count: 4,
+                avg_step_count: 2.0,
+                avg_failure_count: 2.8,
+                confidence: 0.1,
+                last_outcome: "failure".to_string(),
+                last_failure_summary: "many".to_string(),
+                next_focus: "repair".to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        ];
+        sort_and_prune_objective_entries(&mut entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "stable");
+    }
+
+    #[test]
+    fn objective_outcome_format_includes_focus_and_failure_summary() {
+        let entry = ObjectiveOutcomeEntry {
+            key: "router".to_string(),
+            goal_excerpt: "router objective".to_string(),
+            success_count: 2,
+            failure_count: 1,
+            execution_failure_count: 1,
+            verification_failure_count: 0,
+            avg_step_count: 3.0,
+            avg_failure_count: 1.0,
+            confidence: 0.7,
+            last_outcome: "failure".to_string(),
+            last_failure_summary: "execution_failures=1".to_string(),
+            next_focus: "add checkpoints".to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let rendered = format_objective_outcomes(&[entry]);
+        assert!(rendered.contains("focus=\"add checkpoints\""));
+        assert!(rendered.contains("last_failure=\"execution_failures=1\""));
     }
 }

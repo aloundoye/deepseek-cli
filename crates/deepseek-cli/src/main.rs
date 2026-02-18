@@ -528,6 +528,7 @@ enum BenchmarkCmd {
     ListPacks,
     ShowPack(BenchmarkShowPackArgs),
     ImportPack(BenchmarkImportPackArgs),
+    RunMatrix(BenchmarkRunMatrixArgs),
 }
 
 #[derive(Args)]
@@ -539,6 +540,17 @@ struct BenchmarkShowPackArgs {
 struct BenchmarkImportPackArgs {
     name: String,
     source: String,
+}
+
+#[derive(Args)]
+struct BenchmarkRunMatrixArgs {
+    matrix: String,
+    #[arg(long)]
+    output: Option<String>,
+    #[arg(long = "compare")]
+    compare: Vec<String>,
+    #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
+    signing_key_env: String,
 }
 
 #[derive(Subcommand)]
@@ -2830,6 +2842,27 @@ struct BenchmarkCase {
     min_verification_steps: Option<usize>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BenchmarkMatrixSpec {
+    #[serde(default)]
+    name: Option<String>,
+    runs: Vec<BenchmarkMatrixRunSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BenchmarkMatrixRunSpec {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    pack: Option<String>,
+    #[serde(default)]
+    suite: Option<String>,
+    #[serde(default)]
+    cases: Option<usize>,
+    #[serde(default)]
+    seed: Option<u64>,
+}
+
 fn built_in_benchmark_cases() -> Vec<BenchmarkCase> {
     vec![
         BenchmarkCase {
@@ -3832,6 +3865,417 @@ fn compare_benchmark_with_peers(
     }))
 }
 
+fn run_benchmark_matrix(cwd: &Path, args: BenchmarkRunMatrixArgs, json_mode: bool) -> Result<()> {
+    ensure_llm_ready(cwd, json_mode)?;
+    let matrix_path = PathBuf::from(&args.matrix);
+    let spec = load_benchmark_matrix_spec(&matrix_path)?;
+    let matrix_name = spec.name.clone().unwrap_or_else(|| {
+        matrix_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("benchmark-matrix")
+            .to_string()
+    });
+    let matrix_dir = matrix_path.parent().unwrap_or(cwd);
+    let engine = AgentEngine::new(cwd)?;
+
+    let mut run_reports = Vec::new();
+    for (idx, run) in spec.runs.iter().enumerate() {
+        let run_id = run
+            .id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| format!("run-{}", idx + 1));
+        let cases = run.cases.unwrap_or(5).max(1);
+        let suite_path = run
+            .suite
+            .as_deref()
+            .map(|suite| resolve_matrix_suite_path(matrix_dir, suite));
+        let benchmark = run_profile_benchmark(
+            &engine,
+            cases,
+            run.seed,
+            suite_path.as_deref(),
+            run.pack.as_deref(),
+            cwd,
+            &args.signing_key_env,
+        )?;
+        run_reports.push(json!({
+            "id": run_id,
+            "pack": run.pack,
+            "suite": run.suite,
+            "cases": cases,
+            "seed": benchmark.get("seed").and_then(|v| v.as_u64()).or(run.seed),
+            "benchmark": benchmark,
+        }));
+    }
+
+    let summary = aggregate_benchmark_matrix_results(&run_reports);
+    let peer_comparison = if args.compare.is_empty() {
+        None
+    } else {
+        Some(compare_benchmark_matrix_with_peers(
+            "deepseek-cli",
+            &summary,
+            &args.compare,
+        )?)
+    };
+
+    let mut payload = json!({
+        "schema": "deepseek.benchmark.matrix.v1",
+        "generated_at": Utc::now().to_rfc3339(),
+        "agent": "deepseek-cli",
+        "name": matrix_name,
+        "source": matrix_path.display().to_string(),
+        "runs": run_reports,
+        "summary": summary,
+    });
+    if let Some(peer_comparison) = peer_comparison
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("peer_comparison".to_string(), peer_comparison);
+    }
+
+    if let Some(output) = args.output.as_deref() {
+        let output_path = PathBuf::from(output);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(output_path, serde_json::to_vec_pretty(&payload)?)?;
+    }
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "benchmark matrix={} runs={} total_cases={} weighted_success_rate={:.3} weighted_quality_rate={:.3} worst_p95={}ms",
+            payload["name"].as_str().unwrap_or_default(),
+            payload["summary"]["total_runs"].as_u64().unwrap_or(0),
+            payload["summary"]["total_cases"].as_u64().unwrap_or(0),
+            payload["summary"]["weighted_success_rate"]
+                .as_f64()
+                .unwrap_or(0.0),
+            payload["summary"]["weighted_quality_rate"]
+                .as_f64()
+                .unwrap_or(0.0),
+            payload["summary"]["worst_p95_latency_ms"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+    }
+    Ok(())
+}
+
+fn load_benchmark_matrix_spec(path: &Path) -> Result<BenchmarkMatrixSpec> {
+    let raw = fs::read_to_string(path)?;
+    let mut spec: BenchmarkMatrixSpec = serde_json::from_str(&raw)?;
+    if spec.runs.is_empty() {
+        return Err(anyhow!("benchmark matrix has no runs"));
+    }
+    for (idx, run) in spec.runs.iter_mut().enumerate() {
+        run.id = run
+            .id
+            .clone()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .or_else(|| Some(format!("run-{}", idx + 1)));
+        run.pack = run
+            .pack
+            .clone()
+            .map(|pack| pack.trim().to_string())
+            .filter(|pack| !pack.is_empty());
+        run.suite = run
+            .suite
+            .clone()
+            .map(|suite| suite.trim().to_string())
+            .filter(|suite| !suite.is_empty());
+
+        let has_pack = run.pack.is_some();
+        let has_suite = run.suite.is_some();
+        if has_pack == has_suite {
+            return Err(anyhow!(
+                "invalid matrix run {}: specify exactly one of `pack` or `suite`",
+                idx + 1
+            ));
+        }
+        run.cases = Some(run.cases.unwrap_or(5).max(1));
+    }
+    Ok(spec)
+}
+
+fn resolve_matrix_suite_path(base_dir: &Path, suite: &str) -> PathBuf {
+    let candidate = PathBuf::from(suite);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        base_dir.join(candidate)
+    }
+}
+
+fn aggregate_benchmark_matrix_results(run_reports: &[serde_json::Value]) -> serde_json::Value {
+    let mut total_cases = 0_u64;
+    let mut total_succeeded = 0_u64;
+    let mut weighted_quality_sum = 0.0_f64;
+    let mut weighted_p95_sum = 0.0_f64;
+    let mut worst_p95_latency_ms = 0_u64;
+    let mut manifests = BTreeSet::new();
+    let mut corpus_ids = BTreeSet::new();
+    let mut seeds = BTreeSet::new();
+    let mut signed_runs = 0_u64;
+    let mut run_ids = Vec::new();
+
+    for (idx, run) in run_reports.iter().enumerate() {
+        let bench = run.get("benchmark").unwrap_or(run);
+        let executed = bench
+            .get("executed_cases")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let succeeded = bench.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0);
+        let quality_rate = bench
+            .get("quality_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| benchmark_quality_rate(bench));
+        let p95 = bench
+            .get("p95_latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let run_id = run
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("run-{}", idx + 1));
+        run_ids.push(run_id);
+
+        total_cases = total_cases.saturating_add(executed);
+        total_succeeded = total_succeeded.saturating_add(succeeded);
+        weighted_quality_sum += quality_rate * executed as f64;
+        weighted_p95_sum += p95 as f64 * executed as f64;
+        worst_p95_latency_ms = worst_p95_latency_ms.max(p95);
+
+        if let Some(corpus_id) = bench.get("corpus_id").and_then(|v| v.as_str()) {
+            corpus_ids.insert(corpus_id.to_string());
+        }
+        if let Some(seed) = bench.get("seed").and_then(|v| v.as_u64()) {
+            seeds.insert(seed);
+        }
+        if let Some(manifest) = bench
+            .get("scorecard")
+            .and_then(|v| v.get("corpus_manifest_sha256"))
+            .and_then(|v| v.as_str())
+        {
+            manifests.insert(manifest.to_string());
+        }
+        if bench
+            .get("scorecard")
+            .and_then(|v| v.get("signature"))
+            .and_then(|v| v.get("present"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            signed_runs = signed_runs.saturating_add(1);
+        }
+    }
+
+    let weighted_success_rate = if total_cases == 0 {
+        0.0
+    } else {
+        total_succeeded as f64 / total_cases as f64
+    };
+    let weighted_quality_rate = if total_cases == 0 {
+        0.0
+    } else {
+        weighted_quality_sum / total_cases as f64
+    };
+    let weighted_p95_latency_ms = if total_cases == 0 {
+        0
+    } else {
+        (weighted_p95_sum / total_cases as f64).round() as u64
+    };
+
+    let mut compatibility_warnings = Vec::new();
+    if manifests.len() > 1 {
+        compatibility_warnings.push(format!(
+            "matrix uses {} distinct corpus manifests; direct parity ranking is weaker",
+            manifests.len()
+        ));
+    }
+    if corpus_ids.len() > 1 {
+        compatibility_warnings.push(format!(
+            "matrix uses {} distinct corpus_ids",
+            corpus_ids.len()
+        ));
+    }
+
+    json!({
+        "total_runs": run_reports.len(),
+        "run_ids": run_ids,
+        "total_cases": total_cases,
+        "total_succeeded": total_succeeded,
+        "total_failed": total_cases.saturating_sub(total_succeeded),
+        "weighted_success_rate": weighted_success_rate,
+        "weighted_quality_rate": weighted_quality_rate,
+        "weighted_p95_latency_ms": weighted_p95_latency_ms,
+        "worst_p95_latency_ms": worst_p95_latency_ms,
+        "manifest_coverage": if run_reports.is_empty() { 0.0 } else { signed_runs as f64 / run_reports.len() as f64 },
+        "manifest_sha256": manifests.into_iter().collect::<Vec<_>>(),
+        "corpus_ids": corpus_ids.into_iter().collect::<Vec<_>>(),
+        "seeds": seeds.into_iter().collect::<Vec<_>>(),
+        "compatibility_warnings": compatibility_warnings,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct MatrixPeerMetrics {
+    agent: String,
+    total_cases: u64,
+    weighted_success_rate: f64,
+    weighted_quality_rate: f64,
+    worst_p95_latency_ms: u64,
+    manifest_coverage: f64,
+}
+
+fn matrix_peer_metrics_from_value(
+    value: &serde_json::Value,
+    fallback_agent: &str,
+) -> Result<MatrixPeerMetrics> {
+    if let Some(summary) = value.get("summary") {
+        let total_cases = summary
+            .get("total_cases")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let weighted_success_rate = summary
+            .get("weighted_success_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let weighted_quality_rate = summary
+            .get("weighted_quality_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let worst_p95_latency_ms = summary
+            .get("worst_p95_latency_ms")
+            .or_else(|| summary.get("worst_p95_latency"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let manifest_coverage = summary
+            .get("manifest_coverage")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let agent = value
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .or_else(|| summary.get("agent").and_then(|v| v.as_str()))
+            .unwrap_or(fallback_agent)
+            .to_string();
+        return Ok(MatrixPeerMetrics {
+            agent,
+            total_cases,
+            weighted_success_rate,
+            weighted_quality_rate,
+            worst_p95_latency_ms,
+            manifest_coverage,
+        });
+    }
+
+    let bench = benchmark_metrics_from_value(value, fallback_agent)?;
+    Ok(MatrixPeerMetrics {
+        agent: bench.agent,
+        total_cases: bench.executed_cases,
+        weighted_success_rate: bench.success_rate,
+        weighted_quality_rate: bench.quality_rate,
+        worst_p95_latency_ms: bench.p95_latency_ms,
+        manifest_coverage: if bench.manifest_sha256.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+    })
+}
+
+fn compare_benchmark_matrix_with_peers(
+    current_agent: &str,
+    current_summary: &serde_json::Value,
+    paths: &[String],
+) -> Result<serde_json::Value> {
+    let mut rows = Vec::new();
+    rows.push(matrix_peer_metrics_from_value(
+        &json!({"agent": current_agent, "summary": current_summary}),
+        current_agent,
+    )?);
+
+    for path in paths {
+        let raw = fs::read_to_string(path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+        let fallback = Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("peer");
+        rows.push(matrix_peer_metrics_from_value(&parsed, fallback)?);
+    }
+
+    let canonical_cases = rows
+        .iter()
+        .find(|row| row.agent == current_agent)
+        .map(|row| row.total_cases)
+        .unwrap_or(0);
+    let canonical_manifest_coverage = rows
+        .iter()
+        .find(|row| row.agent == current_agent)
+        .map(|row| row.manifest_coverage)
+        .unwrap_or(0.0);
+    let mut coverage_warnings = Vec::new();
+    let mut case_count_warnings = Vec::new();
+    for row in &rows {
+        if (row.manifest_coverage - canonical_manifest_coverage).abs() > 0.001 {
+            coverage_warnings.push(format!(
+                "agent {} manifest_coverage={:.3} differs from {} manifest_coverage={:.3}",
+                row.agent, row.manifest_coverage, current_agent, canonical_manifest_coverage
+            ));
+        }
+        if row.total_cases != canonical_cases {
+            case_count_warnings.push(format!(
+                "agent {} total_cases={} differs from {} total_cases={}",
+                row.agent, row.total_cases, current_agent, canonical_cases
+            ));
+        }
+    }
+
+    let mut ranking = rows.clone();
+    ranking.sort_by(|a, b| {
+        b.weighted_quality_rate
+            .partial_cmp(&a.weighted_quality_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.weighted_success_rate
+                    .partial_cmp(&a.weighted_success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(a.worst_p95_latency_ms.cmp(&b.worst_p95_latency_ms))
+    });
+    let current_rank = ranking
+        .iter()
+        .position(|row| row.agent == current_agent)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+
+    Ok(json!({
+        "current_rank": current_rank,
+        "total_agents": ranking.len(),
+        "ranking": ranking
+            .into_iter()
+            .map(|row| json!({
+                "agent": row.agent,
+                "total_cases": row.total_cases,
+                "weighted_success_rate": row.weighted_success_rate,
+                "weighted_quality_rate": row.weighted_quality_rate,
+                "worst_p95_latency_ms": row.worst_p95_latency_ms,
+                "manifest_coverage": row.manifest_coverage,
+            }))
+            .collect::<Vec<_>>(),
+        "manifest_coverage_warnings": coverage_warnings,
+        "case_count_warnings": case_count_warnings,
+    }))
+}
+
 fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Result<()> {
     let memory = MemoryManager::new(cwd)?;
     let checkpoint_id = if let Some(value) = args.to_checkpoint.as_deref() {
@@ -4712,6 +5156,9 @@ fn run_benchmark(cwd: &Path, cmd: BenchmarkCmd, json_mode: bool) -> Result<()> {
                         .unwrap_or(0),
                 );
             }
+        }
+        BenchmarkCmd::RunMatrix(args) => {
+            return run_benchmark_matrix(cwd, args, json_mode);
         }
     }
     Ok(())

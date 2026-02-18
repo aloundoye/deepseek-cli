@@ -78,8 +78,10 @@ Execution behavior:
 - Planner quality checks auto-repair weak plans with bounded retries before fallback.
 - Planner self-evaluation now includes prior verification-failure memory to improve subsequent plan revisions.
 - Successful/failed runs are persisted into planner strategy memory with score-based prioritization and pruning before future plan injection.
+- Long-horizon objective outcomes are persisted with confidence/failure trends and reinjected into future planning context.
 - `deepseek profile --benchmark` runs planning benchmarks with latency/quality metrics, supports external suites, compares against baseline runs, and produces side-by-side peer ranking with case matrices.
 - Benchmark mode supports thresholds and result export (`--benchmark-suite`, `--benchmark-min-success-rate`, `--benchmark-min-quality-rate`, `--benchmark-max-p95-ms`, `--benchmark-baseline`, `--benchmark-max-regression-ms`, `--benchmark-compare`, `--benchmark-output`), plus reproducible seeded runs with signed corpus/execution manifests and scorecards (`--benchmark-seed`, `--benchmark-signing-key-env`).
+- `deepseek benchmark run-matrix <matrix.json>` executes multi-run parity matrices (packs/suites) with aggregate weighted scorecards and optional peer ranking.
 
 ## Command Overview
 
@@ -88,7 +90,7 @@ Execution behavior:
 - `deepseek plan "<prompt>"`
 - `deepseek run [session-id]`
 - `deepseek profile [--benchmark] [--benchmark-cases N] [--benchmark-seed N] [--benchmark-suite <path>] [--benchmark-pack <name>] [--benchmark-signing-key-env ENV] [--benchmark-min-success-rate F] [--benchmark-min-quality-rate F] [--benchmark-max-p95-ms N] [--benchmark-baseline <path>] [--benchmark-max-regression-ms N] [--benchmark-compare <path>] [--benchmark-output <path>]`
-- `deepseek benchmark list-packs|show-pack <name>|import-pack <name> <source>`
+- `deepseek benchmark list-packs|show-pack <name>|import-pack <name> <source>|run-matrix <matrix.json> [--output <path>] [--compare <path>]`
 - `deepseek autopilot "<prompt>" [--hours|--duration-seconds|--forever] [--max-iterations N]`
 - `deepseek autopilot status [--follow --samples N --interval-seconds N]|pause|stop|resume`
 - `deepseek diff`

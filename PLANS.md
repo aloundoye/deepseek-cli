@@ -273,6 +273,22 @@ Verification:
 - `cargo build --workspace`
 - `cargo build --release --workspace`
 
+### M18 Parity Gap Closure Loop (Objective Memory + Matrix Parity)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added long-horizon objective-outcome memory with confidence scoring/pruning and planning-context reinjection.
+- Added matrix-scale benchmark execution (`benchmark run-matrix`) spanning benchmark packs and external suites.
+- Added aggregate matrix scorecards (weighted success/quality/p95) with manifest/corpus compatibility warnings.
+- Added matrix peer-comparison ranking with manifest-coverage and case-count diagnostics.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
 ## Data/Storage Contracts
 - Canonical append-only event log: `.deepseek/events.jsonl`.
 - Projections remain additive only.

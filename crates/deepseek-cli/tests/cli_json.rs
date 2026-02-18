@@ -860,6 +860,95 @@ fn benchmark_scorecard_is_seeded_and_signed_when_key_present() {
     );
 }
 
+#[test]
+fn benchmark_run_matrix_executes_multiple_runs_and_peer_compare() {
+    let workspace = TempDir::new().expect("workspace");
+    let suite_path = workspace.path().join(".deepseek/matrix-suite.json");
+    fs::create_dir_all(
+        suite_path
+            .parent()
+            .expect("suite path should have parent directory"),
+    )
+    .expect("suite dir");
+    fs::write(
+        &suite_path,
+        r#"{
+  "cases": [
+    {
+      "case_id": "matrix-suite-case",
+      "prompt": "Plan matrix suite verification checks.",
+      "expected_keywords": ["verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    }
+  ]
+}"#,
+    )
+    .expect("suite");
+
+    let matrix_path = workspace.path().join(".deepseek/benchmark-matrix.json");
+    fs::write(
+        &matrix_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "parity-matrix",
+            "runs": [
+                {"id": "pack-smoke", "pack": "smoke", "cases": 1, "seed": 11},
+                {"id": "suite-local", "suite": suite_path.to_string_lossy(), "cases": 1, "seed": 12}
+            ]
+        }))
+        .expect("serialize matrix"),
+    )
+    .expect("matrix");
+
+    let peer_path = workspace.path().join(".deepseek/peer-matrix.json");
+    fs::write(
+        &peer_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agent": "codex",
+            "summary": {
+                "total_runs": 2,
+                "total_cases": 2,
+                "weighted_success_rate": 1.0,
+                "weighted_quality_rate": 1.0,
+                "worst_p95_latency_ms": 1200,
+                "manifest_coverage": 1.0
+            }
+        }))
+        .expect("serialize peer"),
+    )
+    .expect("peer");
+
+    let output_path = workspace.path().join(".deepseek/matrix-output.json");
+    let payload = run_json_with_env(
+        workspace.path(),
+        &[
+            "--json",
+            "benchmark",
+            "run-matrix",
+            matrix_path.to_string_lossy().as_ref(),
+            "--compare",
+            peer_path.to_string_lossy().as_ref(),
+            "--output",
+            output_path.to_string_lossy().as_ref(),
+        ],
+        &[("DEEPSEEK_BENCHMARK_SIGNING_KEY", "matrix-signing-key")],
+    );
+
+    assert_eq!(payload["schema"], "deepseek.benchmark.matrix.v1");
+    assert_eq!(payload["summary"]["total_runs"], 2);
+    assert_eq!(payload["summary"]["total_cases"], 2);
+    assert!(payload["runs"].as_array().is_some_and(|runs| {
+        runs.iter()
+            .all(|run| run["benchmark"]["scorecard"].is_object())
+    }));
+    assert!(
+        payload["peer_comparison"]["ranking"]
+            .as_array()
+            .is_some_and(|rows| rows.len() >= 2)
+    );
+    assert!(output_path.exists());
+}
+
 fn run_json(workspace: &Path, args: &[&str]) -> Value {
     run_json_with_env(workspace, args, &[])
 }
