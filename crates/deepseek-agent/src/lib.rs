@@ -17,7 +17,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -370,11 +370,17 @@ impl AgentEngine {
             )?;
             plan = parse_plan_from_llm(&retry.text, prompt);
         }
+        let objective_outcomes = self
+            .load_matching_objective_outcomes(prompt, 6)
+            .unwrap_or_default();
         let quality_retry_budget = self.cfg.router.max_escalations_per_unit.max(1) as usize;
         let mut quality_attempt = 0usize;
         let mut quality_repairs = Vec::new();
         while let Some(candidate) = plan.clone() {
-            let report = assess_plan_quality(&candidate, prompt);
+            let report = combine_plan_quality_reports(
+                assess_plan_quality(&candidate, prompt),
+                assess_plan_long_horizon_quality(&candidate, prompt, &objective_outcomes),
+            );
             if report.acceptable {
                 break;
             }
@@ -852,27 +858,49 @@ impl AgentEngine {
     }
 
     fn run_subagents(&self, session_id: Uuid, plan: &Plan) -> Result<Vec<String>> {
+        let max_tasks = self
+            .subagents
+            .max_concurrency
+            .saturating_mul(3)
+            .max(self.subagents.max_concurrency);
+        let lane_plan = plan_subagent_execution_lanes(&plan.steps, max_tasks);
         let mut tasks = Vec::new();
         let mut task_targets = HashMap::new();
-        for step in plan.steps.iter().take(self.subagents.max_concurrency) {
-            let role = match step.intent.as_str() {
-                "search" => SubagentRole::Explore,
-                "plan" | "recover" => SubagentRole::Plan,
-                _ => SubagentRole::Task,
-            };
-            let team = match role {
-                SubagentRole::Explore => "explore",
-                SubagentRole::Plan => "planning",
-                SubagentRole::Task => "execution",
+        let mut task_specialization = HashMap::new();
+        let mut task_phase = HashMap::new();
+        let mut task_dependencies = HashMap::new();
+        let mut task_lane = HashMap::new();
+        for lane in lane_plan {
+            let goal = if lane.dependencies.is_empty() {
+                format!(
+                    "{} [phase={} lane={}]",
+                    lane.intent,
+                    lane.phase + 1,
+                    lane.ownership_lane
+                )
+            } else {
+                format!(
+                    "{} [phase={} lane={} deps={}]",
+                    lane.intent,
+                    lane.phase + 1,
+                    lane.ownership_lane,
+                    lane.dependencies.join("|")
+                )
             };
             let task = SubagentTask {
                 run_id: Uuid::now_v7(),
-                name: step.title.clone(),
-                goal: step.intent.clone(),
-                role,
-                team: team.to_string(),
+                name: lane.title.clone(),
+                goal,
+                role: lane.role.clone(),
+                team: lane.team.clone(),
             };
-            task_targets.insert(task.run_id, subagent_targets_for_step(step));
+            let specialization_hint =
+                self.load_subagent_specialization_hint(&lane.role, &lane.domain)?;
+            task_targets.insert(task.run_id, lane.targets);
+            task_specialization.insert(task.run_id, (lane.domain, specialization_hint));
+            task_phase.insert(task.run_id, lane.phase);
+            task_dependencies.insert(task.run_id, lane.dependencies);
+            task_lane.insert(task.run_id, lane.ownership_lane);
             tasks.push(task);
         }
         if tasks.is_empty() {
@@ -884,6 +912,19 @@ impl AgentEngine {
             .iter()
             .map(|task| {
                 let targets = task_targets.get(&task.run_id).cloned().unwrap_or_default();
+                let (domain, specialization_hint) = task_specialization
+                    .get(&task.run_id)
+                    .cloned()
+                    .unwrap_or_else(|| ("general".to_string(), None));
+                let phase = task_phase.get(&task.run_id).copied().unwrap_or(0);
+                let dependencies = task_dependencies
+                    .get(&task.run_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let ownership_lane = task_lane
+                    .get(&task.run_id)
+                    .cloned()
+                    .unwrap_or_else(|| "execution:unscoped".to_string());
                 (
                     task.run_id,
                     SubagentTaskMeta {
@@ -891,6 +932,11 @@ impl AgentEngine {
                         goal: task.goal.clone(),
                         created_at: now.clone(),
                         targets,
+                        domain,
+                        specialization_hint,
+                        phase,
+                        dependencies,
+                        ownership_lane,
                     },
                 )
             })
@@ -922,49 +968,100 @@ impl AgentEngine {
         let root_goal = plan.goal.clone();
         let tool_host = Arc::clone(&self.tool_host);
         let task_targets_ref = Arc::new(task_targets.clone());
+        let task_meta_ref = Arc::new(task_by_id.clone());
         let verification = if plan.verification.is_empty() {
             "none".to_string()
         } else {
             plan.verification.join(" ; ")
         };
-        let results = self.subagents.run_tasks(tasks, move |task| {
-            let request = subagent_request_for_task(
-                &task,
-                &root_goal,
-                &verification,
-                &base_model,
-                &max_think_model,
-            );
-            let client = DeepSeekClient::new(llm_cfg.clone())?;
-            let targets = task_targets_ref
+        let mut tasks_by_phase: BTreeMap<usize, Vec<SubagentTask>> = BTreeMap::new();
+        for task in tasks {
+            let phase = task_by_id
                 .get(&task.run_id)
-                .cloned()
-                .unwrap_or_default();
-            let delegated = run_subagent_delegated_tools(&tool_host, &task, &root_goal, &targets);
-            match client.complete(&request) {
-                Ok(resp) => {
-                    if let Some(delegated) = delegated {
-                        Ok(format!("{}\n[delegated_tools]\n{}", resp.text, delegated))
-                    } else {
-                        Ok(resp.text)
+                .map(|meta| meta.phase)
+                .unwrap_or(0);
+            tasks_by_phase.entry(phase).or_default().push(task);
+        }
+        for phase_tasks in tasks_by_phase.values_mut() {
+            phase_tasks.sort_by(|a, b| {
+                a.team
+                    .cmp(&b.team)
+                    .then(a.name.cmp(&b.name))
+                    .then(a.run_id.cmp(&b.run_id))
+            });
+        }
+
+        let mut results = Vec::new();
+        for phase_tasks in tasks_by_phase.into_values() {
+            let llm_cfg = llm_cfg.clone();
+            let base_model = base_model.clone();
+            let max_think_model = max_think_model.clone();
+            let root_goal = root_goal.clone();
+            let verification = verification.clone();
+            let tool_host = Arc::clone(&tool_host);
+            let task_targets_ref = Arc::clone(&task_targets_ref);
+            let task_meta_ref = Arc::clone(&task_meta_ref);
+            let mut phase_results = self.subagents.run_tasks(phase_tasks, move |task| {
+                let meta = task_meta_ref
+                    .get(&task.run_id)
+                    .cloned()
+                    .unwrap_or_else(|| SubagentTaskMeta {
+                        name: task.name.clone(),
+                        goal: task.goal.clone(),
+                        created_at: Utc::now().to_rfc3339(),
+                        targets: Vec::new(),
+                        domain: "general".to_string(),
+                        specialization_hint: None,
+                        phase: 0,
+                        dependencies: Vec::new(),
+                        ownership_lane: "execution:unscoped".to_string(),
+                    });
+                let request = subagent_request_for_task(
+                    &task,
+                    &root_goal,
+                    &verification,
+                    &base_model,
+                    &max_think_model,
+                    &meta.domain,
+                    meta.specialization_hint.as_deref(),
+                );
+                let client = DeepSeekClient::new(llm_cfg.clone())?;
+                let targets = task_targets_ref
+                    .get(&task.run_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let delegated =
+                    run_subagent_delegated_tools(&tool_host, &task, &root_goal, &targets);
+                match client.complete(&request) {
+                    Ok(resp) => {
+                        if let Some(delegated) = delegated {
+                            Ok(format!("{}\n[delegated_tools]\n{}", resp.text, delegated))
+                        } else {
+                            Ok(resp.text)
+                        }
                     }
+                    Err(err) => Ok(format!(
+                        "fallback subagent '{}' role={:?} team={} analyzed intent '{}' (llm_error={}){}",
+                        task.name,
+                        task.role,
+                        task.team,
+                        task.goal,
+                        err,
+                        delegated
+                            .map(|summary| format!("\n[delegated_tools]\n{summary}"))
+                            .unwrap_or_default()
+                    )),
                 }
-                Err(err) => Ok(format!(
-                    "fallback subagent '{}' role={:?} team={} analyzed intent '{}' (llm_error={}){}",
-                    task.name,
-                    task.role,
-                    task.team,
-                    task.goal,
-                    err,
-                    delegated
-                        .map(|summary| format!("\n[delegated_tools]\n{summary}"))
-                        .unwrap_or_default()
-                )),
-            }
-        });
+            });
+            results.append(&mut phase_results);
+        }
         let merged_summary = self.subagents.merge_results(&results);
         let arbitration = summarize_subagent_merge_arbitration(&results, &task_targets);
         let mut notes = Vec::new();
+        let lane_notes = summarize_subagent_execution_lanes(&task_by_id);
+        if !lane_notes.is_empty() {
+            notes.push(lane_notes.join("\n"));
+        }
         for result in results {
             let updated_at = Utc::now().to_rfc3339();
             let meta =
@@ -976,13 +1073,24 @@ impl AgentEngine {
                         goal: String::new(),
                         created_at: updated_at.clone(),
                         targets: Vec::new(),
+                        domain: "general".to_string(),
+                        specialization_hint: None,
+                        phase: 0,
+                        dependencies: Vec::new(),
+                        ownership_lane: "execution:unscoped".to_string(),
                     });
+            let mut details = vec![
+                format!("phase={}", meta.phase + 1),
+                format!("lane={}", meta.ownership_lane),
+            ];
+            if !meta.targets.is_empty() {
+                details.push(format!("targets={}", meta.targets.join(",")));
+            }
+            if !meta.dependencies.is_empty() {
+                details.push(format!("deps={}", meta.dependencies.join("|")));
+            }
+            let persisted_goal = format!("{} [{}]", meta.goal, details.join(" "));
             if result.success {
-                let persisted_goal = if meta.targets.is_empty() {
-                    meta.goal.clone()
-                } else {
-                    format!("{} [targets={}]", meta.goal, meta.targets.join(","))
-                };
                 self.emit(
                     session_id,
                     EventKind::SubagentCompletedV1 {
@@ -1000,10 +1108,18 @@ impl AgentEngine {
                     created_at: meta.created_at,
                     updated_at,
                 })?;
+                self.remember_subagent_specialization(
+                    &result.role,
+                    &meta.domain,
+                    true,
+                    result.attempts,
+                    &result.output,
+                )?;
             } else {
                 let error = result
                     .error
                     .unwrap_or_else(|| "unknown subagent error".to_string());
+                let error_for_memory = error.clone();
                 let persisted_goal = if meta.targets.is_empty() {
                     meta.goal.clone()
                 } else {
@@ -1026,6 +1142,13 @@ impl AgentEngine {
                     created_at: meta.created_at,
                     updated_at,
                 })?;
+                self.remember_subagent_specialization(
+                    &result.role,
+                    &meta.domain,
+                    false,
+                    result.attempts,
+                    &error_for_memory,
+                )?;
             }
         }
         if !merged_summary.is_empty() {
@@ -1622,6 +1745,102 @@ impl AgentEngine {
         self.write_objective_outcome_memory(&memory)
     }
 
+    fn subagent_specialization_memory_path(&self) -> PathBuf {
+        deepseek_core::runtime_dir(&self.workspace).join("subagent-specializations.json")
+    }
+
+    fn read_subagent_specialization_memory(&self) -> Result<SubagentSpecializationMemory> {
+        let path = self.subagent_specialization_memory_path();
+        if !path.exists() {
+            return Ok(SubagentSpecializationMemory::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        let mut memory = serde_json::from_str(&raw).unwrap_or_default();
+        normalize_subagent_specialization_memory(&mut memory);
+        Ok(memory)
+    }
+
+    fn write_subagent_specialization_memory(
+        &self,
+        memory: &SubagentSpecializationMemory,
+    ) -> Result<()> {
+        let path = self.subagent_specialization_memory_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_vec_pretty(memory)?)?;
+        Ok(())
+    }
+
+    fn load_subagent_specialization_hint(
+        &self,
+        role: &SubagentRole,
+        domain: &str,
+    ) -> Result<Option<String>> {
+        let key = subagent_specialization_key(role, domain);
+        let memory = self.read_subagent_specialization_memory()?;
+        let best = memory.entries.into_iter().find(|entry| entry.key == key);
+        Ok(best.map(|entry| format_subagent_specialization_hint(&entry)))
+    }
+
+    fn remember_subagent_specialization(
+        &self,
+        role: &SubagentRole,
+        domain: &str,
+        success: bool,
+        attempts: u8,
+        summary: &str,
+    ) -> Result<()> {
+        let key = subagent_specialization_key(role, domain);
+        let role_name = format!("{role:?}");
+        let now = Utc::now().to_rfc3339();
+        let mut memory = self.read_subagent_specialization_memory()?;
+        if let Some(entry) = memory.entries.iter_mut().find(|entry| entry.key == key) {
+            let prior_observations = entry.success_count.saturating_add(entry.failure_count);
+            let next_observations = prior_observations.saturating_add(1);
+            entry.avg_attempts = rolling_average(
+                entry.avg_attempts,
+                prior_observations,
+                attempts as f32,
+                next_observations,
+            );
+            if success {
+                entry.success_count = entry.success_count.saturating_add(1);
+                entry.last_outcome = "success".to_string();
+            } else {
+                entry.failure_count = entry.failure_count.saturating_add(1);
+                entry.last_outcome = "failure".to_string();
+            }
+            entry.last_summary = truncate_probe_text(summary.to_string());
+            entry.next_guidance = subagent_specialization_guidance(entry);
+            entry.confidence = compute_subagent_specialization_confidence(entry);
+            entry.updated_at = now;
+        } else {
+            let mut entry = SubagentSpecializationEntry {
+                key,
+                role: role_name,
+                domain: domain.to_string(),
+                success_count: if success { 1 } else { 0 },
+                failure_count: if success { 0 } else { 1 },
+                avg_attempts: attempts as f32,
+                confidence: 0.5,
+                last_outcome: if success {
+                    "success".to_string()
+                } else {
+                    "failure".to_string()
+                },
+                last_summary: truncate_probe_text(summary.to_string()),
+                next_guidance: String::new(),
+                updated_at: now,
+            };
+            entry.next_guidance = subagent_specialization_guidance(&entry);
+            entry.confidence = compute_subagent_specialization_confidence(&entry);
+            memory.entries.push(entry);
+        }
+        sort_and_prune_subagent_specialization_entries(&mut memory.entries);
+        self.write_subagent_specialization_memory(&memory)
+    }
+
     fn emit_cost_event(
         &self,
         session_id: Uuid,
@@ -2026,6 +2245,36 @@ fn default_objective_confidence() -> f32 {
     0.5
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SubagentSpecializationMemory {
+    entries: Vec<SubagentSpecializationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubagentSpecializationEntry {
+    key: String,
+    role: String,
+    domain: String,
+    success_count: u64,
+    #[serde(default)]
+    failure_count: u64,
+    #[serde(default)]
+    avg_attempts: f32,
+    #[serde(default = "default_specialization_confidence")]
+    confidence: f32,
+    #[serde(default)]
+    last_outcome: String,
+    #[serde(default)]
+    last_summary: String,
+    #[serde(default)]
+    next_guidance: String,
+    updated_at: String,
+}
+
+fn default_specialization_confidence() -> f32 {
+    0.5
+}
+
 fn build_planner_prompt(task: &str) -> String {
     format!(
         "Return only JSON with keys: goal, assumptions, steps, verification, risk_notes. \
@@ -2154,6 +2403,100 @@ fn assess_plan_quality(plan: &Plan, user_prompt: &str) -> PlanQualityReport {
         && steps_without_tools == 0;
     PlanQualityReport {
         acceptable,
+        score,
+        issues,
+    }
+}
+
+fn combine_plan_quality_reports(
+    primary: PlanQualityReport,
+    secondary: PlanQualityReport,
+) -> PlanQualityReport {
+    let mut issues = primary.issues;
+    issues.extend(secondary.issues);
+    PlanQualityReport {
+        acceptable: primary.acceptable && secondary.acceptable,
+        score: ((primary.score + secondary.score) / 2.0).clamp(0.0, 1.0),
+        issues,
+    }
+}
+
+fn assess_plan_long_horizon_quality(
+    plan: &Plan,
+    user_prompt: &str,
+    objective_outcomes: &[ObjectiveOutcomeEntry],
+) -> PlanQualityReport {
+    let mut issues = Vec::new();
+    let mut penalty = 0.0_f32;
+    let prompt_lower = user_prompt.to_ascii_lowercase();
+    let long_horizon_prompt = user_prompt.len() >= 170
+        || prompt_lower.contains("end-to-end")
+        || prompt_lower.contains("cross")
+        || prompt_lower.contains("multi")
+        || prompt_lower.contains("migration")
+        || prompt_lower.contains("large")
+        || prompt_lower.contains("long");
+    let risk_heavy_objective = objective_outcomes
+        .iter()
+        .take(4)
+        .any(|entry| entry.avg_failure_count >= 1.0 || entry.confidence < 0.45);
+
+    if !long_horizon_prompt && !risk_heavy_objective {
+        return PlanQualityReport {
+            acceptable: true,
+            score: 1.0,
+            issues,
+        };
+    }
+
+    let min_steps = if risk_heavy_objective { 4 } else { 3 };
+    if plan.steps.len() < min_steps {
+        issues.push(format!(
+            "long-horizon objective requires at least {min_steps} decomposed steps"
+        ));
+        penalty += 0.25;
+    }
+
+    let has_phase_structure = plan.steps.iter().any(|step| {
+        let title = step.title.to_ascii_lowercase();
+        title.contains("phase")
+            || title.contains("milestone")
+            || title.contains("step 1")
+            || title.contains("checkpoint")
+            || title.contains("rollout")
+    });
+    if !has_phase_structure {
+        issues.push("plan lacks explicit milestone/checkpoint decomposition".to_string());
+        penalty += 0.20;
+    }
+
+    let has_checkpoint_guard = plan.steps.iter().any(|step| {
+        let title = step.title.to_ascii_lowercase();
+        title.contains("checkpoint")
+            || title.contains("rollback")
+            || title.contains("recovery")
+            || title.contains("rewind")
+    }) || plan
+        .risk_notes
+        .iter()
+        .any(|note| note.to_ascii_lowercase().contains("rollback"));
+    if !has_checkpoint_guard {
+        issues.push("plan missing checkpoint/rollback guard for replanning safety".to_string());
+        penalty += 0.25;
+    }
+
+    let has_replan_path = plan.steps.iter().any(|step| {
+        let title = step.title.to_ascii_lowercase();
+        title.contains("recover") || title.contains("fallback") || title.contains("triage")
+    });
+    if risk_heavy_objective && !has_replan_path {
+        issues.push("historically risky objective lacks explicit recovery/replan path".to_string());
+        penalty += 0.20;
+    }
+
+    let score = (1.0 - penalty).clamp(0.0, 1.0);
+    PlanQualityReport {
+        acceptable: score >= 0.70,
         score,
         issues,
     }
@@ -3004,6 +3347,8 @@ fn subagent_request_for_task(
     verification: &str,
     base_model: &str,
     max_think_model: &str,
+    domain: &str,
+    specialization_hint: Option<&str>,
 ) -> LlmRequest {
     let (unit, model, max_tokens) = match task.role {
         SubagentRole::Plan => (LlmUnit::Planner, max_think_model.to_string(), 3072),
@@ -3018,8 +3363,17 @@ name={}\n\
 task_goal={}\n\
 main_goal={}\n\
 verification_targets={}\n\
+domain={}\n\
+specialization_hint={}\n\
 Return concise actionable findings only (max 6 bullet points).",
-        task.role, task.team, task.name, task.goal, root_goal, verification
+        task.role,
+        task.team,
+        task.name,
+        task.goal,
+        root_goal,
+        verification,
+        domain,
+        specialization_hint.unwrap_or("none"),
     );
     LlmRequest {
         unit,
@@ -3036,6 +3390,129 @@ struct SubagentTaskMeta {
     goal: String,
     created_at: String,
     targets: Vec<String>,
+    domain: String,
+    specialization_hint: Option<String>,
+    phase: usize,
+    dependencies: Vec<String>,
+    ownership_lane: String,
+}
+
+#[derive(Debug, Clone)]
+struct SubagentExecutionLane {
+    title: String,
+    intent: String,
+    role: SubagentRole,
+    team: String,
+    targets: Vec<String>,
+    domain: String,
+    phase: usize,
+    dependencies: Vec<String>,
+    ownership_lane: String,
+}
+
+fn subagent_role_for_step(step: &PlanStep) -> SubagentRole {
+    match step.intent.as_str() {
+        "search" => SubagentRole::Explore,
+        "plan" | "recover" => SubagentRole::Plan,
+        _ => SubagentRole::Task,
+    }
+}
+
+fn subagent_team_for_role(role: &SubagentRole) -> &'static str {
+    match role {
+        SubagentRole::Explore => "explore",
+        SubagentRole::Plan => "planning",
+        SubagentRole::Task => "execution",
+    }
+}
+
+fn plan_subagent_execution_lanes(
+    steps: &[PlanStep],
+    max_tasks: usize,
+) -> Vec<SubagentExecutionLane> {
+    let capped = max_tasks.max(1);
+    let mut lanes = Vec::new();
+    let mut target_last_phase: HashMap<String, usize> = HashMap::new();
+    let mut target_owner: HashMap<String, String> = HashMap::new();
+
+    for step in steps.iter().take(capped) {
+        let role = subagent_role_for_step(step);
+        let team = subagent_team_for_role(&role).to_string();
+        let targets = subagent_targets_for_step(step);
+        let domain = subagent_domain_for_step(step, &targets);
+        let mut phase = 0usize;
+        let mut dependencies = Vec::new();
+
+        for target in &targets {
+            if let Some(previous_phase) = target_last_phase.get(target).copied() {
+                phase = phase.max(previous_phase.saturating_add(1));
+                dependencies.push(format!("{target}@phase{}", previous_phase + 1));
+            }
+            if let Some(owner) = target_owner.get(target)
+                && owner != &team
+            {
+                dependencies.push(format!("{target}@owner={owner}"));
+            }
+        }
+        dependencies.sort();
+        dependencies.dedup();
+
+        for target in &targets {
+            target_last_phase.insert(target.clone(), phase);
+            target_owner
+                .entry(target.clone())
+                .or_insert_with(|| team.clone());
+        }
+
+        let ownership_lane = if targets.is_empty() {
+            format!("{team}:unscoped")
+        } else {
+            format!("{team}:{}", targets.join(","))
+        };
+        lanes.push(SubagentExecutionLane {
+            title: step.title.clone(),
+            intent: step.intent.clone(),
+            role,
+            team,
+            targets,
+            domain,
+            phase,
+            dependencies,
+            ownership_lane,
+        });
+    }
+
+    lanes.sort_by(|a, b| {
+        a.phase
+            .cmp(&b.phase)
+            .then(a.team.cmp(&b.team))
+            .then(a.title.cmp(&b.title))
+    });
+    lanes
+}
+
+fn summarize_subagent_execution_lanes(
+    meta_by_run: &HashMap<Uuid, SubagentTaskMeta>,
+) -> Vec<String> {
+    let mut phases: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for meta in meta_by_run.values() {
+        let dependencies = if meta.dependencies.is_empty() {
+            "none".to_string()
+        } else {
+            meta.dependencies.join("|")
+        };
+        phases.entry(meta.phase).or_default().push(format!(
+            "{} lane={} deps={}",
+            meta.name, meta.ownership_lane, dependencies
+        ));
+    }
+    phases
+        .into_iter()
+        .map(|(phase, mut rows)| {
+            rows.sort();
+            format!("subagent_phase {}: {}", phase + 1, rows.join(" ; "))
+        })
+        .collect()
 }
 
 fn subagent_targets_for_step(step: &PlanStep) -> Vec<String> {
@@ -3054,6 +3531,121 @@ fn subagent_targets_for_step(step: &PlanStep) -> Vec<String> {
         return vec!["README.md".to_string()];
     }
     Vec::new()
+}
+
+fn subagent_domain_for_step(step: &PlanStep, targets: &[String]) -> String {
+    let intent = step.intent.to_ascii_lowercase();
+    if intent.contains("git") {
+        return "version-control".to_string();
+    }
+    if intent.contains("verify") {
+        return "verification".to_string();
+    }
+    if intent.contains("docs") {
+        return "documentation".to_string();
+    }
+    if intent.contains("search") {
+        return "code-discovery".to_string();
+    }
+    if let Some(domain) = targets.iter().find_map(|target| {
+        let lower = target.to_ascii_lowercase();
+        if lower.ends_with(".rs") {
+            Some("rust-code")
+        } else if lower.ends_with(".ts") || lower.ends_with(".tsx") {
+            Some("typescript-code")
+        } else if lower.ends_with(".js") || lower.ends_with(".jsx") {
+            Some("javascript-code")
+        } else if lower.ends_with(".py") {
+            Some("python-code")
+        } else if lower.ends_with(".md") {
+            Some("documentation")
+        } else if lower.ends_with(".json") || lower.ends_with(".toml") || lower.ends_with(".yaml") {
+            Some("configuration")
+        } else {
+            None
+        }
+    }) {
+        return domain.to_string();
+    }
+    "general".to_string()
+}
+
+fn subagent_specialization_key(role: &SubagentRole, domain: &str) -> String {
+    format!("role={role:?}|domain={domain}")
+}
+
+fn subagent_specialization_guidance(entry: &SubagentSpecializationEntry) -> String {
+    if entry.last_outcome.eq_ignore_ascii_case("success") {
+        return "reuse successful decomposition pattern and keep concise evidence".to_string();
+    }
+    if entry.failure_count > entry.success_count {
+        return "reduce branching; gather stronger evidence before proposing edits".to_string();
+    }
+    "maintain deterministic ordering and verification-first summaries".to_string()
+}
+
+fn compute_subagent_specialization_confidence(entry: &SubagentSpecializationEntry) -> f32 {
+    let observations = entry.success_count.saturating_add(entry.failure_count) as f32;
+    if observations <= f32::EPSILON {
+        return 0.5;
+    }
+    let posterior = (entry.success_count as f32 + 1.0) / (observations + 2.0);
+    let attempts_penalty = ((entry.avg_attempts - 1.0).max(0.0) / 3.0).min(1.0) * 0.20;
+    (posterior - attempts_penalty).clamp(0.0, 1.0)
+}
+
+fn format_subagent_specialization_hint(entry: &SubagentSpecializationEntry) -> String {
+    format!(
+        "confidence={:.3}; successes={}; failures={}; avg_attempts={:.2}; next_guidance={}; last_summary={}",
+        entry.confidence,
+        entry.success_count,
+        entry.failure_count,
+        entry.avg_attempts,
+        entry.next_guidance,
+        if entry.last_summary.is_empty() {
+            "none"
+        } else {
+            entry.last_summary.as_str()
+        }
+    )
+}
+
+fn normalize_subagent_specialization_memory(memory: &mut SubagentSpecializationMemory) {
+    for entry in &mut memory.entries {
+        if !entry.confidence.is_finite() || entry.confidence <= 0.0 {
+            entry.confidence = compute_subagent_specialization_confidence(entry);
+        }
+        if entry.next_guidance.trim().is_empty() {
+            entry.next_guidance = subagent_specialization_guidance(entry);
+        }
+        if entry.role.trim().is_empty() {
+            entry.role = "Task".to_string();
+        }
+        if entry.domain.trim().is_empty() {
+            entry.domain = "general".to_string();
+        }
+        if entry.avg_attempts <= 0.0 {
+            entry.avg_attempts = 1.0;
+        }
+    }
+    sort_and_prune_subagent_specialization_entries(&mut memory.entries);
+}
+
+fn sort_and_prune_subagent_specialization_entries(entries: &mut Vec<SubagentSpecializationEntry>) {
+    entries.retain(|entry| {
+        let observations = entry.success_count.saturating_add(entry.failure_count);
+        !(observations >= 5
+            && entry.failure_count > entry.success_count.saturating_add(2)
+            && entry.confidence < 0.30)
+    });
+    entries.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then(b.success_count.cmp(&a.success_count))
+            .then(a.failure_count.cmp(&b.failure_count))
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    entries.truncate(128);
 }
 
 fn run_subagent_delegated_tools(
@@ -3681,10 +4273,13 @@ mod tests {
             "cargo test --workspace",
             "deepseek-chat",
             "deepseek-reasoner",
+            "rust-code",
+            Some("reuse prior decomposition strategy"),
         );
         assert!(matches!(req.unit, LlmUnit::Planner));
         assert_eq!(req.model, "deepseek-reasoner");
         assert!(req.prompt.contains("main_goal=improve runtime"));
+        assert!(req.prompt.contains("domain=rust-code"));
     }
 
     #[test]
@@ -4202,5 +4797,188 @@ mod tests {
         let rendered = format_objective_outcomes(&[entry]);
         assert!(rendered.contains("focus=\"add checkpoints\""));
         assert!(rendered.contains("last_failure=\"execution_failures=1\""));
+    }
+
+    #[test]
+    fn long_horizon_quality_requires_checkpoint_guards_for_risky_objectives() {
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "migrate service end-to-end".to_string(),
+            assumptions: vec![],
+            steps: vec![
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Phase 1 discover code".to_string(),
+                    intent: "search".to_string(),
+                    tools: vec!["fs.grep".to_string()],
+                    files: vec![],
+                    done: false,
+                },
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Phase 2 apply edits".to_string(),
+                    intent: "edit".to_string(),
+                    tools: vec!["fs.edit".to_string()],
+                    files: vec![],
+                    done: false,
+                },
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Phase 3 verify".to_string(),
+                    intent: "verify".to_string(),
+                    tools: vec!["bash.run".to_string()],
+                    files: vec![],
+                    done: false,
+                },
+            ],
+            verification: vec!["cargo test --workspace".to_string()],
+            risk_notes: vec![],
+        };
+        let objective = ObjectiveOutcomeEntry {
+            key: "migrate|service".to_string(),
+            goal_excerpt: "migrate service".to_string(),
+            success_count: 1,
+            failure_count: 4,
+            execution_failure_count: 2,
+            verification_failure_count: 2,
+            avg_step_count: 3.0,
+            avg_failure_count: 1.6,
+            confidence: 0.35,
+            last_outcome: "failure".to_string(),
+            last_failure_summary: "verification_failures=2".to_string(),
+            next_focus: String::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let report = assess_plan_long_horizon_quality(
+            &plan,
+            "Plan a large end-to-end migration across services",
+            &[objective],
+        );
+        assert!(!report.acceptable);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("checkpoint/rollback"))
+        );
+    }
+
+    #[test]
+    fn subagent_domain_detection_prefers_file_types_and_intent() {
+        let step = PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Update docs".to_string(),
+            intent: "docs".to_string(),
+            tools: vec!["fs.edit".to_string()],
+            files: vec!["README.md".to_string()],
+            done: false,
+        };
+        let targets = subagent_targets_for_step(&step);
+        assert_eq!(subagent_domain_for_step(&step, &targets), "documentation");
+
+        let rust_step = PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Edit engine".to_string(),
+            intent: "task".to_string(),
+            tools: vec!["fs.edit".to_string()],
+            files: vec!["src/lib.rs".to_string()],
+            done: false,
+        };
+        let rust_targets = subagent_targets_for_step(&rust_step);
+        assert_eq!(
+            subagent_domain_for_step(&rust_step, &rust_targets),
+            "rust-code"
+        );
+    }
+
+    #[test]
+    fn specialization_confidence_penalizes_failures_and_retries() {
+        let good = SubagentSpecializationEntry {
+            key: "role=Task|domain=rust-code".to_string(),
+            role: "Task".to_string(),
+            domain: "rust-code".to_string(),
+            success_count: 6,
+            failure_count: 1,
+            avg_attempts: 1.1,
+            confidence: 0.0,
+            last_outcome: "success".to_string(),
+            last_summary: "ok".to_string(),
+            next_guidance: String::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let poor = SubagentSpecializationEntry {
+            key: "role=Task|domain=rust-code".to_string(),
+            role: "Task".to_string(),
+            domain: "rust-code".to_string(),
+            success_count: 1,
+            failure_count: 6,
+            avg_attempts: 2.8,
+            confidence: 0.0,
+            last_outcome: "failure".to_string(),
+            last_summary: "blocked".to_string(),
+            next_guidance: String::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        assert!(
+            compute_subagent_specialization_confidence(&good)
+                > compute_subagent_specialization_confidence(&poor)
+        );
+    }
+
+    #[test]
+    fn subagent_lane_planner_serializes_shared_target_dependencies() {
+        let steps = vec![
+            PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Plan api changes".to_string(),
+                intent: "plan".to_string(),
+                tools: vec!["fs.read".to_string()],
+                files: vec!["src/api.rs".to_string()],
+                done: false,
+            },
+            PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Apply api edits".to_string(),
+                intent: "task".to_string(),
+                tools: vec!["fs.edit".to_string()],
+                files: vec!["src/api.rs".to_string()],
+                done: false,
+            },
+        ];
+        let lanes = plan_subagent_execution_lanes(&steps, 8);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].phase, 0);
+        assert_eq!(lanes[1].phase, 1);
+        assert!(
+            lanes[1]
+                .dependencies
+                .iter()
+                .any(|dep| dep.contains("src/api.rs@phase1"))
+        );
+    }
+
+    #[test]
+    fn subagent_lane_summary_includes_phase_and_lane_metadata() {
+        let run_id = Uuid::now_v7();
+        let mut map = HashMap::new();
+        map.insert(
+            run_id,
+            SubagentTaskMeta {
+                name: "Apply api edits".to_string(),
+                goal: "task".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                targets: vec!["src/api.rs".to_string()],
+                domain: "rust-code".to_string(),
+                specialization_hint: None,
+                phase: 1,
+                dependencies: vec!["src/api.rs@phase1".to_string()],
+                ownership_lane: "execution:src/api.rs".to_string(),
+            },
+        );
+        let summary = summarize_subagent_execution_lanes(&map);
+        assert_eq!(summary.len(), 1);
+        assert!(summary[0].contains("subagent_phase 2"));
+        assert!(summary[0].contains("lane=execution:src/api.rs"));
     }
 }

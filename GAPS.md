@@ -8,12 +8,13 @@ This matrix tracks the remaining gap between `specs.md` expectations and practic
 
 | Area | Gap | Status |
 |---|---|---|
-| Permission control UX | No first-class runtime permission management command and no slash control path. | **Closed in this iteration** (`deepseek permissions show|set`, `/permissions`) |
-| Live autopilot/background semantics | Limited visibility during long runs; no live sampled status stream. | **Partially closed** (`autopilot status --follow --samples --interval-seconds`) |
-| Benchmark realism | Benchmarks relied mostly on fixed built-in synthetic prompts. | **Partially closed** (`--benchmark-suite` external JSON/JSONL cases + quality gates + baseline comparison/regression checks) |
-| Autonomous reasoning quality | Planner/executor still below frontier agents on deep, multi-hop, long-horizon reasoning and self-correction quality. | **Partially closed** (multi-pass quality + verification-feedback repair loops + strategy scoring/pruning + objective-outcome confidence memory injected into planning context) |
-| Subagent intelligence | Subagents are model-backed, but still mostly advisory and not fully delegated tool-using specialists. | **Partially closed** (bounded delegated execution policies by role + approval-aware delegated retries + richer target arbitration scoring/rationales) |
-| Real-world benchmark parity | No standardized side-by-side benchmark corpus + scorer against Codex/Aider/Claude on shared tasks. | **Partially closed** (`--benchmark-compare` ranking + per-case matrix + corpus mismatch warnings + importable packs + seeded signed scorecards/manifests + `benchmark run-matrix` aggregate parity runner) |
+| Core runtime + session model | Claude/Codex-level long-horizon autonomous reliability (multi-turn decomposition and resilient replanning) still trails frontier behavior on hard tasks. | **Partially closed** (objective-outcome memory + long-horizon checkpoint-aware plan scoring + multi-pass plan repair) |
+| File/Git tooling depth | Team/enterprise workflows still miss some higher-level orchestration behaviors (e.g., richer PR-native flows and broader conflict automation). | **Partially closed** |
+| Live autopilot/background semantics | True in-TUI background handoff was missing for direct prompt/shell detachment. | **Mostly closed** (`Ctrl+B` now launches `/background run-agent` or `/background run-shell`, plus attach tailing and stop controls) |
+| Subagent intelligence | Multi-agent conflict-free ownership/dependency scheduling was still too shallow. | **Mostly closed** (role/domain specialization memory + delegated retries + arbitration scoring + explicit phase/lane dependency planning) |
+| Permission/safety governance | Team-managed non-overridable permissions were missing. | **Partially closed** (team policy overlay via `DEEPSEEK_TEAM_POLICY_PATH` / `~/.deepseek/team-policy.json` now enforced) |
+| Advanced visual/sandbox parity | Visual verification capture/analyzer loops and OS-level sandbox isolation remain below frontier parity. | **Open / Future-facing** |
+| Real-world benchmark parity | Need broader shared corpus + strict peer comparability at scale for direct Codex/Aider/Claude benchmarking. | **Partially closed** (`--benchmark-compare` + manifest/seed compatibility checks + signed scorecards/manifests + `benchmark run-matrix` aggregate parity runner + strict compare modes) |
 
 ## Executed Plan (This Iteration)
 
@@ -61,8 +62,24 @@ This matrix tracks the remaining gap between `specs.md` expectations and practic
 4. Add matrix peer comparison ranking with manifest-coverage and case-count diagnostics.
 5. Validate with fmt/clippy/tests/build.
 
+## Executed Plan (Current Iteration +2)
+
+1. Add long-horizon checkpoint-aware replanning quality scoring tied to objective-outcome risk memory.
+2. Add subagent role/domain specialization memory with confidence scoring + guidance feedback loops.
+3. Add strict benchmark compatibility gates (`--benchmark-compare-strict`, `benchmark run-matrix --strict`) for peer parity enforcement.
+4. Add team-managed non-overridable policy overlay support in policy engine.
+5. Validate with fmt/clippy/tests/build.
+
+## Executed Plan (Current Iteration +3)
+
+1. Implement true TUI `Ctrl+B` background execution semantics (agent and shell job launch).
+2. Add first-class background run commands (`background run-agent`, `background run-shell`) with log-tail attach payloads.
+3. Add subagent dependency/ownership lane planner with phased conflict-minimizing execution.
+4. Add tests for background launch/attach/stop JSON contracts and lane-planning behavior.
+5. Validate with fmt/clippy/tests/build.
+
 ## Next Iteration Plan (Remaining Open Gaps)
 
-1. Expand long-horizon autonomous reasoning with explicit multi-turn objective decomposition and checkpoint-aware replanning quality scores.
-2. Add deeper subagent specialization signals (role-specific toolsets + quality feedback loops per subagent/team).
-3. Establish a larger shared real-world benchmark corpus and ingest external Codex/Aider/Claude reports under strict manifest compatibility requirements.
+1. Build/ingest larger shared real-world benchmark corpora and publish reproducible Codex/Aider/Claude parity scorecards.
+2. Extend visual verification from artifact capture to automated analyzer/verification loops with actionable gates.
+3. Strengthen sandbox isolation from policy checks to stricter OS-level execution containment workflows.

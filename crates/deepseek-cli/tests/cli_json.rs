@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command as StdCommand;
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[test]
@@ -684,6 +686,53 @@ fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
 }
 
 #[test]
+fn background_run_shell_attach_tail_and_stop_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+    let started = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "background",
+            "run-shell",
+            "echo",
+            "background-shell-ok",
+        ],
+    );
+    let job_id = started["job_id"].as_str().expect("job id");
+    let stdout_log = started["stdout_log"].as_str().expect("stdout log");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let text = fs::read_to_string(stdout_log).unwrap_or_default();
+        if text.contains("background-shell-ok") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let attached = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "background",
+            "attach",
+            job_id,
+            "--tail-lines",
+            "20",
+        ],
+    );
+    assert_eq!(attached["job_id"], job_id);
+    assert!(
+        attached["log_tail"]["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("background-shell-ok")
+    );
+
+    let stopped = run_json(workspace.path(), &["--json", "background", "stop", job_id]);
+    assert_eq!(stopped["stopped"], true);
+}
+
+#[test]
 fn profile_benchmark_accepts_external_suite_file() {
     let workspace = TempDir::new().expect("workspace");
     let suite_path = workspace.path().join(".deepseek/benchmark-suite.json");
@@ -947,6 +996,125 @@ fn benchmark_run_matrix_executes_multiple_runs_and_peer_compare() {
             .is_some_and(|rows| rows.len() >= 2)
     );
     assert!(output_path.exists());
+}
+
+#[test]
+fn profile_benchmark_compare_strict_fails_on_manifest_mismatch() {
+    let workspace = TempDir::new().expect("workspace");
+    fs::create_dir_all(workspace.path().join(".deepseek")).expect("runtime dir");
+    fs::write(
+        workspace.path().join(".deepseek/peer-no-manifest.json"),
+        r#"{
+  "agent": "codex",
+  "benchmark": {
+    "executed_cases": 1,
+    "succeeded": 1,
+    "p95_latency_ms": 900,
+    "records": [{"case_id":"x","ok":true,"quality_ok":true}]
+  }
+}"#,
+    )
+    .expect("peer report");
+
+    let runtime = workspace.path().join(".deepseek");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    fs::write(
+        runtime.join("settings.local.json"),
+        r#"{"llm":{"offline_fallback":true}}"#,
+    )
+    .expect("settings override");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args([
+            "--json",
+            "profile",
+            "--benchmark",
+            "--benchmark-cases",
+            "1",
+            "--benchmark-compare",
+            workspace
+                .path()
+                .join(".deepseek/peer-no-manifest.json")
+                .to_string_lossy()
+                .as_ref(),
+            "--benchmark-compare-strict",
+            "--benchmark-min-success-rate",
+            "0.0",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("strict mode failed"));
+}
+
+#[test]
+fn benchmark_run_matrix_strict_fails_on_mixed_corpus_compatibility() {
+    let workspace = TempDir::new().expect("workspace");
+    let suite_path = workspace.path().join(".deepseek/strict-suite.json");
+    fs::create_dir_all(
+        suite_path
+            .parent()
+            .expect("suite path should have parent directory"),
+    )
+    .expect("suite dir");
+    fs::write(
+        &suite_path,
+        r#"{
+  "cases": [
+    {
+      "case_id": "strict-suite-case",
+      "prompt": "Plan strict matrix compatibility checks.",
+      "expected_keywords": ["verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    }
+  ]
+}"#,
+    )
+    .expect("suite");
+
+    let matrix_path = workspace.path().join(".deepseek/strict-matrix.json");
+    fs::write(
+        &matrix_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "strict-matrix",
+            "runs": [
+                {"id": "builtin-core", "pack": "core", "cases": 1, "seed": 2},
+                {"id": "local-suite", "suite": suite_path.to_string_lossy(), "cases": 1, "seed": 3}
+            ]
+        }))
+        .expect("serialize matrix"),
+    )
+    .expect("matrix");
+
+    let runtime = workspace.path().join(".deepseek");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    fs::write(
+        runtime.join("settings.local.json"),
+        r#"{"llm":{"offline_fallback":true}}"#,
+    )
+    .expect("settings override");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args([
+            "--json",
+            "benchmark",
+            "run-matrix",
+            matrix_path.to_string_lossy().as_ref(),
+            "--strict",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("strict mode failed"));
 }
 
 fn run_json(workspace: &Path, args: &[&str]) -> Value {

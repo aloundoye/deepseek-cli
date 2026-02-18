@@ -2,6 +2,7 @@ use deepseek_core::ToolCall;
 use glob::Pattern;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Component, Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +102,7 @@ impl PolicyEngine {
 
     pub fn from_app_config(cfg: &deepseek_core::PolicyConfig) -> Self {
         let defaults = PolicyConfig::default();
-        let mapped = PolicyConfig {
+        let mut mapped = PolicyConfig {
             approve_edits: parse_approval_mode(&cfg.approve_edits),
             approve_bash: parse_approval_mode(&cfg.approve_bash),
             allowlist: cfg.allowlist.clone(),
@@ -117,6 +118,9 @@ impl PolicyEngine {
                 cfg.redact_patterns.clone()
             },
         };
+        if let Some(team_policy) = load_team_policy_override() {
+            mapped = apply_team_policy_override(mapped, &team_policy);
+        }
         Self::new(mapped)
     }
 
@@ -256,6 +260,75 @@ fn contains_forbidden_shell_tokens(cmd: &str) -> bool {
     forbidden.iter().any(|needle| cmd.contains(needle))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TeamPolicyFile {
+    #[serde(default)]
+    approve_edits: Option<String>,
+    #[serde(default)]
+    approve_bash: Option<String>,
+    #[serde(default)]
+    allowlist: Vec<String>,
+    #[serde(default)]
+    deny_commands: Vec<String>,
+    #[serde(default)]
+    block_paths: Vec<String>,
+    #[serde(default)]
+    redact_patterns: Vec<String>,
+}
+
+fn load_team_policy_override() -> Option<TeamPolicyFile> {
+    let path = std::env::var("DEEPSEEK_TEAM_POLICY_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| std::path::PathBuf::from(home).join(".deepseek/team-policy.json"))
+        })?;
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn apply_team_policy_override(mut base: PolicyConfig, team: &TeamPolicyFile) -> PolicyConfig {
+    if let Some(mode) = team.approve_edits.as_deref() {
+        base.approve_edits = parse_approval_mode(mode);
+    }
+    if let Some(mode) = team.approve_bash.as_deref() {
+        base.approve_bash = parse_approval_mode(mode);
+    }
+    if !team.allowlist.is_empty() {
+        // Team-managed allowlist wins over local config.
+        base.allowlist = team.allowlist.clone();
+    }
+    if !team.deny_commands.is_empty() {
+        let mut denied = base.denied_command_prefixes;
+        denied.extend(team.deny_commands.iter().cloned());
+        denied.sort();
+        denied.dedup();
+        base.denied_command_prefixes = denied;
+    }
+    if !team.block_paths.is_empty() {
+        let mut blocked = base.denied_secret_paths;
+        blocked.extend(team.block_paths.iter().cloned());
+        blocked.sort();
+        blocked.dedup();
+        base.denied_secret_paths = blocked;
+    }
+    if !team.redact_patterns.is_empty() {
+        let mut patterns = base.redact_patterns;
+        patterns.extend(team.redact_patterns.iter().cloned());
+        patterns.sort();
+        patterns.dedup();
+        base.redact_patterns = patterns;
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +418,47 @@ mod tests {
         };
         assert!(policy.requires_approval(&bash));
         assert!(!policy.requires_approval(&read));
+    }
+
+    #[test]
+    fn team_policy_override_replaces_allowlist_and_forces_modes() {
+        let base = PolicyConfig {
+            approve_edits: false,
+            approve_bash: false,
+            allowlist: vec!["git status".to_string()],
+            denied_secret_paths: vec![".env".to_string()],
+            denied_command_prefixes: vec!["rm".to_string()],
+            redact_patterns: vec!["token".to_string()],
+        };
+        let team = TeamPolicyFile {
+            approve_edits: Some("ask".to_string()),
+            approve_bash: Some("always".to_string()),
+            allowlist: vec!["npm *".to_string()],
+            deny_commands: vec!["curl".to_string()],
+            block_paths: vec!["**/secrets".to_string()],
+            redact_patterns: vec!["password".to_string()],
+        };
+        let merged = apply_team_policy_override(base, &team);
+        assert!(merged.approve_edits);
+        assert!(merged.approve_bash);
+        assert_eq!(merged.allowlist, vec!["npm *"]);
+        assert!(
+            merged
+                .denied_command_prefixes
+                .iter()
+                .any(|rule| rule == "curl")
+        );
+        assert!(
+            merged
+                .denied_secret_paths
+                .iter()
+                .any(|rule| rule == "**/secrets")
+        );
+        assert!(
+            merged
+                .redact_patterns
+                .iter()
+                .any(|pattern| pattern == "password")
+        );
     }
 }

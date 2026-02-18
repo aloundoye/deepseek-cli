@@ -289,6 +289,38 @@ Verification:
 - `cargo build --workspace`
 - `cargo build --release --workspace`
 
+### M19 Parity Gap Closure Loop (Long-Horizon Scoring + Subagent Specialists + Strict Governance)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added checkpoint-aware long-horizon replanning quality scoring tied to objective-outcome risk profiles.
+- Added persistent subagent role/domain specialization memory with confidence scoring and guidance feedback loops.
+- Added strict benchmark compatibility gates for peer parity (`--benchmark-compare-strict`, `benchmark run-matrix --strict`).
+- Added team-managed non-overridable policy overlay support (`DEEPSEEK_TEAM_POLICY_PATH` / `~/.deepseek/team-policy.json`).
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
+### M20 Parity Gap Closure Loop (TUI Background Semantics + Dependency Lanes)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Implemented true TUI background handoff semantics on `Ctrl+B` (queued prompt -> background agent run, `!command` -> background shell run).
+- Added first-class `background run-agent` and `background run-shell` commands with persisted metadata/log paths.
+- Extended `background attach` JSON payloads with bounded stdout/stderr tail capture for active job inspection.
+- Added subagent dependency/ownership lane planning and phased execution to reduce target conflicts across agent-team runs.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
 ## Data/Storage Contracts
 - Canonical append-only event log: `.deepseek/events.jsonl`.
 - Projections remain additive only.

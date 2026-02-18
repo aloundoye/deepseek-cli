@@ -21,8 +21,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -227,6 +228,8 @@ struct ProfileArgs {
     benchmark_max_regression_ms: Option<u64>,
     #[arg(long = "benchmark-compare")]
     benchmark_compare: Vec<String>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    benchmark_compare_strict: bool,
     #[arg(long)]
     benchmark_output: Option<String>,
 }
@@ -451,16 +454,34 @@ enum BackgroundCmd {
     List,
     Attach(BackgroundAttachArgs),
     Stop(BackgroundStopArgs),
+    RunAgent(BackgroundRunAgentArgs),
+    RunShell(BackgroundRunShellArgs),
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct BackgroundAttachArgs {
     job_id: String,
+    #[arg(long, default_value_t = 40)]
+    tail_lines: usize,
 }
 
 #[derive(Args)]
 struct BackgroundStopArgs {
     job_id: String,
+}
+
+#[derive(Args)]
+struct BackgroundRunAgentArgs {
+    #[arg(required = true, num_args = 1..)]
+    prompt: Vec<String>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    tools: bool,
+}
+
+#[derive(Args)]
+struct BackgroundRunShellArgs {
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Args, Default)]
@@ -549,6 +570,8 @@ struct BenchmarkRunMatrixArgs {
     output: Option<String>,
     #[arg(long = "compare")]
     compare: Vec<String>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    strict: bool,
     #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
     signing_key_env: String,
 }
@@ -1618,6 +1641,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                             "/effort",
                             "/skills",
                             "/permissions",
+                            "/background",
                         ],
                     });
                     if json_mode {
@@ -1849,6 +1873,16 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         }
                     }
                 },
+                SlashCommand::Background(args) => match parse_background_cmd(args) {
+                    Ok(command) => run_background(cwd, command, json_mode)?,
+                    Err(err) => {
+                        if json_mode {
+                            print_json(&json!({"error": err.to_string()}))?;
+                        } else {
+                            println!("background parse error: {err}");
+                        }
+                    }
+                },
                 SlashCommand::Unknown { name, .. } => {
                     if json_mode {
                         print_json(&json!({"error": format!("unknown slash command: /{name}")}))?;
@@ -1880,7 +1914,7 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     run_tui_shell_with_bindings(status, bindings, |prompt| {
         if let Some(cmd) = SlashCommand::parse(prompt) {
             let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -2080,6 +2114,10 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     Ok(cmd) => serde_json::to_string_pretty(&permissions_payload(cwd, cmd)?)?,
                     Err(err) => format!("permissions parse error: {err}"),
                 },
+                SlashCommand::Background(args) => match parse_background_cmd(args) {
+                    Ok(cmd) => serde_json::to_string_pretty(&background_payload(cwd, cmd)?)?,
+                    Err(err) => format!("background parse error: {err}"),
+                },
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
             };
             return Ok(out);
@@ -2198,6 +2236,65 @@ fn parse_remote_env_cmd(args: Vec<String>) -> Result<RemoteEnvCmd> {
             }))
         }
         _ => Err(anyhow!("unknown /remote-env subcommand: {sub}")),
+    }
+}
+
+fn parse_background_cmd(args: Vec<String>) -> Result<BackgroundCmd> {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+        return Ok(BackgroundCmd::List);
+    }
+    let sub = args[0].to_ascii_lowercase();
+    match sub.as_str() {
+        "attach" => {
+            let job_id = args
+                .get(1)
+                .ok_or_else(|| anyhow!("usage: /background attach <job_id> [tail_lines]"))?
+                .clone();
+            let tail_lines = args
+                .get(2)
+                .map(|value| {
+                    value.parse::<usize>().map_err(|_| {
+                        anyhow!(
+                            "invalid tail_lines '{}' (expected a positive integer)",
+                            value
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(40)
+                .max(1);
+            Ok(BackgroundCmd::Attach(BackgroundAttachArgs {
+                job_id,
+                tail_lines,
+            }))
+        }
+        "stop" => {
+            let job_id = args
+                .get(1)
+                .ok_or_else(|| anyhow!("usage: /background stop <job_id>"))?
+                .clone();
+            Ok(BackgroundCmd::Stop(BackgroundStopArgs { job_id }))
+        }
+        "run-agent" => {
+            let prompt = args.iter().skip(1).cloned().collect::<Vec<_>>();
+            if prompt.is_empty() {
+                return Err(anyhow!("usage: /background run-agent <prompt>"));
+            }
+            Ok(BackgroundCmd::RunAgent(BackgroundRunAgentArgs {
+                prompt,
+                tools: true,
+            }))
+        }
+        "run-shell" => {
+            let command = args.iter().skip(1).cloned().collect::<Vec<_>>();
+            if command.is_empty() {
+                return Err(anyhow!("usage: /background run-shell <command...>"));
+            }
+            Ok(BackgroundCmd::RunShell(BackgroundRunShellArgs { command }))
+        }
+        _ => Err(anyhow!(
+            "use /background list|attach <job_id>|stop <job_id>|run-agent <prompt>|run-shell <command>"
+        )),
     }
 }
 
@@ -2787,6 +2884,33 @@ fn run_profile(cwd: &Path, args: ProfileArgs, json_mode: bool) -> Result<()> {
                         &args.benchmark_compare,
                     )?)
                 };
+                if args.benchmark_compare_strict
+                    && let Some(comparison) = peer_comparison.as_ref()
+                {
+                    let corpus_warnings = comparison
+                        .get("corpus_match_warnings")
+                        .and_then(|v| v.as_array())
+                        .map(|rows| rows.len())
+                        .unwrap_or(0);
+                    let manifest_warnings = comparison
+                        .get("manifest_match_warnings")
+                        .and_then(|v| v.as_array())
+                        .map(|rows| rows.len())
+                        .unwrap_or(0);
+                    let seed_warnings = comparison
+                        .get("seed_match_warnings")
+                        .and_then(|v| v.as_array())
+                        .map(|rows| rows.len())
+                        .unwrap_or(0);
+                    if corpus_warnings + manifest_warnings + seed_warnings > 0 {
+                        return Err(anyhow!(
+                            "benchmark compare strict mode failed: corpus_warnings={} manifest_warnings={} seed_warnings={}",
+                            corpus_warnings,
+                            manifest_warnings,
+                            seed_warnings
+                        ));
+                    }
+                }
 
                 let mut object = payload.as_object().cloned().unwrap_or_default();
                 object.insert("benchmark".to_string(), bench.clone());
@@ -3911,6 +4035,19 @@ fn run_benchmark_matrix(cwd: &Path, args: BenchmarkRunMatrixArgs, json_mode: boo
     }
 
     let summary = aggregate_benchmark_matrix_results(&run_reports);
+    if args.strict {
+        let local_warnings = summary
+            .get("compatibility_warnings")
+            .and_then(|v| v.as_array())
+            .map(|rows| rows.len())
+            .unwrap_or(0);
+        if local_warnings > 0 {
+            return Err(anyhow!(
+                "benchmark matrix strict mode failed: compatibility_warnings={}",
+                local_warnings
+            ));
+        }
+    }
     let peer_comparison = if args.compare.is_empty() {
         None
     } else {
@@ -3920,6 +4057,27 @@ fn run_benchmark_matrix(cwd: &Path, args: BenchmarkRunMatrixArgs, json_mode: boo
             &args.compare,
         )?)
     };
+    if args.strict
+        && let Some(peer) = peer_comparison.as_ref()
+    {
+        let coverage_warnings = peer
+            .get("manifest_coverage_warnings")
+            .and_then(|v| v.as_array())
+            .map(|rows| rows.len())
+            .unwrap_or(0);
+        let case_warnings = peer
+            .get("case_count_warnings")
+            .and_then(|v| v.as_array())
+            .map(|rows| rows.len())
+            .unwrap_or(0);
+        if coverage_warnings + case_warnings > 0 {
+            return Err(anyhow!(
+                "benchmark matrix strict mode failed: manifest_coverage_warnings={} case_count_warnings={}",
+                coverage_warnings,
+                case_warnings
+            ));
+        }
+    }
 
     let mut payload = json!({
         "schema": "deepseek.benchmark.matrix.v1",
@@ -5944,23 +6102,49 @@ fn validate_replay_events(events: &[EventEnvelope]) -> ReplayValidation {
 }
 
 fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()> {
+    let payload = background_payload(cwd, cmd)?;
+    if json_mode {
+        print_json(&payload)?;
+        return Ok(());
+    }
+
+    if let Some(rows) = payload.as_array() {
+        if rows.is_empty() {
+            println!("no background jobs");
+            return Ok(());
+        }
+        for row in rows {
+            println!(
+                "{} {} {} {}",
+                row["job_id"].as_str().unwrap_or_default(),
+                row["kind"].as_str().unwrap_or_default(),
+                row["status"].as_str().unwrap_or_default(),
+                row["reference"].as_str().unwrap_or_default(),
+            );
+        }
+        return Ok(());
+    }
+
+    if payload
+        .get("stopped")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        println!(
+            "stopped background job {}",
+            payload["job_id"].as_str().unwrap_or_default(),
+        );
+        return Ok(());
+    }
+
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde_json::Value> {
     let store = Store::new(cwd)?;
     match cmd {
-        BackgroundCmd::List => {
-            let jobs = store.list_background_jobs()?;
-            if json_mode {
-                print_json(&jobs)?;
-            } else if jobs.is_empty() {
-                println!("no background jobs");
-            } else {
-                for job in jobs {
-                    println!(
-                        "{} {} {} {}",
-                        job.job_id, job.kind, job.status, job.reference
-                    );
-                }
-            }
-        }
+        BackgroundCmd::List => Ok(serde_json::to_value(store.list_background_jobs()?)?),
         BackgroundCmd::Attach(args) => {
             let job_id = Uuid::parse_str(&args.job_id)?;
             let job = store
@@ -5973,24 +6157,35 @@ fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()>
                     reference: job.reference.clone(),
                 },
             )?;
-            let payload = json!({
+            let metadata =
+                serde_json::from_str::<serde_json::Value>(&job.metadata_json).unwrap_or_default();
+            let stdout_tail = metadata
+                .get("stdout_log")
+                .and_then(|v| v.as_str())
+                .and_then(|path| tail_file_lines(Path::new(path), args.tail_lines));
+            let stderr_tail = metadata
+                .get("stderr_log")
+                .and_then(|v| v.as_str())
+                .and_then(|path| tail_file_lines(Path::new(path), args.tail_lines));
+            Ok(json!({
                 "job_id": job_id,
                 "kind": job.kind,
                 "status": job.status,
                 "reference": job.reference,
-                "metadata": serde_json::from_str::<serde_json::Value>(&job.metadata_json).unwrap_or(serde_json::Value::Null)
-            });
-            if json_mode {
-                print_json(&payload)?;
-            } else {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            }
+                "metadata": metadata,
+                "log_tail": {
+                    "stdout": stdout_tail,
+                    "stderr": stderr_tail
+                }
+            }))
         }
         BackgroundCmd::Stop(args) => {
             let job_id = Uuid::parse_str(&args.job_id)?;
             let mut job = store
                 .load_background_job(job_id)?
                 .ok_or_else(|| anyhow!("background job not found: {}", args.job_id))?;
+            let metadata =
+                serde_json::from_str::<serde_json::Value>(&job.metadata_json).unwrap_or_default();
             if job.kind == "autopilot"
                 && let Ok(run_id) = Uuid::parse_str(&job.reference)
                 && let Some(run) = store.load_autopilot_run(run_id)?
@@ -6008,9 +6203,23 @@ fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()>
                     format!("stop requested at {}\n", Utc::now().to_rfc3339()),
                 )?;
             }
+            let mut terminated_pid = false;
+            if let Some(pid) = metadata.get("pid").and_then(|value| value.as_u64()) {
+                match terminate_background_pid(pid as u32) {
+                    Ok(_) => terminated_pid = true,
+                    Err(err) => {
+                        eprintln!("warning: failed to terminate background pid {pid}: {err}");
+                    }
+                }
+            }
             job.status = "stopped".to_string();
             job.updated_at = Utc::now().to_rfc3339();
-            job.metadata_json = serde_json::json!({"reason":"manual_stop"}).to_string();
+            job.metadata_json = serde_json::json!({
+                "reason":"manual_stop",
+                "terminated_pid": terminated_pid,
+                "previous": metadata,
+            })
+            .to_string();
             store.upsert_background_job(&job)?;
             append_control_event(
                 cwd,
@@ -6019,11 +6228,177 @@ fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()>
                     reason: "manual_stop".to_string(),
                 },
             )?;
-            if json_mode {
-                print_json(&json!({"job_id": job_id, "stopped": true}))?;
-            } else {
-                println!("stopped background job {}", job_id);
+            Ok(json!({
+                "job_id": job_id,
+                "stopped": true,
+                "terminated_pid": terminated_pid
+            }))
+        }
+        BackgroundCmd::RunAgent(args) => {
+            let prompt = args.prompt.join(" ").trim().to_string();
+            if prompt.is_empty() {
+                return Err(anyhow!("background run-agent prompt is empty"));
             }
+            let cfg = AppConfig::ensure(cwd)?;
+            ensure_llm_ready_with_cfg(&cfg, true)?;
+            let exe = std::env::current_exe()?;
+            let mut command = Command::new(exe);
+            command.arg("ask").arg(&prompt);
+            if args.tools {
+                command.arg("--tools");
+            }
+            spawn_background_process(
+                cwd,
+                "agent",
+                format!("ask:{}", &sha256_hex(prompt.as_bytes())[..12]),
+                json!({
+                    "prompt": prompt,
+                    "tools": args.tools,
+                    "command": "deepseek ask",
+                }),
+                command,
+            )
+        }
+        BackgroundCmd::RunShell(args) => {
+            let command_line = args.command.join(" ").trim().to_string();
+            if command_line.is_empty() {
+                return Err(anyhow!("background run-shell command is empty"));
+            }
+            let (shell_label, command) = build_background_shell_command(&command_line);
+            spawn_background_process(
+                cwd,
+                "shell",
+                format!("shell:{}", &sha256_hex(command_line.as_bytes())[..12]),
+                json!({
+                    "command_line": command_line,
+                    "shell": shell_label,
+                }),
+                command,
+            )
+        }
+    }
+}
+
+fn build_background_shell_command(command_line: &str) -> (String, Command) {
+    #[cfg(windows)]
+    {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
+        let mut command = Command::new(&shell);
+        command.arg("/C").arg(command_line);
+        (shell, command)
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut command = Command::new(&shell);
+        command.arg("-lc").arg(command_line);
+        (shell, command)
+    }
+}
+
+fn spawn_background_process(
+    cwd: &Path,
+    kind: &str,
+    reference: String,
+    metadata: serde_json::Value,
+    mut command: Command,
+) -> Result<serde_json::Value> {
+    let store = Store::new(cwd)?;
+    let session = ensure_session_record(cwd, &store)?;
+    let job_id = Uuid::now_v7();
+    let started_at = Utc::now().to_rfc3339();
+    let log_dir = runtime_dir(cwd).join("background").join(kind);
+    fs::create_dir_all(&log_dir)?;
+    let stdout_log = log_dir.join(format!("{job_id}.stdout.log"));
+    let stderr_log = log_dir.join(format!("{job_id}.stderr.log"));
+    let stdout_file = File::create(&stdout_log)?;
+    let stderr_file = File::create(&stderr_log)?;
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    let child = command.spawn()?;
+    let pid = child.id();
+
+    let mut metadata_map = metadata.as_object().cloned().unwrap_or_default();
+    metadata_map.insert("pid".to_string(), json!(pid));
+    metadata_map.insert(
+        "stdout_log".to_string(),
+        json!(stdout_log.to_string_lossy().to_string()),
+    );
+    metadata_map.insert(
+        "stderr_log".to_string(),
+        json!(stderr_log.to_string_lossy().to_string()),
+    );
+    metadata_map.insert("started_at".to_string(), json!(started_at.clone()));
+    let metadata_value = serde_json::Value::Object(metadata_map);
+
+    let record = BackgroundJobRecord {
+        job_id,
+        kind: kind.to_string(),
+        reference: reference.clone(),
+        status: "running".to_string(),
+        metadata_json: metadata_value.to_string(),
+        started_at: started_at.clone(),
+        updated_at: started_at.clone(),
+    };
+    store.upsert_background_job(&record)?;
+    store.append_event(&EventEnvelope {
+        seq_no: store.next_seq_no(session.session_id)?,
+        at: Utc::now(),
+        session_id: session.session_id,
+        kind: EventKind::BackgroundJobStartedV1 {
+            job_id,
+            kind: kind.to_string(),
+            reference: reference.clone(),
+        },
+    })?;
+    // Replay projection currently stores '{}' for BackgroundJobStartedV1 metadata.
+    // Re-apply the richer metadata payload after emitting the canonical event.
+    store.upsert_background_job(&record)?;
+
+    Ok(json!({
+        "job_id": job_id,
+        "kind": kind,
+        "status": "running",
+        "reference": reference,
+        "pid": pid,
+        "stdout_log": stdout_log,
+        "stderr_log": stderr_log,
+        "metadata": metadata_value,
+    }))
+}
+
+fn tail_file_lines(path: &Path, max_lines: usize) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Some(String::new());
+    }
+    let keep = max_lines.max(1);
+    let start = lines.len().saturating_sub(keep);
+    Some(lines[start..].join("\n"))
+}
+
+fn terminate_background_pid(pid: u32) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("taskkill failed for pid {}", pid));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("kill -TERM failed for pid {}", pid));
         }
     }
     Ok(())

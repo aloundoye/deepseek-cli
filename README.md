@@ -74,14 +74,19 @@ Execution behavior:
 - Task-role subagents now run bounded delegated tool execution (including isolated subagent artifact writes) with merge-arbitration summaries when multiple subagents target the same file.
 - Delegated subagent execution now includes approval-aware retries with bounded read-only fallback paths.
 - Autopilot supports live pause/resume control via pause files and `deepseek autopilot pause|resume`, plus live status sampling with `deepseek autopilot status --follow`.
+- TUI `Ctrl+B` now backgrounds queued work directly: normal prompts launch background agent runs, and `!<command>` launches background shell jobs.
+- Background jobs now support native starts for both agents and shell commands (`deepseek background run-agent|run-shell`) with log-tail attach payloads.
 - `deepseek permissions show|set` provides first-class policy control for approvals/allowlist/sandbox mode.
 - Planner quality checks auto-repair weak plans with bounded retries before fallback.
 - Planner self-evaluation now includes prior verification-failure memory to improve subsequent plan revisions.
 - Successful/failed runs are persisted into planner strategy memory with score-based prioritization and pruning before future plan injection.
 - Long-horizon objective outcomes are persisted with confidence/failure trends and reinjected into future planning context.
+- Planner long-horizon quality checks now enforce decomposition + checkpoint/rollback guards for historically risky objectives.
+- Subagent specialization memory persists per role/domain quality and injects guidance into future delegated runs.
 - `deepseek profile --benchmark` runs planning benchmarks with latency/quality metrics, supports external suites, compares against baseline runs, and produces side-by-side peer ranking with case matrices.
 - Benchmark mode supports thresholds and result export (`--benchmark-suite`, `--benchmark-min-success-rate`, `--benchmark-min-quality-rate`, `--benchmark-max-p95-ms`, `--benchmark-baseline`, `--benchmark-max-regression-ms`, `--benchmark-compare`, `--benchmark-output`), plus reproducible seeded runs with signed corpus/execution manifests and scorecards (`--benchmark-seed`, `--benchmark-signing-key-env`).
-- `deepseek benchmark run-matrix <matrix.json>` executes multi-run parity matrices (packs/suites) with aggregate weighted scorecards and optional peer ranking.
+- `deepseek benchmark run-matrix <matrix.json>` executes multi-run parity matrices (packs/suites) with aggregate weighted scorecards and optional peer ranking (including strict compatibility gating).
+- Team-managed policy overlays can be enforced via `DEEPSEEK_TEAM_POLICY_PATH` (or `~/.deepseek/team-policy.json`) and cannot be broadened by local allowlists.
 
 ## Command Overview
 
@@ -89,8 +94,8 @@ Execution behavior:
 - `deepseek ask "<prompt>" [--tools]`
 - `deepseek plan "<prompt>"`
 - `deepseek run [session-id]`
-- `deepseek profile [--benchmark] [--benchmark-cases N] [--benchmark-seed N] [--benchmark-suite <path>] [--benchmark-pack <name>] [--benchmark-signing-key-env ENV] [--benchmark-min-success-rate F] [--benchmark-min-quality-rate F] [--benchmark-max-p95-ms N] [--benchmark-baseline <path>] [--benchmark-max-regression-ms N] [--benchmark-compare <path>] [--benchmark-output <path>]`
-- `deepseek benchmark list-packs|show-pack <name>|import-pack <name> <source>|run-matrix <matrix.json> [--output <path>] [--compare <path>]`
+- `deepseek profile [--benchmark] [--benchmark-cases N] [--benchmark-seed N] [--benchmark-suite <path>] [--benchmark-pack <name>] [--benchmark-signing-key-env ENV] [--benchmark-min-success-rate F] [--benchmark-min-quality-rate F] [--benchmark-max-p95-ms N] [--benchmark-baseline <path>] [--benchmark-max-regression-ms N] [--benchmark-compare <path>] [--benchmark-compare-strict] [--benchmark-output <path>]`
+- `deepseek benchmark list-packs|show-pack <name>|import-pack <name> <source>|run-matrix <matrix.json> [--output <path>] [--compare <path>] [--strict]`
 - `deepseek autopilot "<prompt>" [--hours|--duration-seconds|--forever] [--max-iterations N]`
 - `deepseek autopilot status [--follow --samples N --interval-seconds N]|pause|stop|resume`
 - `deepseek diff`
@@ -102,7 +107,7 @@ Execution behavior:
 - `deepseek git status|history|branch|checkout|commit|pr|resolve`
 - `deepseek skills list|install|remove|run|reload`
 - `deepseek replay run --session-id <uuid> --deterministic`
-- `deepseek background list|attach|stop`
+- `deepseek background list|attach|stop|run-agent|run-shell`
 - `deepseek teleport [--session-id <uuid>] [--output <path>] [--import <path>]`
 - `deepseek remote-env list|add|remove|check`
 - `deepseek status`
@@ -122,7 +127,7 @@ Interactive slash commands:
 - `/help`, `/init`, `/clear`, `/compact`, `/memory`, `/config`, `/model`
 - `/cost`, `/mcp`, `/rewind`, `/export`, `/plan`, `/teleport`, `/remote-env`
 - `/status`, `/effort`, `/skills`
-- `/permissions`
+- `/permissions`, `/background`
 
 ## Configuration
 

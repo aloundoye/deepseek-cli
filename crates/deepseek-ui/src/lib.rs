@@ -37,6 +37,7 @@ pub enum SlashCommand {
     Effort(Option<String>),
     Skills(Vec<String>),
     Permissions(Vec<String>),
+    Background(Vec<String>),
     Unknown { name: String, args: Vec<String> },
 }
 
@@ -69,6 +70,7 @@ impl SlashCommand {
             "effort" => Self::Effort(args.first().cloned()),
             "skills" => Self::Skills(args),
             "permissions" => Self::Permissions(args),
+            "background" => Self::Background(args),
             other => Self::Unknown {
                 name: other.to_string(),
                 args,
@@ -237,7 +239,7 @@ where
     let mut shell = ChatShell::default();
     let mut input = String::new();
     let mut info_line =
-        String::from("Ctrl+C exit | Ctrl+O toggle raw | Ctrl+B background hint | Ctrl+V paste");
+        String::from("Ctrl+C exit | Ctrl+O toggle raw | Ctrl+B background run | Ctrl+V paste");
     let mut show_raw = false;
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
@@ -343,8 +345,40 @@ where
             continue;
         }
         if key == bindings.background {
-            info_line = "background hint: use /status then deepseek background list".to_string();
-            shell.push_tool("background hotkey pressed");
+            let queued = input.trim().to_string();
+            if queued.is_empty() {
+                info_line = "background: type a prompt or !<shell command> first".to_string();
+                continue;
+            }
+            if queued.starts_with('/') {
+                info_line =
+                    "background hotkey supports prompts or !<shell command>, not slash commands"
+                        .to_string();
+                continue;
+            }
+            let background_cmd = if queued.starts_with('!') {
+                let command = queued.trim_start_matches('!').trim().to_string();
+                if command.is_empty() {
+                    info_line = "background shell command is empty".to_string();
+                    continue;
+                }
+                format!("/background run-shell {command}")
+            } else {
+                format!("/background run-agent {queued}")
+            };
+            shell.push_transcript(format!("> {background_cmd}"));
+            input.clear();
+            match on_submit(&background_cmd) {
+                Ok(output) => {
+                    shell.push_transcript(output);
+                    info_line = "background job started".to_string();
+                }
+                Err(err) => {
+                    let text = format!("error: {err}");
+                    shell.push_tool(text.clone());
+                    info_line = text;
+                }
+            }
             continue;
         }
         if key == bindings.paste_hint {
@@ -390,6 +424,8 @@ where
                     "status",
                     "effort",
                     "skills",
+                    "permissions",
+                    "background",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
@@ -584,6 +620,10 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/permissions show"),
             Some(SlashCommand::Permissions(vec!["show".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/background list"),
+            Some(SlashCommand::Background(vec!["list".to_string()]))
         );
     }
 
