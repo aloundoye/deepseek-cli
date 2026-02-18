@@ -15,6 +15,7 @@ sha2.workspace = true
 walkdir.workspace = true
 regex.workspace = true
 glob.workspace = true
+ignore.workspace = true
 uuid.workspace = true
 wait-timeout = "0.2"
 deepseek-core = { path = "../deepseek-core" }
@@ -23,3 +24,4 @@ deepseek-index = { path = "../deepseek-index" }
 deepseek-policy = { path = "../deepseek-policy" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-hooks = { path = "../deepseek-hooks" }
+deepseek-memory = { path = "../deepseek-memory" }

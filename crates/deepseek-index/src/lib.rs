@@ -1,5 +1,6 @@
 use anyhow::Result;
 use deepseek_core::{Session, runtime_dir};
+use ignore::WalkBuilder;
 use notify::{
     Config as NotifyConfig, EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode,
     Watcher,
@@ -16,7 +17,6 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, doc};
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -55,15 +55,7 @@ impl IndexService {
 
     pub fn build(&self, session: &Session) -> Result<Manifest> {
         let mut files = BTreeMap::new();
-        for entry in WalkDir::new(&self.workspace)
-            .into_iter()
-            .filter_entry(|e| match e.path().strip_prefix(&self.workspace) {
-                Ok(rel) => !has_ignored_component(rel),
-                Err(_) => true,
-            })
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
+        for path in workspace_file_paths(&self.workspace, true) {
             if !path.is_file() {
                 continue;
             }
@@ -288,12 +280,10 @@ impl IndexService {
 
     fn query_fallback(&self, q: &str, top_k: usize) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
-        for entry in WalkDir::new(&self.workspace)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_file())
-        {
-            let path = entry.path();
+        for path in workspace_file_paths(&self.workspace, true) {
+            if !path.is_file() {
+                continue;
+            }
             let rel_path = path.strip_prefix(&self.workspace)?;
             if has_ignored_component(rel_path) {
                 continue;
@@ -320,6 +310,40 @@ impl IndexService {
     fn tantivy_dir(&self) -> PathBuf {
         runtime_dir(&self.workspace).join("index/tantivy")
     }
+}
+
+fn workspace_file_paths(workspace: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
+    let mut builder = WalkBuilder::new(workspace);
+    builder.hidden(false);
+    builder.follow_links(false);
+    builder.parents(respect_gitignore);
+    builder.git_ignore(respect_gitignore);
+    builder.git_global(respect_gitignore);
+    builder.git_exclude(respect_gitignore);
+    builder.require_git(false);
+
+    let mut out = Vec::new();
+    for entry in builder.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(workspace) else {
+            continue;
+        };
+        if has_ignored_component(rel) {
+            continue;
+        }
+        out.push(path.to_path_buf());
+    }
+    out
 }
 
 fn has_ignored_component(path: &Path) -> bool {

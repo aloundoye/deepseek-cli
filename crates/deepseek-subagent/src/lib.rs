@@ -4,11 +4,21 @@ use std::sync::Arc;
 use std::thread;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SubagentRole {
     Explore,
     Plan,
     Task,
+}
+
+impl SubagentRole {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Explore => 0,
+            Self::Plan => 1,
+            Self::Task => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +33,10 @@ pub struct SubagentTask {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentResult {
     pub run_id: Uuid,
+    pub name: String,
+    pub role: SubagentRole,
+    pub team: String,
+    pub attempts: u8,
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
@@ -31,11 +45,15 @@ pub struct SubagentResult {
 #[derive(Debug, Clone)]
 pub struct SubagentManager {
     pub max_concurrency: usize,
+    pub max_retries_per_task: usize,
 }
 
 impl Default for SubagentManager {
     fn default() -> Self {
-        Self { max_concurrency: 7 }
+        Self {
+            max_concurrency: 7,
+            max_retries_per_task: 1,
+        }
     }
 }
 
@@ -43,6 +61,7 @@ impl SubagentManager {
     pub fn new(max_concurrency: usize) -> Self {
         Self {
             max_concurrency: max_concurrency.max(1),
+            ..Self::default()
         }
     }
 
@@ -52,6 +71,7 @@ impl SubagentManager {
     {
         let worker = Arc::new(worker);
         let mut pending = tasks;
+        pending.sort_by_key(|task| task.run_id);
         let mut out = Vec::new();
 
         while !pending.is_empty() {
@@ -60,21 +80,39 @@ impl SubagentManager {
             let mut handles = Vec::new();
             for task in chunk {
                 let worker = Arc::clone(&worker);
+                let retries = self.max_retries_per_task;
                 handles.push(thread::spawn(move || {
                     let run_id = task.run_id;
-                    match worker(task) {
-                        Ok(output) => SubagentResult {
-                            run_id,
-                            success: true,
-                            output,
-                            error: None,
-                        },
-                        Err(err) => SubagentResult {
-                            run_id,
-                            success: false,
-                            output: String::new(),
-                            error: Some(err.to_string()),
-                        },
+                    let mut attempts = 0usize;
+                    loop {
+                        attempts += 1;
+                        match worker(task.clone()) {
+                            Ok(output) => {
+                                return SubagentResult {
+                                    run_id,
+                                    name: task.name.clone(),
+                                    role: task.role.clone(),
+                                    team: task.team.clone(),
+                                    attempts: attempts.min(u8::MAX as usize) as u8,
+                                    success: true,
+                                    output,
+                                    error: None,
+                                };
+                            }
+                            Err(err) if attempts <= retries => continue,
+                            Err(err) => {
+                                return SubagentResult {
+                                    run_id,
+                                    name: task.name.clone(),
+                                    role: task.role.clone(),
+                                    team: task.team.clone(),
+                                    attempts: attempts.min(u8::MAX as usize) as u8,
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(err.to_string()),
+                                };
+                            }
+                        }
                     }
                 }));
             }
@@ -85,7 +123,37 @@ impl SubagentManager {
             }
         }
 
+        out.sort_by(|a, b| {
+            a.role
+                .rank()
+                .cmp(&b.role.rank())
+                .then(a.team.cmp(&b.team))
+                .then(a.name.cmp(&b.name))
+                .then(a.run_id.cmp(&b.run_id))
+        });
         out
+    }
+
+    pub fn merge_results(&self, results: &[SubagentResult]) -> String {
+        let mut lines = Vec::new();
+        for result in results {
+            if result.success {
+                lines.push(format!(
+                    "[{}::{:?}] {} (attempts={}): {}",
+                    result.team, result.role, result.name, result.attempts, result.output
+                ));
+            } else {
+                lines.push(format!(
+                    "[{}::{:?}] {} failed (attempts={}): {}",
+                    result.team,
+                    result.role,
+                    result.name,
+                    result.attempts,
+                    result.error.as_deref().unwrap_or("unknown error")
+                ));
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -123,5 +191,57 @@ mod tests {
 
         assert_eq!(results.len(), 5);
         assert!(max_seen.load(Ordering::SeqCst) <= 2);
+        assert!(results.iter().all(|result| result.success));
+    }
+
+    #[test]
+    fn retries_failed_subagents_within_budget() {
+        let mut manager = SubagentManager::new(1);
+        manager.max_retries_per_task = 2;
+        let task = SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: "retry-me".to_string(),
+            goal: "recover".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_w = Arc::clone(&attempts);
+        let results = manager.run_tasks(vec![task], move |_task| {
+            let count = attempts_w.fetch_add(1, Ordering::SeqCst);
+            if count < 1 {
+                anyhow::bail!("transient error")
+            }
+            Ok("recovered".to_string())
+        });
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(results[0].attempts, 2);
+    }
+
+    #[test]
+    fn merged_output_is_deterministic() {
+        let manager = SubagentManager::new(3);
+        let mut tasks = Vec::new();
+        for (team, role, name) in [
+            ("execution", SubagentRole::Task, "apply"),
+            ("planning", SubagentRole::Plan, "split"),
+            ("explore", SubagentRole::Explore, "scan"),
+        ] {
+            tasks.push(SubagentTask {
+                run_id: Uuid::now_v7(),
+                name: name.to_string(),
+                goal: "x".to_string(),
+                role,
+                team: team.to_string(),
+            });
+        }
+        let results = manager.run_tasks(tasks, |task| Ok(format!("ok:{}", task.name)));
+        let merged = manager.merge_results(&results);
+        let lines = merged.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("explore"));
+        assert!(lines[1].contains("planning"));
+        assert!(lines[2].contains("execution"));
     }
 }

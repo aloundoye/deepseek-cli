@@ -11,7 +11,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-walkdir.workspace = true
+ignore.workspace = true
 sha2.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 deepseek-llm = { path = "../deepseek-llm" }
@@ -21,3 +21,4 @@ deepseek-router = { path = "../deepseek-router" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-tools = { path = "../deepseek-tools" }
 deepseek-subagent = { path = "../deepseek-subagent" }
+deepseek-memory = { path = "../deepseek-memory" }

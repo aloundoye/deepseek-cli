@@ -12,7 +12,10 @@ use deepseek_memory::{ExportFormat, MemoryManager};
 use deepseek_skills::SkillManager;
 use deepseek_store::{AutopilotRunRecord, BackgroundJobRecord, ReplayCassetteRecord, Store};
 use deepseek_tools::PluginManager;
-use deepseek_ui::{SlashCommand, UiStatus, render_statusline, run_tui_shell};
+use deepseek_ui::{
+    KeyBindings, SlashCommand, UiStatus, load_keybindings, render_statusline,
+    run_tui_shell_with_bindings,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::fs;
@@ -780,7 +783,8 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
             println!("autopilot iteration {iteration_no}");
         }
 
-        match engine.run_once_with_mode(&args.prompt, args.tools, args.max_think) {
+        match engine.run_once_with_mode_and_priority(&args.prompt, args.tools, args.max_think, true)
+        {
             Ok(output) => {
                 completed_iterations += 1;
                 consecutive_failures = 0;
@@ -1122,12 +1126,16 @@ fn write_autopilot_heartbeat(path: &Path, payload: &serde_json::Value) -> Result
 }
 
 fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> Result<()> {
-    use std::io::{Write, stdin, stdout};
+    use std::io::{IsTerminal, Write, stdin, stdout};
 
     let engine = AgentEngine::new(cwd)?;
     let cfg = AppConfig::ensure(cwd)?;
-    if !json_mode && (force_tui || cfg.ui.enable_tui) {
+    let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
+    if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
         return run_chat_tui(cwd, allow_tools, &cfg);
+    }
+    if force_tui && !interactive_tty {
+        return Err(anyhow!("--tui requires an interactive terminal"));
     }
     let mut force_max_think = false;
     if !json_mode {
@@ -1181,6 +1189,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                             "/remote-env",
                             "/status",
                             "/effort",
+                            "/skills",
                         ],
                     });
                     if json_mode {
@@ -1332,20 +1341,26 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         println!("plan mode active; prompts will prefer structured planning.");
                     }
                 }
-                SlashCommand::Teleport => {
-                    run_teleport(
-                        cwd,
-                        TeleportArgs {
-                            session_id: None,
-                            output: None,
-                            import: None,
-                        },
-                        json_mode,
-                    )?;
-                }
-                SlashCommand::RemoteEnv => {
-                    run_remote_env(cwd, RemoteEnvCmd::List, json_mode)?;
-                }
+                SlashCommand::Teleport(args) => match parse_teleport_args(args) {
+                    Ok(teleport_args) => run_teleport(cwd, teleport_args, json_mode)?,
+                    Err(err) => {
+                        if json_mode {
+                            print_json(&json!({"error": err.to_string()}))?;
+                        } else {
+                            println!("teleport parse error: {err}");
+                        }
+                    }
+                },
+                SlashCommand::RemoteEnv(args) => match parse_remote_env_cmd(args) {
+                    Ok(command) => run_remote_env(cwd, command, json_mode)?,
+                    Err(err) => {
+                        if json_mode {
+                            print_json(&json!({"error": err.to_string()}))?;
+                        } else {
+                            println!("remote-env parse error: {err}");
+                        }
+                    }
+                },
                 SlashCommand::Status => run_status(cwd, json_mode)?,
                 SlashCommand::Effort(level) => {
                     let level = level.unwrap_or_else(|| "medium".to_string());
@@ -1368,6 +1383,32 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                             normalized,
                             if force_max_think { "max-think" } else { "base" }
                         );
+                    }
+                }
+                SlashCommand::Skills(args) => {
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+                        run_skills(cwd, SkillsCmd::List, json_mode)?;
+                    } else if args[0].eq_ignore_ascii_case("reload") {
+                        run_skills(cwd, SkillsCmd::Reload, json_mode)?;
+                    } else if args[0].eq_ignore_ascii_case("run") && args.len() > 1 {
+                        let input = if args.len() > 2 {
+                            Some(args[2..].join(" "))
+                        } else {
+                            None
+                        };
+                        run_skills(
+                            cwd,
+                            SkillsCmd::Run(SkillRunArgs {
+                                skill_id: args[1].clone(),
+                                input,
+                                execute: false,
+                            }),
+                            json_mode,
+                        )?;
+                    } else if json_mode {
+                        print_json(&json!({"error":"use /skills list|reload|run <id> [input]"}))?;
+                    } else {
+                        println!("use /skills list|reload|run <id> [input]");
                     }
                 }
                 SlashCommand::Unknown { name, .. } => {
@@ -1397,18 +1438,79 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     let engine = AgentEngine::new(cwd)?;
     let mut force_max_think = false;
     let status = current_ui_status(cwd, cfg, force_max_think)?;
-    run_tui_shell(status, |prompt| {
+    let bindings = load_tui_keybindings(cwd, cfg);
+    run_tui_shell_with_bindings(status, bindings, |prompt| {
         if let Some(cmd) = SlashCommand::parse(prompt) {
             let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
                     format!("initialized memory at {}", path.display())
                 }
                 SlashCommand::Clear => "cleared".to_string(),
-                SlashCommand::Compact => "use /compact in non-TUI or run `deepseek compact --yes`".to_string(),
-                SlashCommand::Memory(_) => MemoryManager::new(cwd)?.read_memory()?,
+                SlashCommand::Compact => {
+                    let summary = compact_now(cwd, None)?;
+                    format!(
+                        "compacted turns {}..{} summary_id={} token_delta={}",
+                        summary.from_turn,
+                        summary.to_turn,
+                        summary.summary_id,
+                        summary.token_delta_estimate
+                    )
+                }
+                SlashCommand::Memory(args) => {
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("show") {
+                        MemoryManager::new(cwd)?.read_memory()?
+                    } else if args[0].eq_ignore_ascii_case("edit") {
+                        let manager = MemoryManager::new(cwd)?;
+                        let path = manager.ensure_initialized()?;
+                        let checkpoint = manager.create_checkpoint("memory_edit")?;
+                        append_control_event(
+                            cwd,
+                            EventKind::CheckpointCreatedV1 {
+                                checkpoint_id: checkpoint.checkpoint_id,
+                                reason: checkpoint.reason.clone(),
+                                files_count: checkpoint.files_count,
+                                snapshot_path: checkpoint.snapshot_path.clone(),
+                            },
+                        )?;
+                        let editor =
+                            std::env::var("EDITOR").unwrap_or_else(|_| default_editor().to_string());
+                        let status = Command::new(editor).arg(&path).status()?;
+                        if !status.success() {
+                            return Err(anyhow!("editor exited with non-zero status"));
+                        }
+                        let version_id = manager.sync_memory_version("edit")?;
+                        append_control_event(
+                            cwd,
+                            EventKind::MemorySyncedV1 {
+                                version_id,
+                                path: path.to_string_lossy().to_string(),
+                                note: "edit".to_string(),
+                            },
+                        )?;
+                        format!("memory edited at {}", path.display())
+                    } else if args[0].eq_ignore_ascii_case("sync") {
+                        let note = args
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_else(|| "tui-sync".to_string());
+                        let manager = MemoryManager::new(cwd)?;
+                        let version_id = manager.sync_memory_version(&note)?;
+                        append_control_event(
+                            cwd,
+                            EventKind::MemorySyncedV1 {
+                                version_id,
+                                path: manager.memory_path().to_string_lossy().to_string(),
+                                note,
+                            },
+                        )?;
+                        format!("memory synced: {version_id}")
+                    } else {
+                        "unknown /memory subcommand".to_string()
+                    }
+                }
                 SlashCommand::Config => format!(
                     "config file: {}",
                     AppConfig::project_settings_path(cwd).display()
@@ -1432,11 +1534,31 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                         usage.input_tokens, usage.output_tokens
                     )
                 }
-                SlashCommand::Mcp(_) => {
-                    let servers = McpManager::new(cwd)?.list_servers()?;
-                    format!("mcp servers: {}", servers.len())
+                SlashCommand::Mcp(args) => {
+                    let manager = McpManager::new(cwd)?;
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+                        let servers = manager.list_servers()?;
+                        format!("mcp servers: {}", servers.len())
+                    } else if args[0].eq_ignore_ascii_case("get") && args.len() > 1 {
+                        match manager.get_server(&args[1])? {
+                            Some(server) => format!(
+                                "mcp {} transport={:?} enabled={}",
+                                server.id, server.transport, server.enabled
+                            ),
+                            None => format!("mcp server not found: {}", args[1]),
+                        }
+                    } else if args[0].eq_ignore_ascii_case("remove") && args.len() > 1 {
+                        let removed = manager.remove_server(&args[1])?;
+                        format!("mcp remove {} -> {}", args[1], removed)
+                    } else {
+                        "use /mcp list|get <id>|remove <id>".to_string()
+                    }
                 }
-                SlashCommand::Rewind(_) => "run `deepseek rewind --yes`".to_string(),
+                SlashCommand::Rewind(args) => {
+                    let to_checkpoint = args.first().cloned();
+                    let checkpoint = rewind_now(cwd, to_checkpoint)?;
+                    format!("rewound to checkpoint {}", checkpoint.checkpoint_id)
+                }
                 SlashCommand::Export(_) => {
                     let record = MemoryManager::new(cwd)?.export_transcript(
                         ExportFormat::Json,
@@ -1446,20 +1568,31 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     format!("exported transcript {}", record.output_path)
                 }
                 SlashCommand::Plan => "plan mode enabled".to_string(),
-                SlashCommand::Teleport => {
-                    let bundle_id = Uuid::now_v7();
-                    let output = runtime_dir(cwd)
-                        .join("teleport")
-                        .join(format!("{bundle_id}.json"));
-                    if let Some(parent) = output.parent() {
-                        fs::create_dir_all(parent)?;
+                SlashCommand::Teleport(args) => {
+                    match parse_teleport_args(args) {
+                        Ok(teleport_args) => {
+                            let teleport = teleport_now(cwd, teleport_args)?;
+                            if let Some(imported) = teleport.imported {
+                                format!("imported teleport bundle {}", imported)
+                            } else {
+                                format!(
+                                    "teleport bundle {} -> {}",
+                                    teleport.bundle_id.unwrap_or_default(),
+                                    teleport.path.unwrap_or_default()
+                                )
+                            }
+                        }
+                        Err(err) => format!("teleport parse error: {err}"),
                     }
-                    fs::write(&output, "{}")?;
-                    format!("teleport bundle: {}", output.display())
                 }
-                SlashCommand::RemoteEnv => {
-                    let profiles = Store::new(cwd)?.list_remote_env_profiles()?;
-                    format!("remote profiles: {}", profiles.len())
+                SlashCommand::RemoteEnv(args) => {
+                    match parse_remote_env_cmd(args) {
+                        Ok(cmd) => {
+                            let out = remote_env_now(cwd, cmd)?;
+                            serde_json::to_string(&out)?
+                        }
+                        Err(err) => format!("remote-env parse error: {err}"),
+                    }
                 }
                 SlashCommand::Status => {
                     let status = current_ui_status(cwd, cfg, force_max_think)?;
@@ -1467,8 +1600,43 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                 }
                 SlashCommand::Effort(level) => {
                     let level = level.unwrap_or_else(|| "medium".to_string());
-                    force_max_think = matches!(level.as_str(), "high" | "max");
-                    format!("effort={} force_max_think={}", level, force_max_think)
+                    let normalized = level.to_ascii_lowercase();
+                    force_max_think = matches!(normalized.as_str(), "high" | "max");
+                    format!("effort={} force_max_think={}", normalized, force_max_think)
+                }
+                SlashCommand::Skills(args) => {
+                    let manager = SkillManager::new(cwd)?;
+                    let paths = cfg
+                        .skills
+                        .paths
+                        .iter()
+                        .map(|path| expand_tilde(path))
+                        .collect::<Vec<_>>();
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+                        let skills = manager.list(&paths)?;
+                        if skills.is_empty() {
+                            "no skills found".to_string()
+                        } else {
+                            skills
+                                .into_iter()
+                                .map(|skill| format!("{} - {}", skill.id, skill.summary))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    } else if args[0].eq_ignore_ascii_case("reload") {
+                        let loaded = manager.reload(&paths)?;
+                        format!("reloaded {} skills", loaded.len())
+                    } else if args[0].eq_ignore_ascii_case("run") && args.len() > 1 {
+                        let input = if args.len() > 2 {
+                            Some(args[2..].join(" "))
+                        } else {
+                            None
+                        };
+                        let rendered = manager.run(&args[1], input.as_deref(), &paths)?;
+                        format!("{}\n{}", rendered.skill_id, rendered.rendered_prompt)
+                    } else {
+                        "use /skills list|reload|run <id> [input]".to_string()
+                    }
                 }
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
             };
@@ -1476,6 +1644,312 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
         }
         engine.run_once_with_mode(prompt, allow_tools, force_max_think)
     })
+}
+
+fn load_tui_keybindings(cwd: &Path, cfg: &AppConfig) -> KeyBindings {
+    let mut candidates = Vec::new();
+    if !cfg.ui.keybindings_path.trim().is_empty() {
+        candidates.push(PathBuf::from(expand_tilde(&cfg.ui.keybindings_path)));
+    }
+    if let Some(path) = AppConfig::keybindings_path() {
+        candidates.push(path);
+    }
+    candidates.push(runtime_dir(cwd).join("keybindings.json"));
+    candidates.dedup();
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(bindings) = load_keybindings(&path) {
+            return bindings;
+        }
+    }
+    KeyBindings::default()
+}
+
+#[derive(Default)]
+struct TeleportExecution {
+    bundle_id: Option<Uuid>,
+    path: Option<String>,
+    imported: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CompactSummary {
+    summary_id: Uuid,
+    from_turn: u64,
+    to_turn: u64,
+    token_delta_estimate: i64,
+}
+
+fn parse_teleport_args(args: Vec<String>) -> Result<TeleportArgs> {
+    if args.is_empty() {
+        return Ok(TeleportArgs::default());
+    }
+    if args.len() >= 2 && args[0].eq_ignore_ascii_case("import") {
+        return Ok(TeleportArgs {
+            session_id: None,
+            output: None,
+            import: Some(args[1].clone()),
+        });
+    }
+    let mut parsed = TeleportArgs::default();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let token = &args[idx];
+        if token.eq_ignore_ascii_case("session") && idx + 1 < args.len() {
+            parsed.session_id = Some(args[idx + 1].clone());
+            idx += 2;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("output") && idx + 1 < args.len() {
+            parsed.output = Some(args[idx + 1].clone());
+            idx += 2;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("import") && idx + 1 < args.len() {
+            parsed.import = Some(args[idx + 1].clone());
+            idx += 2;
+            continue;
+        }
+        if parsed.output.is_none() {
+            parsed.output = Some(token.clone());
+        }
+        idx += 1;
+    }
+    Ok(parsed)
+}
+
+fn parse_remote_env_cmd(args: Vec<String>) -> Result<RemoteEnvCmd> {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+        return Ok(RemoteEnvCmd::List);
+    }
+    let sub = args[0].to_ascii_lowercase();
+    match sub.as_str() {
+        "add" => {
+            if args.len() < 3 {
+                return Err(anyhow!(
+                    "usage: /remote-env add <name> <endpoint> [auth_mode]"
+                ));
+            }
+            Ok(RemoteEnvCmd::Add(RemoteEnvAddArgs {
+                name: args[1].clone(),
+                endpoint: args[2].clone(),
+                auth_mode: args.get(3).cloned().unwrap_or_else(|| "token".to_string()),
+            }))
+        }
+        "remove" => {
+            if args.len() < 2 {
+                return Err(anyhow!("usage: /remote-env remove <profile_id>"));
+            }
+            Ok(RemoteEnvCmd::Remove(RemoteEnvRemoveArgs {
+                profile_id: args[1].clone(),
+            }))
+        }
+        "check" => {
+            if args.len() < 2 {
+                return Err(anyhow!("usage: /remote-env check <profile_id>"));
+            }
+            Ok(RemoteEnvCmd::Check(RemoteEnvCheckArgs {
+                profile_id: args[1].clone(),
+            }))
+        }
+        _ => Err(anyhow!("unknown /remote-env subcommand: {sub}")),
+    }
+}
+
+fn compact_now(cwd: &Path, from_turn: Option<u64>) -> Result<CompactSummary> {
+    let store = Store::new(cwd)?;
+    let session = store
+        .load_latest_session()?
+        .ok_or_else(|| anyhow!("no session found to compact"))?;
+    let projection = store.rebuild_from_events(session.session_id)?;
+    if projection.transcript.is_empty() {
+        return Err(anyhow!("no transcript to compact"));
+    }
+    let from_turn = from_turn.unwrap_or(1).max(1);
+    let transcript_len = projection.transcript.len() as u64;
+    if from_turn > transcript_len {
+        return Err(anyhow!(
+            "from_turn {} exceeds transcript length {}",
+            from_turn,
+            transcript_len
+        ));
+    }
+    let selected = projection
+        .transcript
+        .iter()
+        .skip((from_turn - 1) as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    let summary_id = Uuid::now_v7();
+    let full_text = selected.join("\n");
+    let before_tokens = estimate_tokens(&full_text);
+    let summary_lines = selected
+        .iter()
+        .take(12)
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.len() > 200 {
+                format!("- {}...", &trimmed[..200])
+            } else {
+                format!("- {trimmed}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let summary = format!(
+        "Compaction summary {}\nfrom_turn: {}\nto_turn: {}\n\n{}",
+        summary_id,
+        from_turn,
+        transcript_len,
+        summary_lines.join("\n")
+    );
+    let token_delta_estimate = before_tokens as i64 - estimate_tokens(&summary) as i64;
+    let replay_pointer = format!(".deepseek/compactions/{summary_id}.md");
+    let summary_path = cwd.join(&replay_pointer);
+    if let Some(parent) = summary_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(summary_path, summary)?;
+    append_control_event(
+        cwd,
+        EventKind::ContextCompactedV1 {
+            summary_id,
+            from_turn,
+            to_turn: transcript_len,
+            token_delta_estimate,
+            replay_pointer,
+        },
+    )?;
+    Ok(CompactSummary {
+        summary_id,
+        from_turn,
+        to_turn: transcript_len,
+        token_delta_estimate,
+    })
+}
+
+fn rewind_now(
+    cwd: &Path,
+    to_checkpoint: Option<String>,
+) -> Result<deepseek_store::CheckpointRecord> {
+    let memory = MemoryManager::new(cwd)?;
+    let checkpoint_id = if let Some(value) = to_checkpoint.as_deref() {
+        Uuid::parse_str(value)?
+    } else {
+        memory
+            .list_checkpoints()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no checkpoints available"))?
+            .checkpoint_id
+    };
+    let checkpoint = memory.rewind_to_checkpoint(checkpoint_id)?;
+    append_control_event(
+        cwd,
+        EventKind::CheckpointRewoundV1 {
+            checkpoint_id: checkpoint.checkpoint_id,
+            reason: checkpoint.reason.clone(),
+        },
+    )?;
+    Ok(checkpoint)
+}
+
+fn teleport_now(cwd: &Path, args: TeleportArgs) -> Result<TeleportExecution> {
+    if let Some(import_path) = args.import {
+        let raw = fs::read_to_string(&import_path)?;
+        let _: serde_json::Value = serde_json::from_str(&raw)?;
+        return Ok(TeleportExecution {
+            imported: Some(import_path),
+            ..TeleportExecution::default()
+        });
+    }
+
+    let store = Store::new(cwd)?;
+    let session_id = if let Some(session_id) = args.session_id {
+        Uuid::parse_str(&session_id)?
+    } else {
+        ensure_session_record(cwd, &store)?.session_id
+    };
+    let projection = store.rebuild_from_events(session_id)?;
+    let bundle_id = Uuid::now_v7();
+    let output_path = args.output.map(PathBuf::from).unwrap_or_else(|| {
+        runtime_dir(cwd)
+            .join("teleport")
+            .join(format!("{bundle_id}.json"))
+    });
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = json!({
+        "bundle_id": bundle_id,
+        "session_id": session_id,
+        "created_at": Utc::now().to_rfc3339(),
+        "turns": projection.transcript,
+        "steps": projection.step_status,
+    });
+    fs::write(&output_path, serde_json::to_vec_pretty(&payload)?)?;
+    append_control_event(
+        cwd,
+        EventKind::TeleportBundleCreatedV1 {
+            bundle_id,
+            path: output_path.to_string_lossy().to_string(),
+        },
+    )?;
+    Ok(TeleportExecution {
+        bundle_id: Some(bundle_id),
+        path: Some(output_path.to_string_lossy().to_string()),
+        imported: None,
+    })
+}
+
+fn remote_env_now(cwd: &Path, cmd: RemoteEnvCmd) -> Result<serde_json::Value> {
+    let store = Store::new(cwd)?;
+    match cmd {
+        RemoteEnvCmd::List => {
+            let profiles = store.list_remote_env_profiles()?;
+            Ok(json!({"profiles": profiles}))
+        }
+        RemoteEnvCmd::Add(args) => {
+            let profile_id = Uuid::now_v7();
+            store.upsert_remote_env_profile(&deepseek_store::RemoteEnvProfileRecord {
+                profile_id,
+                name: args.name.clone(),
+                endpoint: args.endpoint.clone(),
+                auth_mode: args.auth_mode.clone(),
+                metadata_json: "{}".to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            })?;
+            append_control_event(
+                cwd,
+                EventKind::RemoteEnvConfiguredV1 {
+                    profile_id,
+                    name: args.name,
+                    endpoint: args.endpoint,
+                },
+            )?;
+            Ok(json!({"profile_id": profile_id, "configured": true}))
+        }
+        RemoteEnvCmd::Remove(args) => {
+            let profile_id = Uuid::parse_str(&args.profile_id)?;
+            store.remove_remote_env_profile(profile_id)?;
+            Ok(json!({"profile_id": profile_id, "removed": true}))
+        }
+        RemoteEnvCmd::Check(args) => {
+            let profile_id = Uuid::parse_str(&args.profile_id)?;
+            let profile = store
+                .load_remote_env_profile(profile_id)?
+                .ok_or_else(|| anyhow!("remote profile not found: {}", profile_id))?;
+            Ok(json!({
+                "profile_id": profile.profile_id,
+                "name": profile.name,
+                "endpoint": profile.endpoint,
+                "auth_mode": profile.auth_mode,
+                "reachable": true,
+            }))
+        }
+    }
 }
 
 fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Result<UiStatus> {
@@ -2685,10 +3159,26 @@ fn run_resume(cwd: &Path, args: RunArgs) -> Result<String> {
 fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
     match cmd {
         GitCmd::Status => {
+            let porcelain = run_process(cwd, "git", &["status", "--porcelain=2", "--branch"])?;
+            let summary = parse_git_status_summary(&porcelain);
             let output = run_process(cwd, "git", &["status", "--short"])?;
             if json_mode {
-                print_json(&json!({"command":"git status --short", "output": output}))?;
+                print_json(&json!({
+                    "command":"git status --short",
+                    "output": output,
+                    "summary": summary
+                }))?;
             } else {
+                println!(
+                    "branch={} ahead={} behind={} staged={} unstaged={} untracked={} conflicts={}",
+                    summary.branch.as_deref().unwrap_or("detached"),
+                    summary.ahead,
+                    summary.behind,
+                    summary.staged,
+                    summary.unstaged,
+                    summary.untracked,
+                    summary.conflicts
+                );
                 println!("{output}");
             }
         }
@@ -2787,10 +3277,40 @@ fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
             let strategy = args.strategy.to_ascii_lowercase();
             if strategy == "list" {
                 let output = run_process(cwd, "git", &["diff", "--name-only", "--diff-filter=U"])?;
+                let conflicts = output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                let suggestions = conflicts
+                    .iter()
+                    .map(|path| {
+                        json!({
+                            "file": path,
+                            "ours": format!("deepseek git resolve --strategy ours --file {path}"),
+                            "theirs": format!("deepseek git resolve --strategy theirs --file {path}")
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 if json_mode {
-                    print_json(&json!({"conflicts": output.lines().collect::<Vec<_>>() }))?;
+                    print_json(&json!({
+                        "conflicts": conflicts,
+                        "count": suggestions.len(),
+                        "suggestions": suggestions
+                    }))?;
+                } else if suggestions.is_empty() {
+                    println!("no merge conflicts");
                 } else {
                     println!("{output}");
+                    for item in suggestions {
+                        println!(
+                            "resolve {}: {} | {}",
+                            item["file"].as_str().unwrap_or_default(),
+                            item["ours"].as_str().unwrap_or_default(),
+                            item["theirs"].as_str().unwrap_or_default()
+                        );
+                    }
                 }
             } else {
                 let file = args
@@ -2813,6 +3333,60 @@ fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default, Serialize)]
+struct GitStatusSummary {
+    branch: Option<String>,
+    ahead: u64,
+    behind: u64,
+    staged: u64,
+    unstaged: u64,
+    untracked: u64,
+    conflicts: u64,
+}
+
+fn parse_git_status_summary(porcelain: &str) -> GitStatusSummary {
+    let mut summary = GitStatusSummary::default();
+    for line in porcelain.lines() {
+        if let Some(branch) = line.strip_prefix("# branch.head ") {
+            if branch != "(detached)" {
+                summary.branch = Some(branch.trim().to_string());
+            }
+            continue;
+        }
+        if let Some(ab) = line.strip_prefix("# branch.ab ") {
+            let mut parts = ab.split_whitespace();
+            if let Some(ahead) = parts.next().and_then(|part| part.strip_prefix('+')) {
+                summary.ahead = ahead.parse::<u64>().unwrap_or(0);
+            }
+            if let Some(behind) = parts.next().and_then(|part| part.strip_prefix('-')) {
+                summary.behind = behind.parse::<u64>().unwrap_or(0);
+            }
+            continue;
+        }
+        if line.starts_with("? ") {
+            summary.untracked += 1;
+            continue;
+        }
+        if line.starts_with("u ") {
+            summary.conflicts += 1;
+            continue;
+        }
+        if line.starts_with("1 ") || line.starts_with("2 ") {
+            let xy = line.split_whitespace().nth(1).unwrap_or("..");
+            let mut chars = xy.chars();
+            let x = chars.next().unwrap_or('.');
+            let y = chars.next().unwrap_or('.');
+            if x != '.' && x != ' ' {
+                summary.staged += 1;
+            }
+            if y != '.' && y != ' ' {
+                summary.unstaged += 1;
+            }
+        }
+    }
+    summary
 }
 
 fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<()> {
@@ -2923,6 +3497,13 @@ fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<()> {
             let session_id = Uuid::parse_str(&args.session_id)?;
             let store = Store::new(cwd)?;
             let events = read_session_events(cwd, session_id)?;
+            let validation = validate_replay_events(&events);
+            if cfg.replay.strict_mode && !validation.passed {
+                return Err(anyhow!(
+                    "strict replay validation failed: {}",
+                    serde_json::to_string(&validation)?
+                ));
+            }
             let projection = store.rebuild_from_events(session_id)?;
             let events_replayed = events.len() as u64;
             let tool_results_replayed = events
@@ -2938,6 +3519,7 @@ fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<()> {
                 "turns": projection.transcript.len(),
                 "steps": projection.step_status.len(),
                 "router_models": projection.router_models,
+                "validation": validation,
             });
             store.insert_replay_cassette(&ReplayCassetteRecord {
                 cassette_id: Uuid::now_v7(),
@@ -2963,6 +3545,68 @@ fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ReplayValidation {
+    passed: bool,
+    monotonic_seq: bool,
+    missing_tool_results: Vec<String>,
+    orphan_tool_results: Vec<String>,
+}
+
+fn validate_replay_events(events: &[EventEnvelope]) -> ReplayValidation {
+    use std::collections::{BTreeSet, HashSet};
+
+    let mut proposed = HashSet::new();
+    let mut approved = HashSet::new();
+    let mut results = HashSet::new();
+    let mut missing_tool_results = BTreeSet::new();
+    let mut orphan_tool_results = BTreeSet::new();
+
+    let mut monotonic_seq = true;
+    let mut last_seq = 0_u64;
+    for event in events {
+        if event.seq_no < last_seq {
+            monotonic_seq = false;
+        }
+        last_seq = event.seq_no;
+        match &event.kind {
+            EventKind::ToolProposedV1 { proposal } => {
+                if proposal.approved {
+                    proposed.insert(proposal.invocation_id);
+                }
+            }
+            EventKind::ToolApprovedV1 { invocation_id } => {
+                approved.insert(*invocation_id);
+            }
+            EventKind::ToolResultV1 { result } => {
+                results.insert(result.invocation_id);
+            }
+            _ => {}
+        }
+    }
+
+    for invocation_id in proposed.union(&approved) {
+        if !results.contains(invocation_id) {
+            missing_tool_results.insert(invocation_id.to_string());
+        }
+    }
+    for invocation_id in &results {
+        if !approved.contains(invocation_id) && !proposed.contains(invocation_id) {
+            orphan_tool_results.insert(invocation_id.to_string());
+        }
+    }
+
+    let missing_tool_results = missing_tool_results.into_iter().collect::<Vec<_>>();
+    let orphan_tool_results = orphan_tool_results.into_iter().collect::<Vec<_>>();
+    let passed = monotonic_seq && missing_tool_results.is_empty() && orphan_tool_results.is_empty();
+    ReplayValidation {
+        passed,
+        monotonic_seq,
+        missing_tool_results,
+        orphan_tool_results,
+    }
 }
 
 fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()> {
@@ -3052,125 +3696,55 @@ fn run_background(cwd: &Path, cmd: BackgroundCmd, json_mode: bool) -> Result<()>
 }
 
 fn run_teleport(cwd: &Path, args: TeleportArgs, json_mode: bool) -> Result<()> {
-    if let Some(import_path) = args.import {
-        let raw = fs::read_to_string(&import_path)?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
+    let result = teleport_now(cwd, args)?;
+    if let Some(imported) = result.imported {
         if json_mode {
-            print_json(&json!({"imported": true, "bundle": value}))?;
+            print_json(&json!({"imported": true, "path": imported}))?;
         } else {
-            println!("imported teleport bundle from {}", import_path);
+            println!("imported teleport bundle from {}", imported);
         }
-        return Ok(());
-    }
-
-    let store = Store::new(cwd)?;
-    let session_id = if let Some(session_id) = args.session_id {
-        Uuid::parse_str(&session_id)?
     } else {
-        ensure_session_record(cwd, &store)?.session_id
-    };
-    let projection = store.rebuild_from_events(session_id)?;
-    let bundle_id = Uuid::now_v7();
-    let output_path = args.output.map(PathBuf::from).unwrap_or_else(|| {
-        runtime_dir(cwd)
-            .join("teleport")
-            .join(format!("{bundle_id}.json"))
-    });
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let payload = json!({
-        "bundle_id": bundle_id,
-        "session_id": session_id,
-        "created_at": Utc::now().to_rfc3339(),
-        "turns": projection.transcript,
-        "steps": projection.step_status,
-    });
-    fs::write(&output_path, serde_json::to_vec_pretty(&payload)?)?;
-    append_control_event(
-        cwd,
-        EventKind::TeleportBundleCreatedV1 {
-            bundle_id,
-            path: output_path.to_string_lossy().to_string(),
-        },
-    )?;
-    if json_mode {
-        print_json(&json!({"bundle_id": bundle_id, "path": output_path}))?;
-    } else {
-        println!("teleport bundle created at {}", output_path.display());
+        let bundle_id = result
+            .bundle_id
+            .ok_or_else(|| anyhow!("missing bundle id for teleport export"))?;
+        let path = result
+            .path
+            .ok_or_else(|| anyhow!("missing output path for teleport export"))?;
+        if json_mode {
+            print_json(&json!({"bundle_id": bundle_id, "path": path}))?;
+        } else {
+            println!("teleport bundle created at {}", path);
+        }
     }
     Ok(())
 }
 
 fn run_remote_env(cwd: &Path, cmd: RemoteEnvCmd, json_mode: bool) -> Result<()> {
-    let store = Store::new(cwd)?;
-    match cmd {
-        RemoteEnvCmd::List => {
-            let profiles = store.list_remote_env_profiles()?;
-            if json_mode {
-                print_json(&profiles)?;
-            } else if profiles.is_empty() {
-                println!("no remote environment profiles configured");
-            } else {
-                for profile in profiles {
-                    println!(
-                        "{} {} {}",
-                        profile.profile_id, profile.name, profile.endpoint
-                    );
-                }
+    let payload = remote_env_now(cwd, cmd)?;
+    if json_mode {
+        if payload.get("profiles").is_some() {
+            print_json(payload.get("profiles").unwrap_or(&serde_json::Value::Null))?;
+        } else {
+            print_json(&payload)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(profiles) = payload.get("profiles").and_then(|v| v.as_array()) {
+        if profiles.is_empty() {
+            println!("no remote environment profiles configured");
+        } else {
+            for profile in profiles {
+                println!(
+                    "{} {} {}",
+                    profile["profile_id"].as_str().unwrap_or_default(),
+                    profile["name"].as_str().unwrap_or_default(),
+                    profile["endpoint"].as_str().unwrap_or_default()
+                );
             }
         }
-        RemoteEnvCmd::Add(args) => {
-            let profile_id = Uuid::now_v7();
-            store.upsert_remote_env_profile(&deepseek_store::RemoteEnvProfileRecord {
-                profile_id,
-                name: args.name.clone(),
-                endpoint: args.endpoint.clone(),
-                auth_mode: args.auth_mode.clone(),
-                metadata_json: "{}".to_string(),
-                updated_at: Utc::now().to_rfc3339(),
-            })?;
-            append_control_event(
-                cwd,
-                EventKind::RemoteEnvConfiguredV1 {
-                    profile_id,
-                    name: args.name,
-                    endpoint: args.endpoint,
-                },
-            )?;
-            if json_mode {
-                print_json(&json!({"profile_id": profile_id, "configured": true}))?;
-            } else {
-                println!("remote profile configured: {}", profile_id);
-            }
-        }
-        RemoteEnvCmd::Remove(args) => {
-            let profile_id = Uuid::parse_str(&args.profile_id)?;
-            store.remove_remote_env_profile(profile_id)?;
-            if json_mode {
-                print_json(&json!({"profile_id": profile_id, "removed": true}))?;
-            } else {
-                println!("remote profile removed: {}", profile_id);
-            }
-        }
-        RemoteEnvCmd::Check(args) => {
-            let profile_id = Uuid::parse_str(&args.profile_id)?;
-            let profile = store
-                .load_remote_env_profile(profile_id)?
-                .ok_or_else(|| anyhow!("remote profile not found: {}", profile_id))?;
-            let payload = json!({
-                "profile_id": profile.profile_id,
-                "name": profile.name,
-                "endpoint": profile.endpoint,
-                "auth_mode": profile.auth_mode,
-                "reachable": true,
-            });
-            if json_mode {
-                print_json(&payload)?;
-            } else {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            }
-        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     }
     Ok(())
 }

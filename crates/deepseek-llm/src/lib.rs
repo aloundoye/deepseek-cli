@@ -113,22 +113,32 @@ impl DeepSeekClient {
         } else {
             self.cfg.temperature
         };
+        let mut messages = Vec::new();
+        if !self.cfg.language.trim().is_empty() && !self.cfg.language.eq_ignore_ascii_case("en") {
+            messages.push(json!({
+                "role": "system",
+                "content": format!(
+                    "Respond in {} unless the user explicitly asks for another language.",
+                    self.cfg.language
+                )
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": req.prompt
+        }));
 
         match self.cfg.provider.to_ascii_lowercase().as_str() {
             "openai" => json!({
                 "model": req.model,
-                "messages": [
-                    {"role": "user", "content": req.prompt}
-                ],
+                "messages": messages,
                 "temperature": temperature,
                 "stream": self.cfg.stream,
                 "max_tokens": max_tokens
             }),
             _ => json!({
                 "model": req.model,
-                "messages": [
-                    {"role": "user", "content": req.prompt}
-                ],
+                "messages": messages,
                 "temperature": temperature,
                 "stream": self.cfg.stream,
                 "max_tokens": max_tokens
@@ -301,6 +311,7 @@ mod tests {
             prompt: "hello".to_string(),
             model: "deepseek-chat".to_string(),
             max_tokens: 16_000,
+            non_urgent: false,
         });
         assert_eq!(payload["max_tokens"], 2048);
     }
@@ -319,8 +330,33 @@ mod tests {
                 prompt: "hello".to_string(),
                 model: "any".to_string(),
                 max_tokens: 128,
+                non_urgent: false,
             })
             .expect("fallback");
         assert!(out.text.contains("Offline response"));
+    }
+
+    #[test]
+    fn adds_language_system_instruction_when_not_english() {
+        let cfg = LlmConfig {
+            language: "es".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let payload = client.build_payload(&LlmRequest {
+            unit: deepseek_core::LlmUnit::Planner,
+            prompt: "hola".to_string(),
+            model: "deepseek-chat".to_string(),
+            max_tokens: 128,
+            non_urgent: false,
+        });
+        let messages = payload["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Respond in es")
+        );
     }
 }

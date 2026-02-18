@@ -4,6 +4,7 @@
 - Produce immutable binaries for Linux, macOS, and Windows.
 - Publish checksums for every artifact.
 - Generate SBOM per release.
+- Generate provenance attestation for release artifacts.
 - Publish package-manager update paths (Homebrew + Winget).
 - Keep downgrade path available through versioned release assets.
 
@@ -17,6 +18,7 @@ Each tagged release (`vX.Y.Z`) publishes:
 - `deepseek-aarch64-pc-windows-msvc.zip`
 - `checksums.txt`
 - `sbom.spdx.json`
+- provenance attestation (GitHub artifact attestation)
 
 All assets are generated from `cargo build --release --bin deepseek`.
 
@@ -26,7 +28,7 @@ All assets are generated from `cargo build --release --bin deepseek`.
 3. Create and push tag:
    - `git tag vX.Y.Z`
    - `git push origin vX.Y.Z`
-4. GitHub Actions `release.yml` builds artifacts and creates the release.
+4. GitHub Actions `release.yml` builds artifacts, SBOM, and provenance attestation, then creates the release.
 5. Validate checksums and run installer smoke checks.
 6. Homebrew tap update workflow (`homebrew.yml`) publishes formula update.
 7. Winget update workflow (`winget.yml`) publishes manifest update.

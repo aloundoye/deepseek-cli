@@ -11,7 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tantivy.workspace = true
-walkdir.workspace = true
 notify.workspace = true
 uuid.workspace = true
+ignore.workspace = true
 deepseek-core = { path = "../deepseek-core" }

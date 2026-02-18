@@ -496,6 +496,13 @@ fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
 }
 
 fn run_json(workspace: &Path, args: &[&str]) -> Value {
+    let runtime = workspace.join(".deepseek");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    fs::write(
+        runtime.join("settings.local.json"),
+        r#"{"llm":{"offline_fallback":true}}"#,
+    )
+    .expect("settings override");
     let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
         .current_dir(workspace)
         .args(args)

@@ -140,9 +140,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.15.4"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b7b6141e96a8c160799cc2d5adecd5cbbe5054cb8c7c4af53da0f83bb7ad256"
+checksum = "d9a7b350e3bb1767102698302bc37256cbd48422809984b98d292c40e2579aa9"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -581,17 +581,18 @@ dependencies = [
  "chrono",
  "deepseek-core",
  "deepseek-llm",
+ "deepseek-memory",
  "deepseek-observe",
  "deepseek-policy",
  "deepseek-router",
  "deepseek-store",
  "deepseek-subagent",
  "deepseek-tools",
+ "ignore",
  "serde",
  "serde_json",
  "sha2",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -664,13 +665,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deepseek-core",
+ "ignore",
  "notify",
  "serde",
  "serde_json",
  "sha2",
  "tantivy",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -729,6 +730,7 @@ name = "deepseek-policy"
 version = "0.1.0"
 dependencies = [
  "deepseek-core",
+ "glob",
  "regex",
  "serde",
  "serde_json",
@@ -800,9 +802,11 @@ dependencies = [
  "deepseek-diff",
  "deepseek-hooks",
  "deepseek-index",
+ "deepseek-memory",
  "deepseek-policy",
  "deepseek-store",
  "glob",
+ "ignore",
  "regex",
  "reqwest",
  "serde",
@@ -1174,6 +1178,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "globset"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1466,6 +1483,22 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d782a365a015e0f5c04902246139249abf769125006fbe7649e2ee88169b4a"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]

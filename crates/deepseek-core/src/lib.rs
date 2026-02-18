@@ -425,6 +425,8 @@ pub struct LlmRequest {
     pub prompt: String,
     pub model: String,
     pub max_tokens: u32,
+    #[serde(default)]
+    pub non_urgent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,6 +566,7 @@ pub struct LlmConfig {
     pub base_model: String,
     pub max_think_model: String,
     pub provider: String,
+    pub context_window_tokens: u64,
     pub temperature: f32,
     pub endpoint: String,
     pub api_key_env: String,
@@ -583,6 +586,7 @@ impl Default for LlmConfig {
             base_model: DEEPSEEK_V32_CHAT_MODEL.to_string(),
             max_think_model: DEEPSEEK_V32_REASONER_MODEL.to_string(),
             provider: "deepseek".to_string(),
+            context_window_tokens: 1_000_000,
             temperature: 0.2,
             endpoint: "https://api.deepseek.com/chat/completions".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
@@ -593,7 +597,7 @@ impl Default for LlmConfig {
             max_retries: 3,
             retry_base_ms: 400,
             stream: true,
-            offline_fallback: true,
+            offline_fallback: false,
         }
     }
 }
@@ -636,6 +640,8 @@ pub struct PolicyConfig {
     pub approve_edits: String,
     pub approve_bash: String,
     pub allowlist: Vec<String>,
+    pub block_paths: Vec<String>,
+    pub redact_patterns: Vec<String>,
     pub sandbox_mode: String,
 }
 
@@ -652,6 +658,19 @@ impl Default for PolicyConfig {
                 "cargo test".to_string(),
                 "cargo fmt --check".to_string(),
                 "cargo clippy".to_string(),
+            ],
+            block_paths: vec![
+                ".env".to_string(),
+                ".ssh".to_string(),
+                ".aws".to_string(),
+                ".gnupg".to_string(),
+                "**/id_*".to_string(),
+                "**/secret".to_string(),
+            ],
+            redact_patterns: vec![
+                "(?i)(api[_-]?key|token|secret|password)\\s*[:=]\\s*['\\\"]?[a-z0-9_\\-]{8,}['\\\"]?".to_string(),
+                "\\b\\d{3}-\\d{2}-\\d{4}\\b".to_string(),
+                "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b".to_string(),
             ],
             sandbox_mode: "allowlist".to_string(),
         }
@@ -762,7 +781,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            enable_tui: false,
+            enable_tui: true,
             keybindings_path: "~/.deepseek/keybindings.json".to_string(),
             reduced_motion: false,
             statusline_mode: "minimal".to_string(),
@@ -795,6 +814,8 @@ pub struct SchedulingConfig {
     pub off_peak: bool,
     pub off_peak_start_hour: u8,
     pub off_peak_end_hour: u8,
+    pub defer_non_urgent: bool,
+    pub max_defer_seconds: u64,
 }
 
 impl Default for SchedulingConfig {
@@ -803,6 +824,8 @@ impl Default for SchedulingConfig {
             off_peak: false,
             off_peak_start_hour: 0,
             off_peak_end_hour: 6,
+            defer_non_urgent: false,
+            max_defer_seconds: 0,
         }
     }
 }

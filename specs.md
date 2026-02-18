@@ -22,7 +22,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 
 | Feature | Description |
 |---------|-------------|
-| **Terminal-native CLI** | Full shell integration, interactive REPL with rich TUI. |
+| **Terminal-native CLI** | Full shell integration, interactive REPL with rich TUI with Ratatui. |
 | **Cross-platform** | macOS 13.0+, Ubuntu 20.04+/Debian 10+, Windows 10+ (WSL/Git Bash). |
 | **Multiple installation methods** | Native binary, Homebrew, Winget, direct download. |
 | **Session persistence** | Resume sessions with `deepseek run`; checkpointing via event log. |

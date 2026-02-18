@@ -6,12 +6,14 @@ use deepseek_core::{
     SessionBudgets, SessionState, StepOutcome, ToolCall, ToolHost,
 };
 use deepseek_llm::{DeepSeekClient, LlmClient};
+use deepseek_memory::MemoryManager;
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
 use deepseek_store::{ProviderMetricRecord, Store, SubagentRunRecord};
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
 use deepseek_tools::LocalToolHost;
+use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -19,55 +21,86 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
-pub struct SimplePlanner;
+pub struct SchemaPlanner;
 
-impl Planner for SimplePlanner {
+impl Planner for SchemaPlanner {
     fn create_plan(&self, ctx: PlanContext) -> Result<Plan> {
-        let mut steps = vec![
-            PlanStep {
+        let prompt_lower = ctx.user_prompt.to_ascii_lowercase();
+        let mut steps = vec![PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Analyze scope and locate relevant modules".to_string(),
+            intent: "search".to_string(),
+            tools: vec![
+                "index.query".to_string(),
+                "fs.grep".to_string(),
+                "fs.read".to_string(),
+            ],
+            files: vec![],
+            done: false,
+        }];
+
+        if prompt_lower.contains("git")
+            || prompt_lower.contains("branch")
+            || prompt_lower.contains("commit")
+            || prompt_lower.contains("pr")
+        {
+            steps.push(PlanStep {
                 step_id: Uuid::now_v7(),
-                title: "Locate relevant modules".to_string(),
-                intent: "search".to_string(),
+                title: "Assess repository status and history".to_string(),
+                intent: "git".to_string(),
+                tools: vec!["git.status".to_string(), "git.diff".to_string()],
+                files: vec![],
+                done: false,
+            });
+        }
+
+        if prompt_lower.contains("refactor")
+            || prompt_lower.contains("implement")
+            || prompt_lower.contains("fix")
+            || prompt_lower.contains("change")
+            || prompt_lower.contains("update")
+            || prompt_lower.contains("patch")
+        {
+            steps.push(PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Implement code and config updates".to_string(),
+                intent: "edit".to_string(),
                 tools: vec![
-                    "index.query".to_string(),
-                    "fs.search_rg".to_string(),
-                    "fs.read".to_string(),
+                    "fs.edit".to_string(),
+                    "patch.stage".to_string(),
+                    "patch.apply".to_string(),
                 ],
                 files: vec![],
                 done: false,
-            },
-            PlanStep {
-                step_id: Uuid::now_v7(),
-                title: "Implement changes".to_string(),
-                intent: "edit".to_string(),
-                tools: vec!["patch.stage".to_string(), "patch.apply".to_string()],
-                files: vec![],
-                done: false,
-            },
-            PlanStep {
-                step_id: Uuid::now_v7(),
-                title: "Run verification".to_string(),
-                intent: "verify".to_string(),
-                tools: vec!["bash.run".to_string()],
-                files: vec![],
-                done: false,
-            },
-        ];
+            });
+        }
 
-        if ctx.user_prompt.to_lowercase().contains("docs") {
+        if prompt_lower.contains("docs")
+            || prompt_lower.contains("readme")
+            || prompt_lower.contains("guide")
+        {
             steps.push(PlanStep {
                 step_id: Uuid::now_v7(),
                 title: "Update docs".to_string(),
                 intent: "docs".to_string(),
-                tools: vec!["patch.stage".to_string(), "patch.apply".to_string()],
+                tools: vec!["fs.edit".to_string(), "patch.stage".to_string()],
                 files: vec!["README.md".to_string()],
                 done: false,
             });
         }
+
+        steps.push(PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Run verification and collect outcomes".to_string(),
+            intent: "verify".to_string(),
+            tools: vec!["bash.run".to_string()],
+            files: vec![],
+            done: false,
+        });
 
         Ok(Plan {
             plan_id: Uuid::now_v7(),
@@ -75,11 +108,13 @@ impl Planner for SimplePlanner {
             goal: ctx.user_prompt,
             assumptions: vec![
                 "Workspace is writable".to_string(),
-                "Offline LLM mode is acceptable by default".to_string(),
+                "DeepSeek API key is configured or offline fallback is explicitly enabled"
+                    .to_string(),
             ],
             steps,
             verification: vec![
                 "cargo fmt --all -- --check".to_string(),
+                "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
                 "cargo test --workspace".to_string(),
             ],
             risk_notes: vec!["May require approval for patch apply and bash.run".to_string()],
@@ -89,17 +124,23 @@ impl Planner for SimplePlanner {
     fn revise_plan(&self, _ctx: PlanContext, last_plan: &Plan, failure: Failure) -> Result<Plan> {
         let mut revised = last_plan.clone();
         revised.version += 1;
+        revised.steps.retain(|step| !step.done);
         revised.steps.push(PlanStep {
             step_id: Uuid::now_v7(),
-            title: "Recovery: resolve failure".to_string(),
+            title: "Recovery: inspect failure and apply targeted fix".to_string(),
             intent: "recover".to_string(),
-            tools: vec!["fs.search_rg".to_string(), "fs.read".to_string()],
+            tools: vec![
+                "fs.grep".to_string(),
+                "fs.read".to_string(),
+                "fs.edit".to_string(),
+            ],
             files: vec![],
             done: false,
         });
-        revised
-            .risk_notes
-            .push(format!("revision due to failure: {}", failure.summary));
+        revised.risk_notes.push(format!(
+            "revision due to failure: {} ({})",
+            failure.summary, failure.detail
+        ));
         Ok(revised)
     }
 }
@@ -159,7 +200,7 @@ impl Executor for SimpleExecutor {
 pub struct AgentEngine {
     workspace: PathBuf,
     store: Store,
-    planner: SimplePlanner,
+    planner: SchemaPlanner,
     router: WeightedRouter,
     llm: Box<dyn LlmClient + Send + Sync>,
     observer: Observer,
@@ -182,7 +223,7 @@ impl AgentEngine {
         Ok(Self {
             workspace: workspace.to_path_buf(),
             store,
-            planner: SimplePlanner,
+            planner: SchemaPlanner,
             router,
             llm,
             observer,
@@ -213,14 +254,21 @@ impl AgentEngine {
     }
 
     pub fn plan_only(&self, prompt: &str) -> Result<Plan> {
-        self.plan_only_with_mode(prompt, false)
+        self.plan_only_with_mode(prompt, false, false)
     }
 
-    fn plan_only_with_mode(&self, prompt: &str, force_max_think: bool) -> Result<Plan> {
+    fn plan_only_with_mode(
+        &self,
+        prompt: &str,
+        force_max_think: bool,
+        non_urgent: bool,
+    ) -> Result<Plan> {
         let mut session = self.ensure_session()?;
         self.transition(&mut session, SessionState::Planning)?;
-        let reference_expanded_prompt = expand_prompt_references(&self.workspace, prompt, true)
-            .unwrap_or_else(|_| prompt.to_string());
+        let context_augmented_prompt = self.augment_prompt_context(session.session_id, prompt)?;
+        let reference_expanded_prompt =
+            expand_prompt_references(&self.workspace, &context_augmented_prompt, true)
+                .unwrap_or_else(|_| context_augmented_prompt.clone());
         let redacted_prompt = self.policy.redact(&reference_expanded_prompt);
         let planner_request = build_planner_prompt(&redacted_prompt);
 
@@ -265,6 +313,7 @@ impl AgentEngine {
                 prompt: planner_request.clone(),
                 model: decision.selected_model.clone(),
                 max_tokens: session.budgets.max_think_tokens,
+                non_urgent,
             },
         )?;
         self.emit(
@@ -301,6 +350,7 @@ impl AgentEngine {
                     prompt: planner_request,
                     model: self.cfg.llm.max_think_model.clone(),
                     max_tokens: session.budgets.max_think_tokens,
+                    non_urgent,
                 },
             )?;
             self.emit(
@@ -341,7 +391,7 @@ impl AgentEngine {
     }
 
     pub fn run_once(&self, prompt: &str, allow_tools: bool) -> Result<String> {
-        self.run_once_with_mode(prompt, allow_tools, false)
+        self.run_once_with_mode_and_priority(prompt, allow_tools, false, false)
     }
 
     pub fn run_once_with_mode(
@@ -349,6 +399,16 @@ impl AgentEngine {
         prompt: &str,
         allow_tools: bool,
         force_max_think: bool,
+    ) -> Result<String> {
+        self.run_once_with_mode_and_priority(prompt, allow_tools, force_max_think, false)
+    }
+
+    pub fn run_once_with_mode_and_priority(
+        &self,
+        prompt: &str,
+        allow_tools: bool,
+        force_max_think: bool,
+        non_urgent: bool,
     ) -> Result<String> {
         let mut session = self.ensure_session()?;
         self.emit(
@@ -359,14 +419,17 @@ impl AgentEngine {
             },
         )?;
 
-        let mut plan = self.plan_only_with_mode(prompt, force_max_think)?;
+        let mut plan = self.plan_only_with_mode(prompt, force_max_think, non_urgent)?;
         session = self.ensure_session()?;
         self.transition(&mut session, SessionState::ExecutingStep)?;
         let _subagent_notes = self.run_subagents(session.session_id, &plan)?;
         let mut failure_streak = 0_u32;
+        let mut execution_failed = false;
+        let mut step_cursor = 0usize;
+        let mut revision_budget = self.cfg.router.max_escalations_per_unit.max(1) as usize;
 
-        for idx in 0..plan.steps.len() {
-            let step = plan.steps[idx].clone();
+        while step_cursor < plan.steps.len() {
+            let step = plan.steps[step_cursor].clone();
             let call = self.call_for_step(&step, &plan);
             let proposal = self.tool_host.propose(call);
             self.emit(
@@ -407,7 +470,7 @@ impl AgentEngine {
                 }
             };
 
-            plan.steps[idx].done = outcome.success;
+            plan.steps[step_cursor].done = outcome.success;
             self.emit(
                 session.session_id,
                 EventKind::StepMarkedV1 {
@@ -419,6 +482,11 @@ impl AgentEngine {
 
             if !outcome.success {
                 failure_streak += 1;
+                if revision_budget == 0 {
+                    execution_failed = true;
+                    break;
+                }
+                revision_budget = revision_budget.saturating_sub(1);
                 let revised = self.planner.revise_plan(
                     PlanContext {
                         session: session.clone(),
@@ -438,38 +506,46 @@ impl AgentEngine {
                     },
                 )?;
                 plan = revised;
-                break;
+                step_cursor = 0;
+                continue;
             }
+            step_cursor += 1;
         }
 
-        self.transition(&mut session, SessionState::Verifying)?;
+        if execution_failed {
+            self.transition(&mut session, SessionState::Failed)?;
+        } else {
+            self.transition(&mut session, SessionState::Verifying)?;
+        }
         let mut verification_failures = 0_u32;
-        for cmd in &plan.verification {
-            let proposal = self.tool_host.propose(ToolCall {
-                name: "bash.run".to_string(),
-                args: json!({"cmd": cmd}),
-                requires_approval: true,
-            });
-            let (ok, output) = if proposal.approved || allow_tools {
-                let result = self.tool_host.execute(ApprovedToolCall {
-                    invocation_id: proposal.invocation_id,
-                    call: proposal.call,
+        if !execution_failed {
+            for cmd in &plan.verification {
+                let proposal = self.tool_host.propose(ToolCall {
+                    name: "bash.run".to_string(),
+                    args: json!({"cmd": cmd}),
+                    requires_approval: true,
                 });
-                (result.success, result.output.to_string())
-            } else {
-                (false, "approval required".to_string())
-            };
+                let (ok, output) = if proposal.approved || allow_tools {
+                    let result = self.tool_host.execute(ApprovedToolCall {
+                        invocation_id: proposal.invocation_id,
+                        call: proposal.call,
+                    });
+                    (result.success, result.output.to_string())
+                } else {
+                    (false, "approval required".to_string())
+                };
 
-            self.emit(
-                session.session_id,
-                EventKind::VerificationRunV1 {
-                    command: cmd.clone(),
-                    success: ok,
-                    output,
-                },
-            )?;
-            if !ok {
-                verification_failures += 1;
+                self.emit(
+                    session.session_id,
+                    EventKind::VerificationRunV1 {
+                        command: cmd.clone(),
+                        success: ok,
+                        output,
+                    },
+                )?;
+                if !ok {
+                    verification_failures += 1;
+                }
             }
         }
 
@@ -515,13 +591,18 @@ impl AgentEngine {
             )?;
         }
 
-        self.transition(&mut session, SessionState::Completed)?;
+        if execution_failed || verification_failures > 0 {
+            self.transition(&mut session, SessionState::Failed)?;
+        } else {
+            self.transition(&mut session, SessionState::Completed)?;
+        }
 
         let projection = self.store.rebuild_from_events(session.session_id)?;
         Ok(format!(
-            "session={} steps={} router_models={:?} base_model={} max_model={}",
+            "session={} steps={} failures={} router_models={:?} base_model={} max_model={}",
             session.session_id,
             projection.step_status.len(),
+            failure_streak + verification_failures,
             projection.router_models,
             self.cfg.llm.base_model,
             self.cfg.llm.max_think_model
@@ -609,8 +690,7 @@ impl AgentEngine {
                 task.name, task.role, task.team, task.goal
             ))
         });
-        let mut results = results;
-        results.sort_by_key(|result| result.run_id);
+        let merged_summary = self.subagents.merge_results(&results);
         let mut notes = Vec::new();
         for result in results {
             let updated_at = Utc::now().to_rfc3339();
@@ -636,7 +716,6 @@ impl AgentEngine {
                     created_at,
                     updated_at,
                 })?;
-                notes.push(result.output);
             } else {
                 let error = result
                     .error
@@ -660,6 +739,9 @@ impl AgentEngine {
                 })?;
             }
         }
+        if !merged_summary.is_empty() {
+            notes.push(merged_summary);
+        }
         Ok(notes)
     }
 
@@ -680,17 +762,26 @@ impl AgentEngine {
             let hour = Utc::now().hour() as u8;
             let start = self.cfg.scheduling.off_peak_start_hour;
             let end = self.cfg.scheduling.off_peak_end_hour;
-            let in_window = if start <= end {
-                hour >= start && hour < end
-            } else {
-                hour >= start || hour < end
-            };
+            let in_window = in_off_peak_window(hour, start, end);
             if !in_window {
                 let resume_after = next_off_peak_start(start);
+                let mut reason = "outside_off_peak_window".to_string();
+                if req.non_urgent && self.cfg.scheduling.defer_non_urgent {
+                    let delay = seconds_until_off_peak_start(hour, start);
+                    let capped_delay = if self.cfg.scheduling.max_defer_seconds == 0 {
+                        delay
+                    } else {
+                        delay.min(self.cfg.scheduling.max_defer_seconds)
+                    };
+                    if capped_delay > 0 {
+                        reason = format!("outside_off_peak_window_deferred_{}s", capped_delay);
+                        thread::sleep(std::time::Duration::from_secs(capped_delay));
+                    }
+                }
                 self.emit(
                     session_id,
                     EventKind::OffPeakScheduledV1 {
-                        reason: "outside_off_peak_window".to_string(),
+                        reason,
                         resume_after,
                     },
                 )?;
@@ -736,6 +827,67 @@ impl AgentEngine {
         }
 
         Ok(response)
+    }
+
+    fn augment_prompt_context(&self, session_id: Uuid, prompt: &str) -> Result<String> {
+        let projection = self.store.rebuild_from_events(session_id)?;
+        let transcript = projection.transcript;
+        let transcript_text = transcript.join("\n");
+        let transcript_tokens = estimate_tokens(&transcript_text);
+        let threshold = (self.cfg.llm.context_window_tokens as f32
+            * self.cfg.context.auto_compact_threshold.clamp(0.1, 1.0))
+            as u64;
+
+        let mut blocks = Vec::new();
+        if transcript_tokens >= threshold && !transcript.is_empty() {
+            if transcript.len() >= 20 && transcript.len().is_multiple_of(10) {
+                let summary = summarize_transcript(&transcript, 30);
+                let summary_id = Uuid::now_v7();
+                let replay_pointer = format!(".deepseek/compactions/{summary_id}.md");
+                let summary_path =
+                    deepseek_core::runtime_dir(&self.workspace).join(&replay_pointer);
+                if let Some(parent) = summary_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&summary_path, &summary)?;
+                self.emit(
+                    session_id,
+                    EventKind::ContextCompactedV1 {
+                        summary_id,
+                        from_turn: 1,
+                        to_turn: transcript.len() as u64,
+                        token_delta_estimate: transcript_tokens as i64
+                            - estimate_tokens(&summary) as i64,
+                        replay_pointer,
+                    },
+                )?;
+                blocks.push(format!("[auto_compaction]\n{summary}"));
+            }
+        } else if !transcript.is_empty() {
+            let recent = transcript
+                .iter()
+                .rev()
+                .take(16)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            blocks.push(format!("[recent_transcript]\n{recent}"));
+        }
+
+        if let Ok(memory) = MemoryManager::new(&self.workspace)?.read_combined_memory()
+            && !memory.trim().is_empty()
+        {
+            blocks.push(format!("[memory]\n{memory}"));
+        }
+
+        if blocks.is_empty() {
+            Ok(prompt.to_string())
+        } else {
+            Ok(format!("{prompt}\n\n{}", blocks.join("\n\n")))
+        }
     }
 
     fn prompt_cache_dir(&self) -> PathBuf {
@@ -820,6 +972,11 @@ impl AgentEngine {
                 args: json!({"query": plan.goal, "limit": 10}),
                 requires_approval: false,
             },
+            "git" => ToolCall {
+                name: "git.status".to_string(),
+                args: json!({}),
+                requires_approval: false,
+            },
             "edit" => ToolCall {
                 name: "patch.stage".to_string(),
                 args: json!({
@@ -829,6 +986,21 @@ impl AgentEngine {
                     ),
                     "base": ""
                 }),
+                requires_approval: false,
+            },
+            "docs" => ToolCall {
+                name: "fs.edit".to_string(),
+                args: json!({
+                    "path": "README.md",
+                    "search": "## Verification",
+                    "replace": "## Verification\n- Ensure DeepSeek API key is configured for strict-online mode.\n",
+                    "all": false
+                }),
+                requires_approval: false,
+            },
+            "recover" => ToolCall {
+                name: "fs.grep".to_string(),
+                args: json!({"pattern":"error|failed|panic","glob":"**/*","limit":25}),
                 requires_approval: false,
             },
             "verify" => ToolCall {
@@ -993,6 +1165,7 @@ struct PromptReference {
     path: String,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    force_dir: bool,
 }
 
 fn expand_prompt_references(
@@ -1017,32 +1190,18 @@ fn expand_prompt_references(
             continue;
         }
 
-        if full.is_dir() {
+        if reference.force_dir || full.is_dir() {
             let mut shown = 0usize;
             extra.push_str(&format!(
                 "- {} -> directory {}\n",
                 reference.raw, reference.path
             ));
-            for entry in WalkDir::new(&full).into_iter().filter_map(Result::ok) {
-                let entry_path = entry.path();
-                let rel = match entry_path.strip_prefix(workspace) {
-                    Ok(rel) => rel,
-                    Err(_) => continue,
-                };
-                if respect_gitignore && has_ignored_component(rel) {
-                    continue;
-                }
-                if entry.file_type().is_file() {
-                    extra.push_str(&format!(
-                        "  - {}\n",
-                        rel.to_string_lossy().replace('\\', "/")
-                    ));
-                    shown += 1;
-                    if shown >= 50 {
-                        extra.push_str("  - ... (truncated)\n");
-                        break;
-                    }
-                }
+            for rel in walk_workspace_files(workspace, &full, respect_gitignore, 50) {
+                extra.push_str(&format!("  - {rel}\n"));
+                shown += 1;
+            }
+            if shown >= 50 {
+                extra.push_str("  - ... (truncated)\n");
             }
             continue;
         }
@@ -1093,8 +1252,16 @@ fn parse_prompt_reference(token: &str) -> Option<PromptReference> {
     let mut path = body.to_string();
     let mut start_line = None;
     let mut end_line = None;
-    if let Some(idx) = body.rfind(':') {
-        let (candidate_path, range) = body.split_at(idx);
+    let mut force_dir = false;
+
+    if let Some(rest) = body.strip_prefix("dir:") {
+        path = rest.to_string();
+        force_dir = true;
+    } else if let Some(rest) = body.strip_prefix("file:") {
+        path = rest.to_string();
+    }
+    if let Some(idx) = path.rfind(':') {
+        let (candidate_path, range) = path.split_at(idx);
         let range = &range[1..];
         if let Some((start, end)) = parse_line_range(range) {
             path = candidate_path.to_string();
@@ -1108,6 +1275,7 @@ fn parse_prompt_reference(token: &str) -> Option<PromptReference> {
         path,
         start_line,
         end_line,
+        force_dir,
     })
 }
 
@@ -1163,6 +1331,44 @@ fn has_ignored_component(path: &Path) -> bool {
     })
 }
 
+fn walk_workspace_files(
+    workspace: &Path,
+    root: &Path,
+    respect_gitignore: bool,
+    limit: usize,
+) -> Vec<String> {
+    let mut builder = WalkBuilder::new(root);
+    builder.hidden(false);
+    builder.follow_links(false);
+    builder.parents(respect_gitignore);
+    builder.git_ignore(respect_gitignore);
+    builder.git_global(respect_gitignore);
+    builder.git_exclude(respect_gitignore);
+    builder.require_git(false);
+
+    let mut out = Vec::new();
+    for entry in builder.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(workspace) else {
+            continue;
+        };
+        if has_ignored_component(rel) {
+            continue;
+        }
+        out.push(rel.to_string_lossy().replace('\\', "/"));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
 fn prompt_cache_key(provider: &str, model: &str, prompt: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(provider.as_bytes());
@@ -1187,9 +1393,51 @@ fn next_off_peak_start(start_hour: u8) -> String {
     now.to_rfc3339()
 }
 
+fn in_off_peak_window(hour: u8, start: u8, end: u8) -> bool {
+    if start <= end {
+        hour >= start && hour < end
+    } else {
+        hour >= start || hour < end
+    }
+}
+
+fn seconds_until_off_peak_start(current_hour: u8, start_hour: u8) -> u64 {
+    let now_minutes = (current_hour as u64) * 60;
+    let start_minutes = (start_hour as u64) * 60;
+    let minutes_until = if now_minutes <= start_minutes {
+        start_minutes - now_minutes
+    } else {
+        (24 * 60 - now_minutes) + start_minutes
+    };
+    minutes_until * 60
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     // Rough token estimate for local accounting and status reporting.
     (text.chars().count() as u64).div_ceil(4)
+}
+
+fn summarize_transcript(transcript: &[String], max_lines: usize) -> String {
+    let mut lines = transcript
+        .iter()
+        .rev()
+        .take(max_lines)
+        .cloned()
+        .collect::<Vec<_>>();
+    lines.reverse();
+    let rendered = lines
+        .into_iter()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.len() > 240 {
+                format!("- {}...", &trimmed[..240])
+            } else {
+                format!("- {trimmed}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Auto-compacted transcript summary:\n{rendered}")
 }
 
 fn is_valid_transition(from: &SessionState, to: &SessionState) -> bool {
@@ -1254,11 +1502,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_file_and_dir_reference_prefixes() {
+        let refs = extract_prompt_references("look at @file:src/main.rs:4 and @dir:crates");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "src/main.rs");
+        assert_eq!(refs[0].start_line, Some(4));
+        assert_eq!(refs[1].path, "crates");
+        assert!(refs[1].force_dir);
+    }
+
+    #[test]
+    fn expands_dir_reference_with_gitignore_respect() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-agent-dir-ref-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(workspace.join("src")).expect("workspace");
+        fs::create_dir_all(workspace.join("target")).expect("target");
+        fs::write(workspace.join("src/lib.rs"), "fn alpha() {}\n").expect("seed");
+        fs::write(workspace.join("target/build.log"), "ignore me\n").expect("seed");
+
+        let expanded = expand_prompt_references(&workspace, "scan @dir:.", true).expect("expand");
+        assert!(expanded.contains("src/lib.rs"));
+        assert!(!expanded.contains("target/build.log"));
+    }
+
+    #[test]
     fn prompt_cache_key_is_stable() {
         let a = prompt_cache_key("deepseek", "deepseek-chat", "hello");
         let b = prompt_cache_key("deepseek", "deepseek-chat", "hello");
         let c = prompt_cache_key("deepseek", "deepseek-chat", "hello!");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn computes_off_peak_window_and_delay() {
+        assert!(in_off_peak_window(1, 0, 6));
+        assert!(!in_off_peak_window(12, 0, 6));
+        assert_eq!(seconds_until_off_peak_start(12, 0), 43_200);
+        assert_eq!(seconds_until_off_peak_start(2, 3), 3_600);
+    }
+
+    #[test]
+    fn summarizes_transcript_with_line_cap() {
+        let transcript = (0..50)
+            .map(|idx| format!("user: line {idx}"))
+            .collect::<Vec<_>>();
+        let summary = summarize_transcript(&transcript, 5);
+        assert!(summary.contains("line 45"));
+        assert!(!summary.contains("line 1"));
     }
 }

@@ -9,6 +9,7 @@ license.workspace = true
 regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+glob.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 
 [dev-dependencies]

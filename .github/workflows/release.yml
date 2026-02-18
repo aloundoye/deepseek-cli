@@ -83,6 +83,8 @@ jobs:
     needs: build
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/download-artifact@v4
@@ -110,6 +112,15 @@ jobs:
           path: .
           format: spdx-json
           output-file: dist/sbom.spdx.json
+
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/deepseek-*.tar.gz
+            dist/deepseek-*.zip
+            dist/checksums.txt
+            dist/sbom.spdx.json
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

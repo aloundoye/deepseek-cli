@@ -49,6 +49,13 @@ impl MemoryManager {
         self.workspace.join("DEEPSEEK.md")
     }
 
+    pub fn global_memory_path() -> Option<PathBuf> {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        Some(PathBuf::from(home).join(".deepseek/DEEPSEEK.md"))
+    }
+
     pub fn ensure_initialized(&self) -> Result<PathBuf> {
         let path = self.memory_path();
         if path.exists() {
@@ -63,6 +70,29 @@ impl MemoryManager {
     pub fn read_memory(&self) -> Result<String> {
         let path = self.ensure_initialized()?;
         Ok(fs::read_to_string(path)?)
+    }
+
+    pub fn read_combined_memory(&self) -> Result<String> {
+        let mut chunks = Vec::new();
+        if let Some(global) = Self::global_memory_path()
+            && global.exists()
+            && let Ok(text) = fs::read_to_string(&global)
+        {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                chunks.push(format!("[global:{}]\n{}", global.display(), trimmed));
+            }
+        }
+        let project = self.read_memory()?;
+        let project_trimmed = project.trim();
+        if !project_trimmed.is_empty() {
+            chunks.push(format!(
+                "[project:{}]\n{}",
+                self.memory_path().display(),
+                project_trimmed
+            ));
+        }
+        Ok(chunks.join("\n\n"))
     }
 
     pub fn write_memory(&self, content: &str) -> Result<()> {

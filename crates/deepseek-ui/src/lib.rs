@@ -12,7 +12,9 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,10 +31,11 @@ pub enum SlashCommand {
     Rewind(Vec<String>),
     Export(Vec<String>),
     Plan,
-    Teleport,
-    RemoteEnv,
+    Teleport(Vec<String>),
+    RemoteEnv(Vec<String>),
     Status,
     Effort(Option<String>),
+    Skills(Vec<String>),
     Unknown { name: String, args: Vec<String> },
 }
 
@@ -59,10 +62,11 @@ impl SlashCommand {
             "rewind" => Self::Rewind(args),
             "export" => Self::Export(args),
             "plan" => Self::Plan,
-            "teleport" => Self::Teleport,
-            "remote-env" => Self::RemoteEnv,
+            "teleport" => Self::Teleport(args),
+            "remote-env" => Self::RemoteEnv(args),
             "status" => Self::Status,
             "effort" => Self::Effort(args.first().cloned()),
+            "skills" => Self::Skills(args),
             other => Self::Unknown {
                 name: other.to_string(),
                 args,
@@ -131,6 +135,21 @@ pub struct KeyBindings {
     pub paste_hint: KeyEvent,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct KeyBindingsFile {
+    exit: Option<String>,
+    submit: Option<String>,
+    newline: Option<String>,
+    stop: Option<String>,
+    rewind_menu: Option<String>,
+    autocomplete: Option<String>,
+    background: Option<String>,
+    toggle_raw: Option<String>,
+    history_prev: Option<String>,
+    paste_hint: Option<String>,
+}
+
 impl Default for KeyBindings {
     fn default() -> Self {
         Self {
@@ -148,7 +167,62 @@ impl Default for KeyBindings {
     }
 }
 
+impl KeyBindings {
+    fn apply_overrides(mut self, raw: KeyBindingsFile) -> Result<Self> {
+        if let Some(value) = raw.exit {
+            self.exit = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.submit {
+            self.submit = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.newline {
+            self.newline = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.stop {
+            self.stop = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.rewind_menu {
+            self.rewind_menu = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.autocomplete {
+            self.autocomplete = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.background {
+            self.background = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.toggle_raw {
+            self.toggle_raw = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.history_prev {
+            self.history_prev = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.paste_hint {
+            self.paste_hint = parse_key_event(&value)?;
+        }
+        Ok(self)
+    }
+}
+
+pub fn load_keybindings(path: &Path) -> Result<KeyBindings> {
+    let raw = fs::read_to_string(path)?;
+    let parsed: KeyBindingsFile = serde_json::from_str(&raw)?;
+    KeyBindings::default().apply_overrides(parsed)
+}
+
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    run_tui_shell_with_bindings(status, KeyBindings::default(), move |prompt| {
+        on_submit(prompt)
+    })
+}
+
+pub fn run_tui_shell_with_bindings<F>(
+    status: UiStatus,
+    bindings: KeyBindings,
+    mut on_submit: F,
+) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
 {
@@ -163,7 +237,6 @@ where
     let mut info_line =
         String::from("Ctrl+C exit | Ctrl+O toggle raw | Ctrl+B background hint | Ctrl+V paste");
     let mut show_raw = false;
-    let bindings = KeyBindings::default();
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
 
@@ -314,10 +387,13 @@ where
                     "remote-env",
                     "status",
                     "effort",
+                    "skills",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
                 }
+            } else if let Some(completed) = autocomplete_path_input(&input) {
+                input = completed;
             }
             continue;
         }
@@ -370,6 +446,110 @@ where
     Ok(())
 }
 
+fn parse_key_event(value: &str) -> Result<KeyEvent> {
+    let mut modifiers = KeyModifiers::NONE;
+    let mut key_code: Option<KeyCode> = None;
+    for token in value
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let normalized = token.to_ascii_lowercase();
+        match normalized.as_str() {
+            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+            "shift" => modifiers |= KeyModifiers::SHIFT,
+            "alt" | "option" => modifiers |= KeyModifiers::ALT,
+            other => {
+                key_code = Some(
+                    parse_key_code(other)
+                        .ok_or_else(|| anyhow::anyhow!("unsupported keybinding token: {token}"))?,
+                );
+            }
+        }
+    }
+    let code = key_code.ok_or_else(|| anyhow::anyhow!("missing key code in keybinding"))?;
+    Ok(KeyEvent::new(code, modifiers))
+}
+
+fn parse_key_code(value: &str) -> Option<KeyCode> {
+    match value {
+        "enter" => Some(KeyCode::Enter),
+        "esc" | "escape" => Some(KeyCode::Esc),
+        "tab" => Some(KeyCode::Tab),
+        "up" => Some(KeyCode::Up),
+        "down" => Some(KeyCode::Down),
+        "left" => Some(KeyCode::Left),
+        "right" => Some(KeyCode::Right),
+        "backspace" => Some(KeyCode::Backspace),
+        "space" => Some(KeyCode::Char(' ')),
+        value if value.chars().count() == 1 => value.chars().next().map(KeyCode::Char),
+        _ => None,
+    }
+}
+
+fn autocomplete_path_input(input: &str) -> Option<String> {
+    let split_at = input
+        .char_indices()
+        .rfind(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx + 1)
+        .unwrap_or(0);
+    let token = input[split_at..].trim();
+    if token.is_empty() {
+        return None;
+    }
+    let completed = autocomplete_path_token(token)?;
+    let mut out = String::with_capacity(input.len() + completed.len() + 2);
+    out.push_str(&input[..split_at]);
+    out.push_str(&completed);
+    Some(out)
+}
+
+fn autocomplete_path_token(token: &str) -> Option<String> {
+    let (display_token, lookup_token) = if token == "~" || token.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        let rest = token.trim_start_matches("~/");
+        (token.to_string(), PathBuf::from(home).join(rest))
+    } else {
+        (token.to_string(), PathBuf::from(token))
+    };
+
+    let cwd = std::env::current_dir().ok()?;
+    let absolute_lookup = if lookup_token.is_absolute() {
+        lookup_token
+    } else {
+        cwd.join(lookup_token)
+    };
+    let parent = absolute_lookup.parent()?.to_path_buf();
+    let prefix = absolute_lookup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(parent).ok()?.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let mut candidate = name.to_string();
+        if entry.path().is_dir() {
+            candidate.push('/');
+        }
+        matches.push(candidate);
+    }
+    matches.sort();
+    matches.dedup();
+    if matches.len() != 1 {
+        return None;
+    }
+    let replacement = matches.into_iter().next()?;
+    let cut = display_token.len().saturating_sub(prefix.len());
+    let base = &display_token[..cut];
+    Some(format!("{base}{replacement}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +568,17 @@ mod tests {
                 "local".to_string()
             ]))
         );
+        assert_eq!(
+            SlashCommand::parse("/remote-env list"),
+            Some(SlashCommand::RemoteEnv(vec!["list".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/skills run refactor"),
+            Some(SlashCommand::Skills(vec![
+                "run".to_string(),
+                "refactor".to_string()
+            ]))
+        );
     }
 
     #[test]
@@ -401,5 +592,34 @@ mod tests {
         });
         assert!(line.contains("model=deepseek-chat"));
         assert!(line.contains("autopilot=running"));
+    }
+
+    #[test]
+    fn loads_keybindings_from_json_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("deepseek-ui-bindings-{nonce}"));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("keybindings.json");
+        fs::write(
+            &path,
+            r#"{
+  "exit": "ctrl+x",
+  "autocomplete": "tab",
+  "toggle_raw": "ctrl+o"
+}"#,
+        )
+        .expect("write");
+        let bindings = load_keybindings(&path).expect("load");
+        assert_eq!(
+            bindings.exit,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            bindings.autocomplete,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+        );
     }
 }

@@ -10,8 +10,10 @@ use deepseek_core::{
 use deepseek_diff::PatchStore;
 use deepseek_hooks::{HookContext, HookRuntime};
 use deepseek_index::IndexService;
+use deepseek_memory::MemoryManager;
 use deepseek_policy::PolicyEngine;
 use deepseek_store::Store;
+use ignore::WalkBuilder;
 pub use plugins::{
     CatalogPlugin, PluginCommandPrompt, PluginInfo, PluginManager, PluginVerifyResult,
 };
@@ -23,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
@@ -165,13 +166,12 @@ impl LocalToolHost {
                 let mut matches = Vec::new();
                 let compiled = glob::Pattern::new(pattern)
                     .map_err(|err| anyhow!("invalid glob pattern '{pattern}': {err}"))?;
-                for entry in WalkDir::new(&base_path).into_iter().filter_map(Result::ok) {
-                    let path = entry.path();
+                for path in walk_paths(&base_path, &self.workspace, respect_gitignore) {
                     let rel_path = match path.strip_prefix(&self.workspace) {
                         Ok(rel) => rel,
                         Err(_) => continue,
                     };
-                    if respect_gitignore && has_ignored_component(rel_path) {
+                    if should_skip_rel_path(rel_path) {
                         continue;
                     }
                     let rel = normalize_rel_path(rel_path);
@@ -222,11 +222,7 @@ impl LocalToolHost {
                     .case_insensitive(!case_sensitive)
                     .build()?;
                 let mut matches = Vec::new();
-                for entry in WalkDir::new(&self.workspace)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
-                    let path = entry.path();
+                for path in walk_paths(&self.workspace, &self.workspace, respect_gitignore) {
                     if !path.is_file() {
                         continue;
                     }
@@ -234,14 +230,14 @@ impl LocalToolHost {
                         Ok(rel) => rel,
                         Err(_) => continue,
                     };
-                    if respect_gitignore && has_ignored_component(rel_path) {
+                    if should_skip_rel_path(rel_path) {
                         continue;
                     }
                     let rel = normalize_rel_path(rel_path);
                     if !compiled_glob.matches(&rel) {
                         continue;
                     }
-                    let bytes = match fs::read(path) {
+                    let bytes = match fs::read(&path) {
                         Ok(bytes) => bytes,
                         Err(_) => continue,
                     };
@@ -303,6 +299,7 @@ impl LocalToolHost {
                     }));
                 }
 
+                let checkpoint = self.create_checkpoint("fs_edit")?;
                 fs::write(&full, &after)?;
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
@@ -311,7 +308,8 @@ impl LocalToolHost {
                     "edited": true,
                     "replacements": replacements,
                     "before_sha256": before_sha,
-                    "after_sha256": after_sha
+                    "after_sha256": after_sha,
+                    "checkpoint_id": checkpoint.map(|id| id.to_string())
                 }))
             }
             "fs.search_rg" => {
@@ -326,19 +324,16 @@ impl LocalToolHost {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
                 let mut matches = Vec::new();
-                for entry in WalkDir::new(&self.workspace)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
-                    if !entry.path().is_file() {
+                for path in walk_paths(&self.workspace, &self.workspace, true) {
+                    if !path.is_file() {
                         continue;
                     }
-                    let rel_path = entry.path().strip_prefix(&self.workspace)?;
-                    if has_ignored_component(rel_path) {
+                    let rel_path = path.strip_prefix(&self.workspace)?;
+                    if should_skip_rel_path(rel_path) {
                         continue;
                     }
                     let rel = rel_path.to_string_lossy().to_string();
-                    if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(content) = fs::read_to_string(&path) {
                         for (idx, line) in content.lines().enumerate() {
                             if line.contains(q) {
                                 matches.push(json!({"path": rel, "line": idx + 1, "text": line}));
@@ -418,8 +413,12 @@ impl LocalToolHost {
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                let checkpoint = self.create_checkpoint("fs_write")?;
                 fs::write(full, content)?;
-                Ok(json!({"written": true}))
+                Ok(json!({
+                    "written": true,
+                    "checkpoint_id": checkpoint.map(|id| id.to_string())
+                }))
             }
             "bash.run" => {
                 let cmd = call
@@ -477,10 +476,37 @@ impl ToolHost for LocalToolHost {
     }
 }
 
-fn has_ignored_component(path: &Path) -> bool {
+fn should_skip_rel_path(path: &Path) -> bool {
     path.components().any(|c| {
         c.as_os_str() == ".git" || c.as_os_str() == ".deepseek" || c.as_os_str() == "target"
     })
+}
+
+fn walk_paths(root: &Path, workspace: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
+    let mut builder = WalkBuilder::new(root);
+    builder.hidden(false);
+    builder.follow_links(false);
+    builder.parents(respect_gitignore);
+    builder.git_ignore(respect_gitignore);
+    builder.git_global(respect_gitignore);
+    builder.git_exclude(respect_gitignore);
+    builder.require_git(false);
+
+    let mut paths = Vec::new();
+    for entry in builder.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(workspace) else {
+            continue;
+        };
+        if should_skip_rel_path(rel) {
+            continue;
+        }
+        paths.push(path.to_path_buf());
+    }
+    paths
 }
 
 fn normalize_rel_path(path: &Path) -> String {
@@ -695,6 +721,27 @@ impl LocalToolHost {
         };
         let _ = self.store.append_event(&event);
     }
+
+    fn create_checkpoint(&self, reason: &str) -> Result<Option<Uuid>> {
+        let manager = MemoryManager::new(&self.workspace)?;
+        let checkpoint = manager.create_checkpoint(reason)?;
+        let Ok(Some(session)) = self.store.load_latest_session() else {
+            return Ok(Some(checkpoint.checkpoint_id));
+        };
+        let event = EventEnvelope {
+            seq_no: self.store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::CheckpointCreatedV1 {
+                checkpoint_id: checkpoint.checkpoint_id,
+                reason: checkpoint.reason,
+                files_count: checkpoint.files_count,
+                snapshot_path: checkpoint.snapshot_path,
+            },
+        };
+        self.store.append_event(&event)?;
+        Ok(Some(checkpoint.checkpoint_id))
+    }
 }
 
 #[cfg(test)]
@@ -827,6 +874,40 @@ mod tests {
         assert_eq!(edited.output["edited"], true);
         let content = fs::read_to_string(workspace.join("src/main.rs")).expect("updated");
         assert!(content.contains("new_name"));
+    }
+
+    #[test]
+    fn fs_glob_respects_gitignore_rules() {
+        let (workspace, host) = temp_host();
+        fs::create_dir_all(workspace.join("ignored")).expect("ignored dir");
+        fs::create_dir_all(workspace.join("src")).expect("src");
+        fs::write(workspace.join(".gitignore"), "ignored/\n").expect("gitignore");
+        fs::write(workspace.join("ignored/secret.txt"), "secret\n").expect("secret");
+        fs::write(workspace.join("src/main.rs"), "fn main() {}\n").expect("main");
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "fs.glob".to_string(),
+                args: json!({"pattern":"**/*","respectGitignore":true}),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        let paths = result
+            .output
+            .get("matches")
+            .and_then(|items| items.as_array())
+            .expect("matches")
+            .iter()
+            .filter_map(|item| item.get("path").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path.ends_with("src/main.rs")));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.ends_with("ignored/secret.txt"))
+        );
     }
 
     #[test]

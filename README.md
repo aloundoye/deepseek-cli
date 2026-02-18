@@ -10,21 +10,26 @@ It provides planning, execution, patching, indexing, plugin/hooks extensibility,
 - Cross-platform runtime (Linux, macOS, Windows)
 - CLI JSON mode for automation (`--json`)
 - Plugin, skills, hooks, MCP integrations
+- Strict-online default (`DEEPSEEK_API_KEY` required unless offline fallback is explicitly enabled)
+- Rich terminal UI default for `deepseek chat`
+- 1M context-window configuration with automatic context compaction near threshold
 
 ## Install
 
-### GitHub release installer (recommended)
+### GitHub release installer (recommended, no source checkout)
 
 macOS/Linux:
 
 ```bash
-bash scripts/install.sh --version latest
+curl -fsSL https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main/scripts/install.sh | bash -s -- --version latest
 ```
 
 Windows (PowerShell):
 
 ```powershell
-./scripts/install.ps1 -Version latest
+$script = Join-Path $env:TEMP "deepseek-install.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main/scripts/install.ps1 -OutFile $script
+& $script -Version latest
 ```
 
 ### Homebrew
@@ -50,14 +55,15 @@ cargo build --release --bin deepseek
 ## Quickstart
 
 ```bash
-cargo run --bin deepseek -- --json plan "Implement feature X"
-cargo run --bin deepseek -- chat
-cargo run --bin deepseek -- autopilot "Execute and verify task" --hours 4
+export DEEPSEEK_API_KEY="<your-key>"
+deepseek --json plan "Implement feature X"
+deepseek chat
+deepseek autopilot "Execute and verify task" --hours 4
 ```
 
 ## Command Overview
 
-- `deepseek chat [--tools] [--tui]`
+- `deepseek chat [--tools] [--tui]` (TUI is default in interactive terminals)
 - `deepseek ask "<prompt>" [--tools]`
 - `deepseek plan "<prompt>"`
 - `deepseek run [session-id]`
@@ -90,7 +96,7 @@ Global flag:
 Interactive slash commands:
 - `/help`, `/init`, `/clear`, `/compact`, `/memory`, `/config`, `/model`
 - `/cost`, `/mcp`, `/rewind`, `/export`, `/plan`, `/teleport`, `/remote-env`
-- `/status`, `/effort`
+- `/status`, `/effort`, `/skills`
 
 ## Configuration
 
@@ -108,6 +114,13 @@ Additional config files:
 
 Sample config:
 - `config.example.json`
+
+Hospital-focused safety recommendations:
+- Keep `llm.offline_fallback=false` and require `DEEPSEEK_API_KEY`.
+- Set `llm.context_window_tokens=1000000` (default) and tune `context.auto_compact_threshold`.
+- Use strict `[policy].block_paths` and `[policy].redact_patterns` for PHI/secret redaction.
+- Enable `[scheduling].off_peak=true` with `[scheduling].defer_non_urgent=true` for non-urgent autopilot runs.
+- Keep `[telemetry].enabled=false` unless your compliance policy explicitly allows remote telemetry.
 
 ## Plugin/Skill Layout
 
