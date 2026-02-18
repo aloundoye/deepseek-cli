@@ -16,8 +16,10 @@ use deepseek_ui::{
     KeyBindings, SlashCommand, UiStatus, load_keybindings, render_statusline,
     run_tui_shell_with_bindings,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -88,6 +90,14 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCmd,
     },
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCmd,
+    },
+    Permissions {
+        #[command(subcommand)]
+        command: PermissionsCmd,
+    },
     Plugins {
         #[command(subcommand)]
         command: PluginCmd,
@@ -136,6 +146,8 @@ struct AutopilotArgs {
     #[arg(long)]
     stop_file: Option<String>,
     #[arg(long)]
+    pause_file: Option<String>,
+    #[arg(long)]
     heartbeat_file: Option<String>,
     #[arg(long, default_value_t = 10)]
     max_consecutive_failures: u64,
@@ -144,6 +156,7 @@ struct AutopilotArgs {
 #[derive(Subcommand)]
 enum AutopilotCmd {
     Status(AutopilotStatusArgs),
+    Pause(AutopilotPauseArgs),
     Stop(AutopilotStopArgs),
     Resume(AutopilotResumeArgs),
 }
@@ -152,10 +165,22 @@ enum AutopilotCmd {
 struct AutopilotStatusArgs {
     #[arg(long)]
     run_id: Option<String>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    follow: bool,
+    #[arg(long)]
+    samples: Option<u64>,
+    #[arg(long, default_value_t = 2)]
+    interval_seconds: u64,
 }
 
 #[derive(Args)]
 struct AutopilotStopArgs {
+    #[arg(long)]
+    run_id: Option<String>,
+}
+
+#[derive(Args)]
+struct AutopilotPauseArgs {
     #[arg(long)]
     run_id: Option<String>,
 }
@@ -177,7 +202,34 @@ struct RunArgs {
 }
 
 #[derive(Args, Default)]
-struct ProfileArgs {}
+struct ProfileArgs {
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    benchmark: bool,
+    #[arg(long, default_value_t = 5)]
+    benchmark_cases: usize,
+    #[arg(long)]
+    benchmark_seed: Option<u64>,
+    #[arg(long)]
+    benchmark_suite: Option<String>,
+    #[arg(long)]
+    benchmark_pack: Option<String>,
+    #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
+    benchmark_signing_key_env: String,
+    #[arg(long)]
+    benchmark_min_success_rate: Option<f64>,
+    #[arg(long)]
+    benchmark_min_quality_rate: Option<f64>,
+    #[arg(long)]
+    benchmark_max_p95_ms: Option<u64>,
+    #[arg(long)]
+    benchmark_baseline: Option<String>,
+    #[arg(long)]
+    benchmark_max_regression_ms: Option<u64>,
+    #[arg(long = "benchmark-compare")]
+    benchmark_compare: Vec<String>,
+    #[arg(long)]
+    benchmark_output: Option<String>,
+}
 
 #[derive(Args)]
 struct ApplyArgs {
@@ -472,6 +524,61 @@ enum ConfigCmd {
 }
 
 #[derive(Subcommand)]
+enum BenchmarkCmd {
+    ListPacks,
+    ShowPack(BenchmarkShowPackArgs),
+    ImportPack(BenchmarkImportPackArgs),
+}
+
+#[derive(Args)]
+struct BenchmarkShowPackArgs {
+    name: String,
+}
+
+#[derive(Args)]
+struct BenchmarkImportPackArgs {
+    name: String,
+    source: String,
+}
+
+#[derive(Subcommand)]
+enum PermissionsCmd {
+    Show,
+    Set(PermissionsSetArgs),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum PermissionModeArg {
+    Ask,
+    Always,
+    Never,
+}
+
+impl PermissionModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
+#[derive(Args, Default)]
+struct PermissionsSetArgs {
+    #[arg(long)]
+    approve_bash: Option<PermissionModeArg>,
+    #[arg(long)]
+    approve_edits: Option<PermissionModeArg>,
+    #[arg(long)]
+    sandbox_mode: Option<String>,
+    #[arg(long = "allow")]
+    allow: Vec<String>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    clear_allowlist: bool,
+}
+
+#[derive(Subcommand)]
 enum PluginCmd {
     List(PluginListArgs),
     Install(PluginInstallArgs),
@@ -527,6 +634,7 @@ fn main() -> Result<()> {
         Commands::Chat(args) => run_chat(&cwd, cli.json, args.tools, args.tui),
         Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),
         Commands::Ask(args) => {
+            ensure_llm_ready(&cwd, cli.json)?;
             let engine = AgentEngine::new(&cwd)?;
             let output = engine.run_once(&args.prompt, args.tools)?;
             if cli.json {
@@ -537,6 +645,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Plan(args) => {
+            ensure_llm_ready(&cwd, cli.json)?;
             let engine = AgentEngine::new(&cwd)?;
             let plan = engine.plan_only(&args.prompt)?;
             if cli.json {
@@ -547,7 +656,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Run(args) => {
-            let output = run_resume(&cwd, args)?;
+            let output = run_resume(&cwd, args, cli.json)?;
             if cli.json {
                 print_json(&json!({"output": output}))?;
             } else {
@@ -574,6 +683,8 @@ fn main() -> Result<()> {
         Commands::Doctor(args) => run_doctor(&cwd, args, cli.json),
         Commands::Index { command } => run_index(&cwd, command, cli.json),
         Commands::Config { command } => run_config(&cwd, command, cli.json),
+        Commands::Benchmark { command } => run_benchmark(cwd.as_path(), command, cli.json),
+        Commands::Permissions { command } => run_permissions(&cwd, command, cli.json),
         Commands::Plugins { command } => run_plugins(&cwd, command, cli.json),
         Commands::Clean(args) => run_clean(&cwd, args, cli.json),
     }
@@ -582,6 +693,7 @@ fn main() -> Result<()> {
 fn run_autopilot_cmd(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result<()> {
     match args.command {
         Some(AutopilotCmd::Status(status)) => run_autopilot_status(cwd, status, json_mode),
+        Some(AutopilotCmd::Pause(pause)) => run_autopilot_pause(cwd, pause, json_mode),
         Some(AutopilotCmd::Stop(stop)) => run_autopilot_stop(cwd, stop, json_mode),
         Some(AutopilotCmd::Resume(resume)) => run_autopilot_resume(cwd, resume, json_mode),
         None => {
@@ -602,6 +714,7 @@ fn run_autopilot_cmd(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result
                     sleep_seconds: args.sleep_seconds,
                     retry_delay_seconds: args.retry_delay_seconds,
                     stop_file: args.stop_file,
+                    pause_file: args.pause_file,
                     heartbeat_file: args.heartbeat_file,
                     max_consecutive_failures: args.max_consecutive_failures,
                 },
@@ -609,6 +722,64 @@ fn run_autopilot_cmd(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result
             )
         }
     }
+}
+
+fn ensure_llm_ready(cwd: &Path, json_mode: bool) -> Result<()> {
+    let cfg = AppConfig::ensure(cwd)?;
+    ensure_llm_ready_with_cfg(&cfg, json_mode)
+}
+
+fn ensure_llm_ready_with_cfg(cfg: &AppConfig, json_mode: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let provider = cfg.llm.provider.trim().to_ascii_lowercase();
+    if provider != "deepseek" && provider != "openai" {
+        return Err(anyhow!(
+            "unsupported llm.provider='{}' (supported: deepseek, openai)",
+            cfg.llm.provider
+        ));
+    }
+    if cfg.llm.offline_fallback {
+        return Ok(());
+    }
+
+    let env_key = cfg.llm.api_key_env.trim();
+    if env_key.is_empty() {
+        return Err(anyhow!(
+            "llm.api_key_env is empty; set it in .deepseek/settings.json"
+        ));
+    }
+
+    if std::env::var(env_key)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let interactive_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if json_mode || !interactive_tty {
+        return Err(anyhow!(
+            "{} is required when llm.offline_fallback=false. Set it and retry.",
+            env_key
+        ));
+    }
+
+    eprintln!(
+        "API key is required to use provider '{}' (offline fallback is disabled).",
+        cfg.llm.provider
+    );
+    let prompt = format!("Enter {}: ", env_key);
+    let key = rpassword::prompt_password(prompt)?;
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("received empty API key"));
+    }
+    // SAFETY: We set process-local environment for this CLI process before worker threads start.
+    unsafe {
+        std::env::set_var(env_key, trimmed);
+    }
+    Ok(())
 }
 
 struct AutopilotStartArgs {
@@ -623,6 +794,7 @@ struct AutopilotStartArgs {
     sleep_seconds: u64,
     retry_delay_seconds: u64,
     stop_file: Option<String>,
+    pause_file: Option<String>,
     heartbeat_file: Option<String>,
     max_consecutive_failures: u64,
 }
@@ -641,6 +813,7 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
     if args.max_consecutive_failures == 0 {
         return Err(anyhow!("--max-consecutive-failures must be greater than 0"));
     }
+    ensure_llm_ready(cwd, json_mode)?;
 
     let engine = AgentEngine::new(cwd)?;
     let store = Store::new(cwd)?;
@@ -653,6 +826,11 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| runtime_dir(cwd).join("autopilot.stop"));
+    let pause_file = args
+        .pause_file
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| autopilot_pause_path(&stop_file));
     let heartbeat_file = args
         .heartbeat_file
         .as_deref()
@@ -722,12 +900,13 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
             "7200 seconds (default)".to_string()
         };
         println!(
-            "autopilot started: tools={} max_think={} runtime={} max_iterations={:?} stop_file={} heartbeat_file={}",
+            "autopilot started: tools={} max_think={} runtime={} max_iterations={:?} stop_file={} pause_file={} heartbeat_file={}",
             args.tools,
             args.max_think,
             runtime,
             args.max_iterations,
             stop_file.display(),
+            pause_file.display(),
             heartbeat_file.display(),
         );
     }
@@ -736,6 +915,7 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
     let mut failed_iterations = 0_u64;
     let mut consecutive_failures = 0_u64;
     let mut last_error: Option<String> = None;
+    let mut paused_state = false;
 
     write_autopilot_heartbeat(
         &heartbeat_file,
@@ -747,6 +927,7 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
             "failed_iterations": failed_iterations,
             "consecutive_failures": consecutive_failures,
             "stop_file": stop_file,
+            "pause_file": pause_file,
         }),
     )?;
 
@@ -776,6 +957,113 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
         }
         if stop_file.exists() {
             break "stop_file_detected".to_string();
+        }
+        if pause_file.exists() {
+            if !paused_state {
+                paused_state = true;
+                store.upsert_autopilot_run(&AutopilotRunRecord {
+                    run_id,
+                    session_id: session.session_id,
+                    prompt: args.prompt.clone(),
+                    status: "paused".to_string(),
+                    stop_reason: None,
+                    completed_iterations,
+                    failed_iterations,
+                    consecutive_failures,
+                    last_error: last_error.clone(),
+                    stop_file: stop_file.to_string_lossy().to_string(),
+                    heartbeat_file: heartbeat_file.to_string_lossy().to_string(),
+                    tools: args.tools,
+                    max_think: args.max_think,
+                    started_at: started_at.clone(),
+                    updated_at: Utc::now().to_rfc3339(),
+                })?;
+                store.upsert_background_job(&BackgroundJobRecord {
+                    job_id: run_id,
+                    kind: "autopilot".to_string(),
+                    reference: run_id.to_string(),
+                    status: "paused".to_string(),
+                    metadata_json: serde_json::json!({
+                        "completed_iterations": completed_iterations,
+                        "failed_iterations": failed_iterations,
+                        "last_error": last_error.clone(),
+                        "pause_file": pause_file,
+                    })
+                    .to_string(),
+                    started_at: started_at.clone(),
+                    updated_at: Utc::now().to_rfc3339(),
+                })?;
+                if !json_mode {
+                    println!(
+                        "autopilot paused; remove {} to continue",
+                        pause_file.display()
+                    );
+                }
+            }
+            write_autopilot_heartbeat(
+                &heartbeat_file,
+                &json!({
+                    "run_id": run_id,
+                    "status": "paused",
+                    "at": Utc::now().to_rfc3339(),
+                    "completed_iterations": completed_iterations,
+                    "failed_iterations": failed_iterations,
+                    "consecutive_failures": consecutive_failures,
+                    "last_error": last_error,
+                    "pause_file": pause_file,
+                }),
+            )?;
+            store.append_event(&EventEnvelope {
+                seq_no: store.next_seq_no(session.session_id)?,
+                at: Utc::now(),
+                session_id: session.session_id,
+                kind: EventKind::AutopilotRunHeartbeatV1 {
+                    run_id,
+                    completed_iterations,
+                    failed_iterations,
+                    consecutive_failures,
+                    last_error: last_error.clone(),
+                },
+            })?;
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        if paused_state {
+            paused_state = false;
+            store.upsert_autopilot_run(&AutopilotRunRecord {
+                run_id,
+                session_id: session.session_id,
+                prompt: args.prompt.clone(),
+                status: "running".to_string(),
+                stop_reason: None,
+                completed_iterations,
+                failed_iterations,
+                consecutive_failures,
+                last_error: last_error.clone(),
+                stop_file: stop_file.to_string_lossy().to_string(),
+                heartbeat_file: heartbeat_file.to_string_lossy().to_string(),
+                tools: args.tools,
+                max_think: args.max_think,
+                started_at: started_at.clone(),
+                updated_at: Utc::now().to_rfc3339(),
+            })?;
+            store.upsert_background_job(&BackgroundJobRecord {
+                job_id: run_id,
+                kind: "autopilot".to_string(),
+                reference: run_id.to_string(),
+                status: "running".to_string(),
+                metadata_json: serde_json::json!({
+                    "completed_iterations": completed_iterations,
+                    "failed_iterations": failed_iterations,
+                    "last_error": last_error.clone(),
+                })
+                .to_string(),
+                started_at: started_at.clone(),
+                updated_at: Utc::now().to_rfc3339(),
+            })?;
+            if !json_mode {
+                println!("autopilot resumed");
+            }
         }
 
         let iteration_no = completed_iterations + failed_iterations + 1;
@@ -868,6 +1156,7 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
         "max_think": args.max_think,
         "continue_on_error": args.continue_on_error,
         "stop_file": stop_file,
+        "pause_file": pause_file,
         "heartbeat_file": heartbeat_file,
         "last_error": last_error,
     });
@@ -974,6 +1263,83 @@ fn run_autopilot_status(cwd: &Path, args: AutopilotStatusArgs, json_mode: bool) 
         }
         return Ok(());
     };
+    if args.follow {
+        let max_samples = args.samples.unwrap_or(10).max(1);
+        let interval = Duration::from_secs(args.interval_seconds.max(1));
+        let mut samples = Vec::new();
+        let mut current = run;
+        for idx in 0..max_samples {
+            let mut snapshot = autopilot_status_payload(&current);
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("sample_index".to_string(), json!(idx + 1));
+                obj.insert("sampled_at".to_string(), json!(Utc::now().to_rfc3339()));
+            }
+            samples.push(snapshot.clone());
+            if !current.status.eq_ignore_ascii_case("running") {
+                break;
+            }
+            if idx + 1 >= max_samples {
+                break;
+            }
+            thread::sleep(interval);
+            current = store
+                .load_autopilot_run(current.run_id)?
+                .unwrap_or_else(|| current.clone());
+        }
+        let payload = json!({
+            "run_id": current.run_id,
+            "follow": true,
+            "interval_seconds": args.interval_seconds.max(1),
+            "samples_collected": samples.len(),
+            "samples": samples,
+        });
+        if json_mode {
+            print_json(&payload)?;
+        } else {
+            for sample in payload["samples"].as_array().into_iter().flatten() {
+                println!(
+                    "sample#{} at={} status={} completed={} failed={} paused={}",
+                    sample["sample_index"].as_u64().unwrap_or(0),
+                    sample["sampled_at"].as_str().unwrap_or_default(),
+                    sample["status"].as_str().unwrap_or_default(),
+                    sample["completed_iterations"].as_u64().unwrap_or(0),
+                    sample["failed_iterations"].as_u64().unwrap_or(0),
+                    sample["paused"].as_bool().unwrap_or(false),
+                );
+            }
+        }
+    } else {
+        let payload = autopilot_status_payload(&run);
+        if json_mode {
+            print_json(&payload)?;
+        } else {
+            println!(
+                "run={} status={} completed={} failed={} consecutive_failures={}",
+                run.run_id,
+                run.status,
+                run.completed_iterations,
+                run.failed_iterations,
+                run.consecutive_failures
+            );
+            println!("paused={}", payload["paused"].as_bool().unwrap_or(false));
+            if let Some(reason) = run.stop_reason {
+                println!("stop_reason={reason}");
+            }
+            if let Some(err) = run.last_error {
+                println!("last_error={err}");
+            }
+            println!("stop_file={}", run.stop_file);
+            println!(
+                "pause_file={}",
+                payload["pause_file"].as_str().unwrap_or_default()
+            );
+            println!("heartbeat_file={}", run.heartbeat_file);
+        }
+    }
+    Ok(())
+}
+
+fn autopilot_status_payload(run: &AutopilotRunRecord) -> serde_json::Value {
     let heartbeat = if run.heartbeat_file.is_empty() {
         None
     } else {
@@ -981,41 +1347,51 @@ fn run_autopilot_status(cwd: &Path, args: AutopilotStatusArgs, json_mode: bool) 
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
     };
-    let payload = json!({
+    let pause_file = autopilot_pause_path(&PathBuf::from(&run.stop_file));
+    let paused = pause_file.exists();
+    json!({
         "run_id": run.run_id,
         "session_id": run.session_id,
         "status": run.status,
+        "paused": paused,
         "stop_reason": run.stop_reason,
         "completed_iterations": run.completed_iterations,
         "failed_iterations": run.failed_iterations,
         "consecutive_failures": run.consecutive_failures,
         "last_error": run.last_error,
         "stop_file": run.stop_file,
+        "pause_file": pause_file,
         "heartbeat_file": run.heartbeat_file,
         "tools": run.tools,
         "max_think": run.max_think,
         "heartbeat": heartbeat,
-    });
+    })
+}
 
+fn run_autopilot_pause(cwd: &Path, args: AutopilotPauseArgs, json_mode: bool) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let run = find_autopilot_run(&store, args.run_id.as_deref())?
+        .ok_or_else(|| anyhow!("no autopilot runs found"))?;
+    let pause_path = autopilot_pause_path(&PathBuf::from(&run.stop_file));
+    if let Some(parent) = pause_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &pause_path,
+        format!("pause requested at {}\n", Utc::now().to_rfc3339()),
+    )?;
     if json_mode {
-        print_json(&payload)?;
+        print_json(&json!({
+            "run_id": run.run_id,
+            "pause_requested": true,
+            "pause_file": pause_path,
+        }))?;
     } else {
         println!(
-            "run={} status={} completed={} failed={} consecutive_failures={}",
+            "pause requested for run {} via {}",
             run.run_id,
-            run.status,
-            run.completed_iterations,
-            run.failed_iterations,
-            run.consecutive_failures
+            pause_path.display()
         );
-        if let Some(reason) = run.stop_reason {
-            println!("stop_reason={reason}");
-        }
-        if let Some(err) = run.last_error {
-            println!("last_error={err}");
-        }
-        println!("stop_file={}", run.stop_file);
-        println!("heartbeat_file={}", run.heartbeat_file);
     }
     Ok(())
 }
@@ -1036,11 +1412,16 @@ fn run_autopilot_stop(cwd: &Path, args: AutopilotStopArgs, json_mode: bool) -> R
         &stop_path,
         format!("stop requested at {}\n", Utc::now().to_rfc3339()),
     )?;
+    let pause_path = autopilot_pause_path(&stop_path);
+    if pause_path.exists() {
+        let _ = fs::remove_file(&pause_path);
+    }
     if json_mode {
         print_json(&json!({
             "run_id": run.run_id,
             "stop_requested": true,
             "stop_file": stop_path,
+            "pause_file": pause_path,
         }))?;
     } else {
         println!(
@@ -1057,8 +1438,26 @@ fn run_autopilot_resume(cwd: &Path, args: AutopilotResumeArgs, json_mode: bool) 
     let store = Store::new(cwd)?;
     let run = find_autopilot_run(&store, args.run_id.as_deref())?
         .ok_or_else(|| anyhow!("no autopilot runs found"))?;
+    let pause_path = autopilot_pause_path(&PathBuf::from(&run.stop_file));
+    if pause_path.exists() {
+        fs::remove_file(&pause_path)?;
+        if run.status == "running" || run.status == "paused" {
+            if json_mode {
+                print_json(&json!({
+                    "run_id": run.run_id,
+                    "resumed_live": true,
+                    "pause_file": pause_path,
+                }))?;
+            } else {
+                println!("live resume requested for run {}", run.run_id);
+            }
+            return Ok(());
+        }
+    }
     if run.status == "running" {
-        return Err(anyhow!("autopilot run is already marked as running"));
+        return Err(anyhow!(
+            "autopilot run is already marked as running (no pause file present)"
+        ));
     }
 
     run_autopilot(
@@ -1079,6 +1478,7 @@ fn run_autopilot_resume(cwd: &Path, args: AutopilotResumeArgs, json_mode: bool) 
             } else {
                 Some(run.stop_file.clone())
             },
+            pause_file: None,
             heartbeat_file: if run.heartbeat_file.trim().is_empty() {
                 None
             } else {
@@ -1096,6 +1496,20 @@ fn find_autopilot_run(store: &Store, run_id: Option<&str>) -> Result<Option<Auto
         return store.load_autopilot_run(uid);
     }
     store.load_latest_autopilot_run()
+}
+
+fn autopilot_pause_path(stop_file: &Path) -> PathBuf {
+    if let Some(ext) = stop_file.extension()
+        && ext == "stop"
+    {
+        return stop_file.with_extension("pause");
+    }
+    let file_name = stop_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.pause"))
+        .unwrap_or_else(|| "autopilot.pause".to_string());
+    stop_file.with_file_name(file_name)
 }
 
 fn autopilot_deadline(args: &AutopilotStartArgs) -> Result<Option<Instant>> {
@@ -1128,8 +1542,9 @@ fn write_autopilot_heartbeat(path: &Path, payload: &serde_json::Value) -> Result
 fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
-    let engine = AgentEngine::new(cwd)?;
     let cfg = AppConfig::ensure(cwd)?;
+    ensure_llm_ready_with_cfg(&cfg, json_mode)?;
+    let engine = AgentEngine::new(cwd)?;
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
         return run_chat_tui(cwd, allow_tools, &cfg);
@@ -1190,6 +1605,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                             "/status",
                             "/effort",
                             "/skills",
+                            "/permissions",
                         ],
                     });
                     if json_mode {
@@ -1411,6 +1827,16 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         println!("use /skills list|reload|run <id> [input]");
                     }
                 }
+                SlashCommand::Permissions(args) => match parse_permissions_cmd(args) {
+                    Ok(command) => run_permissions(cwd, command, json_mode)?,
+                    Err(err) => {
+                        if json_mode {
+                            print_json(&json!({"error": err.to_string()}))?;
+                        } else {
+                            println!("permissions parse error: {err}");
+                        }
+                    }
+                },
                 SlashCommand::Unknown { name, .. } => {
                     if json_mode {
                         print_json(&json!({"error": format!("unknown slash command: /{name}")}))?;
@@ -1442,7 +1868,7 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     run_tui_shell_with_bindings(status, bindings, |prompt| {
         if let Some(cmd) = SlashCommand::parse(prompt) {
             let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -1638,6 +2064,10 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                         "use /skills list|reload|run <id> [input]".to_string()
                     }
                 }
+                SlashCommand::Permissions(args) => match parse_permissions_cmd(args) {
+                    Ok(cmd) => serde_json::to_string_pretty(&permissions_payload(cwd, cmd)?)?,
+                    Err(err) => format!("permissions parse error: {err}"),
+                },
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
             };
             return Ok(out);
@@ -1756,6 +2186,128 @@ fn parse_remote_env_cmd(args: Vec<String>) -> Result<RemoteEnvCmd> {
             }))
         }
         _ => Err(anyhow!("unknown /remote-env subcommand: {sub}")),
+    }
+}
+
+fn parse_permissions_cmd(args: Vec<String>) -> Result<PermissionsCmd> {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("show") {
+        return Ok(PermissionsCmd::Show);
+    }
+
+    let first = args[0].to_ascii_lowercase();
+    if first == "bash" {
+        let mode = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: /permissions bash <ask|always|never>"))?;
+        return Ok(PermissionsCmd::Set(PermissionsSetArgs {
+            approve_bash: Some(parse_permission_mode(mode)?),
+            ..PermissionsSetArgs::default()
+        }));
+    }
+    if first == "edits" {
+        let mode = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: /permissions edits <ask|always|never>"))?;
+        return Ok(PermissionsCmd::Set(PermissionsSetArgs {
+            approve_edits: Some(parse_permission_mode(mode)?),
+            ..PermissionsSetArgs::default()
+        }));
+    }
+    if first == "sandbox" {
+        let mode = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: /permissions sandbox <mode>"))?;
+        return Ok(PermissionsCmd::Set(PermissionsSetArgs {
+            sandbox_mode: Some(mode.clone()),
+            ..PermissionsSetArgs::default()
+        }));
+    }
+    if first == "allow" {
+        let entry = args
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if entry.trim().is_empty() {
+            return Err(anyhow!("usage: /permissions allow <command-prefix>"));
+        }
+        return Ok(PermissionsCmd::Set(PermissionsSetArgs {
+            allow: vec![entry],
+            ..PermissionsSetArgs::default()
+        }));
+    }
+    if first == "clear-allowlist" {
+        return Ok(PermissionsCmd::Set(PermissionsSetArgs {
+            clear_allowlist: true,
+            ..PermissionsSetArgs::default()
+        }));
+    }
+
+    if first != "set" {
+        return Err(anyhow!(
+            "use /permissions show|set|bash|edits|sandbox|allow|clear-allowlist"
+        ));
+    }
+
+    let mut parsed = PermissionsSetArgs::default();
+    let mut idx = 1usize;
+    while idx < args.len() {
+        let token = args[idx].to_ascii_lowercase();
+        match token.as_str() {
+            "--approve-bash" | "approve-bash" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    anyhow!("usage: /permissions set --approve-bash <ask|always|never>")
+                })?;
+                parsed.approve_bash = Some(parse_permission_mode(value)?);
+            }
+            "--approve-edits" | "approve-edits" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    anyhow!("usage: /permissions set --approve-edits <ask|always|never>")
+                })?;
+                parsed.approve_edits = Some(parse_permission_mode(value)?);
+            }
+            "--sandbox-mode" | "sandbox-mode" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow!("usage: /permissions set --sandbox-mode <mode>"))?;
+                parsed.sandbox_mode = Some(value.clone());
+            }
+            "--allow" | "allow" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow!("usage: /permissions set --allow <command-prefix>"))?;
+                parsed.allow.push(value.clone());
+            }
+            "--clear-allowlist" | "clear-allowlist" => {
+                parsed.clear_allowlist = true;
+            }
+            _ => {
+                return Err(anyhow!(
+                    "unknown permissions option: {} (expected --approve-bash/--approve-edits/--sandbox-mode/--allow/--clear-allowlist)",
+                    args[idx]
+                ));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(PermissionsCmd::Set(parsed))
+}
+
+fn parse_permission_mode(value: &str) -> Result<PermissionModeArg> {
+    match value.to_ascii_lowercase().as_str() {
+        "ask" => Ok(PermissionModeArg::Ask),
+        "always" => Ok(PermissionModeArg::Always),
+        "never" => Ok(PermissionModeArg::Never),
+        _ => Err(anyhow!(
+            "invalid permission mode '{}' (expected ask|always|never)",
+            value
+        )),
     }
 }
 
@@ -2061,7 +2613,7 @@ fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_profile(cwd: &Path, _args: ProfileArgs, json_mode: bool) -> Result<()> {
+fn run_profile(cwd: &Path, args: ProfileArgs, json_mode: bool) -> Result<()> {
     let started = Instant::now();
     let cfg = AppConfig::ensure(cwd)?;
     let store = Store::new(cwd)?;
@@ -2119,6 +2671,137 @@ fn run_profile(cwd: &Path, _args: ProfileArgs, json_mode: bool) -> Result<()> {
         "index": index,
     });
 
+    let payload = if args.benchmark {
+        ensure_llm_ready_with_cfg(&cfg, json_mode)?;
+        let engine = AgentEngine::new(cwd)?;
+        let suite_path = args.benchmark_suite.as_deref().map(Path::new);
+        if suite_path.is_some() && args.benchmark_pack.is_some() {
+            return Err(anyhow!(
+                "use either --benchmark-suite or --benchmark-pack, not both"
+            ));
+        }
+        let bench = run_profile_benchmark(
+            &engine,
+            args.benchmark_cases.max(1),
+            args.benchmark_seed,
+            suite_path,
+            args.benchmark_pack.as_deref(),
+            cwd,
+            &args.benchmark_signing_key_env,
+        );
+        match bench {
+            Ok(bench) => {
+                if let Some(path) = args.benchmark_output.as_deref() {
+                    let output_path = PathBuf::from(path);
+                    if let Some(parent) = output_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&output_path, serde_json::to_vec_pretty(&bench)?)?;
+                }
+                if let Some(min_success_rate) = args.benchmark_min_success_rate {
+                    let executed = bench
+                        .get("executed_cases")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as f64;
+                    let succeeded =
+                        bench.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+                    let success_rate = if executed <= f64::EPSILON {
+                        0.0
+                    } else {
+                        succeeded / executed
+                    };
+                    if success_rate < min_success_rate {
+                        return Err(anyhow!(
+                            "benchmark success rate {:.3} below required minimum {:.3}",
+                            success_rate,
+                            min_success_rate
+                        ));
+                    }
+                }
+                if let Some(max_p95_ms) = args.benchmark_max_p95_ms {
+                    let p95 = bench
+                        .get("p95_latency_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(u64::MAX);
+                    if p95 > max_p95_ms {
+                        return Err(anyhow!(
+                            "benchmark p95 latency {}ms above allowed maximum {}ms",
+                            p95,
+                            max_p95_ms
+                        ));
+                    }
+                }
+                if let Some(min_quality_rate) = args.benchmark_min_quality_rate {
+                    let quality_rate = benchmark_quality_rate(&bench);
+                    if quality_rate < min_quality_rate {
+                        return Err(anyhow!(
+                            "benchmark quality rate {:.3} below required minimum {:.3}",
+                            quality_rate,
+                            min_quality_rate
+                        ));
+                    }
+                }
+
+                let baseline_comparison = if let Some(path) = args.benchmark_baseline.as_deref() {
+                    let baseline_raw = fs::read_to_string(path)?;
+                    let baseline_value: serde_json::Value = serde_json::from_str(&baseline_raw)?;
+                    let baseline_bench = baseline_value.get("benchmark").unwrap_or(&baseline_value);
+                    let comparison = compare_benchmark_runs(&bench, baseline_bench)?;
+                    if let Some(max_regression_ms) = args.benchmark_max_regression_ms
+                        && comparison
+                            .get("p95_regression_ms")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            > max_regression_ms
+                    {
+                        return Err(anyhow!(
+                            "benchmark p95 regression {}ms above allowed maximum {}ms",
+                            comparison
+                                .get("p95_regression_ms")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            max_regression_ms
+                        ));
+                    }
+                    Some(comparison)
+                } else {
+                    None
+                };
+                let peer_comparison = if args.benchmark_compare.is_empty() {
+                    None
+                } else {
+                    Some(compare_benchmark_with_peers(
+                        &bench,
+                        &args.benchmark_compare,
+                    )?)
+                };
+
+                let mut object = payload.as_object().cloned().unwrap_or_default();
+                object.insert("benchmark".to_string(), bench.clone());
+                if let Some(comparison) = baseline_comparison {
+                    object.insert("benchmark_comparison".to_string(), comparison);
+                }
+                if let Some(comparison) = peer_comparison {
+                    object.insert("benchmark_peer_comparison".to_string(), comparison);
+                }
+                serde_json::Value::Object(object)
+            }
+            Err(err) => {
+                let mut object = payload.as_object().cloned().unwrap_or_default();
+                object.insert(
+                    "benchmark".to_string(),
+                    json!({
+                        "ok": false,
+                        "error": err.to_string(),
+                    }),
+                );
+                serde_json::Value::Object(object)
+            }
+        }
+    } else {
+        payload
+    };
+
     if json_mode {
         print_json(&payload)?;
     } else {
@@ -2132,6 +2815,1021 @@ fn run_profile(cwd: &Path, _args: ProfileArgs, json_mode: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BenchmarkCase {
+    #[serde(default)]
+    case_id: String,
+    prompt: String,
+    #[serde(default)]
+    expected_keywords: Vec<String>,
+    #[serde(default)]
+    min_steps: Option<usize>,
+    #[serde(default)]
+    min_verification_steps: Option<usize>,
+}
+
+fn built_in_benchmark_cases() -> Vec<BenchmarkCase> {
+    vec![
+        BenchmarkCase {
+            case_id: "refactor-plan".to_string(),
+            prompt: "Plan a safe refactor for a router module with rollback strategy.".to_string(),
+            expected_keywords: vec!["refactor".to_string(), "verify".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "test-triage".to_string(),
+            prompt: "Create a stepwise plan to investigate flaky tests and isolate nondeterminism."
+                .to_string(),
+            expected_keywords: vec!["test".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "security-hardening".to_string(),
+            prompt:
+                "Plan command-injection hardening for shell execution with verification criteria."
+                    .to_string(),
+            expected_keywords: vec!["verify".to_string(), "bash".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "git-recovery".to_string(),
+            prompt: "Plan recovery from a failed merge with conflict-resolution checkpoints."
+                .to_string(),
+            expected_keywords: vec!["git".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "index-performance".to_string(),
+            prompt: "Plan improvements for index query latency and deterministic cache behavior."
+                .to_string(),
+            expected_keywords: vec!["index".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "mcp-reliability".to_string(),
+            prompt: "Plan reliability improvements for MCP tool discovery and reconnect flows."
+                .to_string(),
+            expected_keywords: vec!["mcp".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "autopilot-ops".to_string(),
+            prompt: "Plan operational guardrails for long-running autopilot loops.".to_string(),
+            expected_keywords: vec!["autopilot".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+        BenchmarkCase {
+            case_id: "release-readiness".to_string(),
+            prompt: "Plan release readiness checks across tests, lint, and packaging artifacts."
+                .to_string(),
+            expected_keywords: vec!["verify".to_string()],
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        },
+    ]
+}
+
+fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
+    let raw = fs::read_to_string(path)?;
+    let mut cases = if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+    {
+        let mut parsed = Vec::new();
+        for (line_no, line) in raw.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let case: BenchmarkCase = serde_json::from_str(trimmed).map_err(|err| {
+                anyhow!(
+                    "invalid benchmark case at {}:{}: {err}",
+                    path.display(),
+                    line_no + 1
+                )
+            })?;
+            parsed.push(case);
+        }
+        parsed
+    } else {
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let items = if let Some(arr) = value.as_array() {
+            arr.clone()
+        } else if let Some(arr) = value.get("cases").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else {
+            return Err(anyhow!(
+                "benchmark suite must be a JSON array or an object with `cases` array"
+            ));
+        };
+        let mut parsed = Vec::new();
+        for (idx, item) in items.into_iter().enumerate() {
+            let case: BenchmarkCase = serde_json::from_value(item).map_err(|err| {
+                anyhow!(
+                    "invalid benchmark case at {}:{}: {err}",
+                    path.display(),
+                    idx + 1
+                )
+            })?;
+            parsed.push(case);
+        }
+        parsed
+    };
+
+    for (idx, case) in cases.iter_mut().enumerate() {
+        case.prompt = case.prompt.trim().to_string();
+        case.expected_keywords = case
+            .expected_keywords
+            .iter()
+            .map(|kw| kw.trim().to_ascii_lowercase())
+            .filter(|kw| !kw.is_empty())
+            .collect();
+        if case.case_id.trim().is_empty() {
+            case.case_id = format!("case-{}", idx + 1);
+        }
+    }
+    cases.retain(|case| !case.prompt.is_empty());
+    if cases.is_empty() {
+        return Err(anyhow!("benchmark suite has no valid cases"));
+    }
+    Ok(cases)
+}
+
+fn built_in_benchmark_pack(name: &str) -> Option<(&'static str, Vec<BenchmarkCase>)> {
+    match name.to_ascii_lowercase().as_str() {
+        "core" => Some(("builtin-core", built_in_benchmark_cases())),
+        "smoke" => Some((
+            "builtin-smoke",
+            built_in_benchmark_cases().into_iter().take(3).collect(),
+        )),
+        "ops" => Some((
+            "builtin-ops",
+            built_in_benchmark_cases()
+                .into_iter()
+                .filter(|case| {
+                    matches!(
+                        case.case_id.as_str(),
+                        "mcp-reliability" | "autopilot-ops" | "release-readiness"
+                    )
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+fn benchmark_pack_dir(cwd: &Path) -> PathBuf {
+    runtime_dir(cwd).join("benchmark-packs")
+}
+
+fn sanitize_pack_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        "pack".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn local_benchmark_pack_path(cwd: &Path, name: &str) -> PathBuf {
+    benchmark_pack_dir(cwd).join(format!("{}.json", sanitize_pack_name(name)))
+}
+
+fn load_benchmark_pack(cwd: &Path, name: &str) -> Result<serde_json::Value> {
+    if let Some((corpus_id, cases)) = built_in_benchmark_pack(name) {
+        return Ok(json!({
+            "name": name,
+            "kind": "builtin",
+            "source": corpus_id,
+            "cases": cases,
+        }));
+    }
+    let path = local_benchmark_pack_path(cwd, name);
+    if !path.exists() {
+        return Err(anyhow!("benchmark pack not found: {}", name));
+    }
+    let raw = fs::read_to_string(&path)?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+    if value.get("name").is_none() {
+        value["name"] = json!(name);
+    }
+    if value.get("kind").is_none() {
+        value["kind"] = json!("imported");
+    }
+    if value.get("source").is_none() {
+        value["source"] = json!(path.display().to_string());
+    }
+    Ok(value)
+}
+
+fn load_benchmark_pack_cases(cwd: &Path, name: &str) -> Result<(String, Vec<BenchmarkCase>)> {
+    if let Some((corpus_id, cases)) = built_in_benchmark_pack(name) {
+        return Ok((corpus_id.to_string(), cases));
+    }
+    let pack = load_benchmark_pack(cwd, name)?;
+    let cases_value = pack
+        .get("cases")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| anyhow!("benchmark pack {} missing cases array", name))?;
+    let mut cases = Vec::new();
+    for (idx, item) in cases_value.into_iter().enumerate() {
+        let case: BenchmarkCase = serde_json::from_value(item).map_err(|err| {
+            anyhow!(
+                "invalid benchmark case in pack {} at index {}: {}",
+                name,
+                idx + 1,
+                err
+            )
+        })?;
+        cases.push(case);
+    }
+    let corpus_id = pack
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or(name)
+        .to_string();
+    Ok((corpus_id, cases))
+}
+
+fn list_benchmark_packs(cwd: &Path) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for (name, source) in [
+        ("core", "builtin-core"),
+        ("smoke", "builtin-smoke"),
+        ("ops", "builtin-ops"),
+    ] {
+        let count = built_in_benchmark_pack(name)
+            .map(|(_, cases)| cases.len())
+            .unwrap_or(0);
+        out.push(json!({
+            "name": name,
+            "kind": "builtin",
+            "source": source,
+            "cases": count,
+        }));
+    }
+
+    let dir = benchmark_pack_dir(cwd);
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let raw = fs::read_to_string(&path)?;
+            let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            let count = value
+                .get("cases")
+                .and_then(|v| v.as_array())
+                .map(|rows| rows.len())
+                .unwrap_or(0);
+            let source = value
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            out.push(json!({
+                "name": value.get("name").and_then(|v| v.as_str()).unwrap_or(stem),
+                "kind": value.get("kind").and_then(|v| v.as_str()).unwrap_or("imported"),
+                "source": source,
+                "cases": count,
+            }));
+        }
+    }
+    out.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+    Ok(out)
+}
+
+fn run_profile_benchmark(
+    engine: &AgentEngine,
+    requested_cases: usize,
+    benchmark_seed: Option<u64>,
+    suite_path: Option<&Path>,
+    pack_name: Option<&str>,
+    cwd: &Path,
+    signing_key_env: &str,
+) -> Result<serde_json::Value> {
+    let (source_kind, cases, corpus_id) = if let Some(path) = suite_path {
+        (
+            "suite".to_string(),
+            load_benchmark_cases(path)?,
+            path.display().to_string(),
+        )
+    } else if let Some(pack_name) = pack_name {
+        let (corpus_id, cases) = load_benchmark_pack_cases(cwd, pack_name)?;
+        (format!("pack:{pack_name}"), cases, corpus_id)
+    } else {
+        (
+            "builtin".to_string(),
+            built_in_benchmark_cases(),
+            "builtin".to_string(),
+        )
+    };
+
+    if cases.is_empty() {
+        return Err(anyhow!("benchmark suite is empty"));
+    }
+
+    let total = requested_cases.min(cases.len()).max(1);
+    let seed =
+        benchmark_seed.unwrap_or_else(|| derive_benchmark_seed(&corpus_id, requested_cases, total));
+    let corpus_manifest =
+        build_benchmark_manifest(&corpus_id, &source_kind, &cases, seed, signing_key_env);
+    let mut selected_cases = select_benchmark_cases(cases, total, seed);
+    let selected_case_ids = selected_cases
+        .iter()
+        .map(|case| case.case_id.clone())
+        .collect::<Vec<_>>();
+    let mut records = Vec::new();
+    let mut latencies = Vec::new();
+    let mut succeeded = 0usize;
+
+    for case in selected_cases.drain(..) {
+        let started = Instant::now();
+        let result = engine.plan_only(&case.prompt);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        latencies.push(elapsed_ms);
+        match result {
+            Ok(plan) => {
+                let plan_text = serde_json::to_string(&plan)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let keyword_total = case.expected_keywords.len();
+                let keyword_matches = case
+                    .expected_keywords
+                    .iter()
+                    .filter(|kw| plan_text.contains(kw.as_str()))
+                    .count();
+                let min_steps = case.min_steps.unwrap_or(1);
+                let min_verification_steps = case.min_verification_steps.unwrap_or(1);
+                let min_steps_ok = plan.steps.len() >= min_steps;
+                let min_verification_ok = plan.verification.len() >= min_verification_steps;
+                let keywords_ok = keyword_total == 0 || keyword_matches == keyword_total;
+                let case_ok = min_steps_ok && min_verification_ok && keywords_ok;
+                if case_ok {
+                    succeeded += 1;
+                }
+                records.push(json!({
+                    "case_id": case.case_id,
+                    "prompt_sha256": sha256_hex(case.prompt.as_bytes()),
+                    "ok": case_ok,
+                    "elapsed_ms": elapsed_ms,
+                    "steps": plan.steps.len(),
+                    "verification_steps": plan.verification.len(),
+                    "min_steps_required": min_steps,
+                    "min_verification_required": min_verification_steps,
+                    "keyword_matches": keyword_matches,
+                    "keyword_total": keyword_total,
+                    "keywords_ok": keywords_ok,
+                    "quality_ok": case_ok,
+                }));
+            }
+            Err(err) => {
+                records.push(json!({
+                    "case_id": case.case_id,
+                    "prompt_sha256": sha256_hex(case.prompt.as_bytes()),
+                    "ok": false,
+                    "elapsed_ms": elapsed_ms,
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    let avg_ms = if latencies.is_empty() {
+        0
+    } else {
+        latencies.iter().sum::<u64>() / (latencies.len() as u64)
+    };
+    latencies.sort_unstable();
+    let p95_ms = if latencies.is_empty() {
+        0
+    } else {
+        let idx = ((latencies.len() - 1) as f64 * 0.95).round() as usize;
+        latencies[idx.min(latencies.len() - 1)]
+    };
+    let quality_passed = records
+        .iter()
+        .filter(|record| {
+            if let Some(ok) = record.get("quality_ok").and_then(|v| v.as_bool()) {
+                return ok;
+            }
+            record.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+        .count();
+    let quality_rate = if total == 0 {
+        0.0
+    } else {
+        quality_passed as f64 / total as f64
+    };
+    let corpus_manifest_sha = corpus_manifest
+        .get("manifest_sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let execution_manifest = build_benchmark_execution_manifest(
+        &corpus_manifest_sha,
+        &selected_case_ids,
+        seed,
+        signing_key_env,
+    );
+    let scorecard = build_benchmark_scorecard(
+        "deepseek-cli",
+        &corpus_manifest_sha,
+        &selected_case_ids,
+        seed,
+        succeeded as u64,
+        total as u64,
+        quality_rate,
+        avg_ms,
+        p95_ms,
+        signing_key_env,
+    );
+
+    Ok(json!({
+        "agent": "deepseek-cli",
+        "generated_at": Utc::now().to_rfc3339(),
+        "ok": succeeded == total,
+        "suite": suite_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| source_kind.clone()),
+        "pack": pack_name,
+        "corpus_id": corpus_id,
+        "seed": seed,
+        "case_ids": selected_case_ids,
+        "requested_cases": requested_cases,
+        "executed_cases": total,
+        "succeeded": succeeded,
+        "failed": total - succeeded,
+        "avg_latency_ms": avg_ms,
+        "p95_latency_ms": p95_ms,
+        "quality_rate": quality_rate,
+        "corpus_manifest": corpus_manifest,
+        "execution_manifest": execution_manifest,
+        "scorecard": scorecard,
+        "records": records,
+    }))
+}
+
+fn derive_benchmark_seed(corpus_id: &str, requested_cases: usize, executed_cases: usize) -> u64 {
+    let digest = sha256_hex(
+        format!(
+            "{}|requested:{}|executed:{}",
+            corpus_id, requested_cases, executed_cases
+        )
+        .as_bytes(),
+    );
+    u64::from_str_radix(&digest[..16], 16).unwrap_or(0)
+}
+
+fn select_benchmark_cases(
+    mut cases: Vec<BenchmarkCase>,
+    total: usize,
+    seed: u64,
+) -> Vec<BenchmarkCase> {
+    cases.sort_by(|a, b| {
+        benchmark_case_rank(seed, a)
+            .cmp(&benchmark_case_rank(seed, b))
+            .then(a.case_id.cmp(&b.case_id))
+    });
+    cases.into_iter().take(total).collect()
+}
+
+fn benchmark_case_rank(seed: u64, case: &BenchmarkCase) -> String {
+    sha256_hex(format!("{seed}|{}|{}", case.case_id, case.prompt).as_bytes())
+}
+
+fn build_benchmark_manifest(
+    corpus_id: &str,
+    source_kind: &str,
+    cases: &[BenchmarkCase],
+    seed: u64,
+    signing_key_env: &str,
+) -> serde_json::Value {
+    let mut case_rows = cases
+        .iter()
+        .map(|case| {
+            let mut keywords = case
+                .expected_keywords
+                .iter()
+                .map(|kw| kw.trim().to_ascii_lowercase())
+                .filter(|kw| !kw.is_empty())
+                .collect::<Vec<_>>();
+            keywords.sort();
+            keywords.dedup();
+            let constraints = json!({
+                "expected_keywords": keywords,
+                "min_steps": case.min_steps.unwrap_or(1),
+                "min_verification_steps": case.min_verification_steps.unwrap_or(1),
+            });
+            json!({
+                "case_id": case.case_id,
+                "prompt_sha256": sha256_hex(case.prompt.as_bytes()),
+                "constraints_sha256": hash_json_value(&constraints),
+            })
+        })
+        .collect::<Vec<_>>();
+    case_rows.sort_by(|a, b| {
+        a.get("case_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .cmp(
+                b.get("case_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )
+    });
+    let mut manifest = json!({
+        "schema": "deepseek.benchmark.manifest.v1",
+        "corpus_id": corpus_id,
+        "source_kind": source_kind,
+        "seed": seed,
+        "case_count": case_rows.len(),
+        "cases": case_rows,
+    });
+    let manifest_sha256 = hash_json_value(&manifest);
+    let signature = sign_benchmark_hash(&manifest_sha256, signing_key_env);
+    if let Some(object) = manifest.as_object_mut() {
+        object.insert("manifest_sha256".to_string(), json!(manifest_sha256));
+        object.insert("signature".to_string(), signature);
+    }
+    manifest
+}
+
+fn build_benchmark_execution_manifest(
+    corpus_manifest_sha256: &str,
+    case_ids: &[String],
+    seed: u64,
+    signing_key_env: &str,
+) -> serde_json::Value {
+    let mut manifest = json!({
+        "schema": "deepseek.benchmark.execution.v1",
+        "seed": seed,
+        "corpus_manifest_sha256": corpus_manifest_sha256,
+        "case_ids": case_ids,
+        "case_count": case_ids.len(),
+    });
+    let manifest_sha256 = hash_json_value(&manifest);
+    let signature = sign_benchmark_hash(&manifest_sha256, signing_key_env);
+    if let Some(object) = manifest.as_object_mut() {
+        object.insert("manifest_sha256".to_string(), json!(manifest_sha256));
+        object.insert("signature".to_string(), signature);
+    }
+    manifest
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_benchmark_scorecard(
+    agent: &str,
+    corpus_manifest_sha256: &str,
+    case_ids: &[String],
+    seed: u64,
+    succeeded: u64,
+    executed_cases: u64,
+    quality_rate: f64,
+    avg_latency_ms: u64,
+    p95_latency_ms: u64,
+    signing_key_env: &str,
+) -> serde_json::Value {
+    let mut scorecard = json!({
+        "schema": "deepseek.benchmark.scorecard.v1",
+        "agent": agent,
+        "seed": seed,
+        "corpus_manifest_sha256": corpus_manifest_sha256,
+        "case_ids": case_ids,
+        "executed_cases": executed_cases,
+        "succeeded": succeeded,
+        "success_rate": if executed_cases == 0 { 0.0 } else { succeeded as f64 / executed_cases as f64 },
+        "quality_rate": quality_rate,
+        "avg_latency_ms": avg_latency_ms,
+        "p95_latency_ms": p95_latency_ms,
+    });
+    let scorecard_sha256 = hash_json_value(&scorecard);
+    let signature = sign_benchmark_hash(&scorecard_sha256, signing_key_env);
+    if let Some(object) = scorecard.as_object_mut() {
+        object.insert("scorecard_sha256".to_string(), json!(scorecard_sha256));
+        object.insert("signature".to_string(), signature);
+    }
+    scorecard
+}
+
+fn hash_json_value(value: &serde_json::Value) -> String {
+    let canonical = canonicalize_json(value);
+    let rendered = serde_json::to_string(&canonical).unwrap_or_default();
+    sha256_hex(rendered.as_bytes())
+}
+
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut ordered = serde_json::Map::new();
+            for key in keys {
+                if let Some(item) = map.get(&key) {
+                    ordered.insert(key, canonicalize_json(item));
+                }
+            }
+            serde_json::Value::Object(ordered)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn sign_benchmark_hash(hash: &str, signing_key_env: &str) -> serde_json::Value {
+    let key_env = signing_key_env.trim();
+    if key_env.is_empty() {
+        return json!({
+            "algorithm": "none",
+            "key_env": "",
+            "present": false,
+        });
+    }
+    let secret = std::env::var(key_env)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(secret) = secret {
+        let digest = sha256_hex(format!("{secret}:{hash}").as_bytes());
+        return json!({
+            "algorithm": "sha256-keyed",
+            "key_env": key_env,
+            "present": true,
+            "digest": digest,
+        });
+    }
+    json!({
+        "algorithm": "none",
+        "key_env": key_env,
+        "present": false,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn benchmark_quality_rate(bench: &serde_json::Value) -> f64 {
+    let records = bench
+        .get("records")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if records.is_empty() {
+        return 0.0;
+    }
+    let passed = records
+        .iter()
+        .filter(|record| {
+            if let Some(ok) = record.get("quality_ok").and_then(|v| v.as_bool()) {
+                return ok;
+            }
+            record.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+        .count() as f64;
+    passed / records.len() as f64
+}
+
+fn compare_benchmark_runs(
+    current: &serde_json::Value,
+    baseline: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let current_p95 = current
+        .get("p95_latency_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("current benchmark missing p95_latency_ms"))?;
+    let baseline_p95 = baseline
+        .get("p95_latency_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("baseline benchmark missing p95_latency_ms"))?;
+    let current_success = current
+        .get("succeeded")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let current_total = current
+        .get("executed_cases")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let baseline_success = baseline
+        .get("succeeded")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let baseline_total = baseline
+        .get("executed_cases")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let current_quality = benchmark_quality_rate(current);
+    let baseline_quality = benchmark_quality_rate(baseline);
+    Ok(json!({
+        "baseline_p95_latency_ms": baseline_p95,
+        "current_p95_latency_ms": current_p95,
+        "p95_regression_ms": current_p95.saturating_sub(baseline_p95),
+        "p95_improvement_ms": baseline_p95.saturating_sub(current_p95),
+        "baseline_success_rate": if baseline_total == 0 { 0.0 } else { baseline_success as f64 / baseline_total as f64 },
+        "current_success_rate": if current_total == 0 { 0.0 } else { current_success as f64 / current_total as f64 },
+        "baseline_quality_rate": baseline_quality,
+        "current_quality_rate": current_quality,
+        "quality_delta": current_quality - baseline_quality,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkMetrics {
+    agent: String,
+    success_rate: f64,
+    quality_rate: f64,
+    p95_latency_ms: u64,
+    executed_cases: u64,
+    corpus_id: String,
+    manifest_sha256: Option<String>,
+    seed: Option<u64>,
+    case_outcomes: HashMap<String, CaseOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CaseOutcome {
+    ok: bool,
+    quality_ok: bool,
+    elapsed_ms: Option<u64>,
+}
+
+fn benchmark_metrics_from_value(
+    value: &serde_json::Value,
+    fallback_agent: &str,
+) -> Result<BenchmarkMetrics> {
+    let bench = value.get("benchmark").unwrap_or(value);
+    let executed = bench
+        .get("executed_cases")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("benchmark report missing executed_cases"))?;
+    let succeeded = bench.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0);
+    let p95_latency_ms = bench
+        .get("p95_latency_ms")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("benchmark report missing p95_latency_ms"))?;
+    let success_rate = if executed == 0 {
+        0.0
+    } else {
+        succeeded as f64 / executed as f64
+    };
+    let quality_rate = benchmark_quality_rate(bench);
+    let agent = value
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .or_else(|| bench.get("agent").and_then(|v| v.as_str()))
+        .unwrap_or(fallback_agent)
+        .to_string();
+    let corpus_id = bench
+        .get("corpus_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| bench.get("suite").and_then(|v| v.as_str()))
+        .unwrap_or("unknown")
+        .to_string();
+    let manifest_sha256 = bench
+        .get("scorecard")
+        .and_then(|v| v.get("corpus_manifest_sha256"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            bench
+                .get("corpus_manifest")
+                .and_then(|v| v.get("manifest_sha256"))
+                .and_then(|v| v.as_str())
+        })
+        .map(ToString::to_string);
+    let seed = bench
+        .get("scorecard")
+        .and_then(|v| v.get("seed"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| bench.get("seed").and_then(|v| v.as_u64()));
+    let case_outcomes = benchmark_case_outcomes(bench);
+    Ok(BenchmarkMetrics {
+        agent,
+        success_rate,
+        quality_rate,
+        p95_latency_ms,
+        executed_cases: executed,
+        corpus_id,
+        manifest_sha256,
+        seed,
+        case_outcomes,
+    })
+}
+
+fn benchmark_case_outcomes(bench: &serde_json::Value) -> HashMap<String, CaseOutcome> {
+    let mut out = HashMap::new();
+    for (idx, record) in bench
+        .get("records")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let case_id = record
+            .get("case_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("case-{}", idx + 1));
+        let ok = record.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let quality_ok = record
+            .get("quality_ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(ok);
+        let elapsed_ms = record.get("elapsed_ms").and_then(|v| v.as_u64());
+        out.insert(
+            case_id,
+            CaseOutcome {
+                ok,
+                quality_ok,
+                elapsed_ms,
+            },
+        );
+    }
+    out
+}
+
+fn compare_benchmark_with_peers(
+    current_bench: &serde_json::Value,
+    paths: &[String],
+) -> Result<serde_json::Value> {
+    let mut rows = Vec::new();
+    rows.push(benchmark_metrics_from_value(
+        &json!({"agent": "deepseek-cli", "benchmark": current_bench}),
+        "deepseek-cli",
+    )?);
+
+    for path in paths {
+        let raw = fs::read_to_string(path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+        let fallback_name = Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("peer");
+        rows.push(benchmark_metrics_from_value(&parsed, fallback_name)?);
+    }
+
+    let mut corpus_warnings = Vec::new();
+    let mut manifest_warnings = Vec::new();
+    let mut seed_warnings = Vec::new();
+    let canonical_corpus = rows
+        .iter()
+        .find(|row| row.agent == "deepseek-cli")
+        .map(|row| row.corpus_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let canonical_manifest = rows
+        .iter()
+        .find(|row| row.agent == "deepseek-cli")
+        .and_then(|row| row.manifest_sha256.clone());
+    let canonical_seed = rows
+        .iter()
+        .find(|row| row.agent == "deepseek-cli")
+        .and_then(|row| row.seed);
+    for row in &rows {
+        if row.corpus_id != canonical_corpus {
+            corpus_warnings.push(format!(
+                "agent {} corpus_id={} differs from deepseek-cli corpus_id={}",
+                row.agent, row.corpus_id, canonical_corpus
+            ));
+        }
+        if let Some(expected_manifest) = canonical_manifest.as_deref() {
+            match row.manifest_sha256.as_deref() {
+                Some(value) if value != expected_manifest => {
+                    manifest_warnings.push(format!(
+                        "agent {} manifest_sha256={} differs from deepseek-cli manifest_sha256={}",
+                        row.agent, value, expected_manifest
+                    ));
+                }
+                None => {
+                    manifest_warnings.push(format!(
+                        "agent {} missing manifest_sha256 for reproducible comparison",
+                        row.agent
+                    ));
+                }
+                _ => {}
+            }
+        } else if row.manifest_sha256.is_none() {
+            manifest_warnings.push(format!(
+                "agent {} missing manifest_sha256 for reproducible comparison",
+                row.agent
+            ));
+        }
+        if let Some(seed) = canonical_seed
+            && row.seed.is_some_and(|value| value != seed)
+        {
+            seed_warnings.push(format!(
+                "agent {} seed={} differs from deepseek-cli seed={}",
+                row.agent,
+                row.seed.unwrap_or_default(),
+                seed
+            ));
+        }
+    }
+
+    let mut ranking = rows.clone();
+    ranking.sort_by(|a, b| {
+        b.quality_rate
+            .partial_cmp(&a.quality_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.success_rate
+                    .partial_cmp(&a.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(a.p95_latency_ms.cmp(&b.p95_latency_ms))
+    });
+
+    let current_rank = ranking
+        .iter()
+        .position(|row| row.agent == "deepseek-cli")
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+
+    let mut case_ids = BTreeSet::new();
+    for row in &rows {
+        for case_id in row.case_outcomes.keys() {
+            case_ids.insert(case_id.clone());
+        }
+    }
+    let case_matrix = case_ids
+        .into_iter()
+        .map(|case_id| {
+            let agents = rows
+                .iter()
+                .map(|row| {
+                    let outcome = row.case_outcomes.get(&case_id).cloned();
+                    json!({
+                        "agent": row.agent.clone(),
+                        "present": outcome.is_some(),
+                        "ok": outcome.as_ref().map(|value| value.ok),
+                        "quality_ok": outcome.as_ref().map(|value| value.quality_ok),
+                        "elapsed_ms": outcome.and_then(|value| value.elapsed_ms),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "case_id": case_id,
+                "agents": agents,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "current_rank": current_rank,
+        "total_agents": ranking.len(),
+        "corpus_id": canonical_corpus,
+        "corpus_match_warnings": corpus_warnings,
+        "ranking": ranking
+            .into_iter()
+            .map(|row| json!({
+                "agent": row.agent,
+                "quality_rate": row.quality_rate,
+                "success_rate": row.success_rate,
+                "p95_latency_ms": row.p95_latency_ms,
+                "executed_cases": row.executed_cases,
+                "corpus_id": row.corpus_id,
+                "manifest_sha256": row.manifest_sha256,
+                "seed": row.seed,
+            }))
+            .collect::<Vec<_>>(),
+        "manifest_match_warnings": manifest_warnings,
+        "seed_match_warnings": seed_warnings,
+        "case_matrix": case_matrix,
+    }))
 }
 
 fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Result<()> {
@@ -2495,6 +4193,12 @@ fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "installed": plugins.len(),
                 "enabled": plugins.iter().filter(|p| p.enabled).count(),
             },
+            "permissions": {
+                "approve_bash": cfg.policy.approve_bash,
+                "approve_edits": cfg.policy.approve_edits,
+                "sandbox_mode": cfg.policy.sandbox_mode,
+                "allowlist_entries": cfg.policy.allowlist.len(),
+            },
             "mcp_servers": mcp_servers.len(),
             "autopilot": latest_autopilot.map(|run| json!({
                 "run_id": run.run_id,
@@ -2516,6 +4220,12 @@ fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "plugins": {
                 "installed": plugins.len(),
                 "enabled": plugins.iter().filter(|p| p.enabled).count(),
+            },
+            "permissions": {
+                "approve_bash": cfg.policy.approve_bash,
+                "approve_edits": cfg.policy.approve_edits,
+                "sandbox_mode": cfg.policy.sandbox_mode,
+                "allowlist_entries": cfg.policy.allowlist.len(),
             },
             "mcp_servers": mcp_servers.len(),
             "autopilot": null,
@@ -2539,6 +4249,21 @@ fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         println!(
             "mcp_servers={}",
             payload["mcp_servers"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "permissions bash={} edits={} sandbox={} allowlist={}",
+            payload["permissions"]["approve_bash"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["permissions"]["approve_edits"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["permissions"]["sandbox_mode"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["permissions"]["allowlist_entries"]
+                .as_u64()
+                .unwrap_or(0),
         );
         if !payload["autopilot"].is_null() {
             println!(
@@ -2928,6 +4653,165 @@ fn run_config(cwd: &Path, cmd: ConfigCmd, json_mode: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_benchmark(cwd: &Path, cmd: BenchmarkCmd, json_mode: bool) -> Result<()> {
+    match cmd {
+        BenchmarkCmd::ListPacks => {
+            let packs = list_benchmark_packs(cwd)?;
+            if json_mode {
+                print_json(&json!(packs))?;
+            } else if packs.is_empty() {
+                println!("no benchmark packs found");
+            } else {
+                for pack in packs {
+                    println!(
+                        "{} ({}) cases={} source={}",
+                        pack["name"].as_str().unwrap_or_default(),
+                        pack["kind"].as_str().unwrap_or_default(),
+                        pack["cases"].as_u64().unwrap_or(0),
+                        pack["source"].as_str().unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        BenchmarkCmd::ShowPack(args) => {
+            let pack = load_benchmark_pack(cwd, &args.name)?;
+            if json_mode {
+                print_json(&pack)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&pack)?);
+            }
+        }
+        BenchmarkCmd::ImportPack(args) => {
+            let source = Path::new(&args.source);
+            let cases = load_benchmark_cases(source)?;
+            let dir = benchmark_pack_dir(cwd);
+            fs::create_dir_all(&dir)?;
+            let destination = dir.join(format!("{}.json", sanitize_pack_name(&args.name)));
+            let payload = json!({
+                "name": args.name,
+                "kind": "imported",
+                "source": source.display().to_string(),
+                "imported_at": Utc::now().to_rfc3339(),
+                "cases": cases,
+            });
+            fs::write(&destination, serde_json::to_vec_pretty(&payload)?)?;
+            if json_mode {
+                print_json(&json!({
+                    "imported": true,
+                    "name": payload["name"],
+                    "cases": payload["cases"].as_array().map(|rows| rows.len()).unwrap_or(0),
+                    "path": destination,
+                }))?;
+            } else {
+                println!(
+                    "imported benchmark pack {} with {} cases",
+                    payload["name"].as_str().unwrap_or_default(),
+                    payload["cases"]
+                        .as_array()
+                        .map(|rows| rows.len())
+                        .unwrap_or(0),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_permissions(cwd: &Path, cmd: PermissionsCmd, json_mode: bool) -> Result<()> {
+    let payload = permissions_payload(cwd, cmd)?;
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "permissions: bash={} edits={} sandbox={} allowlist={}",
+            payload["policy"]["approve_bash"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["policy"]["approve_edits"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["policy"]["sandbox_mode"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["policy"]["allowlist_entries"].as_u64().unwrap_or(0),
+        );
+        if payload["updated"].as_bool().unwrap_or(false) {
+            println!(
+                "updated project permissions at {}",
+                AppConfig::config_path(cwd).display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<serde_json::Value> {
+    let mut cfg = AppConfig::ensure(cwd)?;
+    let mut updated = false;
+    match cmd {
+        PermissionsCmd::Show => {}
+        PermissionsCmd::Set(args) => {
+            if let Some(mode) = args.approve_bash {
+                let value = mode.as_str().to_string();
+                if cfg.policy.approve_bash != value {
+                    cfg.policy.approve_bash = value;
+                    updated = true;
+                }
+            }
+            if let Some(mode) = args.approve_edits {
+                let value = mode.as_str().to_string();
+                if cfg.policy.approve_edits != value {
+                    cfg.policy.approve_edits = value;
+                    updated = true;
+                }
+            }
+            if let Some(mode) = args.sandbox_mode {
+                let mode = mode.trim();
+                if mode.is_empty() {
+                    return Err(anyhow!("sandbox_mode cannot be empty"));
+                }
+                if cfg.policy.sandbox_mode != mode {
+                    cfg.policy.sandbox_mode = mode.to_string();
+                    updated = true;
+                }
+            }
+            if args.clear_allowlist && !cfg.policy.allowlist.is_empty() {
+                cfg.policy.allowlist.clear();
+                updated = true;
+            }
+            for entry in args.allow {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !cfg
+                    .policy
+                    .allowlist
+                    .iter()
+                    .any(|existing| existing == trimmed)
+                {
+                    cfg.policy.allowlist.push(trimmed.to_string());
+                    updated = true;
+                }
+            }
+            if updated {
+                cfg.save(cwd)?;
+            }
+        }
+    }
+
+    Ok(json!({
+        "updated": updated,
+        "policy": {
+            "approve_bash": cfg.policy.approve_bash,
+            "approve_edits": cfg.policy.approve_edits,
+            "sandbox_mode": cfg.policy.sandbox_mode,
+            "allowlist_entries": cfg.policy.allowlist.len(),
+            "allowlist": cfg.policy.allowlist,
+        }
+    }))
+}
+
 fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
     let manager = PluginManager::new(cwd)?;
     match cmd {
@@ -3111,6 +4995,7 @@ fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
             }
         }
         PluginCmd::Run(args) => {
+            ensure_llm_ready(cwd, json_mode)?;
             let rendered = manager.render_command_prompt(
                 &args.plugin_id,
                 &args.command_name,
@@ -3141,7 +5026,7 @@ fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_resume(cwd: &Path, args: RunArgs) -> Result<String> {
+fn run_resume(cwd: &Path, args: RunArgs, json_mode: bool) -> Result<String> {
     if let Some(session_id) = args.session_id {
         let session_id = Uuid::parse_str(&session_id)?;
         let store = Store::new(cwd)?;
@@ -3153,6 +5038,7 @@ fn run_resume(cwd: &Path, args: RunArgs) -> Result<String> {
             projection.step_status.len()
         ));
     }
+    ensure_llm_ready(cwd, json_mode)?;
     AgentEngine::new(cwd)?.resume()
 }
 
@@ -3451,6 +5337,7 @@ fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<()> {
         SkillsCmd::Run(args) => {
             let run = manager.run(&args.skill_id, args.input.as_deref(), &paths)?;
             if args.execute {
+                ensure_llm_ready(cwd, json_mode)?;
                 let output = AgentEngine::new(cwd)?.run_once(&run.rendered_prompt, false)?;
                 if json_mode {
                     print_json(&json!({"skill": run, "output": output}))?;

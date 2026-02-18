@@ -16,6 +16,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+rpassword.workspace = true
+sha2.workspace = true
 deepseek-agent = { path = "../deepseek-agent" }
 deepseek-core = { path = "../deepseek-core" }
 deepseek-diff = { path = "../deepseek-diff" }

@@ -22,6 +22,22 @@ fn plan_command_emits_json_shape() {
 }
 
 #[test]
+fn ask_json_fails_fast_without_api_key_when_offline_disabled() {
+    let workspace = TempDir::new().expect("workspace");
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .env_remove("DEEPSEEK_API_KEY")
+        .args(["--json", "ask", "hello"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("DEEPSEEK_API_KEY"));
+}
+
+#[test]
 fn plugins_commands_round_trip_json() {
     let workspace = TempDir::new().expect("workspace");
     let plugin_root = workspace.path().join("demo-plugin");
@@ -221,6 +237,30 @@ fn autopilot_status_stop_resume_commands_work() {
         &["--json", "autopilot", "status", "--run-id", &run_id],
     );
     assert_eq!(status["run_id"], run_id);
+    assert!(status["pause_file"].as_str().is_some());
+
+    let follow = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "autopilot",
+            "status",
+            "--run-id",
+            &run_id,
+            "--follow",
+            "--samples",
+            "2",
+            "--interval-seconds",
+            "1",
+        ],
+    );
+    assert_eq!(follow["follow"], true);
+    assert!(follow["samples_collected"].as_u64().unwrap_or(0) >= 1);
+    assert!(
+        follow["samples"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
 
     let stop = run_json(
         workspace.path(),
@@ -228,12 +268,62 @@ fn autopilot_status_stop_resume_commands_work() {
     );
     assert_eq!(stop["stop_requested"], true);
 
+    let pause = run_json(
+        workspace.path(),
+        &["--json", "autopilot", "pause", "--run-id", &run_id],
+    );
+    assert_eq!(pause["pause_requested"], true);
+
     let resumed = run_json(
         workspace.path(),
         &["--json", "autopilot", "resume", "--run-id", &run_id],
     );
     assert!(resumed["run_id"].as_str().is_some());
-    assert!(resumed["stop_reason"].as_str().is_some());
+    if resumed["resumed_live"].is_null() {
+        assert!(resumed["stop_reason"].as_str().is_some());
+    } else {
+        assert_eq!(resumed["resumed_live"], true);
+    }
+}
+
+#[test]
+fn permissions_show_set_and_status_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+    let shown = run_json(workspace.path(), &["--json", "permissions", "show"]);
+    assert!(shown["policy"]["approve_bash"].as_str().is_some());
+    assert!(shown["policy"]["allowlist"].is_array());
+
+    let updated = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "permissions",
+            "set",
+            "--approve-bash",
+            "always",
+            "--approve-edits",
+            "never",
+            "--sandbox-mode",
+            "workspace-write",
+            "--clear-allowlist",
+            "--allow",
+            "npm *",
+        ],
+    );
+    assert_eq!(updated["updated"], true);
+    assert_eq!(updated["policy"]["approve_bash"], "always");
+    assert_eq!(updated["policy"]["approve_edits"], "never");
+    assert_eq!(updated["policy"]["sandbox_mode"], "workspace-write");
+    assert!(
+        updated["policy"]["allowlist"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|entry| entry == "npm *"))
+    );
+
+    let status = run_json(workspace.path(), &["--json", "status"]);
+    assert_eq!(status["permissions"]["approve_bash"], "always");
+    assert_eq!(status["permissions"]["approve_edits"], "never");
+    assert_eq!(status["permissions"]["sandbox_mode"], "workspace-write");
 }
 
 #[test]
@@ -330,6 +420,104 @@ fn mcp_memory_export_and_profile_emit_json() {
     let profile = run_json(workspace.path(), &["--json", "profile"]);
     assert!(profile["profile_id"].as_str().is_some());
     assert!(profile["elapsed_ms"].as_u64().is_some());
+
+    let profile_benchmark = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "profile",
+            "--benchmark",
+            "--benchmark-cases",
+            "2",
+            "--benchmark-min-success-rate",
+            "0.0",
+            "--benchmark-max-p95-ms",
+            "60000",
+            "--benchmark-output",
+            workspace
+                .path()
+                .join(".deepseek/benchmark.json")
+                .to_string_lossy()
+                .as_ref(),
+        ],
+    );
+    assert_eq!(profile_benchmark["benchmark"]["executed_cases"], 2);
+    assert!(profile_benchmark["benchmark"]["records"].is_array());
+    assert!(workspace.path().join(".deepseek/benchmark.json").exists());
+
+    fs::write(
+        workspace.path().join(".deepseek/baseline-benchmark.json"),
+        serde_json::to_vec_pretty(&profile_benchmark["benchmark"]).expect("serialize baseline"),
+    )
+    .expect("baseline");
+    let compared = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "profile",
+            "--benchmark",
+            "--benchmark-cases",
+            "2",
+            "--benchmark-min-quality-rate",
+            "0.0",
+            "--benchmark-baseline",
+            workspace
+                .path()
+                .join(".deepseek/baseline-benchmark.json")
+                .to_string_lossy()
+                .as_ref(),
+            "--benchmark-max-regression-ms",
+            "60000",
+        ],
+    );
+    assert!(compared["benchmark_comparison"].is_object());
+    assert!(compared["benchmark_comparison"]["p95_regression_ms"].is_u64());
+
+    fs::write(
+        workspace.path().join(".deepseek/peer-codex.json"),
+        r#"{
+  "agent": "codex",
+  "benchmark": {
+    "executed_cases": 2,
+    "succeeded": 2,
+    "p95_latency_ms": 1200,
+    "records": [
+      {"ok": true, "quality_ok": true},
+      {"ok": true, "quality_ok": true}
+    ]
+  }
+}"#,
+    )
+    .expect("peer report");
+    let peer_compare = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "profile",
+            "--benchmark",
+            "--benchmark-cases",
+            "2",
+            "--benchmark-compare",
+            workspace
+                .path()
+                .join(".deepseek/peer-codex.json")
+                .to_string_lossy()
+                .as_ref(),
+            "--benchmark-min-quality-rate",
+            "0.0",
+        ],
+    );
+    assert!(peer_compare["benchmark_peer_comparison"]["ranking"].is_array());
+    assert!(
+        peer_compare["benchmark_peer_comparison"]["ranking"]
+            .as_array()
+            .is_some_and(|rows| rows.len() >= 2)
+    );
+    assert!(
+        peer_compare["benchmark_peer_comparison"]["case_matrix"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
 
     let removed = run_json(workspace.path(), &["--json", "mcp", "remove", "local"]);
     assert_eq!(removed["removed"], true);
@@ -495,7 +683,188 @@ fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
     assert_eq!(removed["removed"], true);
 }
 
+#[test]
+fn profile_benchmark_accepts_external_suite_file() {
+    let workspace = TempDir::new().expect("workspace");
+    let suite_path = workspace.path().join(".deepseek/benchmark-suite.json");
+    fs::create_dir_all(
+        suite_path
+            .parent()
+            .expect("benchmark suite file should have a parent"),
+    )
+    .expect("suite dir");
+    fs::write(
+        &suite_path,
+        r#"{
+  "cases": [
+    {
+      "case_id": "suite-docs",
+      "prompt": "Plan docs updates with verification checks.",
+      "expected_keywords": ["verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    },
+    {
+      "case_id": "suite-git",
+      "prompt": "Plan git cleanup and branch verification.",
+      "expected_keywords": ["git"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    }
+  ]
+}"#,
+    )
+    .expect("suite");
+
+    let payload = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "profile",
+            "--benchmark",
+            "--benchmark-suite",
+            suite_path.to_string_lossy().as_ref(),
+            "--benchmark-cases",
+            "2",
+            "--benchmark-min-success-rate",
+            "0.0",
+        ],
+    );
+
+    assert_eq!(
+        payload["benchmark"]["suite"],
+        suite_path.to_string_lossy().to_string()
+    );
+    assert_eq!(payload["benchmark"]["executed_cases"], 2);
+    assert_eq!(
+        payload["benchmark"]["records"]
+            .as_array()
+            .map(|rows| rows.len()),
+        Some(2)
+    );
+}
+
+#[test]
+fn benchmark_pack_import_list_show_and_profile_work() {
+    let workspace = TempDir::new().expect("workspace");
+    let source = workspace.path().join("pack-source.json");
+    fs::write(
+        &source,
+        r#"{
+  "cases": [
+    {
+      "case_id": "pack-case-1",
+      "prompt": "Plan benchmark pack import verification.",
+      "expected_keywords": ["verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    }
+  ]
+}"#,
+    )
+    .expect("pack source");
+
+    let imported = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "benchmark",
+            "import-pack",
+            "public-pack",
+            source.to_string_lossy().as_ref(),
+        ],
+    );
+    assert_eq!(imported["imported"], true);
+    assert_eq!(imported["name"], "public-pack");
+
+    let listed = run_json(workspace.path(), &["--json", "benchmark", "list-packs"]);
+    assert!(
+        listed
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "public-pack"))
+    );
+
+    let shown = run_json(
+        workspace.path(),
+        &["--json", "benchmark", "show-pack", "public-pack"],
+    );
+    assert_eq!(shown["name"], "public-pack");
+    assert_eq!(shown["cases"].as_array().map(|rows| rows.len()), Some(1));
+
+    let from_pack = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "profile",
+            "--benchmark",
+            "--benchmark-pack",
+            "public-pack",
+            "--benchmark-cases",
+            "1",
+            "--benchmark-min-success-rate",
+            "0.0",
+        ],
+    );
+    assert_eq!(from_pack["benchmark"]["pack"], "public-pack");
+    assert_eq!(from_pack["benchmark"]["executed_cases"], 1);
+}
+
+#[test]
+fn benchmark_scorecard_is_seeded_and_signed_when_key_present() {
+    let workspace = TempDir::new().expect("workspace");
+    let args = [
+        "--json",
+        "profile",
+        "--benchmark",
+        "--benchmark-cases",
+        "2",
+        "--benchmark-seed",
+        "77",
+        "--benchmark-min-success-rate",
+        "0.0",
+    ];
+
+    let first = run_json_with_env(
+        workspace.path(),
+        &args,
+        &[("DEEPSEEK_BENCHMARK_SIGNING_KEY", "test-signing-key")],
+    );
+    let benchmark = &first["benchmark"];
+    assert_eq!(benchmark["seed"], 77);
+    let manifest_sha = benchmark["corpus_manifest"]["manifest_sha256"]
+        .as_str()
+        .expect("manifest hash");
+    assert_eq!(
+        benchmark["scorecard"]["corpus_manifest_sha256"],
+        manifest_sha
+    );
+    assert_eq!(benchmark["corpus_manifest"]["signature"]["present"], true);
+    assert_eq!(
+        benchmark["execution_manifest"]["signature"]["present"],
+        true
+    );
+    assert_eq!(benchmark["scorecard"]["signature"]["present"], true);
+
+    let second = run_json_with_env(
+        workspace.path(),
+        &args,
+        &[("DEEPSEEK_BENCHMARK_SIGNING_KEY", "test-signing-key")],
+    );
+    assert_eq!(
+        first["benchmark"]["case_ids"],
+        second["benchmark"]["case_ids"]
+    );
+    assert_eq!(
+        first["benchmark"]["execution_manifest"]["manifest_sha256"],
+        second["benchmark"]["execution_manifest"]["manifest_sha256"]
+    );
+}
+
 fn run_json(workspace: &Path, args: &[&str]) -> Value {
+    run_json_with_env(workspace, args, &[])
+}
+
+fn run_json_with_env(workspace: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
     let runtime = workspace.join(".deepseek");
     fs::create_dir_all(&runtime).expect("runtime dir");
     fs::write(
@@ -503,13 +872,11 @@ fn run_json(workspace: &Path, args: &[&str]) -> Value {
         r#"{"llm":{"offline_fallback":true}}"#,
     )
     .expect("settings override");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
-        .current_dir(workspace)
-        .args(args)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"));
+    command.current_dir(workspace).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.assert().success().get_output().stdout.clone();
     serde_json::from_slice(&output).expect("json output")
 }

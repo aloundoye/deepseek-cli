@@ -381,6 +381,14 @@ pub struct ProfileRunRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationRunRecord {
+    pub command: String,
+    pub success: bool,
+    pub output: String,
+    pub run_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundJobRecord {
     pub job_id: Uuid,
     pub kind: String,
@@ -801,6 +809,34 @@ impl Store {
             output_tokens: output_tokens.max(0) as u64,
             records: records.max(0) as u64,
         })
+    }
+
+    pub fn list_recent_verification_runs(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<VerificationRunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT command, success, output, run_at
+             FROM verification_runs
+             WHERE session_id = ?1
+             ORDER BY run_at DESC
+             LIMIT ?2",
+        )?;
+        let mut out = Vec::new();
+        let rows = stmt.query_map(params![session_id.to_string(), limit as i64], |r| {
+            Ok(VerificationRunRecord {
+                command: r.get(0)?,
+                success: r.get::<_, i64>(1)? != 0,
+                output: r.get(2)?,
+                run_at: r.get(3)?,
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn list_context_compactions(

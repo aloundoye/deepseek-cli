@@ -10,15 +10,16 @@ use deepseek_memory::MemoryManager;
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
-use deepseek_store::{ProviderMetricRecord, Store, SubagentRunRecord};
+use deepseek_store::{ProviderMetricRecord, Store, SubagentRunRecord, VerificationRunRecord};
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
 use deepseek_tools::LocalToolHost;
 use ignore::WalkBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -369,7 +370,117 @@ impl AgentEngine {
             )?;
             plan = parse_plan_from_llm(&retry.text, prompt);
         }
-        let plan = if let Some(plan) = plan {
+        let quality_retry_budget = self.cfg.router.max_escalations_per_unit.max(1) as usize;
+        let mut quality_attempt = 0usize;
+        let mut quality_repairs = Vec::new();
+        while let Some(candidate) = plan.clone() {
+            let report = assess_plan_quality(&candidate, prompt);
+            if report.acceptable {
+                break;
+            }
+            quality_repairs = report.issues.clone();
+            if quality_attempt >= quality_retry_budget {
+                plan = None;
+                break;
+            }
+            quality_attempt += 1;
+            self.emit(
+                session.session_id,
+                EventKind::RouterEscalationV1 {
+                    reason_codes: vec![
+                        "plan_quality_retry".to_string(),
+                        format!("quality_score_{:.2}", report.score),
+                    ],
+                },
+            )?;
+            let repair_prompt = build_plan_quality_repair_prompt(prompt, &candidate, &report);
+            let repaired = self.complete_with_cache(
+                session.session_id,
+                &LlmRequest {
+                    unit: LlmUnit::Planner,
+                    prompt: repair_prompt.clone(),
+                    model: self.cfg.llm.max_think_model.clone(),
+                    max_tokens: session.budgets.max_think_tokens,
+                    non_urgent,
+                },
+            )?;
+            self.emit(
+                session.session_id,
+                EventKind::UsageUpdatedV1 {
+                    unit: LlmUnit::Planner,
+                    model: self.cfg.llm.max_think_model.clone(),
+                    input_tokens: estimate_tokens(&repair_prompt),
+                    output_tokens: estimate_tokens(&repaired.text),
+                },
+            )?;
+            self.emit_cost_event(
+                session.session_id,
+                estimate_tokens(&repair_prompt),
+                estimate_tokens(&repaired.text),
+            )?;
+            plan = parse_plan_from_llm(&repaired.text, prompt);
+        }
+        let verification_feedback = self
+            .store
+            .list_recent_verification_runs(session.session_id, 12)?
+            .into_iter()
+            .filter(|run| !run.success)
+            .collect::<Vec<_>>();
+        let mut feedback_attempt = 0usize;
+        let mut feedback_repairs = Vec::new();
+        while let Some(candidate) = plan.clone() {
+            let report = assess_plan_feedback_alignment(&candidate, &verification_feedback);
+            if report.acceptable {
+                break;
+            }
+            feedback_repairs = report.issues.clone();
+            if feedback_attempt >= quality_retry_budget {
+                plan = None;
+                break;
+            }
+            feedback_attempt += 1;
+            self.emit(
+                session.session_id,
+                EventKind::RouterEscalationV1 {
+                    reason_codes: vec![
+                        "plan_feedback_retry".to_string(),
+                        format!("feedback_score_{:.2}", report.score),
+                    ],
+                },
+            )?;
+            let repair_prompt = build_verification_feedback_repair_prompt(
+                prompt,
+                &candidate,
+                &report,
+                &verification_feedback,
+            );
+            let repaired = self.complete_with_cache(
+                session.session_id,
+                &LlmRequest {
+                    unit: LlmUnit::Planner,
+                    prompt: repair_prompt.clone(),
+                    model: self.cfg.llm.max_think_model.clone(),
+                    max_tokens: session.budgets.max_think_tokens,
+                    non_urgent,
+                },
+            )?;
+            self.emit(
+                session.session_id,
+                EventKind::UsageUpdatedV1 {
+                    unit: LlmUnit::Planner,
+                    model: self.cfg.llm.max_think_model.clone(),
+                    input_tokens: estimate_tokens(&repair_prompt),
+                    output_tokens: estimate_tokens(&repaired.text),
+                },
+            )?;
+            self.emit_cost_event(
+                session.session_id,
+                estimate_tokens(&repair_prompt),
+                estimate_tokens(&repaired.text),
+            )?;
+            plan = parse_plan_from_llm(&repaired.text, prompt);
+        }
+        let mut plan = if let Some(plan) = plan {
             plan
         } else {
             self.planner.create_plan(PlanContext {
@@ -378,6 +489,20 @@ impl AgentEngine {
                 prior_failures: vec![],
             })?
         };
+        if !quality_repairs.is_empty() {
+            plan.risk_notes.push(format!(
+                "plan_quality_repairs={} issues={}",
+                quality_attempt,
+                quality_repairs.join(" | ")
+            ));
+        }
+        if !feedback_repairs.is_empty() {
+            plan.risk_notes.push(format!(
+                "verification_feedback_repairs={} issues={}",
+                feedback_attempt,
+                feedback_repairs.join(" | ")
+            ));
+        }
 
         session.active_plan_id = Some(plan.plan_id);
         self.store.save_session(&session)?;
@@ -422,7 +547,17 @@ impl AgentEngine {
         let mut plan = self.plan_only_with_mode(prompt, force_max_think, non_urgent)?;
         session = self.ensure_session()?;
         self.transition(&mut session, SessionState::ExecutingStep)?;
-        let _subagent_notes = self.run_subagents(session.session_id, &plan)?;
+        let subagent_notes = self.run_subagents(session.session_id, &plan)?;
+        let runtime_goal = augment_goal_with_subagent_notes(&plan.goal, &subagent_notes);
+        if !subagent_notes.is_empty() {
+            self.emit(
+                session.session_id,
+                EventKind::TurnAddedV1 {
+                    role: "assistant".to_string(),
+                    content: format!("[subagents]\n{}", summarize_subagent_notes(&subagent_notes)),
+                },
+            )?;
+        }
         let mut failure_streak = 0_u32;
         let mut execution_failed = false;
         let mut step_cursor = 0usize;
@@ -430,44 +565,110 @@ impl AgentEngine {
 
         while step_cursor < plan.steps.len() {
             let step = plan.steps[step_cursor].clone();
-            let call = self.call_for_step(&step, &plan);
-            let proposal = self.tool_host.propose(call);
-            self.emit(
-                session.session_id,
-                EventKind::ToolProposedV1 {
-                    proposal: proposal.clone(),
-                },
-            )?;
-
-            let outcome = if proposal.approved || allow_tools {
+            let calls = self.calls_for_step(&step, &runtime_goal);
+            let mut notes = Vec::new();
+            let mut step_success = true;
+            let mut proposals = Vec::new();
+            for call in calls {
+                let proposal = self.tool_host.propose(call);
                 self.emit(
                     session.session_id,
-                    EventKind::ToolApprovedV1 {
-                        invocation_id: proposal.invocation_id,
+                    EventKind::ToolProposedV1 {
+                        proposal: proposal.clone(),
                     },
                 )?;
-                let result = self.tool_host.execute(ApprovedToolCall {
-                    invocation_id: proposal.invocation_id,
-                    call: proposal.call.clone(),
-                });
-                self.emit(
-                    session.session_id,
-                    EventKind::ToolResultV1 {
-                        result: result.clone(),
-                    },
-                )?;
-                self.emit_patch_events_if_any(session.session_id, &proposal.call.name, &result)?;
-                StepOutcome {
-                    step_id: step.step_id,
-                    success: result.success,
-                    notes: result.output.to_string(),
-                }
+                proposals.push(proposal);
+            }
+            if proposals.is_empty() {
+                step_success = false;
+                notes.push("no executable tools for step".to_string());
             } else {
-                StepOutcome {
-                    step_id: step.step_id,
-                    success: false,
-                    notes: "approval required".to_string(),
+                for proposal in &proposals {
+                    if !(proposal.approved
+                        || allow_tools
+                        || self.request_tool_approval(&proposal.call).unwrap_or(false))
+                    {
+                        step_success = false;
+                        notes.push(format!("approval required for {}", proposal.call.name));
+                        break;
+                    }
                 }
+            }
+            if step_success {
+                for proposal in &proposals {
+                    self.emit(
+                        session.session_id,
+                        EventKind::ToolApprovedV1 {
+                            invocation_id: proposal.invocation_id,
+                        },
+                    )?;
+                }
+
+                if should_parallel_execute_calls(&proposals) {
+                    let mut handles = Vec::new();
+                    for proposal in &proposals {
+                        let tool_host = Arc::clone(&self.tool_host);
+                        let invocation_id = proposal.invocation_id;
+                        let call = proposal.call.clone();
+                        handles.push(thread::spawn(move || {
+                            let result = tool_host.execute(ApprovedToolCall {
+                                invocation_id,
+                                call: call.clone(),
+                            });
+                            (call.name, result)
+                        }));
+                    }
+                    let mut results = Vec::new();
+                    for handle in handles {
+                        let joined = handle
+                            .join()
+                            .map_err(|_| anyhow!("parallel tool execution thread panicked"))?;
+                        results.push(joined);
+                    }
+                    for (call_name, result) in results {
+                        self.emit(
+                            session.session_id,
+                            EventKind::ToolResultV1 {
+                                result: result.clone(),
+                            },
+                        )?;
+                        self.emit_patch_events_if_any(session.session_id, &call_name, &result)?;
+                        notes.push(format!("{call_name} => {}", result.output));
+                        if !result.success {
+                            step_success = false;
+                            break;
+                        }
+                    }
+                } else {
+                    for proposal in &proposals {
+                        let result = self.tool_host.execute(ApprovedToolCall {
+                            invocation_id: proposal.invocation_id,
+                            call: proposal.call.clone(),
+                        });
+                        self.emit(
+                            session.session_id,
+                            EventKind::ToolResultV1 {
+                                result: result.clone(),
+                            },
+                        )?;
+                        self.emit_patch_events_if_any(
+                            session.session_id,
+                            &proposal.call.name,
+                            &result,
+                        )?;
+                        notes.push(format!("{} => {}", proposal.call.name, result.output));
+                        if !result.success {
+                            step_success = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let outcome = StepOutcome {
+                step_id: step.step_id,
+                success: step_success,
+                notes: notes.join("\n"),
             };
 
             plan.steps[step_cursor].done = outcome.success;
@@ -487,18 +688,30 @@ impl AgentEngine {
                     break;
                 }
                 revision_budget = revision_budget.saturating_sub(1);
-                let revised = self.planner.revise_plan(
-                    PlanContext {
-                        session: session.clone(),
-                        user_prompt: prompt.to_string(),
-                        prior_failures: vec![],
-                    },
-                    &plan,
-                    Failure {
-                        summary: "step failed".to_string(),
-                        detail: outcome.notes,
-                    },
-                )?;
+                let failure_detail = outcome.notes.clone();
+                let revised = self
+                    .revise_plan_with_llm(
+                        session.session_id,
+                        prompt,
+                        &plan,
+                        failure_streak,
+                        &failure_detail,
+                        non_urgent,
+                    )
+                    .or_else(|_| {
+                        self.planner.revise_plan(
+                            PlanContext {
+                                session: session.clone(),
+                                user_prompt: prompt.to_string(),
+                                prior_failures: vec![],
+                            },
+                            &plan,
+                            Failure {
+                                summary: "step failed".to_string(),
+                                detail: failure_detail.clone(),
+                            },
+                        )
+                    })?;
                 self.emit(
                     session.session_id,
                     EventKind::PlanRevisedV1 {
@@ -525,7 +738,10 @@ impl AgentEngine {
                     args: json!({"cmd": cmd}),
                     requires_approval: true,
                 });
-                let (ok, output) = if proposal.approved || allow_tools {
+                let (ok, output) = if proposal.approved
+                    || allow_tools
+                    || self.request_tool_approval(&proposal.call).unwrap_or(false)
+                {
                     let result = self.tool_host.execute(ApprovedToolCall {
                         invocation_id: proposal.invocation_id,
                         call: proposal.call,
@@ -593,16 +809,19 @@ impl AgentEngine {
 
         if execution_failed || verification_failures > 0 {
             self.transition(&mut session, SessionState::Failed)?;
+            self.remember_failed_strategy(prompt, &plan, failure_streak, verification_failures)?;
         } else {
             self.transition(&mut session, SessionState::Completed)?;
+            self.remember_successful_strategy(prompt, &plan)?;
         }
 
         let projection = self.store.rebuild_from_events(session.session_id)?;
         Ok(format!(
-            "session={} steps={} failures={} router_models={:?} base_model={} max_model={}",
+            "session={} steps={} failures={} subagents={} router_models={:?} base_model={} max_model={}",
             session.session_id,
             projection.step_status.len(),
             failure_streak + verification_failures,
+            subagent_notes.len(),
             projection.router_models,
             self.cfg.llm.base_model,
             self.cfg.llm.max_think_model
@@ -625,30 +844,29 @@ impl AgentEngine {
     }
 
     fn run_subagents(&self, session_id: Uuid, plan: &Plan) -> Result<Vec<String>> {
-        let tasks = plan
-            .steps
-            .iter()
-            .take(self.subagents.max_concurrency)
-            .map(|step| {
-                let role = match step.intent.as_str() {
-                    "search" => SubagentRole::Explore,
-                    "plan" | "recover" => SubagentRole::Plan,
-                    _ => SubagentRole::Task,
-                };
-                let team = match role {
-                    SubagentRole::Explore => "explore",
-                    SubagentRole::Plan => "planning",
-                    SubagentRole::Task => "execution",
-                };
-                SubagentTask {
-                    run_id: Uuid::now_v7(),
-                    name: step.title.clone(),
-                    goal: step.intent.clone(),
-                    role,
-                    team: team.to_string(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        let mut task_targets = HashMap::new();
+        for step in plan.steps.iter().take(self.subagents.max_concurrency) {
+            let role = match step.intent.as_str() {
+                "search" => SubagentRole::Explore,
+                "plan" | "recover" => SubagentRole::Plan,
+                _ => SubagentRole::Task,
+            };
+            let team = match role {
+                SubagentRole::Explore => "explore",
+                SubagentRole::Plan => "planning",
+                SubagentRole::Task => "execution",
+            };
+            let task = SubagentTask {
+                run_id: Uuid::now_v7(),
+                name: step.title.clone(),
+                goal: step.intent.clone(),
+                role,
+                team: team.to_string(),
+            };
+            task_targets.insert(task.run_id, subagent_targets_for_step(step));
+            tasks.push(task);
+        }
         if tasks.is_empty() {
             return Ok(Vec::new());
         }
@@ -657,9 +875,15 @@ impl AgentEngine {
         let task_by_id = tasks
             .iter()
             .map(|task| {
+                let targets = task_targets.get(&task.run_id).cloned().unwrap_or_default();
                 (
                     task.run_id,
-                    (task.name.clone(), task.goal.clone(), now.clone()),
+                    SubagentTaskMeta {
+                        name: task.name.clone(),
+                        goal: task.goal.clone(),
+                        created_at: now.clone(),
+                        targets,
+                    },
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -684,21 +908,73 @@ impl AgentEngine {
             })?;
         }
 
-        let results = self.subagents.run_tasks(tasks, |task| {
-            Ok(format!(
-                "subagent '{}' role={:?} team={} analyzed intent '{}'",
-                task.name, task.role, task.team, task.goal
-            ))
+        let llm_cfg = self.cfg.llm.clone();
+        let base_model = self.cfg.llm.base_model.clone();
+        let max_think_model = self.cfg.llm.max_think_model.clone();
+        let root_goal = plan.goal.clone();
+        let tool_host = Arc::clone(&self.tool_host);
+        let task_targets_ref = Arc::new(task_targets.clone());
+        let verification = if plan.verification.is_empty() {
+            "none".to_string()
+        } else {
+            plan.verification.join(" ; ")
+        };
+        let results = self.subagents.run_tasks(tasks, move |task| {
+            let request = subagent_request_for_task(
+                &task,
+                &root_goal,
+                &verification,
+                &base_model,
+                &max_think_model,
+            );
+            let client = DeepSeekClient::new(llm_cfg.clone())?;
+            let targets = task_targets_ref
+                .get(&task.run_id)
+                .cloned()
+                .unwrap_or_default();
+            let delegated = run_subagent_delegated_tools(&tool_host, &task, &root_goal, &targets);
+            match client.complete(&request) {
+                Ok(resp) => {
+                    if let Some(delegated) = delegated {
+                        Ok(format!("{}\n[delegated_tools]\n{}", resp.text, delegated))
+                    } else {
+                        Ok(resp.text)
+                    }
+                }
+                Err(err) => Ok(format!(
+                    "fallback subagent '{}' role={:?} team={} analyzed intent '{}' (llm_error={}){}",
+                    task.name,
+                    task.role,
+                    task.team,
+                    task.goal,
+                    err,
+                    delegated
+                        .map(|summary| format!("\n[delegated_tools]\n{summary}"))
+                        .unwrap_or_default()
+                )),
+            }
         });
         let merged_summary = self.subagents.merge_results(&results);
+        let arbitration = summarize_subagent_merge_arbitration(&results, &task_targets);
         let mut notes = Vec::new();
         for result in results {
             let updated_at = Utc::now().to_rfc3339();
-            let (name, goal, created_at) = task_by_id
-                .get(&result.run_id)
-                .cloned()
-                .unwrap_or_else(|| ("subagent".to_string(), String::new(), updated_at.clone()));
+            let meta =
+                task_by_id
+                    .get(&result.run_id)
+                    .cloned()
+                    .unwrap_or_else(|| SubagentTaskMeta {
+                        name: "subagent".to_string(),
+                        goal: String::new(),
+                        created_at: updated_at.clone(),
+                        targets: Vec::new(),
+                    });
             if result.success {
+                let persisted_goal = if meta.targets.is_empty() {
+                    meta.goal.clone()
+                } else {
+                    format!("{} [targets={}]", meta.goal, meta.targets.join(","))
+                };
                 self.emit(
                     session_id,
                     EventKind::SubagentCompletedV1 {
@@ -708,18 +984,23 @@ impl AgentEngine {
                 )?;
                 self.store.upsert_subagent_run(&SubagentRunRecord {
                     run_id: result.run_id,
-                    name,
-                    goal,
+                    name: meta.name,
+                    goal: persisted_goal,
                     status: "completed".to_string(),
                     output: Some(result.output.clone()),
                     error: None,
-                    created_at,
+                    created_at: meta.created_at,
                     updated_at,
                 })?;
             } else {
                 let error = result
                     .error
                     .unwrap_or_else(|| "unknown subagent error".to_string());
+                let persisted_goal = if meta.targets.is_empty() {
+                    meta.goal.clone()
+                } else {
+                    format!("{} [targets={}]", meta.goal, meta.targets.join(","))
+                };
                 self.emit(
                     session_id,
                     EventKind::SubagentFailedV1 {
@@ -729,12 +1010,12 @@ impl AgentEngine {
                 )?;
                 self.store.upsert_subagent_run(&SubagentRunRecord {
                     run_id: result.run_id,
-                    name,
-                    goal,
+                    name: meta.name,
+                    goal: persisted_goal,
                     status: "failed".to_string(),
                     output: None,
                     error: Some(error),
-                    created_at,
+                    created_at: meta.created_at,
                     updated_at,
                 })?;
             }
@@ -742,7 +1023,96 @@ impl AgentEngine {
         if !merged_summary.is_empty() {
             notes.push(merged_summary);
         }
+        if !arbitration.is_empty() {
+            notes.push(arbitration.join("\n"));
+        }
         Ok(notes)
+    }
+
+    fn revise_plan_with_llm(
+        &self,
+        session_id: Uuid,
+        user_prompt: &str,
+        current_plan: &Plan,
+        failure_streak: u32,
+        failure_detail: &str,
+        non_urgent: bool,
+    ) -> Result<Plan> {
+        let revision_prompt =
+            build_plan_revision_prompt(user_prompt, current_plan, failure_streak, failure_detail);
+        let mut decision = self.router.select(
+            LlmUnit::Planner,
+            RouterSignals {
+                prompt_complexity: (user_prompt.len() as f32 / 500.0).min(1.0),
+                repo_breadth: 0.7,
+                failure_streak: (failure_streak as f32 / 3.0).min(1.0),
+                verification_failures: 0.0,
+                low_confidence: 0.6,
+                ambiguity_flags: 0.4,
+            },
+        );
+        if self.cfg.router.auto_max_think
+            && !decision
+                .selected_model
+                .eq_ignore_ascii_case(&self.cfg.llm.max_think_model)
+        {
+            decision.selected_model = self.cfg.llm.max_think_model.clone();
+            decision.escalated = true;
+            if !decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "revision_failure_escalation")
+            {
+                decision
+                    .reason_codes
+                    .push("revision_failure_escalation".to_string());
+            }
+        }
+        self.emit(
+            session_id,
+            EventKind::RouterDecisionV1 {
+                decision: decision.clone(),
+            },
+        )?;
+        self.observer.record_router_decision(&decision)?;
+        if decision.escalated {
+            self.emit(
+                session_id,
+                EventKind::RouterEscalationV1 {
+                    reason_codes: decision.reason_codes.clone(),
+                },
+            )?;
+        }
+
+        let response = self.complete_with_cache(
+            session_id,
+            &LlmRequest {
+                unit: LlmUnit::Planner,
+                prompt: revision_prompt.clone(),
+                model: decision.selected_model.clone(),
+                max_tokens: 4096,
+                non_urgent,
+            },
+        )?;
+        self.emit(
+            session_id,
+            EventKind::UsageUpdatedV1 {
+                unit: LlmUnit::Planner,
+                model: decision.selected_model.clone(),
+                input_tokens: estimate_tokens(&revision_prompt),
+                output_tokens: estimate_tokens(&response.text),
+            },
+        )?;
+        self.emit_cost_event(
+            session_id,
+            estimate_tokens(&revision_prompt),
+            estimate_tokens(&response.text),
+        )?;
+
+        let mut revised = parse_plan_from_llm(&response.text, user_prompt)
+            .ok_or_else(|| anyhow!("llm revision response did not contain a valid plan"))?;
+        revised.version = current_plan.version + 1;
+        Ok(revised)
     }
 
     fn complete_with_cache(
@@ -882,6 +1252,27 @@ impl AgentEngine {
         {
             blocks.push(format!("[memory]\n{memory}"));
         }
+        let strategy_entries = self.load_matching_strategies(prompt, 4).unwrap_or_default();
+        if !strategy_entries.is_empty() {
+            blocks.push(format!(
+                "[strategy_memory]\n{}",
+                format_strategy_entries(&strategy_entries)
+            ));
+        }
+        let verification_feedback = self
+            .store
+            .list_recent_verification_runs(session_id, 10)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|run| !run.success)
+            .take(6)
+            .collect::<Vec<_>>();
+        if !verification_feedback.is_empty() {
+            blocks.push(format!(
+                "[verification_feedback]\n{}",
+                format_verification_feedback(&verification_feedback)
+            ));
+        }
 
         if blocks.is_empty() {
             Ok(prompt.to_string())
@@ -915,6 +1306,154 @@ impl AgentEngine {
             serde_json::to_vec(response)?,
         )?;
         Ok(())
+    }
+
+    fn planner_strategy_memory_path(&self) -> PathBuf {
+        deepseek_core::runtime_dir(&self.workspace).join("planner-strategies.json")
+    }
+
+    fn read_planner_strategy_memory(&self) -> Result<PlannerStrategyMemory> {
+        let path = self.planner_strategy_memory_path();
+        if !path.exists() {
+            return Ok(PlannerStrategyMemory::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        let mut memory = serde_json::from_str(&raw).unwrap_or_default();
+        normalize_strategy_memory(&mut memory);
+        Ok(memory)
+    }
+
+    fn write_planner_strategy_memory(&self, memory: &PlannerStrategyMemory) -> Result<()> {
+        let path = self.planner_strategy_memory_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_vec_pretty(memory)?)?;
+        Ok(())
+    }
+
+    fn load_matching_strategies(
+        &self,
+        prompt: &str,
+        limit: usize,
+    ) -> Result<Vec<PlannerStrategyEntry>> {
+        let key = plan_goal_pattern(prompt);
+        let key_terms = key
+            .split('|')
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        let memory = self.read_planner_strategy_memory()?;
+        let mut matches = memory
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                if entry.key == key {
+                    return true;
+                }
+                key_terms
+                    .iter()
+                    .any(|term| entry.key.contains(term) || entry.goal_excerpt.contains(term))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(b.success_count.cmp(&a.success_count))
+                .then(a.failure_count.cmp(&b.failure_count))
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        matches.truncate(limit.max(1));
+        Ok(matches)
+    }
+
+    fn remember_successful_strategy(&self, prompt: &str, plan: &Plan) -> Result<()> {
+        let mut memory = self.read_planner_strategy_memory()?;
+        let key = plan_goal_pattern(prompt);
+        let strategy_summary = summarize_strategy(plan);
+        let verification = plan
+            .verification
+            .iter()
+            .map(|cmd| cmd.trim().to_string())
+            .filter(|cmd| !cmd.is_empty())
+            .take(6)
+            .collect::<Vec<_>>();
+        if verification.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        if let Some(entry) = memory.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.goal_excerpt = truncate_strategy_prompt(prompt);
+            entry.strategy_summary = strategy_summary;
+            entry.verification = verification;
+            entry.success_count = entry.success_count.saturating_add(1);
+            entry.score = compute_strategy_score(entry.success_count, entry.failure_count);
+            entry.last_outcome = "success".to_string();
+            entry.updated_at = now;
+        } else {
+            memory.entries.push(PlannerStrategyEntry {
+                key,
+                goal_excerpt: truncate_strategy_prompt(prompt),
+                strategy_summary,
+                verification,
+                success_count: 1,
+                failure_count: 0,
+                score: compute_strategy_score(1, 0),
+                last_outcome: "success".to_string(),
+                updated_at: now,
+            });
+        }
+        sort_and_prune_strategy_entries(&mut memory.entries);
+        self.write_planner_strategy_memory(&memory)
+    }
+
+    fn remember_failed_strategy(
+        &self,
+        prompt: &str,
+        plan: &Plan,
+        failure_streak: u32,
+        verification_failures: u32,
+    ) -> Result<()> {
+        let mut memory = self.read_planner_strategy_memory()?;
+        let key = plan_goal_pattern(prompt);
+        let mut strategy_summary = summarize_strategy(plan);
+        strategy_summary.push_str(&format!(
+            " | failures=execution:{} verification:{}",
+            failure_streak, verification_failures
+        ));
+        let verification = plan
+            .verification
+            .iter()
+            .map(|cmd| cmd.trim().to_string())
+            .filter(|cmd| !cmd.is_empty())
+            .take(6)
+            .collect::<Vec<_>>();
+        let now = Utc::now().to_rfc3339();
+        if let Some(entry) = memory.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.goal_excerpt = truncate_strategy_prompt(prompt);
+            entry.strategy_summary = strategy_summary;
+            if !verification.is_empty() {
+                entry.verification = verification;
+            }
+            entry.failure_count = entry.failure_count.saturating_add(1);
+            entry.score = compute_strategy_score(entry.success_count, entry.failure_count);
+            entry.last_outcome = "failure".to_string();
+            entry.updated_at = now;
+        } else {
+            memory.entries.push(PlannerStrategyEntry {
+                key,
+                goal_excerpt: truncate_strategy_prompt(prompt),
+                strategy_summary,
+                verification,
+                success_count: 0,
+                failure_count: 1,
+                score: compute_strategy_score(0, 1),
+                last_outcome: "failure".to_string(),
+                updated_at: now,
+            });
+        }
+        sort_and_prune_strategy_entries(&mut memory.entries);
+        self.write_planner_strategy_memory(&memory)
     }
 
     fn emit_cost_event(
@@ -965,11 +1504,150 @@ impl AgentEngine {
         Ok(())
     }
 
-    fn call_for_step(&self, step: &PlanStep, plan: &Plan) -> ToolCall {
+    fn calls_for_step(&self, step: &PlanStep, plan_goal: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        for tool in &step.tools {
+            if let Some(call) = self.call_for_declared_tool(step, plan_goal, tool) {
+                if calls
+                    .iter()
+                    .any(|existing: &ToolCall| existing.name == call.name)
+                {
+                    continue;
+                }
+                calls.push(call);
+            }
+            if calls.len() >= 3 {
+                break;
+            }
+        }
+        if calls.is_empty() {
+            calls.push(self.call_for_step(step, plan_goal));
+        }
+        calls
+    }
+
+    fn call_for_declared_tool(
+        &self,
+        step: &PlanStep,
+        plan_goal: &str,
+        tool: &str,
+    ) -> Option<ToolCall> {
+        let (tool_name, suffix) = parse_declared_tool(tool);
+        let suffix = suffix.as_deref();
+        let primary_file = step.files.first().cloned();
+        let search_pattern = plan_goal_pattern(plan_goal);
+        match tool_name.as_str() {
+            "index.query" => Some(ToolCall {
+                name: "index.query".to_string(),
+                args: json!({"q": plan_goal, "top_k": 10}),
+                requires_approval: false,
+            }),
+            "fs.grep" => Some(ToolCall {
+                name: "fs.grep".to_string(),
+                args: json!({
+                    "pattern": suffix.filter(|s| !s.is_empty()).unwrap_or(&search_pattern),
+                    "glob": "**/*",
+                    "limit": 50,
+                    "respectGitignore": true
+                }),
+                requires_approval: false,
+            }),
+            "fs.read" => {
+                let path = suffix
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or(primary_file)?;
+                Some(ToolCall {
+                    name: "fs.read".to_string(),
+                    args: json!({"path": path}),
+                    requires_approval: false,
+                })
+            }
+            "fs.search_rg" => Some(ToolCall {
+                name: "fs.search_rg".to_string(),
+                args: json!({"query": plan_goal, "limit": 20}),
+                requires_approval: false,
+            }),
+            "fs.list" => Some(ToolCall {
+                name: "fs.list".to_string(),
+                args: json!({"dir": "."}),
+                requires_approval: false,
+            }),
+            "git.status" => Some(ToolCall {
+                name: "git.status".to_string(),
+                args: json!({}),
+                requires_approval: false,
+            }),
+            "git.diff" => Some(ToolCall {
+                name: "git.diff".to_string(),
+                args: json!({}),
+                requires_approval: false,
+            }),
+            "git.show" => Some(ToolCall {
+                name: "git.show".to_string(),
+                args: json!({"spec": suffix.filter(|s| !s.is_empty()).unwrap_or("HEAD")}),
+                requires_approval: false,
+            }),
+            "bash.run" => Some(ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd": suffix.filter(|s| !s.is_empty()).unwrap_or("cargo test --workspace")}),
+                requires_approval: true,
+            }),
+            // Retain legacy behavior so existing patch/apply workflows continue to function.
+            "patch.stage" => Some(ToolCall {
+                name: "patch.stage".to_string(),
+                args: json!({
+                    "unified_diff": format!(
+                            "diff --git a/.deepseek/notes.txt b/.deepseek/notes.txt\nnew file mode 100644\nindex 0000000..2b9d865\n--- /dev/null\n+++ b/.deepseek/notes.txt\n@@ -0,0 +1 @@\n+{}\n",
+                        plan_goal.replace('\n', " ")
+                    ),
+                    "base": ""
+                }),
+                requires_approval: false,
+            }),
+            "fs.edit" => {
+                let path = if let Some(path) = primary_file {
+                    path
+                } else if step.intent == "docs" {
+                    "README.md".to_string()
+                } else {
+                    return None;
+                };
+                Some(ToolCall {
+                    name: "fs.edit".to_string(),
+                    args: json!({
+                        "path": path,
+                        "search": "## Verification",
+                        "replace": "## Verification\n- Ensure DeepSeek API key is configured for strict-online mode.\n",
+                        "all": false
+                    }),
+                    requires_approval: false,
+                })
+            }
+            "fs.write" => {
+                let path = suffix
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or(primary_file)
+                    .unwrap_or_else(|| ".deepseek/notes.txt".to_string());
+                Some(ToolCall {
+                    name: "fs.write".to_string(),
+                    args: json!({
+                        "path": path,
+                        "content": format!("Plan goal: {}\nStep: {}\nIntent: {}\n", plan_goal, step.title, step.intent)
+                    }),
+                    requires_approval: false,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn call_for_step(&self, step: &PlanStep, plan_goal: &str) -> ToolCall {
         match step.intent.as_str() {
             "search" => ToolCall {
                 name: "fs.search_rg".to_string(),
-                args: json!({"query": plan.goal, "limit": 10}),
+                args: json!({"query": plan_goal, "limit": 10}),
                 requires_approval: false,
             },
             "git" => ToolCall {
@@ -982,7 +1660,7 @@ impl AgentEngine {
                 args: json!({
                     "unified_diff": format!(
                         "diff --git a/.deepseek/notes.txt b/.deepseek/notes.txt\nnew file mode 100644\nindex 0000000..2b9d865\n--- /dev/null\n+++ b/.deepseek/notes.txt\n@@ -0,0 +1 @@\n+{}\n",
-                        plan.goal.replace('\n', " ")
+                        plan_goal.replace('\n', " ")
                     ),
                     "base": ""
                 }),
@@ -1014,6 +1692,29 @@ impl AgentEngine {
                 requires_approval: false,
             },
         }
+    }
+
+    fn request_tool_approval(&self, call: &ToolCall) -> Result<bool> {
+        let mut stdout = std::io::stdout();
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() || !stdout.is_terminal() {
+            return Ok(false);
+        }
+
+        let compact_args = serde_json::to_string(&call.args)
+            .unwrap_or_else(|_| "<unserializable args>".to_string());
+        writeln!(
+            stdout,
+            "approval required for tool `{}` with args {}",
+            call.name, compact_args
+        )?;
+        write!(stdout, "approve this call? [y/N]: ")?;
+        stdout.flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let normalized = input.trim().to_ascii_lowercase();
+        Ok(matches!(normalized.as_str(), "y" | "yes"))
     }
 
     fn emit_patch_events_if_any(
@@ -1099,6 +1800,31 @@ struct PlanLlmStep {
     files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PlannerStrategyMemory {
+    entries: Vec<PlannerStrategyEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlannerStrategyEntry {
+    key: String,
+    goal_excerpt: String,
+    strategy_summary: String,
+    verification: Vec<String>,
+    success_count: u64,
+    #[serde(default)]
+    failure_count: u64,
+    #[serde(default = "default_strategy_score")]
+    score: f32,
+    #[serde(default)]
+    last_outcome: String,
+    updated_at: String,
+}
+
+fn default_strategy_score() -> f32 {
+    0.5
+}
+
 fn build_planner_prompt(task: &str) -> String {
     format!(
         "Return only JSON with keys: goal, assumptions, steps, verification, risk_notes. \
@@ -1106,29 +1832,450 @@ fn build_planner_prompt(task: &str) -> String {
     )
 }
 
+fn build_plan_revision_prompt(
+    user_prompt: &str,
+    current_plan: &Plan,
+    failure_streak: u32,
+    failure_detail: &str,
+) -> String {
+    let plan_json = serde_json::to_string_pretty(current_plan)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize plan\"}".to_string());
+    format!(
+        "The current execution plan failed and needs revision.\n\
+Return ONLY JSON with keys: goal, assumptions, steps, verification, risk_notes.\n\
+Each step must include: title, intent, tools, files.\n\
+Keep successful structure where possible and focus on fixing the failure.\n\n\
+User goal:\n{user_prompt}\n\n\
+Failure streak: {failure_streak}\n\
+Latest failure:\n{failure_detail}\n\n\
+Current plan:\n{plan_json}"
+    )
+}
+
+#[derive(Debug, Clone)]
+struct PlanQualityReport {
+    acceptable: bool,
+    score: f32,
+    issues: Vec<String>,
+}
+
+fn assess_plan_quality(plan: &Plan, user_prompt: &str) -> PlanQualityReport {
+    let mut issues = Vec::new();
+    let mut penalty = 0.0_f32;
+    let prompt_lower = user_prompt.to_ascii_lowercase();
+
+    let prompt_words = user_prompt.split_whitespace().count();
+    let min_steps = if prompt_words >= 18 || user_prompt.len() >= 120 {
+        3
+    } else {
+        2
+    };
+    if plan.steps.len() < min_steps {
+        issues.push(format!(
+            "plan has {} steps; expected at least {min_steps}",
+            plan.steps.len()
+        ));
+        penalty += 0.25;
+    }
+    if plan.verification.is_empty() {
+        issues.push("verification is empty".to_string());
+        penalty += 0.35;
+    }
+
+    let steps_without_tools = plan
+        .steps
+        .iter()
+        .filter(|step| step.tools.is_empty())
+        .count();
+    if steps_without_tools > 0 {
+        issues.push(format!("{steps_without_tools} step(s) missing tools"));
+        penalty += 0.20;
+    }
+
+    let mut unique_tools = HashSet::new();
+    for step in &plan.steps {
+        for tool in &step.tools {
+            unique_tools.insert(normalize_declared_tool_name(
+                tool.split_once(':').map_or(tool.as_str(), |(name, _)| name),
+            ));
+        }
+    }
+    if unique_tools.len() < 2 {
+        issues.push("tool diversity is low (fewer than 2 unique tools)".to_string());
+        penalty += 0.10;
+    }
+
+    let mut titles = HashSet::new();
+    let mut duplicate_titles = 0usize;
+    for step in &plan.steps {
+        let lowered = step.title.trim().to_ascii_lowercase();
+        if !lowered.is_empty() && !titles.insert(lowered) {
+            duplicate_titles += 1;
+        }
+    }
+    if duplicate_titles > 0 {
+        issues.push(format!("{duplicate_titles} duplicate step title(s)"));
+        penalty += 0.10;
+    }
+
+    if prompt_lower.contains("implement")
+        || prompt_lower.contains("fix")
+        || prompt_lower.contains("refactor")
+        || prompt_lower.contains("change")
+    {
+        let has_edit = unique_tools.iter().any(|tool| {
+            matches!(
+                tool.as_str(),
+                "fs.edit" | "fs.write" | "patch.stage" | "patch.apply"
+            )
+        });
+        if !has_edit {
+            issues
+                .push("implementation intent detected but no edit/patch tool in plan".to_string());
+            penalty += 0.20;
+        }
+    }
+
+    let has_verification_tool = unique_tools.contains("bash.run")
+        || plan
+            .verification
+            .iter()
+            .any(|cmd| !cmd.trim().is_empty() && !cmd.trim().starts_with('#'));
+    if !has_verification_tool {
+        issues.push("verification commands or verification tool are missing".to_string());
+        penalty += 0.20;
+    }
+
+    let score = (1.0 - penalty).clamp(0.0, 1.0);
+    let acceptable = score >= 0.65
+        && plan.steps.len() >= 2
+        && !plan.verification.is_empty()
+        && steps_without_tools == 0;
+    PlanQualityReport {
+        acceptable,
+        score,
+        issues,
+    }
+}
+
+fn build_plan_quality_repair_prompt(
+    user_prompt: &str,
+    current_plan: &Plan,
+    report: &PlanQualityReport,
+) -> String {
+    let plan_json = serde_json::to_string_pretty(current_plan)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize plan\"}".to_string());
+    let issues = if report.issues.is_empty() {
+        "- no issues captured".to_string()
+    } else {
+        report
+            .issues
+            .iter()
+            .map(|issue| format!("- {issue}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Improve the following plan quality and return ONLY JSON with keys: goal, assumptions, steps, verification, risk_notes.\n\
+Each step must include: title, intent, tools, files.\n\
+Keep the original goal and preserve useful progress, but resolve all quality issues.\n\n\
+User goal:\n{user_prompt}\n\n\
+Quality score: {:.2}\n\
+Quality issues:\n{}\n\n\
+Current draft plan:\n{}",
+        report.score, issues, plan_json
+    )
+}
+
+fn assess_plan_feedback_alignment(
+    plan: &Plan,
+    feedback: &[VerificationRunRecord],
+) -> PlanQualityReport {
+    if feedback.is_empty() {
+        return PlanQualityReport {
+            acceptable: true,
+            score: 1.0,
+            issues: Vec::new(),
+        };
+    }
+    let mut issues = Vec::new();
+    let mut missing = 0usize;
+    let verification_text = plan
+        .verification
+        .iter()
+        .chain(plan.steps.iter().map(|step| &step.title))
+        .chain(plan.steps.iter().flat_map(|step| step.tools.iter()))
+        .map(|item| item.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    for run in feedback.iter().take(6) {
+        let markers = verification_feedback_markers(&run.command);
+        if markers.is_empty() {
+            continue;
+        }
+        let covered = markers
+            .iter()
+            .any(|marker| verification_text.contains(marker));
+        if !covered {
+            missing += 1;
+            issues.push(format!(
+                "plan does not address previously failing command context: {}",
+                run.command
+            ));
+        }
+    }
+    if issues.is_empty() {
+        return PlanQualityReport {
+            acceptable: true,
+            score: 1.0,
+            issues,
+        };
+    }
+    let total = feedback.iter().take(6).count().max(1) as f32;
+    let penalty = (missing as f32 / total) * 0.8;
+    let score = (1.0 - penalty).clamp(0.0, 1.0);
+    PlanQualityReport {
+        acceptable: score >= 0.70 && missing == 0,
+        score,
+        issues,
+    }
+}
+
+fn build_verification_feedback_repair_prompt(
+    user_prompt: &str,
+    current_plan: &Plan,
+    report: &PlanQualityReport,
+    feedback: &[VerificationRunRecord],
+) -> String {
+    let plan_json = serde_json::to_string_pretty(current_plan)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize plan\"}".to_string());
+    let issues = if report.issues.is_empty() {
+        "- no issues captured".to_string()
+    } else {
+        report
+            .issues
+            .iter()
+            .map(|issue| format!("- {issue}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Revise the plan and return ONLY JSON with keys: goal, assumptions, steps, verification, risk_notes.\n\
+Each step must include: title, intent, tools, files.\n\
+Incorporate verification feedback from previous failures.\n\n\
+User goal:\n{user_prompt}\n\n\
+Feedback alignment score: {:.2}\n\
+Issues:\n{}\n\n\
+Previous verification failures:\n{}\n\n\
+Current draft plan:\n{}",
+        report.score,
+        issues,
+        format_verification_feedback(feedback),
+        plan_json
+    )
+}
+
+fn verification_feedback_markers(command: &str) -> Vec<String> {
+    command
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':'))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3 && token != "and" && token != "the")
+        .take(6)
+        .collect::<Vec<_>>()
+}
+
+fn format_verification_feedback(feedback: &[VerificationRunRecord]) -> String {
+    feedback
+        .iter()
+        .take(8)
+        .map(|run| {
+            let output = run.output.trim();
+            let compact = if output.chars().count() > 120 {
+                let head = output.chars().take(120).collect::<String>();
+                format!("{head}...")
+            } else {
+                output.to_string()
+            };
+            format!("- [{}] {} => {}", run.run_at, run.command, compact)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_strategy(plan: &Plan) -> String {
+    let mut segments = Vec::new();
+    let step_titles = plan
+        .steps
+        .iter()
+        .take(4)
+        .map(|step| step.title.trim())
+        .filter(|title| !title.is_empty())
+        .collect::<Vec<_>>();
+    if !step_titles.is_empty() {
+        segments.push(format!("steps={}", step_titles.join(" -> ")));
+    }
+    let tools = plan
+        .steps
+        .iter()
+        .flat_map(|step| step.tools.iter())
+        .map(|tool| {
+            normalize_declared_tool_name(tool.split_once(':').map_or(tool, |(name, _)| name))
+        })
+        .collect::<HashSet<_>>();
+    if !tools.is_empty() {
+        let mut sorted = tools.into_iter().collect::<Vec<_>>();
+        sorted.sort();
+        segments.push(format!("tools={}", sorted.join(",")));
+    }
+    if plan.verification.is_empty() {
+        segments.push("verification=none".to_string());
+    } else {
+        segments.push(format!(
+            "verification={}",
+            plan.verification
+                .iter()
+                .take(3)
+                .map(|cmd| cmd.trim())
+                .filter(|cmd| !cmd.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ; ")
+        ));
+    }
+    segments.join(" | ")
+}
+
+fn truncate_strategy_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.chars().count() <= 220 {
+        return trimmed.to_string();
+    }
+    let head = trimmed.chars().take(220).collect::<String>();
+    format!("{head}...")
+}
+
+fn format_strategy_entries(entries: &[PlannerStrategyEntry]) -> String {
+    entries
+        .iter()
+        .take(6)
+        .map(|entry| {
+            format!(
+                "- key={} score={:.3} success_count={} failure_count={} last_outcome={} goal=\"{}\" strategy=\"{}\" verification={}",
+                entry.key,
+                entry.score,
+                entry.success_count,
+                entry.failure_count,
+                if entry.last_outcome.is_empty() {
+                    "unknown"
+                } else {
+                    entry.last_outcome.as_str()
+                },
+                entry.goal_excerpt,
+                entry.strategy_summary,
+                entry
+                    .verification
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ; ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compute_strategy_score(success_count: u64, failure_count: u64) -> f32 {
+    let observations = success_count.saturating_add(failure_count) as f32;
+    let posterior_mean = (success_count as f32 + 1.0) / (observations + 2.0);
+    let confidence = (observations / 10.0).clamp(0.0, 1.0);
+    (0.5 * (1.0 - confidence) + posterior_mean * confidence).clamp(0.0, 1.0)
+}
+
+fn normalize_strategy_memory(memory: &mut PlannerStrategyMemory) {
+    for entry in &mut memory.entries {
+        if !entry.score.is_finite() || entry.score <= 0.0 {
+            entry.score = compute_strategy_score(entry.success_count, entry.failure_count);
+        }
+        if entry.last_outcome.trim().is_empty() {
+            entry.last_outcome = if entry.success_count >= entry.failure_count {
+                "success".to_string()
+            } else {
+                "failure".to_string()
+            };
+        }
+    }
+    sort_and_prune_strategy_entries(&mut memory.entries);
+}
+
+fn sort_and_prune_strategy_entries(entries: &mut Vec<PlannerStrategyEntry>) {
+    entries.retain(|entry| {
+        let observations = entry.success_count.saturating_add(entry.failure_count);
+        !(observations >= 3
+            && entry.failure_count > entry.success_count.saturating_add(1)
+            && entry.score < 0.35)
+    });
+    entries.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(b.success_count.cmp(&a.success_count))
+            .then(a.failure_count.cmp(&b.failure_count))
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    entries.truncate(64);
+}
+
 fn parse_plan_from_llm(text: &str, fallback_goal: &str) -> Option<Plan> {
     let snippet = extract_json_snippet(text)?;
     let parsed: PlanLlmShape = serde_json::from_str(snippet).ok()?;
-    if parsed.steps.is_empty() {
+    let mut steps = Vec::new();
+    for step in parsed.steps.into_iter().take(16) {
+        let title = step.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let inferred_intent = infer_intent(&step.intent, &step.tools, title);
+        let mut tools = step
+            .tools
+            .into_iter()
+            .map(|tool| tool.trim().to_string())
+            .filter(|tool| !tool.is_empty())
+            .collect::<Vec<_>>();
+        if tools.is_empty() {
+            tools = default_tools_for_intent(&inferred_intent);
+        }
+        if tools.is_empty() {
+            continue;
+        }
+        let mut files = step
+            .files
+            .into_iter()
+            .map(|file| file.trim().to_string())
+            .filter(|file| !file.is_empty())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        steps.push(PlanStep {
+            step_id: Uuid::now_v7(),
+            title: title.to_string(),
+            intent: inferred_intent,
+            tools,
+            files,
+            done: false,
+        });
+    }
+    if steps.is_empty() {
         return None;
     }
-    let steps = parsed
-        .steps
-        .into_iter()
-        .map(|s| PlanStep {
-            step_id: Uuid::now_v7(),
-            title: s.title,
-            intent: s.intent,
-            tools: s.tools,
-            files: s.files,
-            done: false,
-        })
-        .collect::<Vec<_>>();
 
     Some(Plan {
         plan_id: Uuid::now_v7(),
         version: 1,
-        goal: parsed.goal.unwrap_or_else(|| fallback_goal.to_string()),
+        goal: parsed
+            .goal
+            .map(|goal| goal.trim().to_string())
+            .filter(|goal| !goal.is_empty())
+            .unwrap_or_else(|| fallback_goal.to_string()),
         assumptions: parsed.assumptions,
         steps,
         verification: if parsed.verification.is_empty() {
@@ -1157,6 +2304,120 @@ fn extract_json_snippet(text: &str) -> Option<&str> {
         return Some(text[start..=end].trim());
     }
     None
+}
+
+fn infer_intent(raw_intent: &str, tools: &[String], title: &str) -> String {
+    let intent = raw_intent.trim().to_ascii_lowercase();
+    if !intent.is_empty() {
+        return intent;
+    }
+    let title_lc = title.to_ascii_lowercase();
+    if title_lc.contains("verify") || title_lc.contains("test") {
+        return "verify".to_string();
+    }
+    if title_lc.contains("doc") || title_lc.contains("readme") {
+        return "docs".to_string();
+    }
+    if title_lc.contains("git") || title_lc.contains("branch") || title_lc.contains("commit") {
+        return "git".to_string();
+    }
+    if title_lc.contains("search") || title_lc.contains("find") || title_lc.contains("analy") {
+        return "search".to_string();
+    }
+    if title_lc.contains("edit")
+        || title_lc.contains("implement")
+        || title_lc.contains("fix")
+        || title_lc.contains("refactor")
+    {
+        return "edit".to_string();
+    }
+    if let Some(tool) = tools.first() {
+        let base = tool.split_once(':').map_or(tool.as_str(), |(name, _)| name);
+        if base.starts_with("git.") {
+            return "git".to_string();
+        }
+        if base == "bash.run" {
+            return "verify".to_string();
+        }
+    }
+    "task".to_string()
+}
+
+fn default_tools_for_intent(intent: &str) -> Vec<String> {
+    match intent {
+        "search" => vec![
+            "index.query".to_string(),
+            "fs.grep".to_string(),
+            "fs.read".to_string(),
+        ],
+        "git" => vec!["git.status".to_string(), "git.diff".to_string()],
+        "edit" => vec!["fs.edit".to_string(), "patch.stage".to_string()],
+        "docs" => vec!["fs.edit".to_string()],
+        "verify" => vec!["bash.run".to_string()],
+        "recover" => vec!["fs.grep".to_string(), "fs.read".to_string()],
+        _ => vec!["fs.list".to_string()],
+    }
+}
+
+fn parse_declared_tool(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ("".to_string(), None);
+    }
+
+    let (name, arg) = if let Some((name, rest)) = trimmed.split_once(':') {
+        (name.trim(), Some(rest.trim().to_string()))
+    } else if trimmed.ends_with(')') {
+        if let Some(open_idx) = trimmed.find('(') {
+            let name = trimmed[..open_idx].trim();
+            let inner = trimmed[(open_idx + 1)..(trimmed.len() - 1)].trim();
+            (name, Some(inner.to_string()))
+        } else {
+            (trimmed, None)
+        }
+    } else {
+        (trimmed, None)
+    };
+
+    let normalized = normalize_declared_tool_name(name);
+    (normalized, arg.filter(|s| !s.is_empty()))
+}
+
+fn normalize_declared_tool_name(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "bash" | "shell" | "shell.run" | "run" => "bash.run".to_string(),
+        "grep" | "search" => "fs.grep".to_string(),
+        "read" | "read_file" | "fs.read_file" => "fs.read".to_string(),
+        "write" | "write_file" | "fs.write_file" => "fs.write".to_string(),
+        "edit" | "modify" => "fs.edit".to_string(),
+        "list" => "fs.list".to_string(),
+        "git_status" => "git.status".to_string(),
+        "git_diff" => "git.diff".to_string(),
+        "git_show" => "git.show".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn should_parallel_execute_calls(proposals: &[deepseek_core::ToolProposal]) -> bool {
+    proposals.len() > 1
+        && proposals
+            .iter()
+            .all(|proposal| is_parallel_safe_tool(&proposal.call.name))
+}
+
+fn is_parallel_safe_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.list"
+            | "fs.read"
+            | "fs.grep"
+            | "fs.glob"
+            | "fs.search_rg"
+            | "git.status"
+            | "git.diff"
+            | "git.show"
+            | "index.query"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1417,6 +2678,396 @@ fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).div_ceil(4)
 }
 
+fn subagent_request_for_task(
+    task: &SubagentTask,
+    root_goal: &str,
+    verification: &str,
+    base_model: &str,
+    max_think_model: &str,
+) -> LlmRequest {
+    let (unit, model, max_tokens) = match task.role {
+        SubagentRole::Plan => (LlmUnit::Planner, max_think_model.to_string(), 3072),
+        SubagentRole::Explore => (LlmUnit::Planner, base_model.to_string(), 2048),
+        SubagentRole::Task => (LlmUnit::Executor, base_model.to_string(), 2048),
+    };
+    let prompt = format!(
+        "You are a coding subagent.\n\
+role={:?}\n\
+team={}\n\
+name={}\n\
+task_goal={}\n\
+main_goal={}\n\
+verification_targets={}\n\
+Return concise actionable findings only (max 6 bullet points).",
+        task.role, task.team, task.name, task.goal, root_goal, verification
+    );
+    LlmRequest {
+        unit,
+        prompt,
+        model,
+        max_tokens,
+        non_urgent: false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SubagentTaskMeta {
+    name: String,
+    goal: String,
+    created_at: String,
+    targets: Vec<String>,
+}
+
+fn subagent_targets_for_step(step: &PlanStep) -> Vec<String> {
+    if !step.files.is_empty() {
+        let mut files = step
+            .files
+            .iter()
+            .map(|file| file.trim().to_string())
+            .filter(|file| !file.is_empty())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        return files;
+    }
+    if step.intent.eq_ignore_ascii_case("docs") {
+        return vec!["README.md".to_string()];
+    }
+    Vec::new()
+}
+
+fn run_subagent_delegated_tools(
+    tool_host: &LocalToolHost,
+    task: &SubagentTask,
+    root_goal: &str,
+    targets: &[String],
+) -> Option<String> {
+    let calls = subagent_delegated_calls(task, root_goal, targets);
+    if calls.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for call in calls {
+        let mut active_call = call;
+        let mut attempt = 1usize;
+        loop {
+            let proposal = tool_host.propose(active_call.clone());
+            if !proposal.approved {
+                lines.push(format!(
+                    "{} {:?} delegated {} blocked (attempt={})",
+                    task.team, task.role, proposal.call.name, attempt
+                ));
+                if let Some(retry) = subagent_retry_call(task, &proposal.call, root_goal, targets) {
+                    active_call = retry;
+                    attempt += 1;
+                    if attempt <= 2 {
+                        continue;
+                    }
+                }
+                break;
+            }
+            let result = tool_host.execute(ApprovedToolCall {
+                invocation_id: proposal.invocation_id,
+                call: proposal.call.clone(),
+            });
+            let output = truncate_probe_text(
+                serde_json::to_string(&result.output)
+                    .unwrap_or_else(|_| "<unserializable delegated output>".to_string()),
+            );
+            if result.success {
+                lines.push(format!(
+                    "{} {:?} delegated {} => {}",
+                    task.team, task.role, proposal.call.name, output
+                ));
+                break;
+            }
+            lines.push(format!(
+                "{} {:?} delegated {} failed (attempt={}) => {}",
+                task.team, task.role, proposal.call.name, attempt, output
+            ));
+            if let Some(retry) = subagent_retry_call(task, &proposal.call, root_goal, targets) {
+                active_call = retry;
+                attempt += 1;
+                if attempt <= 2 {
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn subagent_delegated_calls(
+    task: &SubagentTask,
+    root_goal: &str,
+    targets: &[String],
+) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    if let Some(primary) = subagent_probe_call(task, root_goal) {
+        calls.push(primary);
+    }
+    if matches!(task.role, SubagentRole::Task) {
+        let note_path = format!(".deepseek/subagents/{}.md", task.run_id);
+        let target_render = if targets.is_empty() {
+            "none".to_string()
+        } else {
+            targets.join(", ")
+        };
+        calls.push(ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({
+                "path": note_path,
+                "content": format!(
+                    "subagent={}\nrole={:?}\nteam={}\nmain_goal={}\ntargets={}\n",
+                    task.name, task.role, task.team, root_goal, target_render
+                )
+            }),
+            requires_approval: true,
+        });
+    }
+    calls.truncate(2);
+    calls
+}
+
+fn subagent_retry_call(
+    task: &SubagentTask,
+    previous_call: &ToolCall,
+    root_goal: &str,
+    targets: &[String],
+) -> Option<ToolCall> {
+    if previous_call.name == "fs.write" || previous_call.name == "patch.apply" {
+        return Some(subagent_readonly_fallback_call(task, root_goal, targets));
+    }
+    if previous_call.name == "bash.run" {
+        return Some(ToolCall {
+            name: "fs.grep".to_string(),
+            args: json!({
+                "pattern": plan_goal_pattern(root_goal),
+                "glob": "**/*",
+                "limit": 25,
+                "respectGitignore": true
+            }),
+            requires_approval: false,
+        });
+    }
+    None
+}
+
+fn subagent_readonly_fallback_call(
+    task: &SubagentTask,
+    root_goal: &str,
+    targets: &[String],
+) -> ToolCall {
+    if let Some(path) = targets.first() {
+        return ToolCall {
+            name: "fs.read".to_string(),
+            args: json!({"path": path}),
+            requires_approval: false,
+        };
+    }
+    let pattern = if task.goal.trim().is_empty() {
+        plan_goal_pattern(root_goal)
+    } else {
+        plan_goal_pattern(&task.goal)
+    };
+    ToolCall {
+        name: "fs.grep".to_string(),
+        args: json!({
+            "pattern": pattern,
+            "glob": "**/*",
+            "limit": 20,
+            "respectGitignore": true
+        }),
+        requires_approval: false,
+    }
+}
+
+fn summarize_subagent_merge_arbitration(
+    results: &[deepseek_subagent::SubagentResult],
+    targets_by_run: &HashMap<Uuid, Vec<String>>,
+) -> Vec<String> {
+    let mut by_target: HashMap<String, Vec<&deepseek_subagent::SubagentResult>> = HashMap::new();
+    for result in results {
+        let targets = targets_by_run
+            .get(&result.run_id)
+            .cloned()
+            .unwrap_or_default();
+        for target in targets {
+            if target.trim().is_empty() {
+                continue;
+            }
+            by_target.entry(target).or_default().push(result);
+        }
+    }
+    let mut notes = Vec::new();
+    let mut targets = by_target.keys().cloned().collect::<Vec<_>>();
+    targets.sort();
+    for target in targets {
+        let Some(candidates) = by_target.get(&target) else {
+            continue;
+        };
+        if candidates.len() <= 1 {
+            continue;
+        }
+        let mut ordered = candidates.clone();
+        ordered.sort_by(|a, b| {
+            subagent_arbitration_score(b, &target)
+                .total_cmp(&subagent_arbitration_score(a, &target))
+                .then(
+                    subagent_arbitration_priority(&a.role)
+                        .cmp(&subagent_arbitration_priority(&b.role)),
+                )
+                .then(a.attempts.cmp(&b.attempts))
+                .then(a.name.cmp(&b.name))
+                .then(a.run_id.cmp(&b.run_id))
+        });
+        let winner = ordered[0];
+        let contenders = ordered
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{}::{:?}({}) score={:.3}",
+                    candidate.team,
+                    candidate.role,
+                    candidate.name,
+                    subagent_arbitration_score(candidate, &target)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let winner_score = subagent_arbitration_score(winner, &target);
+        notes.push(format!(
+            "merge_arbitration target={} contenders=[{}] winner={}::{:?}({}) winner_score={:.3} rationale={}",
+            target,
+            contenders,
+            winner.team,
+            winner.role,
+            winner.name,
+            winner_score,
+            subagent_arbitration_rationale(winner, &target)
+        ));
+    }
+    notes
+}
+
+fn subagent_arbitration_priority(role: &SubagentRole) -> u8 {
+    match role {
+        SubagentRole::Task => 0,
+        SubagentRole::Plan => 1,
+        SubagentRole::Explore => 2,
+    }
+}
+
+fn subagent_arbitration_score(result: &deepseek_subagent::SubagentResult, target: &str) -> f32 {
+    let mut score = if result.success { 0.7 } else { 0.15 };
+    score += match result.role {
+        SubagentRole::Task => 0.20,
+        SubagentRole::Plan => 0.14,
+        SubagentRole::Explore => 0.08,
+    };
+    let output = result.output.to_ascii_lowercase();
+    let target_lc = target.to_ascii_lowercase();
+    if !target_lc.is_empty() && output.contains(&target_lc) {
+        score += 0.12;
+    }
+    if output.contains("verify") || output.contains("test") {
+        score += 0.05;
+    }
+    if output.contains("blocked") || output.contains("failed") {
+        score -= 0.10;
+    }
+    score -= (result.attempts.saturating_sub(1) as f32) * 0.04;
+    score.clamp(0.0, 1.0)
+}
+
+fn subagent_arbitration_rationale(
+    result: &deepseek_subagent::SubagentResult,
+    target: &str,
+) -> String {
+    let mut signals = Vec::new();
+    if result.success {
+        signals.push("success");
+    } else {
+        signals.push("failed");
+    }
+    if result.attempts <= 1 {
+        signals.push("single-attempt");
+    } else {
+        signals.push("retried");
+    }
+    let output = result.output.to_ascii_lowercase();
+    if output.contains(&target.to_ascii_lowercase()) {
+        signals.push("mentions-target");
+    }
+    if output.contains("verify") || output.contains("test") {
+        signals.push("has-verification-signal");
+    }
+    format!("{} role={:?}", signals.join("+"), result.role)
+}
+
+fn subagent_probe_call(task: &SubagentTask, root_goal: &str) -> Option<ToolCall> {
+    match task.role {
+        SubagentRole::Explore => Some(ToolCall {
+            name: "index.query".to_string(),
+            args: json!({"q": root_goal, "top_k": 8}),
+            requires_approval: false,
+        }),
+        SubagentRole::Plan => Some(ToolCall {
+            name: "fs.grep".to_string(),
+            args: json!({
+                "pattern": plan_goal_pattern(root_goal),
+                "glob": "**/*",
+                "limit": 20,
+                "respectGitignore": true
+            }),
+            requires_approval: false,
+        }),
+        SubagentRole::Task => Some(ToolCall {
+            name: "git.status".to_string(),
+            args: json!({}),
+            requires_approval: false,
+        }),
+    }
+}
+
+fn truncate_probe_text(text: String) -> String {
+    const MAX_CHARS: usize = 480;
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let head = text.chars().take(MAX_CHARS).collect::<String>();
+    format!("{head}...")
+}
+
+fn plan_goal_pattern(goal: &str) -> String {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in goal.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            current.push(ch.to_ascii_lowercase());
+            continue;
+        }
+        if current.len() >= 4 {
+            terms.push(current.clone());
+        }
+        current.clear();
+    }
+    if current.len() >= 4 {
+        terms.push(current);
+    }
+    terms.sort();
+    terms.dedup();
+    if terms.is_empty() {
+        return "TODO|FIXME|panic|error".to_string();
+    }
+    terms.into_iter().take(4).collect::<Vec<_>>().join("|")
+}
+
 fn summarize_transcript(transcript: &[String], max_lines: usize) -> String {
     let mut lines = transcript
         .iter()
@@ -1438,6 +3089,42 @@ fn summarize_transcript(transcript: &[String], max_lines: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("Auto-compacted transcript summary:\n{rendered}")
+}
+
+fn summarize_subagent_notes(notes: &[String]) -> String {
+    notes
+        .iter()
+        .flat_map(|note| note.lines())
+        .take(12)
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.len() > 240 {
+                format!("- {}...", &trimmed[..240])
+            } else {
+                format!("- {trimmed}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn augment_goal_with_subagent_notes(goal: &str, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return goal.to_string();
+    }
+    let joined = notes
+        .iter()
+        .flat_map(|note| note.lines())
+        .take(6)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        goal.to_string()
+    } else {
+        format!("{goal} [subagent_findings: {joined}]")
+    }
 }
 
 fn is_valid_transition(from: &SessionState, to: &SessionState) -> bool {
@@ -1550,5 +3237,554 @@ mod tests {
         let summary = summarize_transcript(&transcript, 5);
         assert!(summary.contains("line 45"));
         assert!(!summary.contains("line 1"));
+    }
+
+    #[test]
+    fn plan_goal_pattern_uses_meaningful_terms() {
+        let pattern = plan_goal_pattern("Refactor planner execution for git status and retries");
+        assert!(pattern.contains("refactor"));
+        assert!(pattern.contains("planner"));
+    }
+
+    #[test]
+    fn declared_tool_mapping_prefers_step_files_for_reads() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-agent-tool-map-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let engine = AgentEngine::new(&workspace).expect("engine");
+        let step = PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Read target file".to_string(),
+            intent: "search".to_string(),
+            tools: vec!["fs.read".to_string()],
+            files: vec!["src/main.rs".to_string()],
+            done: false,
+        };
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "inspect".to_string(),
+            assumptions: vec![],
+            steps: vec![step.clone()],
+            verification: vec![],
+            risk_notes: vec![],
+        };
+        let calls = engine.calls_for_step(&step, &plan.goal);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs.read");
+        assert_eq!(calls[0].args["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn declared_tools_generate_multiple_calls() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-agent-multicall-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let engine = AgentEngine::new(&workspace).expect("engine");
+        let step = PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Explore".to_string(),
+            intent: "search".to_string(),
+            tools: vec![
+                "index.query".to_string(),
+                "fs.grep".to_string(),
+                "git.status".to_string(),
+            ],
+            files: vec![],
+            done: false,
+        };
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "router thresholds".to_string(),
+            assumptions: vec![],
+            steps: vec![step.clone()],
+            verification: vec![],
+            risk_notes: vec![],
+        };
+        let calls = engine.calls_for_step(&step, &plan.goal);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].name, "index.query");
+        assert_eq!(calls[1].name, "fs.grep");
+        assert_eq!(calls[2].name, "git.status");
+    }
+
+    #[test]
+    fn declared_tools_support_suffix_syntax() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-agent-suffix-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let engine = AgentEngine::new(&workspace).expect("engine");
+        let step = PlanStep {
+            step_id: Uuid::now_v7(),
+            title: "Run precise checks".to_string(),
+            intent: "verify".to_string(),
+            tools: vec![
+                "bash.run:cargo test -p deepseek-agent".to_string(),
+                "git.show:HEAD~1".to_string(),
+                "fs.grep:router|planner".to_string(),
+            ],
+            files: vec![],
+            done: false,
+        };
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "verify runtime".to_string(),
+            assumptions: vec![],
+            steps: vec![step.clone()],
+            verification: vec![],
+            risk_notes: vec![],
+        };
+        let calls = engine.calls_for_step(&step, &plan.goal);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].name, "bash.run");
+        assert_eq!(calls[0].args["cmd"], "cargo test -p deepseek-agent");
+        assert_eq!(calls[1].name, "git.show");
+        assert_eq!(calls[1].args["spec"], "HEAD~1");
+        assert_eq!(calls[2].name, "fs.grep");
+        assert_eq!(calls[2].args["pattern"], "router|planner");
+    }
+
+    #[test]
+    fn subagent_request_uses_reasoner_for_plan_role() {
+        let task = SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: "planner".to_string(),
+            goal: "decompose".to_string(),
+            role: SubagentRole::Plan,
+            team: "planning".to_string(),
+        };
+        let req = subagent_request_for_task(
+            &task,
+            "improve runtime",
+            "cargo test --workspace",
+            "deepseek-chat",
+            "deepseek-reasoner",
+        );
+        assert!(matches!(req.unit, LlmUnit::Planner));
+        assert_eq!(req.model, "deepseek-reasoner");
+        assert!(req.prompt.contains("main_goal=improve runtime"));
+    }
+
+    #[test]
+    fn parse_plan_infers_intent_and_default_tools() {
+        let text = r#"
+```json
+{
+  "goal": "stabilize planner",
+  "steps": [
+    { "title": "Search for failures", "intent": "", "tools": [], "files": [] },
+    { "title": "Run verification", "intent": "", "tools": ["bash.run:cargo test -p deepseek-agent"], "files": [] }
+  ],
+  "verification": []
+}
+```
+"#;
+        let plan = parse_plan_from_llm(text, "fallback").expect("plan");
+        assert_eq!(plan.goal, "stabilize planner");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].intent, "search");
+        assert_eq!(
+            plan.steps[0].tools,
+            vec!["index.query", "fs.grep", "fs.read"]
+        );
+        assert_eq!(
+            plan.steps[1].tools,
+            vec!["bash.run:cargo test -p deepseek-agent"]
+        );
+        assert!(!plan.verification.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_discards_empty_steps() {
+        let text = r#"
+{"goal":"x","steps":[{"title":"   ","intent":"","tools":[],"files":[]}]}
+"#;
+        assert!(parse_plan_from_llm(text, "fallback").is_none());
+    }
+
+    #[test]
+    fn summarize_subagent_notes_limits_lines() {
+        let notes = vec![
+            "one\ntwo\nthree".to_string(),
+            "four\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen".to_string(),
+        ];
+        let summary = summarize_subagent_notes(&notes);
+        let lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 12);
+        assert!(summary.contains("one"));
+        assert!(!summary.contains("thirteen"));
+    }
+
+    #[test]
+    fn parse_declared_tool_supports_aliases_and_paren_args() {
+        let (name, arg) = parse_declared_tool("bash(cargo test --workspace)");
+        assert_eq!(name, "bash.run");
+        assert_eq!(arg.as_deref(), Some("cargo test --workspace"));
+
+        let (name, arg) = parse_declared_tool("read:src/main.rs");
+        assert_eq!(name, "fs.read");
+        assert_eq!(arg.as_deref(), Some("src/main.rs"));
+
+        let (name, arg) = parse_declared_tool("git_show(HEAD~2)");
+        assert_eq!(name, "git.show");
+        assert_eq!(arg.as_deref(), Some("HEAD~2"));
+    }
+
+    #[test]
+    fn plan_revision_prompt_contains_context() {
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 2,
+            goal: "Improve runtime".to_string(),
+            assumptions: vec!["workspace writable".to_string()],
+            steps: vec![PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Inspect".to_string(),
+                intent: "search".to_string(),
+                tools: vec!["index.query".to_string()],
+                files: vec!["src/lib.rs".to_string()],
+                done: false,
+            }],
+            verification: vec!["cargo test -p deepseek-agent".to_string()],
+            risk_notes: vec![],
+        };
+        let prompt = build_plan_revision_prompt("Fix planner", &plan, 2, "approval required");
+        assert!(prompt.contains("Fix planner"));
+        assert!(prompt.contains("approval required"));
+        assert!(prompt.contains("\"version\": 2"));
+    }
+
+    #[test]
+    fn plan_quality_detects_missing_depth_and_verification() {
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "implement robust retry handling".to_string(),
+            assumptions: vec![],
+            steps: vec![PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Inspect retry code".to_string(),
+                intent: "search".to_string(),
+                tools: vec!["fs.read".to_string()],
+                files: vec!["src/retry.rs".to_string()],
+                done: false,
+            }],
+            verification: Vec::new(),
+            risk_notes: vec![],
+        };
+        let report = assess_plan_quality(
+            &plan,
+            "Implement retry handling and add verification commands for reliability.",
+        );
+        assert!(!report.acceptable);
+        assert!(report.score < 0.65);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("verification"))
+        );
+        assert!(report.issues.iter().any(|issue| issue.contains("steps")));
+    }
+
+    #[test]
+    fn plan_quality_repair_prompt_includes_reported_issues() {
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "stabilize planner".to_string(),
+            assumptions: vec![],
+            steps: vec![PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Do task".to_string(),
+                intent: "task".to_string(),
+                tools: vec!["fs.list".to_string()],
+                files: vec![],
+                done: false,
+            }],
+            verification: vec![],
+            risk_notes: vec![],
+        };
+        let report = PlanQualityReport {
+            acceptable: false,
+            score: 0.42,
+            issues: vec!["verification is empty".to_string()],
+        };
+        let prompt = build_plan_quality_repair_prompt("Fix planner reliability", &plan, &report);
+        assert!(prompt.contains("Fix planner reliability"));
+        assert!(prompt.contains("verification is empty"));
+        assert!(prompt.contains("Quality score: 0.42"));
+    }
+
+    #[test]
+    fn feedback_alignment_flags_missing_failed_command_coverage() {
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "stabilize".to_string(),
+            assumptions: vec![],
+            steps: vec![PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Inspect logs".to_string(),
+                intent: "search".to_string(),
+                tools: vec!["fs.grep".to_string()],
+                files: vec![],
+                done: false,
+            }],
+            verification: vec!["cargo fmt --all -- --check".to_string()],
+            risk_notes: vec![],
+        };
+        let feedback = vec![VerificationRunRecord {
+            command: "pytest -k router_smoke".to_string(),
+            success: false,
+            output: "test failure".to_string(),
+            run_at: Utc::now().to_rfc3339(),
+        }];
+        let report = assess_plan_feedback_alignment(&plan, &feedback);
+        assert!(!report.acceptable);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("failing command"))
+        );
+    }
+
+    #[test]
+    fn delegated_calls_for_task_include_bounded_write_step() {
+        let task = SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: "apply-fix".to_string(),
+            goal: "edit".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+        };
+        let calls = subagent_delegated_calls(
+            &task,
+            "fix runtime",
+            &["src/lib.rs".to_string(), "src/main.rs".to_string()],
+        );
+        assert!(!calls.is_empty());
+        assert!(calls.len() <= 2);
+        assert!(calls.iter().any(|call| call.name == "fs.write"));
+    }
+
+    #[test]
+    fn merge_arbitration_reports_conflicting_targets() {
+        let shared = "src/lib.rs".to_string();
+        let a = deepseek_subagent::SubagentResult {
+            run_id: Uuid::now_v7(),
+            name: "planner".to_string(),
+            role: SubagentRole::Plan,
+            team: "planning".to_string(),
+            attempts: 1,
+            success: true,
+            output: "a".to_string(),
+            error: None,
+        };
+        let b = deepseek_subagent::SubagentResult {
+            run_id: Uuid::now_v7(),
+            name: "executor".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+            attempts: 1,
+            success: true,
+            output: "b".to_string(),
+            error: None,
+        };
+        let mut targets = HashMap::new();
+        targets.insert(a.run_id, vec![shared.clone()]);
+        targets.insert(b.run_id, vec![shared.clone()]);
+        let notes = summarize_subagent_merge_arbitration(&[a, b], &targets);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("merge_arbitration"));
+        assert!(notes[0].contains(&shared));
+    }
+
+    #[test]
+    fn augment_goal_uses_subagent_notes() {
+        let goal = "stabilize runtime";
+        let notes = vec!["first finding".to_string(), "second finding".to_string()];
+        let augmented = augment_goal_with_subagent_notes(goal, &notes);
+        assert!(augmented.contains("stabilize runtime"));
+        assert!(augmented.contains("subagent_findings"));
+        assert!(augmented.contains("first finding"));
+    }
+
+    #[test]
+    fn parallel_execution_only_for_read_only_calls() {
+        use deepseek_core::{ToolCall, ToolProposal};
+        let safe = vec![
+            ToolProposal {
+                invocation_id: Uuid::now_v7(),
+                call: ToolCall {
+                    name: "fs.grep".to_string(),
+                    args: json!({}),
+                    requires_approval: false,
+                },
+                approved: true,
+            },
+            ToolProposal {
+                invocation_id: Uuid::now_v7(),
+                call: ToolCall {
+                    name: "git.status".to_string(),
+                    args: json!({}),
+                    requires_approval: false,
+                },
+                approved: true,
+            },
+        ];
+        assert!(should_parallel_execute_calls(&safe));
+
+        let mixed = vec![
+            ToolProposal {
+                invocation_id: Uuid::now_v7(),
+                call: ToolCall {
+                    name: "fs.grep".to_string(),
+                    args: json!({}),
+                    requires_approval: false,
+                },
+                approved: true,
+            },
+            ToolProposal {
+                invocation_id: Uuid::now_v7(),
+                call: ToolCall {
+                    name: "fs.edit".to_string(),
+                    args: json!({}),
+                    requires_approval: false,
+                },
+                approved: true,
+            },
+        ];
+        assert!(!should_parallel_execute_calls(&mixed));
+    }
+
+    #[test]
+    fn subagent_probe_call_maps_roles_to_read_only_tools() {
+        let run_id = Uuid::now_v7();
+        let explore = SubagentTask {
+            run_id,
+            name: "scan".to_string(),
+            goal: "search".to_string(),
+            role: SubagentRole::Explore,
+            team: "explore".to_string(),
+        };
+        let plan = SubagentTask {
+            role: SubagentRole::Plan,
+            ..explore.clone()
+        };
+        let task = SubagentTask {
+            role: SubagentRole::Task,
+            ..explore
+        };
+        let explore_probe = subagent_probe_call(&plan, "planner").expect("plan probe");
+        assert_eq!(explore_probe.name, "fs.grep");
+        assert_eq!(explore_probe.args["pattern"], "planner");
+        assert_eq!(explore_probe.args["glob"], "**/*");
+        assert_eq!(explore_probe.args["limit"], 20);
+        let explore_role_probe = subagent_probe_call(
+            &SubagentTask {
+                role: SubagentRole::Explore,
+                ..plan.clone()
+            },
+            "planner",
+        )
+        .expect("explore probe");
+        assert_eq!(explore_role_probe.name, "index.query");
+        assert_eq!(explore_role_probe.args["q"], "planner");
+        assert_eq!(
+            subagent_probe_call(&task, "planner")
+                .map(|call| call.name)
+                .as_deref(),
+            Some("git.status")
+        );
+    }
+
+    #[test]
+    fn strategy_scores_penalize_failures_and_prune_chronic_entries() {
+        assert!(compute_strategy_score(6, 1) > compute_strategy_score(1, 6));
+
+        let mut entries = vec![
+            PlannerStrategyEntry {
+                key: "stable".to_string(),
+                goal_excerpt: "keep stable behavior".to_string(),
+                strategy_summary: "good".to_string(),
+                verification: vec!["cargo test".to_string()],
+                success_count: 5,
+                failure_count: 1,
+                score: compute_strategy_score(5, 1),
+                last_outcome: "success".to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+            PlannerStrategyEntry {
+                key: "noisy".to_string(),
+                goal_excerpt: "broken path".to_string(),
+                strategy_summary: "bad".to_string(),
+                verification: vec!["cargo test".to_string()],
+                success_count: 0,
+                failure_count: 5,
+                score: compute_strategy_score(0, 5),
+                last_outcome: "failure".to_string(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        ];
+        sort_and_prune_strategy_entries(&mut entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "stable");
+    }
+
+    #[test]
+    fn subagent_retry_downgrades_blocked_write_to_read_only_fallback() {
+        let task = SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: "apply-fix".to_string(),
+            goal: "edit".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+        };
+        let write_call = deepseek_core::ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({"path": ".deepseek/subagents/test.md", "content": "x"}),
+            requires_approval: true,
+        };
+        let fallback = subagent_retry_call(
+            &task,
+            &write_call,
+            "stabilize runtime",
+            &["src/lib.rs".to_string()],
+        )
+        .expect("fallback");
+        assert_eq!(fallback.name, "fs.read");
+        assert_eq!(fallback.args["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn arbitration_score_prefers_successful_target_specific_results() {
+        let target = "src/lib.rs";
+        let weak = deepseek_subagent::SubagentResult {
+            run_id: Uuid::now_v7(),
+            name: "explore".to_string(),
+            role: SubagentRole::Explore,
+            team: "explore".to_string(),
+            attempts: 2,
+            success: false,
+            output: "blocked".to_string(),
+            error: Some("approval".to_string()),
+        };
+        let strong = deepseek_subagent::SubagentResult {
+            run_id: Uuid::now_v7(),
+            name: "executor".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+            attempts: 1,
+            success: true,
+            output: "updated src/lib.rs and added verification test".to_string(),
+            error: None,
+        };
+        assert!(
+            subagent_arbitration_score(&strong, target) > subagent_arbitration_score(&weak, target)
+        );
     }
 }

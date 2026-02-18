@@ -13,6 +13,8 @@ It provides planning, execution, patching, indexing, plugin/hooks extensibility,
 - Strict-online default (`DEEPSEEK_API_KEY` required unless offline fallback is explicitly enabled)
 - Rich terminal UI default for `deepseek chat`
 - 1M context-window configuration with automatic context compaction near threshold
+- Interactive approval prompts for gated tool calls in TTY sessions
+- Multi-tool step execution from planner output (including alias/suffix tool syntax)
 
 ## Install
 
@@ -61,14 +63,34 @@ deepseek chat
 deepseek autopilot "Execute and verify task" --hours 4
 ```
 
+Credential behavior:
+- Interactive TTY commands prompt for `DEEPSEEK_API_KEY` if missing and `llm.offline_fallback=false`.
+- Non-interactive/JSON mode fails fast with a clear error instead of attempting a network call.
+
+Execution behavior:
+- Planner steps can execute multiple declared tools per step (up to 3), in declared order.
+- Declared tool syntax supports `name:arg` and `name(arg)` forms (for example `bash.run:cargo test --workspace`).
+- Subagents run model-backed analysis with delegated read-only tool probes and are recorded in transcript/status output.
+- Task-role subagents now run bounded delegated tool execution (including isolated subagent artifact writes) with merge-arbitration summaries when multiple subagents target the same file.
+- Delegated subagent execution now includes approval-aware retries with bounded read-only fallback paths.
+- Autopilot supports live pause/resume control via pause files and `deepseek autopilot pause|resume`, plus live status sampling with `deepseek autopilot status --follow`.
+- `deepseek permissions show|set` provides first-class policy control for approvals/allowlist/sandbox mode.
+- Planner quality checks auto-repair weak plans with bounded retries before fallback.
+- Planner self-evaluation now includes prior verification-failure memory to improve subsequent plan revisions.
+- Successful/failed runs are persisted into planner strategy memory with score-based prioritization and pruning before future plan injection.
+- `deepseek profile --benchmark` runs planning benchmarks with latency/quality metrics, supports external suites, compares against baseline runs, and produces side-by-side peer ranking with case matrices.
+- Benchmark mode supports thresholds and result export (`--benchmark-suite`, `--benchmark-min-success-rate`, `--benchmark-min-quality-rate`, `--benchmark-max-p95-ms`, `--benchmark-baseline`, `--benchmark-max-regression-ms`, `--benchmark-compare`, `--benchmark-output`), plus reproducible seeded runs with signed corpus/execution manifests and scorecards (`--benchmark-seed`, `--benchmark-signing-key-env`).
+
 ## Command Overview
 
 - `deepseek chat [--tools] [--tui]` (TUI is default in interactive terminals)
 - `deepseek ask "<prompt>" [--tools]`
 - `deepseek plan "<prompt>"`
 - `deepseek run [session-id]`
+- `deepseek profile [--benchmark] [--benchmark-cases N] [--benchmark-seed N] [--benchmark-suite <path>] [--benchmark-pack <name>] [--benchmark-signing-key-env ENV] [--benchmark-min-success-rate F] [--benchmark-min-quality-rate F] [--benchmark-max-p95-ms N] [--benchmark-baseline <path>] [--benchmark-max-regression-ms N] [--benchmark-compare <path>] [--benchmark-output <path>]`
+- `deepseek benchmark list-packs|show-pack <name>|import-pack <name> <source>`
 - `deepseek autopilot "<prompt>" [--hours|--duration-seconds|--forever] [--max-iterations N]`
-- `deepseek autopilot status|stop|resume`
+- `deepseek autopilot status [--follow --samples N --interval-seconds N]|pause|stop|resume`
 - `deepseek diff`
 - `deepseek apply [--patch-id <uuid>] --yes`
 - `deepseek rewind [--to-checkpoint <uuid>] --yes`
@@ -87,6 +109,7 @@ deepseek autopilot "Execute and verify task" --hours 4
 - `deepseek doctor`
 - `deepseek index build|update|status|watch|query <q> [--top-k N]`
 - `deepseek config edit|show`
+- `deepseek permissions show|set [--approve-bash <ask|always|never>] [--approve-edits <ask|always|never>] [--sandbox-mode <mode>] [--allow <prefix>] [--clear-allowlist]`
 - `deepseek plugins list|install|remove|enable|disable|inspect|catalog|search|verify|run`
 - `deepseek clean [--dry-run]`
 
@@ -97,6 +120,7 @@ Interactive slash commands:
 - `/help`, `/init`, `/clear`, `/compact`, `/memory`, `/config`, `/model`
 - `/cost`, `/mcp`, `/rewind`, `/export`, `/plan`, `/teleport`, `/remote-env`
 - `/status`, `/effort`, `/skills`
+- `/permissions`
 
 ## Configuration
 

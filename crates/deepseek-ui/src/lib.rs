@@ -36,6 +36,7 @@ pub enum SlashCommand {
     Status,
     Effort(Option<String>),
     Skills(Vec<String>),
+    Permissions(Vec<String>),
     Unknown { name: String, args: Vec<String> },
 }
 
@@ -67,6 +68,7 @@ impl SlashCommand {
             "status" => Self::Status,
             "effort" => Self::Effort(args.first().cloned()),
             "skills" => Self::Skills(args),
+            "permissions" => Self::Permissions(args),
             other => Self::Unknown {
                 name: other.to_string(),
                 args,
@@ -578,6 +580,10 @@ mod tests {
                 "run".to_string(),
                 "refactor".to_string()
             ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/permissions show"),
+            Some(SlashCommand::Permissions(vec!["show".to_string()]))
         );
     }
 

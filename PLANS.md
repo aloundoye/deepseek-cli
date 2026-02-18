@@ -201,6 +201,78 @@ Verification:
   - `cargo build --workspace`
   - `cargo build --release --workspace`
 
+### M13 Parity Gap Closure Loop
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added first-class permission controls with `deepseek permissions show|set` and `/permissions` in line/TUI chat.
+- Added richer live autopilot control semantics via `deepseek autopilot status --follow --samples --interval-seconds`.
+- Expanded benchmark parity by allowing external benchmark suites (`--benchmark-suite`) with per-case quality gates.
+
+Verification:
+- `cargo test -p deepseek-cli --test cli_json`
+- `cargo test -p deepseek-ui`
+
+### M14 Parity Gap Closure Loop (Reasoning/Subagents/Benchmarks)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added bounded planner quality self-critique and repair retries before schema fallback.
+- Added subagent delegated read-only tool probes (explore/plan/task role mapping) merged into output.
+- Added benchmark quality-rate gating, baseline comparison/regression checks, and peer report ranking (`--benchmark-compare`).
+
+Verification:
+- `cargo test -p deepseek-agent`
+- `cargo test -p deepseek-cli --test cli_json`
+
+### M15 Parity Gap Closure Loop (Feedback Memory + Arbitration + Corpus Matrix)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added planner verification-feedback memory in context and multi-pass feedback-alignment repair retries.
+- Upgraded subagents from read-only probes to bounded delegated tool execution.
+- Added subagent conflict-aware merge arbitration summaries for shared target files.
+- Expanded benchmark peer comparison to include corpus mismatch warnings and per-case matrix.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
+### M16 Parity Gap Closure Loop (Strategy Memory + Pack Workflow)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added persisted planner strategy memory from successful runs and strategy-memory context injection in planning.
+- Added scoped subagent delegated execution policies by role (bounded tool calls and task artifact writes).
+- Added benchmark pack command workflow (`benchmark list-packs|show-pack|import-pack`) and `profile --benchmark-pack`.
+- Extended benchmark side-by-side report with case-level matrix and corpus compatibility warnings.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
+### M17 Parity Gap Closure Loop (Scored Strategies + Signed Scorecards)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added planner strategy-memory scoring and pruning to suppress chronically low-performing strategy memories.
+- Added approval-aware delegated subagent retries with bounded read-only fallback when delegated edits are blocked.
+- Upgraded subagent merge arbitration with per-target scoring and rationale output for conflict resolution.
+- Added seeded benchmark determinism plus signed corpus/execution manifests and benchmark scorecards.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
 ## Data/Storage Contracts
 - Canonical append-only event log: `.deepseek/events.jsonl`.
 - Projections remain additive only.
