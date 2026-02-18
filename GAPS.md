@@ -13,8 +13,8 @@ This matrix tracks the remaining gap between `specs.md` expectations and practic
 | Live autopilot/background semantics | True in-TUI background handoff was missing for direct prompt/shell detachment. | **Mostly closed** (`Ctrl+B` now launches `/background run-agent` or `/background run-shell`, plus attach tailing and stop controls) |
 | Subagent intelligence | Multi-agent conflict-free ownership/dependency scheduling was still too shallow. | **Mostly closed** (role/domain specialization memory + delegated retries + arbitration scoring + explicit phase/lane dependency planning) |
 | Permission/safety governance | Team-managed non-overridable permissions were missing. | **Partially closed** (team policy overlay via `DEEPSEEK_TEAM_POLICY_PATH` / `~/.deepseek/team-policy.json` now enforced) |
-| Advanced visual/sandbox parity | Visual verification capture/analyzer loops and OS-level sandbox isolation remain below frontier parity. | **Open / Future-facing** |
-| Real-world benchmark parity | Need broader shared corpus + strict peer comparability at scale for direct Codex/Aider/Claude benchmarking. | **Partially closed** (`--benchmark-compare` + manifest/seed compatibility checks + signed scorecards/manifests + `benchmark run-matrix` aggregate parity runner + strict compare modes) |
+| Advanced visual/sandbox parity | Visual artifact capture existed but lacked strict analyzers/gates; sandbox mode semantics needed stronger runtime enforcement. | **Partially closed** (`visual list|analyze --strict` + runtime shell sandbox enforcement for `read-only`/`workspace-write`) |
+| Real-world benchmark parity | Need broader shared corpus + strict peer comparability at scale for direct Codex/Aider/Claude benchmarking. | **Partially closed** (`--benchmark-compare` + manifest/seed compatibility checks + signed scorecards/manifests + `benchmark run-matrix` aggregate parity runner + strict compare modes + expanded builtin `parity` pack) |
 
 ## Executed Plan (This Iteration)
 
@@ -78,8 +78,16 @@ This matrix tracks the remaining gap between `specs.md` expectations and practic
 4. Add tests for background launch/attach/stop JSON contracts and lane-planning behavior.
 5. Validate with fmt/clippy/tests/build.
 
+## Executed Plan (Current Iteration +4)
+
+1. Enforce stronger shell sandbox semantics by mode (`read-only`, `workspace-write`) at tool runtime.
+2. Add production visual verification control plane (`visual list|analyze`) with strict pass/fail quality gates.
+3. Expand built-in benchmark parity corpus (`benchmark` builtin `parity` pack) for broader reproducible peer comparisons.
+4. Extend slash/TUI flows with `/visual` command parity.
+5. Validate with fmt/clippy/tests/build.
+
 ## Next Iteration Plan (Remaining Open Gaps)
 
-1. Build/ingest larger shared real-world benchmark corpora and publish reproducible Codex/Aider/Claude parity scorecards.
-2. Extend visual verification from artifact capture to automated analyzer/verification loops with actionable gates.
-3. Strengthen sandbox isolation from policy checks to stricter OS-level execution containment workflows.
+1. Build/ingest larger shared real-world benchmark corpora from external/public task sets and publish reproducible Codex/Aider/Claude parity scorecards.
+2. Extend visual verification beyond static heuristics to richer UI-diff/expectation analyzers.
+3. Strengthen sandbox isolation from command-level policy to OS-level execution containment workflows.

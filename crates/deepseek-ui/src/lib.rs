@@ -38,6 +38,7 @@ pub enum SlashCommand {
     Skills(Vec<String>),
     Permissions(Vec<String>),
     Background(Vec<String>),
+    Visual(Vec<String>),
     Unknown { name: String, args: Vec<String> },
 }
 
@@ -71,6 +72,7 @@ impl SlashCommand {
             "skills" => Self::Skills(args),
             "permissions" => Self::Permissions(args),
             "background" => Self::Background(args),
+            "visual" => Self::Visual(args),
             other => Self::Unknown {
                 name: other.to_string(),
                 args,
@@ -426,6 +428,7 @@ where
                     "skills",
                     "permissions",
                     "background",
+                    "visual",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
@@ -624,6 +627,13 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/background list"),
             Some(SlashCommand::Background(vec!["list".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/visual analyze --strict"),
+            Some(SlashCommand::Visual(vec![
+                "analyze".to_string(),
+                "--strict".to_string()
+            ]))
         );
     }
 

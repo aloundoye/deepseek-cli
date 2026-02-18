@@ -32,6 +32,7 @@ const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
 pub struct LocalToolHost {
     workspace: PathBuf,
     policy: PolicyEngine,
+    sandbox_mode: String,
     patches: PatchStore,
     index: IndexService,
     store: Store,
@@ -52,12 +53,14 @@ impl LocalToolHost {
         runner: Arc<dyn ShellRunner + Send + Sync>,
     ) -> Result<Self> {
         let cfg = AppConfig::load(workspace).unwrap_or_default();
+        let sandbox_mode = policy.sandbox_mode().to_ascii_lowercase();
         Ok(Self {
             workspace: workspace.to_path_buf(),
             patches: PatchStore::new(workspace)?,
             index: IndexService::new(workspace)?,
             store: Store::new(workspace)?,
             policy,
+            sandbox_mode,
             runner,
             plugins: PluginManager::new(workspace).ok(),
             hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
@@ -426,6 +429,7 @@ impl LocalToolHost {
                     .get("cmd")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("cmd missing"))?;
+                self.enforce_sandbox_mode(cmd)?;
                 self.policy.check_command(cmd)?;
                 let timeout = call
                     .args
@@ -448,6 +452,29 @@ impl LocalToolHost {
             "stderr": result.stderr,
             "timed_out": result.timed_out,
         }))
+    }
+
+    fn enforce_sandbox_mode(&self, cmd: &str) -> Result<()> {
+        match self.sandbox_mode.as_str() {
+            "read-only" | "readonly" => {
+                if command_has_mutating_intent(cmd) {
+                    return Err(anyhow!(
+                        "sandbox_mode=read-only blocked mutating command: {}",
+                        cmd
+                    ));
+                }
+            }
+            "workspace-write" | "workspace_write" => {
+                if command_references_outside_workspace(cmd, &self.workspace) {
+                    return Err(anyhow!(
+                        "sandbox_mode=workspace-write blocked path outside workspace: {}",
+                        cmd
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -511,6 +538,151 @@ fn walk_paths(root: &Path, workspace: &Path, respect_gitignore: bool) -> Vec<Pat
 
 fn normalize_rel_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn shell_tokens(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | '(' | ')' | '[' | ']'))
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn command_has_mutating_intent(cmd: &str) -> bool {
+    let tokens = shell_tokens(cmd);
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut lowered = cmd.to_ascii_lowercase();
+    lowered.retain(|ch| ch != '\n' && ch != '\r');
+    if lowered.contains(">>")
+        || lowered.contains(" >")
+        || lowered.contains("1>")
+        || lowered.contains("2>")
+    {
+        return true;
+    }
+
+    let command = tokens[0].as_str();
+    if matches!(
+        command,
+        "rm" | "rmdir"
+            | "del"
+            | "rd"
+            | "mv"
+            | "cp"
+            | "mkdir"
+            | "touch"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "truncate"
+            | "dd"
+            | "mkfs"
+            | "format"
+            | "patch"
+            | "tee"
+    ) {
+        return true;
+    }
+
+    if command == "git"
+        && tokens.get(1).is_some_and(|sub| {
+            matches!(
+                sub.as_str(),
+                "add"
+                    | "commit"
+                    | "push"
+                    | "merge"
+                    | "rebase"
+                    | "reset"
+                    | "checkout"
+                    | "restore"
+                    | "clean"
+                    | "cherry-pick"
+            )
+        })
+    {
+        return true;
+    }
+    if command == "cargo"
+        && tokens.get(1).is_some_and(|sub| {
+            matches!(
+                sub.as_str(),
+                "add" | "remove" | "update" | "install" | "publish" | "fix"
+            )
+        })
+    {
+        return true;
+    }
+    if matches!(command, "npm" | "pnpm" | "yarn")
+        && tokens
+            .get(1)
+            .is_some_and(|sub| matches!(sub.as_str(), "install" | "update" | "uninstall" | "add"))
+    {
+        return true;
+    }
+    if matches!(command, "pip" | "pip3")
+        && tokens
+            .get(1)
+            .is_some_and(|sub| matches!(sub.as_str(), "install" | "uninstall"))
+    {
+        return true;
+    }
+    if command == "sed" && tokens.iter().any(|token| token == "-i") {
+        return true;
+    }
+    if command == "perl" && tokens.iter().any(|token| token.starts_with("-i")) {
+        return true;
+    }
+
+    false
+}
+
+fn token_to_absolute_path(token: &str) -> Option<PathBuf> {
+    let token = token.trim();
+    if token.is_empty() || token.starts_with('-') {
+        return None;
+    }
+    if token.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        return Some(PathBuf::from(home).join(token.trim_start_matches("~/")));
+    }
+    let candidate = PathBuf::from(token);
+    if candidate.is_absolute() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn command_references_outside_workspace(cmd: &str, workspace: &Path) -> bool {
+    let workspace_root =
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    for raw in cmd.split_whitespace() {
+        let token =
+            raw.trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | '(' | ')' | '[' | ']'));
+        if token.is_empty() || token.starts_with('-') {
+            continue;
+        }
+        if token == ".."
+            || token.starts_with("../")
+            || token.contains("/../")
+            || token.ends_with("/..")
+        {
+            return true;
+        }
+        if let Some(path) = token_to_absolute_path(token)
+            && !path.starts_with(&workspace_root)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -752,6 +924,7 @@ mod tests {
         runtime_dir,
     };
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     fn temp_host() -> (PathBuf, LocalToolHost) {
         let workspace =
@@ -759,6 +932,32 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace");
         let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("tool host");
         (workspace, host)
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner {
+        commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingRunner {
+        fn captured(&self) -> Vec<String> {
+            self.commands.lock().expect("commands").clone()
+        }
+    }
+
+    impl ShellRunner for RecordingRunner {
+        fn run(&self, cmd: &str, _cwd: &Path, _timeout: Duration) -> Result<ShellRunResult> {
+            self.commands
+                .lock()
+                .expect("commands")
+                .push(cmd.to_string());
+            Ok(ShellRunResult {
+                status: Some(0),
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+                timed_out: false,
+            })
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -950,5 +1149,95 @@ mod tests {
         let events_path = runtime_dir(&workspace).join("events.jsonl");
         let events = fs::read_to_string(events_path).expect("events");
         assert!(events.contains("VisualArtifactCapturedV1"));
+    }
+
+    #[test]
+    fn read_only_sandbox_blocks_mutating_bash_commands() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-tools-ro-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["touch *".to_string()];
+        cfg.policy.sandbox_mode = "read-only".to_string();
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"touch note.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sandbox_mode=read-only")
+        );
+        assert!(runner.captured().is_empty());
+    }
+
+    #[test]
+    fn workspace_write_sandbox_blocks_absolute_outside_paths() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-tools-ww-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let outside = std::env::temp_dir().join(format!("deepseek-outside-{}.txt", Uuid::now_v7()));
+        fs::write(&outside, "outside").expect("outside file");
+
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["cat *".to_string()];
+        cfg.policy.sandbox_mode = "workspace-write".to_string();
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd": format!("cat {}", outside.display())}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sandbox_mode=workspace-write")
+        );
+        assert!(runner.captured().is_empty());
+    }
+
+    #[test]
+    fn workspace_write_sandbox_allows_workspace_relative_paths() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-tools-ww-allow-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("note.txt"), "hello").expect("note");
+
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["cat *".to_string()];
+        cfg.policy.sandbox_mode = "workspace-write".to_string();
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"cat note.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
     }
 }

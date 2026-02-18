@@ -1357,6 +1357,29 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_visual_artifacts(&self, limit: usize) -> Result<Vec<VisualArtifactRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT artifact_id, path, mime, metadata_json, created_at
+             FROM visual_artifacts ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit.max(1) as i64], |r| {
+            Ok(VisualArtifactRecord {
+                artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                path: r.get(1)?,
+                mime: r.get(2)?,
+                metadata_json: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn upsert_remote_env_profile(&self, record: &RemoteEnvProfileRecord) -> Result<()> {
         let conn = self.db()?;
         conn.execute(

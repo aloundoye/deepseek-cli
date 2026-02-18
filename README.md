@@ -76,6 +76,7 @@ Execution behavior:
 - Autopilot supports live pause/resume control via pause files and `deepseek autopilot pause|resume`, plus live status sampling with `deepseek autopilot status --follow`.
 - TUI `Ctrl+B` now backgrounds queued work directly: normal prompts launch background agent runs, and `!<command>` launches background shell jobs.
 - Background jobs now support native starts for both agents and shell commands (`deepseek background run-agent|run-shell`) with log-tail attach payloads.
+- Sandbox modes now enforce runtime semantics for shell commands (`read-only` blocks mutating commands, `workspace-write` blocks absolute/out-of-workspace path targets).
 - `deepseek permissions show|set` provides first-class policy control for approvals/allowlist/sandbox mode.
 - Planner quality checks auto-repair weak plans with bounded retries before fallback.
 - Planner self-evaluation now includes prior verification-failure memory to improve subsequent plan revisions.
@@ -86,7 +87,9 @@ Execution behavior:
 - `deepseek profile --benchmark` runs planning benchmarks with latency/quality metrics, supports external suites, compares against baseline runs, and produces side-by-side peer ranking with case matrices.
 - Benchmark mode supports thresholds and result export (`--benchmark-suite`, `--benchmark-min-success-rate`, `--benchmark-min-quality-rate`, `--benchmark-max-p95-ms`, `--benchmark-baseline`, `--benchmark-max-regression-ms`, `--benchmark-compare`, `--benchmark-output`), plus reproducible seeded runs with signed corpus/execution manifests and scorecards (`--benchmark-seed`, `--benchmark-signing-key-env`).
 - `deepseek benchmark run-matrix <matrix.json>` executes multi-run parity matrices (packs/suites) with aggregate weighted scorecards and optional peer ranking (including strict compatibility gating).
+- Built-in benchmark packs now include an expanded `parity` pack for broader reproducible peer-comparison coverage.
 - Team-managed policy overlays can be enforced via `DEEPSEEK_TEAM_POLICY_PATH` (or `~/.deepseek/team-policy.json`) and cannot be broadened by local allowlists.
+- `deepseek visual list|analyze` provides visual artifact inventory plus strict analysis gates for captured image/PDF artifacts.
 
 ## Command Overview
 
@@ -108,6 +111,7 @@ Execution behavior:
 - `deepseek skills list|install|remove|run|reload`
 - `deepseek replay run --session-id <uuid> --deterministic`
 - `deepseek background list|attach|stop|run-agent|run-shell`
+- `deepseek visual list [--limit N]|analyze [--limit N --min-bytes N --min-artifacts N --min-image-artifacts N --strict]`
 - `deepseek teleport [--session-id <uuid>] [--output <path>] [--import <path>]`
 - `deepseek remote-env list|add|remove|check`
 - `deepseek status`
@@ -127,7 +131,7 @@ Interactive slash commands:
 - `/help`, `/init`, `/clear`, `/compact`, `/memory`, `/config`, `/model`
 - `/cost`, `/mcp`, `/rewind`, `/export`, `/plan`, `/teleport`, `/remote-env`
 - `/status`, `/effort`, `/skills`
-- `/permissions`, `/background`
+- `/permissions`, `/background`, `/visual`
 
 ## Configuration
 

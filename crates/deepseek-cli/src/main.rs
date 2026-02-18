@@ -74,6 +74,10 @@ enum Commands {
         #[command(subcommand)]
         command: BackgroundCmd,
     },
+    Visual {
+        #[command(subcommand)]
+        command: VisualCmd,
+    },
     Teleport(TeleportArgs),
     RemoteEnv {
         #[command(subcommand)]
@@ -458,6 +462,12 @@ enum BackgroundCmd {
     RunShell(BackgroundRunShellArgs),
 }
 
+#[derive(Subcommand)]
+enum VisualCmd {
+    List(VisualListArgs),
+    Analyze(VisualAnalyzeArgs),
+}
+
 #[derive(Args, Clone)]
 struct BackgroundAttachArgs {
     job_id: String,
@@ -482,6 +492,26 @@ struct BackgroundRunAgentArgs {
 struct BackgroundRunShellArgs {
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Args)]
+struct VisualListArgs {
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct VisualAnalyzeArgs {
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+    #[arg(long, default_value_t = 128)]
+    min_bytes: u64,
+    #[arg(long, default_value_t = 1)]
+    min_artifacts: usize,
+    #[arg(long, default_value_t = 1)]
+    min_image_artifacts: usize,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    strict: bool,
 }
 
 #[derive(Args, Default)]
@@ -710,6 +740,7 @@ fn main() -> Result<()> {
         Commands::Skills { command } => run_skills(&cwd, command, cli.json),
         Commands::Replay { command } => run_replay(&cwd, command, cli.json),
         Commands::Background { command } => run_background(&cwd, command, cli.json),
+        Commands::Visual { command } => run_visual(&cwd, command, cli.json),
         Commands::Teleport(args) => run_teleport(&cwd, args, cli.json),
         Commands::RemoteEnv { command } => run_remote_env(&cwd, command, cli.json),
         Commands::Status => run_status(&cwd, cli.json),
@@ -1642,6 +1673,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                             "/skills",
                             "/permissions",
                             "/background",
+                            "/visual",
                         ],
                     });
                     if json_mode {
@@ -1883,6 +1915,16 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         }
                     }
                 },
+                SlashCommand::Visual(args) => match parse_visual_cmd(args) {
+                    Ok(command) => run_visual(cwd, command, json_mode)?,
+                    Err(err) => {
+                        if json_mode {
+                            print_json(&json!({"error": err.to_string()}))?;
+                        } else {
+                            println!("visual parse error: {err}");
+                        }
+                    }
+                },
                 SlashCommand::Unknown { name, .. } => {
                     if json_mode {
                         print_json(&json!({"error": format!("unknown slash command: /{name}")}))?;
@@ -1914,7 +1956,7 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     run_tui_shell_with_bindings(status, bindings, |prompt| {
         if let Some(cmd) = SlashCommand::parse(prompt) {
             let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -2118,6 +2160,10 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     Ok(cmd) => serde_json::to_string_pretty(&background_payload(cwd, cmd)?)?,
                     Err(err) => format!("background parse error: {err}"),
                 },
+                SlashCommand::Visual(args) => match parse_visual_cmd(args) {
+                    Ok(cmd) => serde_json::to_string_pretty(&visual_payload(cwd, cmd)?)?,
+                    Err(err) => format!("visual parse error: {err}"),
+                },
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
             };
             return Ok(out);
@@ -2296,6 +2342,100 @@ fn parse_background_cmd(args: Vec<String>) -> Result<BackgroundCmd> {
             "use /background list|attach <job_id>|stop <job_id>|run-agent <prompt>|run-shell <command>"
         )),
     }
+}
+
+fn parse_visual_cmd(args: Vec<String>) -> Result<VisualCmd> {
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+        let mut limit = 25usize;
+        let mut idx = if args.is_empty() { 0 } else { 1 };
+        while idx < args.len() {
+            if args[idx].eq_ignore_ascii_case("--limit") {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| anyhow!("usage: /visual list [--limit <n>]"))?;
+                limit = value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("invalid limit '{}'", value))?
+                    .max(1);
+            } else {
+                return Err(anyhow!(
+                    "unknown /visual list option: {} (expected --limit)",
+                    args[idx]
+                ));
+            }
+            idx += 1;
+        }
+        return Ok(VisualCmd::List(VisualListArgs { limit }));
+    }
+
+    if args[0].eq_ignore_ascii_case("analyze") {
+        let mut parsed = VisualAnalyzeArgs {
+            limit: 25,
+            min_bytes: 128,
+            min_artifacts: 1,
+            min_image_artifacts: 1,
+            strict: false,
+        };
+        let mut idx = 1usize;
+        while idx < args.len() {
+            let token = args[idx].to_ascii_lowercase();
+            match token.as_str() {
+                "--limit" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --limit <n>"))?;
+                    parsed.limit = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid limit '{}'", value))?
+                        .max(1);
+                }
+                "--min-bytes" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --min-bytes <n>"))?;
+                    parsed.min_bytes = value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow!("invalid min-bytes '{}'", value))?;
+                }
+                "--min-artifacts" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --min-artifacts <n>"))?;
+                    parsed.min_artifacts = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid min-artifacts '{}'", value))?
+                        .max(1);
+                }
+                "--min-image-artifacts" => {
+                    idx += 1;
+                    let value = args.get(idx).ok_or_else(|| {
+                        anyhow!("usage: /visual analyze --min-image-artifacts <n>")
+                    })?;
+                    parsed.min_image_artifacts = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid min-image-artifacts '{}'", value))?
+                        .max(1);
+                }
+                "--strict" => parsed.strict = true,
+                _ => {
+                    return Err(anyhow!(
+                        "unknown /visual analyze option: {} (expected --limit/--min-bytes/--min-artifacts/--min-image-artifacts/--strict)",
+                        args[idx]
+                    ));
+                }
+            }
+            idx += 1;
+        }
+        return Ok(VisualCmd::Analyze(parsed));
+    }
+
+    Err(anyhow!(
+        "use /visual list [--limit <n>] | /visual analyze [--limit <n>] [--min-bytes <n>] [--min-artifacts <n>] [--min-image-artifacts <n>] [--strict]"
+    ))
 }
 
 fn parse_permissions_cmd(args: Vec<String>) -> Result<PermissionsCmd> {
@@ -3055,6 +3195,82 @@ fn built_in_benchmark_cases() -> Vec<BenchmarkCase> {
     ]
 }
 
+fn built_in_parity_benchmark_cases() -> Vec<BenchmarkCase> {
+    let mut cases = built_in_benchmark_cases();
+    let extra = vec![
+        (
+            "frontend-a11y",
+            "Plan accessibility hardening for keyboard navigation and focus traps.",
+            vec!["verify", "test"],
+        ),
+        (
+            "backend-migration",
+            "Plan a staged database migration with rollback checkpoints and data validation.",
+            vec!["verify", "checkpoint"],
+        ),
+        (
+            "ci-flake-hunt",
+            "Plan CI flake triage with deterministic replay instrumentation.",
+            vec!["test", "verify"],
+        ),
+        (
+            "incident-recovery",
+            "Plan post-incident recovery actions with containment and follow-up verification.",
+            vec!["verify", "rollback"],
+        ),
+        (
+            "plugin-hardening",
+            "Plan plugin sandbox hardening and hook failure isolation policies.",
+            vec!["plugin", "verify"],
+        ),
+        (
+            "docs-quality-gates",
+            "Plan docs quality checks including link validation and changelog integrity.",
+            vec!["verify", "docs"],
+        ),
+        (
+            "remote-env-safety",
+            "Plan remote environment safety checks before deployment commands.",
+            vec!["remote", "verify"],
+        ),
+        (
+            "tui-regression-pack",
+            "Plan regression testing for TUI hotkeys and slash command parity.",
+            vec!["tui", "test"],
+        ),
+        (
+            "security-scan-gates",
+            "Plan security scan gates and remediation prioritization for release branches.",
+            vec!["security", "verify"],
+        ),
+        (
+            "api-contract-evolution",
+            "Plan API contract evolution with backward compatibility checkpoints.",
+            vec!["verify", "api"],
+        ),
+        (
+            "benchmark-governance",
+            "Plan benchmark governance with manifest consistency and peer comparability controls.",
+            vec!["benchmark", "manifest"],
+        ),
+        (
+            "subagent-team-orchestration",
+            "Plan dependency-aware subagent orchestration across frontend backend and testing teams.",
+            vec!["subagent", "verify"],
+        ),
+    ];
+    for (case_id, prompt, keywords) in extra {
+        cases.push(BenchmarkCase {
+            case_id: case_id.to_string(),
+            prompt: prompt.to_string(),
+            expected_keywords: keywords.into_iter().map(str::to_string).collect(),
+            min_steps: Some(2),
+            min_verification_steps: Some(1),
+        });
+    }
+    cases
+}
+
 fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
     let raw = fs::read_to_string(path)?;
     let mut cases = if path
@@ -3141,6 +3357,7 @@ fn built_in_benchmark_pack(name: &str) -> Option<(&'static str, Vec<BenchmarkCas
                 })
                 .collect(),
         )),
+        "parity" => Some(("builtin-parity", built_in_parity_benchmark_cases())),
         _ => None,
     }
 }
@@ -3236,6 +3453,7 @@ fn list_benchmark_packs(cwd: &Path) -> Result<Vec<serde_json::Value>> {
         ("core", "builtin-core"),
         ("smoke", "builtin-smoke"),
         ("ops", "builtin-ops"),
+        ("parity", "builtin-parity"),
     ] {
         let count = built_in_benchmark_pack(name)
             .map(|(_, cases)| cases.len())
@@ -6402,6 +6620,169 @@ fn terminate_background_pid(pid: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_visual(cwd: &Path, cmd: VisualCmd, json_mode: bool) -> Result<()> {
+    let payload = visual_payload(cwd, cmd)?;
+    if json_mode {
+        print_json(&payload)?;
+        return Ok(());
+    }
+
+    if let Some(rows) = payload.as_array() {
+        if rows.is_empty() {
+            println!("no visual artifacts found");
+            return Ok(());
+        }
+        for row in rows {
+            println!(
+                "{} {} exists={} size={} path={}",
+                row["artifact_id"].as_str().unwrap_or_default(),
+                row["mime"].as_str().unwrap_or_default(),
+                row["exists"].as_bool().unwrap_or(false),
+                row["size_bytes"].as_u64().unwrap_or(0),
+                row["path"].as_str().unwrap_or_default(),
+            );
+        }
+        return Ok(());
+    }
+
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::Value> {
+    let store = Store::new(cwd)?;
+    match cmd {
+        VisualCmd::List(args) => {
+            let artifacts = store.list_visual_artifacts(args.limit.max(1))?;
+            let rows = artifacts
+                .into_iter()
+                .map(|artifact| {
+                    let full = resolve_visual_artifact_path(cwd, &artifact.path);
+                    let metadata = fs::metadata(&full).ok();
+                    json!({
+                        "artifact_id": artifact.artifact_id,
+                        "path": artifact.path,
+                        "full_path": full,
+                        "mime": artifact.mime,
+                        "metadata": serde_json::from_str::<serde_json::Value>(&artifact.metadata_json).unwrap_or_default(),
+                        "created_at": artifact.created_at,
+                        "exists": metadata.is_some(),
+                        "size_bytes": metadata.map(|m| m.len()).unwrap_or(0),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!(rows))
+        }
+        VisualCmd::Analyze(args) => {
+            let artifacts = store.list_visual_artifacts(args.limit.max(1))?;
+            let mut rows = Vec::new();
+            let mut missing_paths = Vec::new();
+            let mut tiny_artifacts = Vec::new();
+            let mut image_like_count = 0usize;
+            let mut existing_count = 0usize;
+
+            for artifact in artifacts {
+                let full = resolve_visual_artifact_path(cwd, &artifact.path);
+                let metadata = fs::metadata(&full).ok();
+                let exists = metadata.is_some();
+                let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                if exists {
+                    existing_count = existing_count.saturating_add(1);
+                } else {
+                    missing_paths.push(artifact.path.clone());
+                }
+                let image_like =
+                    artifact.mime.starts_with("image/") || artifact.mime == "application/pdf";
+                if image_like {
+                    image_like_count = image_like_count.saturating_add(1);
+                    if exists && size_bytes < args.min_bytes {
+                        tiny_artifacts.push(artifact.path.clone());
+                    }
+                }
+
+                rows.push(json!({
+                    "artifact_id": artifact.artifact_id,
+                    "path": artifact.path,
+                    "full_path": full,
+                    "mime": artifact.mime,
+                    "created_at": artifact.created_at,
+                    "exists": exists,
+                    "size_bytes": size_bytes,
+                    "image_like": image_like,
+                }));
+            }
+
+            let total = rows.len();
+            let mut warnings = Vec::new();
+            if total < args.min_artifacts {
+                warnings.push(format!(
+                    "captured_artifacts={} below required minimum {}",
+                    total, args.min_artifacts
+                ));
+            }
+            if image_like_count < args.min_image_artifacts {
+                warnings.push(format!(
+                    "image_like_artifacts={} below required minimum {}",
+                    image_like_count, args.min_image_artifacts
+                ));
+            }
+            if !missing_paths.is_empty() {
+                warnings.push(format!(
+                    "{} artifact files are missing",
+                    missing_paths.len()
+                ));
+            }
+            if !tiny_artifacts.is_empty() {
+                warnings.push(format!(
+                    "{} artifacts are smaller than {} bytes",
+                    tiny_artifacts.len(),
+                    args.min_bytes
+                ));
+            }
+            let ok = warnings.is_empty();
+            let payload = json!({
+                "ok": ok,
+                "summary": {
+                    "total_artifacts": total,
+                    "existing_artifacts": existing_count,
+                    "missing_artifacts": total.saturating_sub(existing_count),
+                    "image_like_artifacts": image_like_count,
+                    "min_bytes": args.min_bytes,
+                    "min_artifacts": args.min_artifacts,
+                    "min_image_artifacts": args.min_image_artifacts,
+                },
+                "warnings": warnings,
+                "missing_paths": missing_paths,
+                "tiny_artifacts": tiny_artifacts,
+                "artifacts": rows,
+            });
+            if args.strict && !ok {
+                return Err(anyhow!(
+                    "visual analysis failed: {}",
+                    payload["warnings"]
+                        .as_array()
+                        .map(|rows| rows
+                            .iter()
+                            .filter_map(|row| row.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "))
+                        .unwrap_or_else(|| "unknown warning".to_string())
+                ));
+            }
+            Ok(payload)
+        }
+    }
+}
+
+fn resolve_visual_artifact_path(cwd: &Path, artifact_path: &str) -> PathBuf {
+    let candidate = PathBuf::from(artifact_path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    }
 }
 
 fn run_teleport(cwd: &Path, args: TeleportArgs, json_mode: bool) -> Result<()> {

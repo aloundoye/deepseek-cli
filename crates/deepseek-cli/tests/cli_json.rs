@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use deepseek_store::{Store, VisualArtifactRecord};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::process::Command as StdCommand;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uuid::Uuid;
 
 #[test]
 fn plan_command_emits_json_shape() {
@@ -733,6 +735,87 @@ fn background_run_shell_attach_tail_and_stop_emit_json() {
 }
 
 #[test]
+fn visual_list_and_analyze_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+    let image_rel = "ui/screen.png";
+    let image_path = workspace.path().join(image_rel);
+    fs::create_dir_all(
+        image_path
+            .parent()
+            .expect("image file should have a parent directory"),
+    )
+    .expect("image dir");
+    fs::write(
+        &image_path,
+        vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    )
+    .expect("image");
+
+    let store = Store::new(workspace.path()).expect("store");
+    store
+        .insert_visual_artifact(&VisualArtifactRecord {
+            artifact_id: Uuid::now_v7(),
+            path: image_rel.to_string(),
+            mime: "image/png".to_string(),
+            metadata_json: "{}".to_string(),
+            created_at: "2026-02-18T00:00:00Z".to_string(),
+        })
+        .expect("insert visual artifact");
+
+    let listed = run_json(
+        workspace.path(),
+        &["--json", "visual", "list", "--limit", "10"],
+    );
+    assert_eq!(listed.as_array().map(|rows| rows.len()), Some(1));
+    assert_eq!(listed[0]["path"], image_rel);
+    assert_eq!(listed[0]["exists"], true);
+
+    let analyzed = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "visual",
+            "analyze",
+            "--limit",
+            "10",
+            "--min-bytes",
+            "8",
+            "--min-artifacts",
+            "1",
+            "--min-image-artifacts",
+            "1",
+            "--strict",
+        ],
+    );
+    assert_eq!(analyzed["ok"], true);
+    assert_eq!(analyzed["summary"]["image_like_artifacts"], 1);
+}
+
+#[test]
+fn visual_analyze_strict_fails_without_artifacts() {
+    let workspace = TempDir::new().expect("workspace");
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args([
+            "--json",
+            "visual",
+            "analyze",
+            "--strict",
+            "--min-artifacts",
+            "1",
+            "--min-image-artifacts",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("visual analysis failed"));
+}
+
+#[test]
 fn profile_benchmark_accepts_external_suite_file() {
     let workspace = TempDir::new().expect("workspace");
     let suite_path = workspace.path().join(".deepseek/benchmark-suite.json");
@@ -856,6 +939,27 @@ fn benchmark_pack_import_list_show_and_profile_work() {
     );
     assert_eq!(from_pack["benchmark"]["pack"], "public-pack");
     assert_eq!(from_pack["benchmark"]["executed_cases"], 1);
+}
+
+#[test]
+fn benchmark_builtin_parity_pack_is_available() {
+    let workspace = TempDir::new().expect("workspace");
+    let listed = run_json(workspace.path(), &["--json", "benchmark", "list-packs"]);
+    assert!(
+        listed
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "parity"))
+    );
+    let shown = run_json(
+        workspace.path(),
+        &["--json", "benchmark", "show-pack", "parity"],
+    );
+    assert_eq!(shown["name"], "parity");
+    assert!(
+        shown["cases"]
+            .as_array()
+            .is_some_and(|rows| rows.len() >= 12)
+    );
 }
 
 #[test]

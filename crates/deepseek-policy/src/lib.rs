@@ -13,6 +13,7 @@ pub struct PolicyConfig {
     pub denied_secret_paths: Vec<String>,
     pub denied_command_prefixes: Vec<String>,
     pub redact_patterns: Vec<String>,
+    pub sandbox_mode: String,
 }
 
 impl Default for PolicyConfig {
@@ -56,6 +57,7 @@ impl Default for PolicyConfig {
                 "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b"
                     .to_string(),
             ],
+            sandbox_mode: "allowlist".to_string(),
         }
     }
 }
@@ -116,6 +118,11 @@ impl PolicyEngine {
                 defaults.redact_patterns
             } else {
                 cfg.redact_patterns.clone()
+            },
+            sandbox_mode: if cfg.sandbox_mode.trim().is_empty() {
+                defaults.sandbox_mode
+            } else {
+                cfg.sandbox_mode.trim().to_ascii_lowercase()
             },
         };
         if let Some(team_policy) = load_team_policy_override() {
@@ -179,6 +186,10 @@ impl PolicyEngine {
         (call.name == "patch.apply" && self.cfg.approve_edits)
             || (call.name == "bash.run" && self.cfg.approve_bash)
             || call.requires_approval
+    }
+
+    pub fn sandbox_mode(&self) -> &str {
+        &self.cfg.sandbox_mode
     }
 }
 
@@ -274,6 +285,8 @@ struct TeamPolicyFile {
     block_paths: Vec<String>,
     #[serde(default)]
     redact_patterns: Vec<String>,
+    #[serde(default)]
+    sandbox_mode: Option<String>,
 }
 
 fn load_team_policy_override() -> Option<TeamPolicyFile> {
@@ -325,6 +338,12 @@ fn apply_team_policy_override(mut base: PolicyConfig, team: &TeamPolicyFile) -> 
         patterns.sort();
         patterns.dedup();
         base.redact_patterns = patterns;
+    }
+    if let Some(mode) = team.sandbox_mode.as_deref() {
+        let normalized = mode.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            base.sandbox_mode = normalized;
+        }
     }
     base
 }
@@ -429,6 +448,7 @@ mod tests {
             denied_secret_paths: vec![".env".to_string()],
             denied_command_prefixes: vec!["rm".to_string()],
             redact_patterns: vec!["token".to_string()],
+            sandbox_mode: "allowlist".to_string(),
         };
         let team = TeamPolicyFile {
             approve_edits: Some("ask".to_string()),
@@ -437,11 +457,13 @@ mod tests {
             deny_commands: vec!["curl".to_string()],
             block_paths: vec!["**/secrets".to_string()],
             redact_patterns: vec!["password".to_string()],
+            sandbox_mode: Some("workspace-write".to_string()),
         };
         let merged = apply_team_policy_override(base, &team);
         assert!(merged.approve_edits);
         assert!(merged.approve_bash);
         assert_eq!(merged.allowlist, vec!["npm *"]);
+        assert_eq!(merged.sandbox_mode, "workspace-write");
         assert!(
             merged
                 .denied_command_prefixes
@@ -460,5 +482,15 @@ mod tests {
                 .iter()
                 .any(|pattern| pattern == "password")
         );
+    }
+
+    #[test]
+    fn sandbox_mode_maps_from_app_config() {
+        let cfg = deepseek_core::PolicyConfig {
+            sandbox_mode: "read-only".to_string(),
+            ..deepseek_core::PolicyConfig::default()
+        };
+        let policy = PolicyEngine::from_app_config(&cfg);
+        assert_eq!(policy.sandbox_mode(), "read-only");
     }
 }

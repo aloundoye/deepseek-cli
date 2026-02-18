@@ -321,6 +321,22 @@ Verification:
 - `cargo build --workspace`
 - `cargo build --release --workspace`
 
+### M21 Parity Gap Closure Loop (Visual Gates + Sandbox Semantics + Parity Corpus Breadth)
+Status: [x] Completed (current iteration)
+
+Scope:
+- Added stronger runtime sandbox semantics for shell tool execution (`read-only` blocks mutating commands; `workspace-write` blocks outside-workspace absolute paths).
+- Added visual verification command plane (`visual list|analyze`) with strict quality-gate mode for captured image/PDF artifacts.
+- Added `/visual` slash command parity in line/TUI chat paths.
+- Expanded benchmark corpus breadth with builtin `parity` pack for larger reproducible internal peer-comparison coverage.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace`
+- `cargo build --release --workspace`
+
 ## Data/Storage Contracts
 - Canonical append-only event log: `.deepseek/events.jsonl`.
 - Projections remain additive only.
