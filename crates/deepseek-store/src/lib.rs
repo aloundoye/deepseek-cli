@@ -259,6 +259,58 @@ const MIGRATIONS: &[(i64, &str)] = &[
             updated_at TEXT NOT NULL
          );",
     ),
+    (
+        6,
+        "CREATE TABLE IF NOT EXISTS task_queue (
+            task_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            outcome TEXT,
+            artifact_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS web_search_cache (
+            query_hash TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            results_count INTEGER NOT NULL,
+            cached_at TEXT NOT NULL,
+            ttl_seconds INTEGER NOT NULL DEFAULT 900
+         );
+         CREATE TABLE IF NOT EXISTS session_locks (
+            session_id TEXT PRIMARY KEY,
+            lock_holder TEXT NOT NULL,
+            locked_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS review_runs (
+            review_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            preset TEXT NOT NULL,
+            target TEXT NOT NULL,
+            findings_json TEXT NOT NULL,
+            findings_count INTEGER NOT NULL,
+            critical_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            artifact_path TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS permission_mode_log (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            from_mode TEXT NOT NULL,
+            to_mode TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+         );",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -456,6 +508,58 @@ pub struct RemoteEnvProfileRecord {
     pub auth_mode: String,
     pub metadata_json: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskQueueRecord {
+    pub task_id: Uuid,
+    pub session_id: Uuid,
+    pub title: String,
+    pub priority: u32,
+    pub status: String,
+    pub outcome: Option<String>,
+    pub artifact_path: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchCacheRecord {
+    pub query_hash: String,
+    pub query: String,
+    pub results_json: String,
+    pub results_count: u64,
+    pub cached_at: String,
+    pub ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLockRecord {
+    pub session_id: Uuid,
+    pub lock_holder: String,
+    pub locked_at: String,
+    pub heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewRunRecord {
+    pub review_id: Uuid,
+    pub session_id: Uuid,
+    pub preset: String,
+    pub target: String,
+    pub findings_json: String,
+    pub findings_count: u64,
+    pub critical_count: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub artifact_id: Uuid,
+    pub task_id: Uuid,
+    pub artifact_path: String,
+    pub files_json: String,
+    pub created_at: String,
 }
 
 pub struct Store {
@@ -1534,6 +1638,350 @@ impl Store {
         Ok(())
     }
 
+    // --- Session Locking ---
+
+    pub fn try_acquire_session_lock(&self, session_id: Uuid, holder: &str) -> Result<bool> {
+        let conn = self.db()?;
+        let now = Utc::now().to_rfc3339();
+        // Try to acquire; fail if another holder has it and heartbeat is recent (< 60s)
+        let existing: Option<(String, String)> = conn
+            .prepare("SELECT lock_holder, heartbeat_at FROM session_locks WHERE session_id = ?1")?
+            .query_row([session_id.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .ok();
+        if let Some((existing_holder, heartbeat)) = existing {
+            if existing_holder != holder {
+                // Check if heartbeat is stale (> 60 seconds)
+                if let Ok(hb) = chrono::DateTime::parse_from_rfc3339(&heartbeat) {
+                    let age = Utc::now().signed_duration_since(hb.with_timezone(&Utc));
+                    if age.num_seconds() < 60 {
+                        return Ok(false); // Lock held by another process
+                    }
+                }
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO session_locks (session_id, lock_holder, locked_at, heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id.to_string(), holder, &now, &now],
+        )?;
+        Ok(true)
+    }
+
+    pub fn release_session_lock(&self, session_id: Uuid, holder: &str) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "DELETE FROM session_locks WHERE session_id = ?1 AND lock_holder = ?2",
+            params![session_id.to_string(), holder],
+        )?;
+        Ok(())
+    }
+
+    pub fn heartbeat_session_lock(&self, session_id: Uuid, holder: &str) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "UPDATE session_locks SET heartbeat_at = ?1 WHERE session_id = ?2 AND lock_holder = ?3",
+            params![Utc::now().to_rfc3339(), session_id.to_string(), holder],
+        )?;
+        Ok(())
+    }
+
+    // --- Session Forking ---
+
+    pub fn fork_session(&self, from_session_id: Uuid) -> Result<Session> {
+        let source = self
+            .load_session(from_session_id)?
+            .ok_or_else(|| anyhow::anyhow!("session not found: {from_session_id}"))?;
+        let new_id = Uuid::now_v7();
+        let forked = Session {
+            session_id: new_id,
+            workspace_root: source.workspace_root.clone(),
+            baseline_commit: source.baseline_commit.clone(),
+            status: SessionState::Idle,
+            budgets: source.budgets.clone(),
+            active_plan_id: None,
+        };
+        self.save_session(&forked)?;
+        // Record fork events in both sessions
+        let seq = self.next_seq_no(from_session_id)?;
+        self.append_event(&EventEnvelope {
+            seq_no: seq,
+            at: Utc::now(),
+            session_id: from_session_id,
+            kind: EventKind::SessionForkedV1 {
+                from_session_id,
+                to_session_id: new_id,
+            },
+        })?;
+        Ok(forked)
+    }
+
+    // --- Task Queue ---
+
+    pub fn insert_task(&self, record: &TaskQueueRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO task_queue (task_id, session_id, title, priority, status, outcome, artifact_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.task_id.to_string(),
+                record.session_id.to_string(),
+                record.title,
+                record.priority as i64,
+                record.status,
+                record.outcome,
+                record.artifact_path,
+                record.created_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_status(
+        &self,
+        task_id: Uuid,
+        status: &str,
+        outcome: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "UPDATE task_queue SET status = ?1, outcome = ?2, updated_at = ?3 WHERE task_id = ?4",
+            params![
+                status,
+                outcome,
+                Utc::now().to_rfc3339(),
+                task_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tasks(&self, session_id: Option<Uuid>) -> Result<Vec<TaskQueueRecord>> {
+        let conn = self.db()?;
+        let mut out = Vec::new();
+        if let Some(sid) = session_id {
+            let mut stmt = conn.prepare(
+                "SELECT task_id, session_id, title, priority, status, outcome, artifact_path, created_at, updated_at
+                 FROM task_queue WHERE session_id = ?1 ORDER BY priority DESC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([sid.to_string()], |r| {
+                Ok(TaskQueueRecord {
+                    task_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    title: r.get(2)?,
+                    priority: r.get::<_, i64>(3)? as u32,
+                    status: r.get(4)?,
+                    outcome: r.get(5)?,
+                    artifact_path: r.get(6)?,
+                    created_at: r.get(7)?,
+                    updated_at: r.get(8)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT task_id, session_id, title, priority, status, outcome, artifact_path, created_at, updated_at
+                 FROM task_queue ORDER BY priority DESC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(TaskQueueRecord {
+                    task_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    title: r.get(2)?,
+                    priority: r.get::<_, i64>(3)? as u32,
+                    status: r.get(4)?,
+                    outcome: r.get(5)?,
+                    artifact_path: r.get(6)?,
+                    created_at: r.get(7)?,
+                    updated_at: r.get(8)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    // --- Web Search Cache ---
+
+    pub fn get_web_search_cache(&self, query_hash: &str) -> Result<Option<WebSearchCacheRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT query_hash, query, results_json, results_count, cached_at, ttl_seconds
+             FROM web_search_cache WHERE query_hash = ?1",
+        )?;
+        let mut rows = stmt.query([query_hash])?;
+        if let Some(row) = rows.next()? {
+            let cached_at: String = row.get(4)?;
+            let ttl: i64 = row.get(5)?;
+            // Check if cache is still valid
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&cached_at) {
+                let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc));
+                if age.num_seconds() > ttl {
+                    // Expired
+                    conn.execute(
+                        "DELETE FROM web_search_cache WHERE query_hash = ?1",
+                        [query_hash],
+                    )?;
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(WebSearchCacheRecord {
+                query_hash: row.get(0)?,
+                query: row.get(1)?,
+                results_json: row.get(2)?,
+                results_count: row.get::<_, i64>(3)? as u64,
+                cached_at,
+                ttl_seconds: ttl as u64,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn set_web_search_cache(&self, record: &WebSearchCacheRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO web_search_cache (query_hash, query, results_json, results_count, cached_at, ttl_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.query_hash,
+                record.query,
+                record.results_json,
+                record.results_count as i64,
+                record.cached_at,
+                record.ttl_seconds as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // --- Review Runs ---
+
+    pub fn insert_review_run(&self, record: &ReviewRunRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO review_runs (review_id, session_id, preset, target, findings_json, findings_count, critical_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.review_id.to_string(),
+                record.session_id.to_string(),
+                record.preset,
+                record.target,
+                record.findings_json,
+                record.findings_count as i64,
+                record.critical_count as i64,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_review_runs(&self, session_id: Uuid) -> Result<Vec<ReviewRunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT review_id, session_id, preset, target, findings_json, findings_count, critical_count, created_at
+             FROM review_runs WHERE session_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([session_id.to_string()], |r| {
+            Ok(ReviewRunRecord {
+                review_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                preset: r.get(2)?,
+                target: r.get(3)?,
+                findings_json: r.get(4)?,
+                findings_count: r.get::<_, i64>(5)? as u64,
+                critical_count: r.get::<_, i64>(6)? as u64,
+                created_at: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // --- Artifacts ---
+
+    pub fn insert_artifact(&self, record: &ArtifactRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO artifacts (artifact_id, task_id, artifact_path, files_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.artifact_id.to_string(),
+                record.task_id.to_string(),
+                record.artifact_path,
+                record.files_json,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_artifacts_for_task(&self, task_id: Uuid) -> Result<Vec<ArtifactRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT artifact_id, task_id, artifact_path, files_json, created_at
+             FROM artifacts WHERE task_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([task_id.to_string()], |r| {
+            Ok(ArtifactRecord {
+                artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                task_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                artifact_path: r.get(2)?,
+                files_json: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // --- Sessions by workspace (for --continue) ---
+
+    pub fn load_latest_session_for_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Option<Session>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, workspace_root, baseline_commit, status, budgets, active_plan_id
+             FROM sessions WHERE workspace_root = ?1 ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([workspace_root])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(Session {
+                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                workspace_root: row.get(1)?,
+                baseline_commit: row.get(2)?,
+                status: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                budgets: serde_json::from_str(&row.get::<_, String>(4)?)?,
+                active_plan_id: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|v| Uuid::parse_str(&v))
+                    .transpose()?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn rebuild_from_events(&self, session_id: Uuid) -> Result<RebuildProjection> {
         if !self.events_path.exists() {
             return Ok(RebuildProjection::default());
@@ -2036,6 +2484,90 @@ impl Store {
                     ],
                 )?;
             }
+            EventKind::PermissionModeChangedV1 { from, to } => {
+                conn.execute(
+                    "INSERT INTO permission_mode_log (session_id, from_mode, to_mode, changed_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        event.session_id.to_string(),
+                        from,
+                        to,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::TaskCreatedV1 {
+                task_id,
+                title,
+                priority,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO task_queue (task_id, session_id, title, priority, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                    params![
+                        task_id.to_string(),
+                        event.session_id.to_string(),
+                        title,
+                        *priority as i64,
+                        Utc::now().to_rfc3339(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::TaskCompletedV1 { task_id, outcome } => {
+                conn.execute(
+                    "UPDATE task_queue SET status = 'completed', outcome = ?1, updated_at = ?2 WHERE task_id = ?3",
+                    params![outcome, Utc::now().to_rfc3339(), task_id.to_string()],
+                )?;
+            }
+            EventKind::ReviewStartedV1 {
+                review_id,
+                preset,
+                target,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO review_runs (review_id, session_id, preset, target, findings_json, findings_count, critical_count, created_at)
+                     VALUES (?1, ?2, ?3, ?4, '[]', 0, 0, ?5)",
+                    params![
+                        review_id.to_string(),
+                        event.session_id.to_string(),
+                        preset,
+                        target,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+            EventKind::ReviewCompletedV1 {
+                review_id,
+                findings_count,
+                critical_count,
+            } => {
+                conn.execute(
+                    "UPDATE review_runs SET findings_count = ?1, critical_count = ?2 WHERE review_id = ?3",
+                    params![
+                        *findings_count as i64,
+                        *critical_count as i64,
+                        review_id.to_string()
+                    ],
+                )?;
+            }
+            EventKind::ArtifactBundledV1 {
+                task_id,
+                artifact_path,
+                files,
+            } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO artifacts (artifact_id, task_id, artifact_path, files_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        task_id.to_string(),
+                        artifact_path,
+                        serde_json::to_string(files)?,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
             _ => {}
         }
         Ok(())
@@ -2058,6 +2590,9 @@ pub struct RebuildProjection {
     pub usage_output_tokens: u64,
     pub compaction_events: usize,
     pub autopilot_runs: Vec<Uuid>,
+    pub permission_mode: Option<String>,
+    pub task_ids: Vec<Uuid>,
+    pub review_ids: Vec<Uuid>,
 }
 
 fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
@@ -2107,6 +2642,11 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             proj.compaction_events = proj.compaction_events.saturating_add(1)
         }
         EventKind::AutopilotRunStartedV1 { run_id, .. } => proj.autopilot_runs.push(*run_id),
+        EventKind::PermissionModeChangedV1 { to, .. } => {
+            proj.permission_mode = Some(to.clone())
+        }
+        EventKind::TaskCreatedV1 { task_id, .. } => proj.task_ids.push(*task_id),
+        EventKind::ReviewStartedV1 { review_id, .. } => proj.review_ids.push(*review_id),
         _ => {}
     }
 }
@@ -2164,6 +2704,13 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::RemoteEnvConfiguredV1 { .. } => "RemoteEnvConfigured@v1",
         EventKind::TeleportBundleCreatedV1 { .. } => "TeleportBundleCreated@v1",
         EventKind::TelemetryEventV1 { .. } => "TelemetryEvent@v1",
+        EventKind::PermissionModeChangedV1 { .. } => "PermissionModeChanged@v1",
+        EventKind::WebSearchExecutedV1 { .. } => "WebSearchExecuted@v1",
+        EventKind::ReviewStartedV1 { .. } => "ReviewStarted@v1",
+        EventKind::ReviewCompletedV1 { .. } => "ReviewCompleted@v1",
+        EventKind::TaskCreatedV1 { .. } => "TaskCreated@v1",
+        EventKind::TaskCompletedV1 { .. } => "TaskCompleted@v1",
+        EventKind::ArtifactBundledV1 { .. } => "ArtifactBundled@v1",
     }
 }
 

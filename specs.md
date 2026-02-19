@@ -26,7 +26,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Cross-platform** | macOS 13.0+, Ubuntu 20.04+/Debian 10+, Windows 10+ (WSL/Git Bash). |
 | **Multiple installation methods** | Native binary, Homebrew, Winget, direct download. |
 | **Session persistence** | Resume sessions with `deepseek run`; checkpointing via event log. |
-| **Large context** | 1M token window, automatic context compression when nearing limits. |
+| **Large context** | 128K token window (DeepSeek API limit), automatic context compression when nearing limits. |
 | **Project-wide awareness** | Indexes entire codebase; understands file structure and dependencies. |
 | **Checkpointing** | Auto-saves file edits; reversible via `/rewind` or keyboard shortcut. |
 | **Fast Mode** | Optimized API parameters for lower latency (configurable). |
@@ -46,6 +46,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | `fs.glob` | Pattern-based file search. |
 | `fs.grep` | Content search with regex. |
 | `web.fetch` | Fetch URL content, auto-extract text from HTML. Configurable timeout and max_bytes. |
+| `web.search` | Web search returning structured results (title, URL, snippet, provenance). Cached with TTL. |
 | `@file` references | Mention files directly: `@src/auth.ts:42-58`. |
 | `@dir` references | Include whole directories. |
 
@@ -77,6 +78,16 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | `/remote-env` | Configure remote sessions. |
 | `/status` | Current model, mode, and configuration. |
 | `/effort` | Control thinking depth (low/medium/high/max). |
+| `/context` | Inspect context window: token breakdown by source (system prompt, conversation, tools, memory). |
+| `/permissions` | View/change permission mode (ask/auto/locked). Dry-run evaluator shows what a tool call would produce under current mode. |
+| `/sandbox` | View/configure sandbox mode (allowlist/isolated/off/workspace-write/read-only). |
+| `/agents` | List running and completed subagents with status and output summaries. |
+| `/tasks` | Open Mission Control: view/manage task queue, reorder priorities, inspect artifacts. |
+| `/review` | Start a read-only code review pipeline. Presets: security, perf, style, PR-ready. Accepts `--diff`, `--staged`, `--pr N`, `--path P`, `--focus F`. |
+| `/search` | Web search: query the web and include results as context. Cached with TTL. Provenance metadata attached to results. |
+| `/terminal-setup` | Configure shell integration, prompt markers, and terminal capabilities. |
+| `/keybindings` | Edit keyboard shortcuts interactively; opens `~/.deepseek/keybindings.json`. |
+| `/doctor` | Run diagnostics: check API connectivity, config validity, tool availability, index health, disk space. |
 
 ### 2.5 MCP (Model Context Protocol) Extensibility
 
@@ -111,6 +122,9 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | Ctrl+B | Background agents and shell commands. |
 | Ctrl+O | Toggle transcript mode (show raw thinking). |
 | Ctrl+C | Cancel current operation. |
+| Shift+Tab | Cycle permission mode (ask → auto → locked). |
+| Ctrl+T | Toggle Mission Control pane (tasks/subagents). |
+| Ctrl+A | Toggle Artifacts pane. |
 
 ### 2.8 Configuration System
 
@@ -159,7 +173,25 @@ The following features are derived from Claude Code’s current (2026) capabilit
 - **Security hardening:** No command injection, XSS, SQL injection.
 - **Team permissions:** Managed permissions that cannot be overwritten locally.
 
-### 2.12 DeepSeek-Specific Enhancements
+### 2.12 Permission Modes
+
+The CLI supports three runtime permission modes that govern how tool calls are authorized:
+
+| Mode | Behavior |
+|------|----------|
+| **ask** (default) | Prompt the user for approval on each tool call that matches the policy gate (edits, bash, etc.). Read-only tools (fs.read, fs.glob, fs.grep, index.query) always pass. |
+| **auto** | Auto-approve tool calls that match the allowlist. Calls not on the allowlist still prompt for approval. Ideal for workflows where the user trusts a known set of commands. |
+| **locked** | Deny all non-read operations. No writes, no edits, no bash, no patch apply. Useful for review-only sessions or when exploring a codebase. |
+
+**UX:**
+- **Shift+Tab** cycles between modes at the REPL prompt: ask → auto → locked → ask.
+- **Status bar** shows current mode as a colored indicator: `[ASK]` (yellow), `[AUTO]` (green), `[LOCKED]` (red).
+- **Event log:** Every mode change is recorded as `PermissionModeChangedV1 { from, to }` in the event stream.
+- **`/permissions` command:** Displays current mode, lists what each tool would do under the active mode (dry-run evaluator), and allows switching modes interactively.
+- **Team policy override:** If `team-policy.json` sets `permission_mode`, it cannot be overridden locally.
+- **Configuration:** `policy.permission_mode` in settings (default: `"ask"`).
+
+### 2.13 DeepSeek-Specific Enhancements
 
 | Enhancement | Description |
 |--------------|-------------|
@@ -267,6 +299,10 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
 
 **`web.fetch`:** Fetches URL content via HTTP GET, strips HTML tags to plain text, and truncates to a configurable max byte limit. Useful for documentation lookup, API exploration, and web content analysis.
 
+**`web.search`:** Performs a web search query and returns structured results with title, URL, snippet, and provenance metadata (source, timestamp). Results are cached with a configurable TTL (default 15 minutes) to avoid redundant queries. Distinct from `web.fetch`: search returns a list of results for discovery, while fetch retrieves a single URL's content. The `/search` slash command provides interactive access.
+
+**Review pipeline constraints:** When `/review` or `deepseek review` is active, the tool host enters **read-only mode**: `fs.write`, `fs.edit`, `patch.stage`, `patch.apply`, `bash.run`, and `web.fetch` are all forbidden. Only read tools (`fs.read`, `fs.glob`, `fs.grep`, `index.query`, `git.diff`, `git.log`, `git.show`) are permitted. This ensures the review pipeline cannot modify the codebase.
+
 **Auto-lint after edit:** When `policy.lint_after_edit` is configured (e.g., `"cargo fmt --check"`), the tool host automatically runs the linter after every `fs.edit` and includes diagnostics in the tool result JSON. This enables the LLM to self-heal formatting/lint issues without a separate tool call.
 
 ### 4.6 Patch Staging and Application
@@ -326,7 +362,9 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
   - Main conversation pane (scrollable, syntax highlighting).
   - Plan pane (collapsible) showing current plan and step progress.
   - Tool output pane (real-time logs from subagents or tool executions).
-  - Status bar: model, cost, pending approvals, background jobs.
+  - **Mission Control pane** (toggle via `/tasks` or Ctrl+T): task queue with status indicators, subagent swimlanes, priority reordering. Shows running/pending/completed tasks with elapsed time and token usage.
+  - **Artifacts pane** (toggle via Ctrl+A): displays task artifacts from `.deepseek/artifacts/<task-id>/`. Each task bundle contains `plan.md`, `diff.patch`, `verification.md`. Artifacts are browsable and diffable inline.
+  - Status bar: model, cost, pending approvals, background jobs, **permission mode indicator** (`[ASK]`/`[AUTO]`/`[LOCKED]`).
 - Keyboard shortcuts as listed in section 2.7.
 - Multi-line input with Shift+Enter.
 - Autocomplete for commands and file paths.
@@ -344,12 +382,17 @@ In addition to the REPL, the CLI supports one-shot commands:
 - `deepseek index build|update|status|query` – manage index.
 - `deepseek config edit|show` – edit configuration.
 - `deepseek review [--diff|--staged|--pr N|--path P] [--focus F]` – structured code review with severity levels.
+- `deepseek exec "<command>"` – execute a shell command under policy enforcement (allowlist, sandbox, approval) and print structured output.
+- `deepseek tasks [list|show <id>|cancel <id>]` – manage the task queue from the command line.
+- `deepseek doctor` – run diagnostics (API connectivity, config validation, tool/binary availability, index health, disk space, sandbox integrity).
+- `deepseek search "<query>"` – web search from CLI, returns results with provenance metadata.
 
 **Print mode (`-p`):** Any command can be run non-interactively with the `-p` flag. Reads prompt from trailing arguments or stdin pipe. Supports `--output-format` (`text`, `json`, `stream-json`). Designed for CI/CD pipelines, scripting, and integration with other tools.
 
 **Session continuation:**
-- `--continue` resumes the most recent session, restoring full conversation context.
-- `--resume <UUID>` resumes a specific session by ID.
+- `--continue` / `-c` resumes the most recent session, restoring full conversation context.
+- `--resume <UUID>` / `-r <UUID>` resumes a specific session by ID.
+- `--fork-session <UUID>` forks an existing session: clones conversation + state into a new session with a fresh event stream. The original session is untouched. File locking prevents concurrent writes to the same session.
 
 **Per-invocation overrides:**
 - `--model <name>` overrides `llm.base_model` for this run.
@@ -417,7 +460,7 @@ base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 provider = "deepseek"              # deepseek | openai | anthropic | custom | local | ollama
 profile = "v3_2"
-context_window_tokens = 1000000
+context_window_tokens = 128000
 temperature = 0.2
 endpoint = "https://api.deepseek.com/chat/completions"
 api_key_env = "DEEPSEEK_API_KEY"
@@ -452,6 +495,7 @@ redact_patterns = [
     '(?i)\b(mrn|medical_record_number|patient_id)\s*[:=]\s*[a-z0-9\-]{4,}\b',
 ]
 sandbox_mode = "allowlist"     # allowlist | isolated | off
+permission_mode = "ask"        # ask | auto | locked
 # lint_after_edit = "cargo fmt --check"  # auto-lint after fs.edit
 
 [plugins]

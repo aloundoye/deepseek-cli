@@ -428,6 +428,39 @@ pub enum EventKind {
         from_session_id: Uuid,
         to_session_id: Uuid,
     },
+    PermissionModeChangedV1 {
+        from: String,
+        to: String,
+    },
+    WebSearchExecutedV1 {
+        query: String,
+        results_count: u64,
+        cached: bool,
+    },
+    ReviewStartedV1 {
+        review_id: Uuid,
+        preset: String,
+        target: String,
+    },
+    ReviewCompletedV1 {
+        review_id: Uuid,
+        findings_count: u64,
+        critical_count: u64,
+    },
+    TaskCreatedV1 {
+        task_id: Uuid,
+        title: String,
+        priority: u32,
+    },
+    TaskCompletedV1 {
+        task_id: Uuid,
+        outcome: String,
+    },
+    ArtifactBundledV1 {
+        task_id: Uuid,
+        artifact_path: String,
+        files: Vec<String>,
+    },
     TelemetryEventV1 {
         name: String,
         properties: serde_json::Value,
@@ -701,7 +734,7 @@ impl Default for LlmConfig {
             max_think_model: DEEPSEEK_V32_REASONER_MODEL.to_string(),
             provider: "deepseek".to_string(),
             profile: DEEPSEEK_PROFILE_V32.to_string(),
-            context_window_tokens: 1_000_000,
+            context_window_tokens: 128_000,
             temperature: 0.2,
             endpoint: "https://api.deepseek.com/chat/completions".to_string(),
             api_key: None,
@@ -759,6 +792,8 @@ pub struct PolicyConfig {
     pub redact_patterns: Vec<String>,
     pub sandbox_mode: String,
     pub sandbox_wrapper: Option<String>,
+    /// Permission mode: "ask" (default), "auto", or "locked".
+    pub permission_mode: String,
     /// Optional lint command to run automatically after fs.edit (e.g., "cargo fmt --check").
     pub lint_after_edit: Option<String>,
 }
@@ -792,6 +827,7 @@ impl Default for PolicyConfig {
             ],
             sandbox_mode: "allowlist".to_string(),
             sandbox_wrapper: None,
+            permission_mode: "ask".to_string(),
             lint_after_edit: None,
         }
     }

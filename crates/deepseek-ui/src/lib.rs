@@ -6,10 +6,10 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
@@ -39,6 +39,15 @@ pub enum SlashCommand {
     Permissions(Vec<String>),
     Background(Vec<String>),
     Visual(Vec<String>),
+    Context,
+    Sandbox(Vec<String>),
+    Agents,
+    Tasks(Vec<String>),
+    Review(Vec<String>),
+    Search(Vec<String>),
+    TerminalSetup,
+    Keybindings,
+    Doctor,
     Unknown { name: String, args: Vec<String> },
 }
 
@@ -73,6 +82,15 @@ impl SlashCommand {
             "permissions" => Self::Permissions(args),
             "background" => Self::Background(args),
             "visual" => Self::Visual(args),
+            "context" => Self::Context,
+            "sandbox" => Self::Sandbox(args),
+            "agents" => Self::Agents,
+            "tasks" => Self::Tasks(args),
+            "review" => Self::Review(args),
+            "search" => Self::Search(args),
+            "terminal-setup" => Self::TerminalSetup,
+            "keybindings" => Self::Keybindings,
+            "doctor" => Self::Doctor,
             other => Self::Unknown {
                 name: other.to_string(),
                 args,
@@ -89,33 +107,339 @@ pub struct UiStatus {
     pub estimated_cost_usd: f64,
     pub background_jobs: usize,
     pub autopilot_running: bool,
+    pub permission_mode: String,
+    pub active_tasks: usize,
+    #[serde(default)]
+    pub context_used_tokens: u64,
+    #[serde(default = "default_context_max")]
+    pub context_max_tokens: u64,
+    #[serde(default)]
+    pub session_turns: usize,
+    #[serde(default)]
+    pub working_directory: String,
+}
+
+fn default_context_max() -> u64 {
+    128_000
 }
 
 pub fn render_statusline(status: &UiStatus) -> String {
+    let mode_indicator = match status.permission_mode.as_str() {
+        "auto" => "[AUTO]",
+        "locked" => "[LOCKED]",
+        _ => "[ASK]",
+    };
+    let tasks_part = if status.active_tasks > 0 {
+        format!(" tasks={}", status.active_tasks)
+    } else {
+        String::new()
+    };
+    let ctx_pct = if status.context_max_tokens > 0 {
+        (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64
+    } else {
+        0
+    };
+    let ctx_part = if status.context_max_tokens > 0 {
+        format!(
+            " ctx={}K/{}K({}%)",
+            status.context_used_tokens / 1000,
+            status.context_max_tokens / 1000,
+            ctx_pct
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "model={} approvals={} jobs={} autopilot={} cost=${:.6}",
+        "model={} {} approvals={} jobs={}{} autopilot={}{} cost=${:.4}",
         status.model,
+        mode_indicator,
         status.pending_approvals,
         status.background_jobs,
+        tasks_part,
         if status.autopilot_running {
             "running"
         } else {
             "idle"
         },
+        ctx_part,
         status.estimated_cost_usd,
     )
 }
 
+fn render_statusline_spans(status: &UiStatus) -> Vec<Span<'static>> {
+    let mode_color = match status.permission_mode.as_str() {
+        "auto" => Color::Green,
+        "locked" => Color::Red,
+        _ => Color::Yellow,
+    };
+    let mode_label = match status.permission_mode.as_str() {
+        "auto" => " AUTO ",
+        "locked" => " LOCKED ",
+        _ => " ASK ",
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", status.model),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            mode_label.to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(mode_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if status.pending_approvals > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} pending ", status.pending_approvals),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if status.active_tasks > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} tasks ", status.active_tasks),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    if status.background_jobs > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} jobs ", status.background_jobs),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+
+    if status.autopilot_running {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            " AUTOPILOT ".to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if status.context_max_tokens > 0 {
+        let pct =
+            (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64;
+        let ctx_color = if pct > 80 {
+            Color::Red
+        } else if pct > 60 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(
+                " {}K/{}K ",
+                status.context_used_tokens / 1000,
+                status.context_max_tokens / 1000
+            ),
+            Style::default().fg(ctx_color),
+        ));
+    }
+
+    spans.push(Span::styled(
+        format!(" ${:.4} ", status.estimated_cost_usd),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    spans
+}
+
+fn style_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
+    let (prefix, prefix_style, body_style) = match entry.kind {
+        MessageKind::User => (
+            "❯ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        ),
+        MessageKind::Assistant => (
+            "  ",
+            Style::default(),
+            Style::default().fg(Color::White),
+        ),
+        MessageKind::System => (
+            "⚙ ",
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        ),
+        MessageKind::ToolCall => (
+            "⚡ ",
+            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Yellow),
+        ),
+        MessageKind::ToolResult => (
+            "  ↳ ",
+            Style::default().fg(Color::Green),
+            Style::default().fg(Color::DarkGray),
+        ),
+        MessageKind::Error => (
+            "✗ ",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
+        ),
+    };
+
+    // Simple markdown-like styling for assistant messages
+    let text = &entry.text;
+    if entry.kind == MessageKind::Assistant {
+        if text.starts_with("```") {
+            return Line::from(vec![Span::styled(
+                text.clone(),
+                Style::default().fg(Color::DarkGray),
+            )]);
+        }
+        if text.starts_with("# ") || text.starts_with("## ") || text.starts_with("### ") {
+            return Line::from(vec![Span::styled(
+                text.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]);
+        }
+        if text.starts_with("- ") || text.starts_with("* ") {
+            return Line::from(vec![
+                Span::styled(
+                    "  • ".to_string(),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(text[2..].to_string(), body_style),
+            ]);
+        }
+    }
+
+    Line::from(vec![
+        Span::styled(prefix.to_string(), prefix_style),
+        Span::styled(text.clone(), body_style),
+    ])
+}
+
+fn render_context_gauge(status: &UiStatus, area: Rect, frame: &mut ratatui::Frame<'_>) {
+    if status.context_max_tokens == 0 {
+        return;
+    }
+    let ratio = (status.context_used_tokens as f64 / status.context_max_tokens as f64)
+        .clamp(0.0, 1.0);
+    let color = if ratio > 0.8 {
+        Color::Red
+    } else if ratio > 0.6 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    let gauge = Gauge::default()
+        .block(Block::default())
+        .gauge_style(Style::default().fg(color).bg(Color::DarkGray))
+        .ratio(ratio)
+        .label(format!(
+            "Context: {}K / {}K ({:.0}%)",
+            status.context_used_tokens / 1000,
+            status.context_max_tokens / 1000,
+            ratio * 100.0
+        ));
+    frame.render_widget(gauge, area);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    User,
+    Assistant,
+    System,
+    ToolCall,
+    ToolResult,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptEntry {
+    pub kind: MessageKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightPane {
+    Plan,
+    Tools,
+    MissionControl,
+    Artifacts,
+}
+
+impl RightPane {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Tools => "Tools",
+            Self::MissionControl => "Mission Control",
+            Self::Artifacts => "Artifacts",
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            Self::Plan => Self::Tools,
+            Self::Tools => Self::MissionControl,
+            Self::MissionControl => Self::Artifacts,
+            Self::Artifacts => Self::Plan,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatShell {
-    pub transcript: Vec<String>,
+    pub transcript: Vec<TranscriptEntry>,
     pub plan_lines: Vec<String>,
     pub tool_lines: Vec<String>,
+    pub mission_control_lines: Vec<String>,
+    pub artifact_lines: Vec<String>,
+    pub active_tool: Option<String>,
+    pub spinner_tick: usize,
 }
 
 impl ChatShell {
     pub fn push_transcript(&mut self, line: impl Into<String>) {
-        self.transcript.push(line.into());
+        self.transcript.push(TranscriptEntry {
+            kind: MessageKind::Assistant,
+            text: line.into(),
+        });
+    }
+
+    pub fn push_user(&mut self, line: impl Into<String>) {
+        self.transcript.push(TranscriptEntry {
+            kind: MessageKind::User,
+            text: line.into(),
+        });
+    }
+
+    pub fn push_system(&mut self, line: impl Into<String>) {
+        self.transcript.push(TranscriptEntry {
+            kind: MessageKind::System,
+            text: line.into(),
+        });
+    }
+
+    pub fn push_error(&mut self, line: impl Into<String>) {
+        self.transcript.push(TranscriptEntry {
+            kind: MessageKind::Error,
+            text: line.into(),
+        });
     }
 
     pub fn push_plan(&mut self, line: impl Into<String>) {
@@ -124,6 +448,19 @@ impl ChatShell {
 
     pub fn push_tool(&mut self, line: impl Into<String>) {
         self.tool_lines.push(line.into());
+    }
+
+    pub fn push_mission_control(&mut self, line: impl Into<String>) {
+        self.mission_control_lines.push(line.into());
+    }
+
+    pub fn push_artifact(&mut self, line: impl Into<String>) {
+        self.artifact_lines.push(line.into());
+    }
+
+    fn spinner_frame(&self) -> &'static str {
+        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        FRAMES[self.spinner_tick % FRAMES.len()]
     }
 }
 
@@ -294,88 +631,246 @@ where
     let mut shell = ChatShell::default();
     let mut input = String::new();
     let mut info_line =
-        String::from("Ctrl+C exit | Ctrl+O toggle raw | Ctrl+B background run | Ctrl+V paste");
-    let mut show_raw = false;
+        String::from("Ctrl+C exit | Tab autocomplete | Ctrl+O toggle pane | Ctrl+B background | Shift+Enter newline");
+    let mut right_pane = RightPane::Plan;
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
+    let mut cursor_visible;
+    let mut tick_count: usize = 0;
 
     loop {
-        let status_line = render_statusline(&status);
+        tick_count = tick_count.wrapping_add(1);
+        shell.spinner_tick = tick_count;
+        cursor_visible = tick_count % 8 < 5;
+
         terminal.draw(|frame| {
             let area = frame.area();
+
+            // Main vertical layout:
+            //  [context gauge]  (1 line)
+            //  [body area]      (fills)
+            //  [tool output]    (20%)
+            //  [input]          (3 lines)
+            //  [status bar]     (1 line)
+            //  [info/help]      (1 line)
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Percentage(65),
-                    Constraint::Percentage(25),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
+                    Constraint::Length(1),    // context gauge
+                    Constraint::Min(8),       // body (transcript + side pane)
+                    Constraint::Percentage(18), // tool output
+                    Constraint::Length(3),    // input
+                    Constraint::Length(1),    // status bar
+                    Constraint::Length(1),    // info/help line
                 ])
                 .split(area);
 
+            // Context usage gauge
+            render_context_gauge(&status, vertical[0], frame);
+
+            // Body: Transcript (left 72%) + Right pane (28%)
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                .split(vertical[0]);
+                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                .split(vertical[1]);
 
-            let transcript_lines = shell
+            // Transcript with styled entries
+            let transcript_lines: Vec<Line<'_>> = shell
                 .transcript
                 .iter()
                 .rev()
-                .take(200)
-                .cloned()
+                .take(500)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
-                .map(Line::from)
-                .collect::<Vec<_>>();
+                .map(|entry| style_transcript_line(entry))
+                .collect();
+
+            let transcript_title = if let Some(ref tool) = shell.active_tool {
+                format!(" {} {} ", shell.spinner_frame(), tool)
+            } else {
+                " Transcript ".to_string()
+            };
+
             frame.render_widget(
                 Paragraph::new(transcript_lines)
-                    .block(Block::default().title("Transcript").borders(Borders::ALL))
+                    .block(
+                        Block::default()
+                            .title(Span::styled(
+                                transcript_title,
+                                Style::default()
+                                    .fg(theme.primary)
+                                    .add_modifier(Modifier::BOLD),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(
+                                if shell.active_tool.is_some() {
+                                    Color::Yellow
+                                } else {
+                                    theme.primary
+                                },
+                            )),
+                    )
                     .wrap(Wrap { trim: false }),
                 body[0],
             );
 
-            let right_lines = if show_raw {
-                shell.tool_lines.clone()
+            // Right pane (Plan / Tools / Mission Control / Artifacts)
+            let right_lines: Vec<Line<'_>> = match right_pane {
+                RightPane::Plan => shell
+                    .plan_lines
+                    .iter()
+                    .map(|l| {
+                        if l.starts_with("##") {
+                            Line::from(Span::styled(
+                                l.clone(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ))
+                        } else if l.starts_with("- [x]") {
+                            Line::from(Span::styled(
+                                l.clone(),
+                                Style::default().fg(Color::Green),
+                            ))
+                        } else if l.starts_with("- [ ]") {
+                            Line::from(Span::styled(
+                                l.clone(),
+                                Style::default().fg(Color::DarkGray),
+                            ))
+                        } else {
+                            Line::from(l.as_str())
+                        }
+                    })
+                    .collect(),
+                RightPane::Tools => shell
+                    .tool_lines
+                    .iter()
+                    .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Yellow))))
+                    .collect(),
+                RightPane::MissionControl => shell
+                    .mission_control_lines
+                    .iter()
+                    .map(|l| Line::from(l.as_str()))
+                    .collect(),
+                RightPane::Artifacts => shell
+                    .artifact_lines
+                    .iter()
+                    .map(|l| Line::from(l.as_str()))
+                    .collect(),
+            };
+
+            // Pane tabs
+            let pane_tabs = Tabs::new(vec![
+                Span::raw("Plan"),
+                Span::raw("Tools"),
+                Span::raw("Mission"),
+                Span::raw("Artifacts"),
+            ])
+            .select(match right_pane {
+                RightPane::Plan => 0,
+                RightPane::Tools => 1,
+                RightPane::MissionControl => 2,
+                RightPane::Artifacts => 3,
+            })
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(
+                Style::default()
+                    .fg(theme.secondary)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+            let right_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(body[1]);
+
+            frame.render_widget(pane_tabs, right_layout[0]);
+            frame.render_widget(
+                Paragraph::new(right_lines)
+                    .block(
+                        Block::default()
+                            .title(right_pane.title())
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                right_layout[1],
+            );
+
+            // Tool output area
+            let tool_output_lines: Vec<Line<'_>> = shell
+                .tool_lines
+                .iter()
+                .rev()
+                .take(50)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|l| {
+                    if l.starts_with("error") || l.starts_with("Error") {
+                        Line::from(Span::styled(l.clone(), Style::default().fg(Color::Red)))
+                    } else if l.starts_with("ok") || l.starts_with("success") {
+                        Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
+                    } else {
+                        Line::from(Span::styled(
+                            l.clone(),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                    }
+                })
+                .collect();
+
+            frame.render_widget(
+                Paragraph::new(tool_output_lines)
+                    .block(
+                        Block::default()
+                            .title(Span::styled(
+                                " Tool Output ",
+                                Style::default().fg(Color::Yellow),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                vertical[2],
+            );
+
+            // Input with blinking cursor
+            let input_display = if cursor_visible {
+                format!("{}█", input)
             } else {
-                shell.plan_lines.clone()
+                format!("{} ", input)
             };
             frame.render_widget(
-                Paragraph::new(
-                    right_lines
-                        .into_iter()
-                        .map(Line::from)
-                        .collect::<Vec<Line>>(),
-                )
-                .block(
+                Paragraph::new(input_display).block(
                     Block::default()
-                        .title(if show_raw { "Tools" } else { "Plan" })
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: false }),
-                body[1],
-            );
-
-            frame.render_widget(
-                Paragraph::new(shell.tool_lines.join("\n"))
-                    .block(Block::default().title("Tool Output").borders(Borders::ALL))
-                    .wrap(Wrap { trim: false }),
-                vertical[1],
-            );
-
-            frame.render_widget(
-                Paragraph::new(input.clone()).block(
-                    Block::default()
-                        .title("Input")
+                        .title(Span::styled(
+                            " deepseek ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(theme.primary)),
                 ),
-                vertical[2],
+                vertical[3],
             );
-            frame.render_widget(Paragraph::new(status_line), vertical[3]);
-            frame.render_widget(Paragraph::new(info_line.clone()), vertical[4]);
+
+            // Status bar with styled spans
+            frame.render_widget(
+                Paragraph::new(Line::from(render_statusline_spans(&status))),
+                vertical[4],
+            );
+
+            // Info/help line
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    info_line.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                vertical[5],
+            );
         })?;
 
         if !event::poll(Duration::from_millis(120))? {
@@ -395,8 +890,8 @@ where
             break;
         }
         if key == bindings.toggle_raw {
-            show_raw = !show_raw;
-            info_line = format!("raw_mode={show_raw}");
+            right_pane = right_pane.cycle();
+            info_line = format!("pane: {}", right_pane.title());
             continue;
         }
         if key == bindings.background {
@@ -421,7 +916,7 @@ where
             } else {
                 format!("/background run-agent {queued}")
             };
-            shell.push_transcript(format!("> {background_cmd}"));
+            shell.push_user(&background_cmd);
             input.clear();
             match on_submit(&background_cmd) {
                 Ok(output) => {
@@ -482,6 +977,15 @@ where
                     "permissions",
                     "background",
                     "visual",
+                    "context",
+                    "sandbox",
+                    "agents",
+                    "tasks",
+                    "review",
+                    "search",
+                    "terminal-setup",
+                    "keybindings",
+                    "doctor",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
@@ -510,7 +1014,7 @@ where
             if history.len() > 100 {
                 let _ = history.pop_front();
             }
-            shell.push_transcript(format!("> {prompt}"));
+            shell.push_user(&prompt);
             input.clear();
             match on_submit(&prompt) {
                 Ok(output) => {
@@ -698,9 +1202,17 @@ mod tests {
             estimated_cost_usd: 0.001,
             background_jobs: 1,
             autopilot_running: true,
+            permission_mode: "ask".to_string(),
+            active_tasks: 3,
+            context_used_tokens: 50_000,
+            context_max_tokens: 128_000,
+            session_turns: 5,
+            working_directory: "/tmp".to_string(),
         });
         assert!(line.contains("model=deepseek-chat"));
         assert!(line.contains("autopilot=running"));
+        assert!(line.contains("[ASK]"));
+        assert!(line.contains("tasks=3"));
     }
 
     #[test]
@@ -730,5 +1242,134 @@ mod tests {
             bindings.autocomplete,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
         );
+    }
+
+    #[test]
+    fn parses_new_slash_commands() {
+        assert_eq!(SlashCommand::parse("/context"), Some(SlashCommand::Context));
+        assert_eq!(
+            SlashCommand::parse("/sandbox enable"),
+            Some(SlashCommand::Sandbox(vec!["enable".to_string()]))
+        );
+        assert_eq!(SlashCommand::parse("/agents"), Some(SlashCommand::Agents));
+        assert_eq!(
+            SlashCommand::parse("/tasks list"),
+            Some(SlashCommand::Tasks(vec!["list".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/review security"),
+            Some(SlashCommand::Review(vec!["security".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/search rust async patterns"),
+            Some(SlashCommand::Search(vec![
+                "rust".to_string(),
+                "async".to_string(),
+                "patterns".to_string()
+            ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/terminal-setup"),
+            Some(SlashCommand::TerminalSetup)
+        );
+        assert_eq!(
+            SlashCommand::parse("/keybindings"),
+            Some(SlashCommand::Keybindings)
+        );
+        assert_eq!(SlashCommand::parse("/doctor"), Some(SlashCommand::Doctor));
+    }
+
+    #[test]
+    fn statusline_shows_context_usage() {
+        let line = render_statusline(&UiStatus {
+            model: "deepseek-chat".to_string(),
+            pending_approvals: 0,
+            estimated_cost_usd: 0.0,
+            background_jobs: 0,
+            autopilot_running: false,
+            permission_mode: "auto".to_string(),
+            active_tasks: 0,
+            context_used_tokens: 96_000,
+            context_max_tokens: 128_000,
+            session_turns: 10,
+            working_directory: "/workspace".to_string(),
+        });
+        assert!(line.contains("[AUTO]"));
+        assert!(line.contains("ctx=96K/128K(75%)"));
+    }
+
+    #[test]
+    fn statusline_permission_modes() {
+        let make_status = |mode: &str| UiStatus {
+            model: "test".to_string(),
+            permission_mode: mode.to_string(),
+            ..Default::default()
+        };
+        assert!(render_statusline(&make_status("ask")).contains("[ASK]"));
+        assert!(render_statusline(&make_status("auto")).contains("[AUTO]"));
+        assert!(render_statusline(&make_status("locked")).contains("[LOCKED]"));
+    }
+
+    #[test]
+    fn styled_statusline_spans_include_mode_badge() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            permission_mode: "locked".to_string(),
+            pending_approvals: 1,
+            active_tasks: 2,
+            background_jobs: 1,
+            autopilot_running: true,
+            context_used_tokens: 100_000,
+            context_max_tokens: 128_000,
+            ..Default::default()
+        };
+        let spans = render_statusline_spans(&status);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("deepseek-chat"));
+        assert!(text.contains("LOCKED"));
+        assert!(text.contains("pending"));
+        assert!(text.contains("tasks"));
+        assert!(text.contains("AUTOPILOT"));
+        assert!(text.contains("100K/128K"));
+    }
+
+    #[test]
+    fn right_pane_cycles_through_all_variants() {
+        let mut pane = RightPane::Plan;
+        pane = pane.cycle();
+        assert_eq!(pane, RightPane::Tools);
+        pane = pane.cycle();
+        assert_eq!(pane, RightPane::MissionControl);
+        pane = pane.cycle();
+        assert_eq!(pane, RightPane::Artifacts);
+        pane = pane.cycle();
+        assert_eq!(pane, RightPane::Plan);
+    }
+
+    #[test]
+    fn chat_shell_typed_entries() {
+        let mut shell = ChatShell::default();
+        shell.push_user("hello");
+        shell.push_transcript("response");
+        shell.push_system("info");
+        shell.push_error("oops");
+        assert_eq!(shell.transcript.len(), 4);
+        assert_eq!(shell.transcript[0].kind, MessageKind::User);
+        assert_eq!(shell.transcript[1].kind, MessageKind::Assistant);
+        assert_eq!(shell.transcript[2].kind, MessageKind::System);
+        assert_eq!(shell.transcript[3].kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn spinner_cycles_through_frames() {
+        let mut shell = ChatShell::default();
+        let mut frames = Vec::new();
+        for i in 0..10 {
+            shell.spinner_tick = i;
+            frames.push(shell.spinner_frame().to_string());
+        }
+        assert_eq!(frames.len(), 10);
+        // All frames are braille characters
+        assert!(frames.iter().all(|f| f.chars().all(|c| c as u32 >= 0x2800)));
     }
 }
