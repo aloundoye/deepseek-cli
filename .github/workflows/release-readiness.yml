@@ -1,0 +1,75 @@
+name: Release Readiness
+
+on:
+  workflow_dispatch:
+
+jobs:
+  readiness-unix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin deepseek
+
+      - name: Installer dry run (unix)
+        run: bash scripts/install.sh --dry-run --version v0.0.0 --repo example/example
+
+      - name: Rollback rehearsal smoke with mock DeepSeek API
+        env:
+          DEEPSEEK_API_KEY: test-api-key
+        run: |
+          set -euo pipefail
+          python3 scripts/mock_deepseek_api.py --port 18765 > /tmp/deepseek-mock.log 2>&1 &
+          echo $! > /tmp/deepseek-mock.pid
+          trap 'kill "$(cat /tmp/deepseek-mock.pid)" >/dev/null 2>&1 || true' EXIT
+          sleep 1
+
+          workspace="$(mktemp -d)"
+          mkdir -p "$workspace/.deepseek"
+          cat > "$workspace/.deepseek/settings.local.json" <<JSON
+          {
+            "llm": {
+              "provider": "deepseek",
+              "profile": "v3_2",
+              "endpoint": "http://127.0.0.1:18765/chat/completions",
+              "api_key_env": "DEEPSEEK_API_KEY",
+              "stream": false
+            }
+          }
+          JSON
+          (
+            cd "$workspace"
+            "${GITHUB_WORKSPACE}/target/release/deepseek" --json plan "rollback validation" > rollback-validation.json
+          )
+          python3 - <<PY
+          import json, pathlib
+          payload = json.loads(pathlib.Path("${workspace}/rollback-validation.json").read_text())
+          if not isinstance(payload.get("steps"), list) or not payload["steps"]:
+              raise SystemExit("rollback rehearsal plan missing steps")
+          PY
+
+      - name: Upload release readiness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-readiness-unix
+          path: |
+            /tmp/deepseek-mock.log
+
+  readiness-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer dry run (windows)
+        shell: pwsh
+        run: ./scripts/install.ps1 -DryRun -Version v0.0.0 -Repo example/example

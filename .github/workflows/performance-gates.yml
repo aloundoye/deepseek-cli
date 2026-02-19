@@ -1,0 +1,93 @@
+name: Performance Gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  benchmark-slo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build deepseek binary
+        run: cargo build --bin deepseek
+
+      - name: Start mock DeepSeek API
+        run: |
+          python3 scripts/mock_deepseek_api.py --port 18765 > /tmp/deepseek-mock.log 2>&1 &
+          echo $! > /tmp/deepseek-mock.pid
+          sleep 1
+
+      - name: Enforce benchmark SLO gates
+        env:
+          DEEPSEEK_API_KEY: test-api-key
+          MOCK_ENDPOINT: http://127.0.0.1:18765/chat/completions
+        run: |
+          set -euo pipefail
+          trap 'kill "$(cat /tmp/deepseek-mock.pid)" >/dev/null 2>&1 || true' EXIT
+
+          workspace="$(mktemp -d)"
+          mkdir -p "$workspace/.deepseek"
+          cat > "$workspace/.deepseek/settings.local.json" <<JSON
+          {
+            "llm": {
+              "provider": "deepseek",
+              "profile": "v3_2",
+              "endpoint": "${MOCK_ENDPOINT}",
+              "api_key_env": "DEEPSEEK_API_KEY",
+              "stream": false
+            }
+          }
+          JSON
+
+          (
+            cd "$workspace"
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json profile \
+              --benchmark \
+              --benchmark-suite "${GITHUB_WORKSPACE}/.github/benchmark/slo-suite.json" \
+              --benchmark-cases 3 \
+              --benchmark-min-success-rate 1.0 \
+              --benchmark-min-quality-rate 1.0 \
+              --benchmark-max-p95-ms 2000 \
+              --benchmark-output ".deepseek/benchmark.json" \
+              > profile.json
+
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json benchmark run-matrix \
+              "${GITHUB_WORKSPACE}/.github/benchmark/slo-matrix.json" \
+              --strict \
+              --output ".deepseek/matrix.json" \
+              --report-output ".deepseek/matrix.md" \
+              > matrix_stdout.json
+          )
+
+          python3 - <<PY
+          import json, pathlib
+          profile = json.loads(pathlib.Path("${workspace}/profile.json").read_text())
+          benchmark = profile.get("benchmark", {})
+          p95 = benchmark.get("p95_latency_ms")
+          if p95 is None:
+              raise SystemExit("missing p95_latency_ms in benchmark output")
+          if int(p95) > 2000:
+              raise SystemExit(f"p95 latency {p95}ms exceeds 2000ms budget")
+          matrix = json.loads(pathlib.Path("${workspace}/matrix_stdout.json").read_text())
+          if matrix.get("schema") != "deepseek.benchmark.matrix.v1":
+              raise SystemExit("benchmark matrix schema mismatch")
+          PY
+
+      - name: Upload performance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-gate-artifacts
+          path: |
+            /tmp/deepseek-mock.log

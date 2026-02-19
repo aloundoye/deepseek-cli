@@ -12,7 +12,9 @@
 
 ## Common failure modes and responses
 - LLM outage / rate limit:
-  - Verify fallback behavior (`offline_fallback=true` if desired).
+  - Verify `DEEPSEEK_API_KEY` or `llm.api_key` is configured and endpoint/provider/profile settings are correct.
+  - Confirm `llm.provider=deepseek`; unsupported providers fail fast.
+  - If using `llm.profile=v3_2_speciale`, switch to `v3_2` if the Speciale endpoint/model is unavailable (DeepSeek documents a limited run ending December 15, 2025).
   - Increase retry/backoff in `[llm]`.
   - For non-urgent workloads, consider `[scheduling].off_peak=true` and `[scheduling].defer_non_urgent=true`.
 - Tool execution denied:
@@ -41,11 +43,21 @@
 - Verify rollback with:
   - `deepseek --json plan "rollback validation"`
   - `cargo test --workspace --all-targets`
+  - `deepseek --json replay list --limit 20` (ensure replay ledger is intact after downgrade)
 
 ## Replay integrity checks
 - `deepseek replay run --session-id <id> --deterministic` validates monotonic event sequencing.
+- `deepseek replay list [--session-id <id>] [--limit N]` inspects recent replay cassette records and deterministic metadata.
 - Strict replay fails closed when tool proposals/approvals do not have matching tool results.
 - Replay strict mode never executes tools or provider calls; it rehydrates from event history only.
+
+## Production drill cadence
+- Weekly:
+  - Run `performance-gates.yml` and inspect benchmark artifacts for regressions.
+  - Run `security-gates.yml` and resolve any advisory/license failures.
+- Before each release:
+  - Run `release-readiness.yml` and attach artifacts to release notes.
+  - Run `live-deepseek-smoke.yml` (with production key scope) and confirm first-token latency SLO.
 
 ## Telemetry policy
 - Telemetry is opt-in only (`[telemetry].enabled=false` by default).

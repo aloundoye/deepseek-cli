@@ -1,0 +1,43 @@
+name: Parity Publication
+
+on:
+  schedule:
+    - cron: "0 10 * * 1"
+  workflow_dispatch:
+
+jobs:
+  publish-parity:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enable offline benchmark mode for scheduled publication
+        run: |
+          mkdir -p .deepseek
+          cat > .deepseek/settings.local.json <<'JSON'
+          {"llm":{"offline_fallback":true}}
+          JSON
+
+      - name: Publish parity report bundle
+        run: |
+          cargo run --bin deepseek -- benchmark publish-parity \
+            --matrix .github/benchmark/parity-matrix.json \
+            --output-dir .deepseek/reports/parity \
+            --strict
+
+      - name: Upload parity report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-parity-report
+          path: .deepseek/reports/parity

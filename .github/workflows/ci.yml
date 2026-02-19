@@ -38,7 +38,7 @@ jobs:
         run: cargo build --workspace
 
       - name: cli json smoke
-        run: cargo run --bin deepseek -- --json plan "CI smoke"
+        run: cargo run --bin deepseek -- --json status
 
       - name: extended cli smoke
         shell: bash

@@ -1,0 +1,82 @@
+name: Live DeepSeek Smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 6 * * *"
+
+jobs:
+  live-smoke:
+    if: ${{ secrets.DEEPSEEK_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    env:
+      FIRST_TOKEN_MAX_MS: "2000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build deepseek binary
+        run: cargo build --bin deepseek
+
+      - name: Live API smoke (ask/plan/autopilot)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          workspace="$(mktemp -d)"
+          mkdir -p "$workspace/.deepseek"
+          (
+            cd "$workspace"
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json ask "Live smoke ask check." > ask.json
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json plan "Live smoke plan check." > plan.json
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json autopilot "Live smoke autopilot check." \
+              --max-iterations 1 \
+              --duration-seconds 45 \
+              --tools false \
+              > autopilot.json
+          )
+
+          python3 - <<PY
+          import json, pathlib
+          ask = json.loads(pathlib.Path("${workspace}/ask.json").read_text())
+          if not ask.get("output"):
+              raise SystemExit("ask output is empty")
+          plan = json.loads(pathlib.Path("${workspace}/plan.json").read_text())
+          if not isinstance(plan.get("steps"), list) or not plan["steps"]:
+              raise SystemExit("plan output has no steps")
+          autopilot = json.loads(pathlib.Path("${workspace}/autopilot.json").read_text())
+          if int(autopilot.get("completed_iterations", 0)) < 1:
+              raise SystemExit("autopilot did not complete at least one iteration")
+          PY
+
+      - name: Live first-token latency gate
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          payload='{"model":"deepseek-chat","messages":[{"role":"user","content":"Respond with ok."}],"stream":true,"max_tokens":64}'
+          start_ms=$(date +%s%3N)
+          first_line="$(
+            curl -sS -N https://api.deepseek.com/chat/completions \
+              -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "${payload}" | awk '/^data:/{print; exit}'
+          )"
+          end_ms=$(date +%s%3N)
+          if [ -z "${first_line}" ]; then
+            echo "no streaming data frame received from DeepSeek endpoint" >&2
+            exit 1
+          fi
+          first_token_ms=$((end_ms - start_ms))
+          echo "first_token_ms=${first_token_ms}"
+          if [ "${first_token_ms}" -gt "${FIRST_TOKEN_MAX_MS}" ]; then
+            echo "first token latency ${first_token_ms}ms exceeds ${FIRST_TOKEN_MAX_MS}ms budget" >&2
+            exit 1
+          fi

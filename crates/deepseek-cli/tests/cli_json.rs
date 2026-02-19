@@ -2,8 +2,11 @@ use assert_cmd::Command;
 use deepseek_store::{Store, VisualArtifactRecord};
 use serde_json::Value;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command as StdCommand;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -26,7 +29,7 @@ fn plan_command_emits_json_shape() {
 }
 
 #[test]
-fn ask_json_fails_fast_without_api_key_when_offline_disabled() {
+fn ask_json_fails_fast_without_api_key_when_api_key_missing() {
     let workspace = TempDir::new().expect("workspace");
     let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
         .current_dir(workspace.path())
@@ -39,6 +42,148 @@ fn ask_json_fails_fast_without_api_key_when_offline_disabled() {
         .clone();
     let stderr = String::from_utf8_lossy(&output);
     assert!(stderr.contains("DEEPSEEK_API_KEY"));
+}
+
+#[test]
+fn ask_json_uses_workspace_local_api_key_when_env_missing() {
+    let workspace = TempDir::new().expect("workspace");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
+    fs::write(
+        workspace.path().join(".deepseek/settings.local.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llm": {
+                "provider": "deepseek",
+                "profile": "v3_2",
+                "endpoint": mock.endpoint,
+                "api_key_env": "DEEPSEEK_API_KEY",
+                "api_key": "workspace-local-key"
+            }
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("settings");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .env_remove("DEEPSEEK_API_KEY")
+        .args(["--json", "ask", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).expect("json payload");
+    assert!(
+        payload["output"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+}
+
+#[test]
+fn ask_json_rejects_invalid_deepseek_profile() {
+    let workspace = TempDir::new().expect("workspace");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
+    fs::write(
+        workspace.path().join(".deepseek/settings.local.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llm": {
+                "provider": "deepseek",
+                "profile": "invalid_profile",
+                "endpoint": mock.endpoint,
+                "api_key_env": "DEEPSEEK_API_KEY"
+            }
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("settings");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .env("DEEPSEEK_API_KEY", "test-api-key")
+        .args(["--json", "ask", "hello"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("llm.profile"));
+}
+
+#[test]
+fn ask_json_requires_speciale_profile_when_speciale_model_is_selected() {
+    let workspace = TempDir::new().expect("workspace");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
+    fs::write(
+        workspace.path().join(".deepseek/settings.local.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llm": {
+                "provider": "deepseek",
+                "profile": "v3_2",
+                "base_model": "deepseek-v3.2-speciale",
+                "endpoint": mock.endpoint,
+                "api_key_env": "DEEPSEEK_API_KEY"
+            }
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("settings");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .env("DEEPSEEK_API_KEY", "test-api-key")
+        .args(["--json", "ask", "hello"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("requires llm.profile='v3_2_speciale'"));
+}
+
+#[test]
+fn config_show_redacts_api_key_in_json_and_text_modes() {
+    let workspace = TempDir::new().expect("workspace");
+    let runtime = workspace.path().join(".deepseek");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    fs::write(
+        runtime.join("settings.local.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llm": {
+                "api_key": "dsk-secret-value"
+            }
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("settings file");
+
+    let json_out = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args(["--json", "config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&json_out).expect("json");
+    assert_eq!(payload["llm"]["api_key"], "***REDACTED***");
+
+    let text_out = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&text_out);
+    assert!(stdout.contains("***REDACTED***"));
+    assert!(!stdout.contains("dsk-secret-value"));
 }
 
 #[test]
@@ -331,6 +476,64 @@ fn permissions_show_set_and_status_emit_json() {
 }
 
 #[test]
+fn permissions_set_respects_team_policy_locks() {
+    let workspace = TempDir::new().expect("workspace");
+    let team_policy_path = workspace.path().join(".deepseek/team-policy.json");
+    fs::create_dir_all(
+        team_policy_path
+            .parent()
+            .expect("team policy parent directory"),
+    )
+    .expect("team policy dir");
+    fs::write(
+        &team_policy_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "approve_bash": "never",
+            "allowlist": ["git status"],
+            "sandbox_mode": "read-only"
+        }))
+        .expect("serialize team policy"),
+    )
+    .expect("write team policy");
+
+    let shown = run_json_with_env(
+        workspace.path(),
+        &["--json", "permissions", "show"],
+        &[(
+            "DEEPSEEK_TEAM_POLICY_PATH",
+            team_policy_path.to_string_lossy().as_ref(),
+        )],
+    );
+    assert_eq!(shown["team_policy"]["active"], true);
+    assert_eq!(shown["team_policy"]["approve_bash_locked"], true);
+    assert_eq!(shown["team_policy"]["allowlist_locked"], true);
+    assert_eq!(shown["team_policy"]["sandbox_mode_locked"], true);
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .env(
+            "DEEPSEEK_TEAM_POLICY_PATH",
+            team_policy_path.to_string_lossy().as_ref(),
+        )
+        .args([
+            "--json",
+            "permissions",
+            "set",
+            "--approve-bash",
+            "always",
+            "--allow",
+            "npm *",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("locks permissions fields"));
+}
+
+#[test]
 fn plugins_catalog_search_and_verify_emit_json() {
     let workspace = TempDir::new().expect("workspace");
     let catalog_root = workspace.path().join(".deepseek/plugins");
@@ -570,6 +773,17 @@ fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
         .status()
         .expect("git init");
     assert!(init_status.success());
+    let initial_branch = String::from_utf8_lossy(
+        &StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git branch --show-current")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(!initial_branch.is_empty());
 
     let git_status = run_json(workspace.path(), &["--json", "git", "status"]);
     assert!(git_status["output"].as_str().is_some());
@@ -652,6 +866,23 @@ fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
     );
     assert_eq!(replay["deterministic"], true);
     assert!(replay["tool_results_replayed"].as_u64().is_some());
+    let replay_list = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "replay",
+            "list",
+            "--session-id",
+            session_id,
+            "--limit",
+            "5",
+        ],
+    );
+    assert!(
+        replay_list
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["session_id"] == session_id))
+    );
 
     let teleport = run_json(workspace.path(), &["--json", "teleport"]);
     assert!(teleport["bundle_id"].as_str().is_some());
@@ -685,6 +916,139 @@ fn git_skills_replay_background_teleport_and_remote_env_emit_json() {
         &["--json", "remote-env", "remove", profile_id],
     );
     assert_eq!(removed["removed"], true);
+}
+
+#[test]
+fn git_resolve_all_and_stage_clears_conflicts() {
+    if StdCommand::new("git").arg("--version").output().is_err() {
+        return;
+    }
+
+    let workspace = TempDir::new().expect("workspace");
+    let init_status = StdCommand::new("git")
+        .current_dir(workspace.path())
+        .arg("init")
+        .status()
+        .expect("git init");
+    assert!(init_status.success());
+    let initial_branch = String::from_utf8_lossy(
+        &StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git branch --show-current")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(!initial_branch.is_empty());
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config email")
+            .success()
+    );
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config name")
+            .success()
+    );
+
+    let conflicted = workspace.path().join("conflicted.txt");
+    fs::write(&conflicted, "base\n").expect("write base");
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["add", "conflicted.txt"])
+            .status()
+            .expect("git add")
+            .success()
+    );
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["commit", "-m", "base"])
+            .status()
+            .expect("git commit base")
+            .success()
+    );
+
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["checkout", "-b", "feature"])
+            .status()
+            .expect("git checkout feature")
+            .success()
+    );
+    fs::write(&conflicted, "feature\n").expect("write feature");
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["commit", "-am", "feature"])
+            .status()
+            .expect("git commit feature")
+            .success()
+    );
+
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["checkout", &initial_branch])
+            .status()
+            .expect("git checkout initial branch")
+            .success()
+    );
+    fs::write(&conflicted, "main\n").expect("write main");
+    assert!(
+        StdCommand::new("git")
+            .current_dir(workspace.path())
+            .args(["commit", "-am", "main"])
+            .status()
+            .expect("git commit main")
+            .success()
+    );
+
+    let merge_status = StdCommand::new("git")
+        .current_dir(workspace.path())
+        .args(["merge", "feature"])
+        .status()
+        .expect("git merge");
+    assert!(!merge_status.success());
+
+    let resolved = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "git",
+            "resolve",
+            "--strategy",
+            "ours",
+            "--all",
+            "--stage",
+        ],
+    );
+    assert!(resolved["count"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(resolved["stage"], true);
+    assert!(
+        resolved["resolved_files"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row == "conflicted.txt"))
+    );
+
+    let remaining = StdCommand::new("git")
+        .current_dir(workspace.path())
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .expect("git diff conflicts");
+    assert!(remaining.status.success());
+    let remaining_stdout = String::from_utf8_lossy(&remaining.stdout);
+    assert!(remaining_stdout.trim().is_empty());
 }
 
 #[test]
@@ -816,6 +1180,203 @@ fn visual_analyze_strict_fails_without_artifacts() {
 }
 
 #[test]
+fn visual_analyze_baseline_detects_changes_in_strict_mode() {
+    let workspace = TempDir::new().expect("workspace");
+    let image_rel = "ui/screen.png";
+    let image_path = workspace.path().join(image_rel);
+    fs::create_dir_all(
+        image_path
+            .parent()
+            .expect("image file should have a parent directory"),
+    )
+    .expect("image dir");
+    fs::write(&image_path, vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4]).expect("image");
+
+    let store = Store::new(workspace.path()).expect("store");
+    store
+        .insert_visual_artifact(&VisualArtifactRecord {
+            artifact_id: Uuid::now_v7(),
+            path: image_rel.to_string(),
+            mime: "image/png".to_string(),
+            metadata_json: "{}".to_string(),
+            created_at: "2026-02-18T00:00:00Z".to_string(),
+        })
+        .expect("insert visual artifact");
+
+    let baseline_path = workspace.path().join(".deepseek/visual-baseline.json");
+    let seeded = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "visual",
+            "analyze",
+            "--min-bytes",
+            "1",
+            "--write-baseline",
+            baseline_path.to_string_lossy().as_ref(),
+        ],
+    );
+    assert_eq!(seeded["ok"], true);
+    assert!(baseline_path.exists());
+
+    fs::write(&image_path, vec![0x89, b'P', b'N', b'G', 9, 9, 9, 9, 9]).expect("mutate image");
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args([
+            "--json",
+            "visual",
+            "analyze",
+            "--baseline",
+            baseline_path.to_string_lossy().as_ref(),
+            "--strict",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("changed_artifacts"));
+}
+
+#[test]
+fn visual_analyze_semantic_expectations_pass_with_dimensions() {
+    let workspace = TempDir::new().expect("workspace");
+    let image_rel = "ui/login-screen.png";
+    let image_path = workspace.path().join(image_rel);
+    fs::create_dir_all(
+        image_path
+            .parent()
+            .expect("image file should have a parent directory"),
+    )
+    .expect("image dir");
+    write_fake_png_with_dimensions(&image_path, 1280, 720).expect("image");
+
+    let store = Store::new(workspace.path()).expect("store");
+    store
+        .insert_visual_artifact(&VisualArtifactRecord {
+            artifact_id: Uuid::now_v7(),
+            path: image_rel.to_string(),
+            mime: "image/png".to_string(),
+            metadata_json: "{}".to_string(),
+            created_at: "2026-02-18T00:00:00Z".to_string(),
+        })
+        .expect("insert visual artifact");
+
+    let expect_path = workspace.path().join(".deepseek/visual-expect.json");
+    fs::create_dir_all(
+        expect_path
+            .parent()
+            .expect("expectation file should have a parent directory"),
+    )
+    .expect("expect dir");
+    fs::write(
+        &expect_path,
+        r#"{
+  "schema": "deepseek.visual.expectation.v1",
+  "rules": [
+    {
+      "name": "login-screen",
+      "path_glob": "ui/login-*.png",
+      "min_count": 1,
+      "mime": "image/png",
+      "min_width": 1200,
+      "min_height": 700,
+      "max_width": 1600,
+      "max_height": 900,
+      "required_path_substrings": ["login"]
+    }
+  ]
+}"#,
+    )
+    .expect("expect file");
+
+    let analyzed = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "visual",
+            "analyze",
+            "--min-bytes",
+            "1",
+            "--expect",
+            expect_path.to_string_lossy().as_ref(),
+            "--strict",
+        ],
+    );
+    assert_eq!(analyzed["ok"], true);
+    assert_eq!(analyzed["semantic"]["rules_total"], 1);
+    assert_eq!(analyzed["semantic"]["rules_passed"], 1);
+}
+
+#[test]
+fn visual_analyze_semantic_expectations_fail_in_strict_mode() {
+    let workspace = TempDir::new().expect("workspace");
+    let image_rel = "ui/dashboard.png";
+    let image_path = workspace.path().join(image_rel);
+    fs::create_dir_all(
+        image_path
+            .parent()
+            .expect("image file should have a parent directory"),
+    )
+    .expect("image dir");
+    write_fake_png_with_dimensions(&image_path, 1280, 720).expect("image");
+
+    let store = Store::new(workspace.path()).expect("store");
+    store
+        .insert_visual_artifact(&VisualArtifactRecord {
+            artifact_id: Uuid::now_v7(),
+            path: image_rel.to_string(),
+            mime: "image/png".to_string(),
+            metadata_json: "{}".to_string(),
+            created_at: "2026-02-18T00:00:00Z".to_string(),
+        })
+        .expect("insert visual artifact");
+
+    let expect_path = workspace.path().join(".deepseek/visual-expect-fail.json");
+    fs::create_dir_all(
+        expect_path
+            .parent()
+            .expect("expectation file should have a parent directory"),
+    )
+    .expect("expect dir");
+    fs::write(
+        &expect_path,
+        r#"{
+  "rules": [
+    {
+      "name": "dashboard-too-wide",
+      "path_glob": "ui/*.png",
+      "min_count": 1,
+      "max_width": 1000
+    }
+  ]
+}"#,
+    )
+    .expect("expect file");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .args([
+            "--json",
+            "visual",
+            "analyze",
+            "--min-bytes",
+            "1",
+            "--expect",
+            expect_path.to_string_lossy().as_ref(),
+            "--strict",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("semantic_expectations_failed"));
+}
+
+#[test]
 fn profile_benchmark_accepts_external_suite_file() {
     let workspace = TempDir::new().expect("workspace");
     let suite_path = workspace.path().join(".deepseek/benchmark-suite.json");
@@ -939,6 +1500,119 @@ fn benchmark_pack_import_list_show_and_profile_work() {
     );
     assert_eq!(from_pack["benchmark"]["pack"], "public-pack");
     assert_eq!(from_pack["benchmark"]["executed_cases"], 1);
+}
+
+#[test]
+fn benchmark_sync_public_catalog_imports_relative_sources() {
+    let workspace = TempDir::new().expect("workspace");
+    let catalog_dir = workspace.path().join(".deepseek/public-catalog");
+    fs::create_dir_all(&catalog_dir).expect("catalog dir");
+
+    let suite_a = catalog_dir.join("suite-a.json");
+    fs::write(
+        &suite_a,
+        r#"{
+  "cases": [
+    {
+      "case_id": "public-a",
+      "prompt": "Plan public corpus A validation.",
+      "expected_keywords": ["verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    }
+  ]
+}"#,
+    )
+    .expect("suite a");
+    let suite_b = catalog_dir.join("suite-b.jsonl");
+    fs::write(
+        &suite_b,
+        r#"{"case_id":"public-b","prompt":"Plan public corpus B validation.","expected_keywords":["verify"],"min_steps":1,"min_verification_steps":1}"#,
+    )
+    .expect("suite b");
+
+    let catalog = catalog_dir.join("catalog.json");
+    fs::write(
+        &catalog,
+        r#"{
+  "schema": "deepseek.benchmark.catalog.v1",
+  "packs": [
+    { "name": "public-a", "source": "suite-a.json", "kind": "public" },
+    { "name": "public-b", "source": "suite-b.jsonl", "kind": "public" }
+  ]
+}"#,
+    )
+    .expect("catalog");
+
+    let synced = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "benchmark",
+            "sync-public",
+            catalog.to_string_lossy().as_ref(),
+            "--prefix",
+            "ext-",
+        ],
+    );
+    assert_eq!(synced["count"], 2);
+    assert!(
+        synced["imported"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "ext-public-a"))
+    );
+
+    let listed = run_json(workspace.path(), &["--json", "benchmark", "list-packs"]);
+    assert!(
+        listed
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "ext-public-b"))
+    );
+}
+
+#[test]
+fn benchmark_publish_parity_writes_latest_and_history() {
+    let workspace = TempDir::new().expect("workspace");
+    let matrix_path = workspace.path().join(".deepseek/publish-matrix.json");
+    fs::create_dir_all(
+        matrix_path
+            .parent()
+            .expect("matrix should have parent directory"),
+    )
+    .expect("matrix dir");
+    fs::write(
+        &matrix_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "publish-smoke",
+            "runs": [
+                {"id": "smoke", "pack": "smoke", "cases": 1, "seed": 11}
+            ]
+        }))
+        .expect("matrix serialize"),
+    )
+    .expect("matrix write");
+
+    let output_dir = workspace.path().join(".deepseek/reports/parity");
+    let payload = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "benchmark",
+            "publish-parity",
+            "--matrix",
+            matrix_path.to_string_lossy().as_ref(),
+            "--output-dir",
+            output_dir.to_string_lossy().as_ref(),
+        ],
+    );
+    assert_eq!(payload["published"], true);
+    assert_eq!(
+        payload["matrix_payload"]["schema"],
+        "deepseek.benchmark.matrix.v1"
+    );
+    assert!(output_dir.join("latest.json").exists());
+    assert!(output_dir.join("latest.md").exists());
+    assert!(output_dir.join("history.jsonl").exists());
 }
 
 #[test]
@@ -1072,6 +1746,7 @@ fn benchmark_run_matrix_executes_multiple_runs_and_peer_compare() {
     .expect("peer");
 
     let output_path = workspace.path().join(".deepseek/matrix-output.json");
+    let report_path = workspace.path().join(".deepseek/matrix-report.md");
     let payload = run_json_with_env(
         workspace.path(),
         &[
@@ -1081,6 +1756,10 @@ fn benchmark_run_matrix_executes_multiple_runs_and_peer_compare() {
             matrix_path.to_string_lossy().as_ref(),
             "--compare",
             peer_path.to_string_lossy().as_ref(),
+            "--require-agent",
+            "deepseek-cli,codex",
+            "--report-output",
+            report_path.to_string_lossy().as_ref(),
             "--output",
             output_path.to_string_lossy().as_ref(),
         ],
@@ -1099,7 +1778,16 @@ fn benchmark_run_matrix_executes_multiple_runs_and_peer_compare() {
             .as_array()
             .is_some_and(|rows| rows.len() >= 2)
     );
+    assert!(
+        payload["report_markdown"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Peer Ranking")
+    );
     assert!(output_path.exists());
+    assert!(report_path.exists());
+    let report_text = fs::read_to_string(report_path).expect("report");
+    assert!(report_text.contains("Benchmark Matrix Report"));
 }
 
 #[test]
@@ -1120,16 +1808,12 @@ fn profile_benchmark_compare_strict_fails_on_manifest_mismatch() {
     )
     .expect("peer report");
 
-    let runtime = workspace.path().join(".deepseek");
-    fs::create_dir_all(&runtime).expect("runtime dir");
-    fs::write(
-        runtime.join("settings.local.json"),
-        r#"{"llm":{"offline_fallback":true}}"#,
-    )
-    .expect("settings override");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
         .current_dir(workspace.path())
+        .env("DEEPSEEK_API_KEY", "test-api-key")
         .args([
             "--json",
             "profile",
@@ -1195,16 +1879,12 @@ fn benchmark_run_matrix_strict_fails_on_mixed_corpus_compatibility() {
     )
     .expect("matrix");
 
-    let runtime = workspace.path().join(".deepseek");
-    fs::create_dir_all(&runtime).expect("runtime dir");
-    fs::write(
-        runtime.join("settings.local.json"),
-        r#"{"llm":{"offline_fallback":true}}"#,
-    )
-    .expect("settings override");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
         .current_dir(workspace.path())
+        .env("DEEPSEEK_API_KEY", "test-api-key")
         .args([
             "--json",
             "benchmark",
@@ -1221,23 +1901,238 @@ fn benchmark_run_matrix_strict_fails_on_mixed_corpus_compatibility() {
     assert!(stderr.contains("strict mode failed"));
 }
 
+#[test]
+fn benchmark_run_matrix_fails_when_required_agent_missing() {
+    let workspace = TempDir::new().expect("workspace");
+    let matrix_path = workspace
+        .path()
+        .join(".deepseek/benchmark-matrix-required.json");
+    fs::create_dir_all(
+        matrix_path
+            .parent()
+            .expect("matrix file should have a parent directory"),
+    )
+    .expect("matrix dir");
+    fs::write(
+        &matrix_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "required-agents",
+            "runs": [
+                {"id": "core", "pack": "core", "cases": 1, "seed": 1}
+            ]
+        }))
+        .expect("serialize matrix"),
+    )
+    .expect("write matrix");
+
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
+        .current_dir(workspace.path())
+        .env("DEEPSEEK_API_KEY", "test-api-key")
+        .args([
+            "--json",
+            "benchmark",
+            "run-matrix",
+            matrix_path.to_string_lossy().as_ref(),
+            "--require-agent",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(stderr.contains("missing required agents"));
+}
+
 fn run_json(workspace: &Path, args: &[&str]) -> Value {
     run_json_with_env(workspace, args, &[])
 }
 
 fn run_json_with_env(workspace: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
-    let runtime = workspace.join(".deepseek");
-    fs::create_dir_all(&runtime).expect("runtime dir");
-    fs::write(
-        runtime.join("settings.local.json"),
-        r#"{"llm":{"offline_fallback":true}}"#,
-    )
-    .expect("settings override");
+    let mock = start_mock_llm_server();
+    configure_runtime_for_mock_llm(workspace, &mock.endpoint);
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"));
-    command.current_dir(workspace).args(args);
+    command
+        .current_dir(workspace)
+        .env("DEEPSEEK_API_KEY", "test-api-key")
+        .args(args);
     for (key, value) in envs {
         command.env(key, value);
     }
     let output = command.assert().success().get_output().stdout.clone();
     serde_json::from_slice(&output).expect("json output")
+}
+
+fn write_fake_png_with_dimensions(
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<(), std::io::Error> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+    fs::write(path, bytes)
+}
+
+struct MockLlmServer {
+    endpoint: String,
+    stop_tx: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for MockLlmServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_mock_llm_server() -> MockLlmServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock llm server");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking listener");
+    let addr = listener.local_addr().expect("mock addr");
+    let (tx, rx) = mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        loop {
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = handle_mock_llm_connection(&mut stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    MockLlmServer {
+        endpoint: format!("http://{addr}/chat/completions"),
+        stop_tx: Some(tx),
+        handle: Some(handle),
+    }
+}
+
+fn configure_runtime_for_mock_llm(workspace: &Path, endpoint: &str) {
+    let runtime = workspace.join(".deepseek");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    fs::write(
+        runtime.join("settings.local.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "llm": {
+                "provider": "deepseek",
+                "endpoint": endpoint,
+                "api_key_env": "DEEPSEEK_API_KEY"
+            }
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("settings override");
+}
+
+fn handle_mock_llm_connection(stream: &mut TcpStream) -> std::io::Result<()> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut header_end = None;
+    while header_end.is_none() {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        header_end = find_subsequence(&buffer, b"\r\n\r\n").map(|idx| idx + 4);
+        if buffer.len() > 1_048_576 {
+            break;
+        }
+    }
+
+    let header_len = header_end.unwrap_or(buffer.len());
+    let content_length = parse_content_length(&buffer[..header_len]);
+    let mut body = if header_len <= buffer.len() {
+        buffer[header_len..].to_vec()
+    } else {
+        Vec::new()
+    };
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+
+    let prompt =
+        extract_prompt_from_request_body(&body).unwrap_or_else(|| "mock prompt".to_string());
+    let content = if prompt.to_ascii_lowercase().contains("plan") {
+        "Generated plan: discover files, propose edits, verify with tests.".to_string()
+    } else {
+        format!("Mock response: {prompt}")
+    };
+    let payload = serde_json::json!({
+        "choices": [
+            {
+                "message": {
+                    "content": content
+                }
+            }
+        ]
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn parse_content_length(headers: &[u8]) -> usize {
+    let raw = String::from_utf8_lossy(headers);
+    for line in raw.lines() {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next().unwrap_or_default().trim();
+        if key.eq_ignore_ascii_case("content-length")
+            && let Some(value) = parts.next()
+            && let Ok(parsed) = value.trim().parse::<usize>()
+        {
+            return parsed;
+        }
+    }
+    0
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn extract_prompt_from_request_body(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|rows| rows.last())
+        .and_then(|row| row.get("content"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
 }

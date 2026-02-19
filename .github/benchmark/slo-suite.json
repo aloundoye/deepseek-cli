@@ -1,0 +1,26 @@
+{
+  "schema": "deepseek.benchmark.suite.v1",
+  "cases": [
+    {
+      "case_id": "slo-router-refactor",
+      "prompt": "Plan safe router refactor with verification and rollback.",
+      "expected_keywords": ["plan", "verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    },
+    {
+      "case_id": "slo-replay-hardening",
+      "prompt": "Plan deterministic replay hardening and verify safety checks.",
+      "expected_keywords": ["plan", "verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    },
+    {
+      "case_id": "slo-release-gate",
+      "prompt": "Plan release readiness checks and verify rollback criteria.",
+      "expected_keywords": ["plan", "verify"],
+      "min_steps": 1,
+      "min_verification_steps": 1
+    }
+  ]
+}
