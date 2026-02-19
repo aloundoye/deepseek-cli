@@ -447,6 +447,8 @@ struct TeamPolicyFile {
     sandbox_mode: Option<String>,
     #[serde(default)]
     sandbox_wrapper: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -456,6 +458,7 @@ pub struct TeamPolicyLocks {
     pub approve_bash_locked: bool,
     pub allowlist_locked: bool,
     pub sandbox_mode_locked: bool,
+    pub permission_mode_locked: bool,
 }
 
 impl TeamPolicyLocks {
@@ -464,6 +467,7 @@ impl TeamPolicyLocks {
             || self.approve_bash_locked
             || self.allowlist_locked
             || self.sandbox_mode_locked
+            || self.permission_mode_locked
     }
 }
 
@@ -476,6 +480,10 @@ pub fn team_policy_locks() -> Option<TeamPolicyLocks> {
         allowlist_locked: !team.allowlist.is_empty(),
         sandbox_mode_locked: team
             .sandbox_mode
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        permission_mode_locked: team
+            .permission_mode
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
     })
@@ -553,6 +561,9 @@ fn apply_team_policy_override(mut base: PolicyConfig, team: &TeamPolicyFile) -> 
         } else {
             Some(normalized)
         };
+    }
+    if let Some(mode) = team.permission_mode.as_deref() {
+        base.permission_mode = PermissionMode::from_str_lossy(mode);
     }
     base
 }
@@ -677,6 +688,7 @@ mod tests {
             redact_patterns: vec!["password".to_string()],
             sandbox_mode: Some("workspace-write".to_string()),
             sandbox_wrapper: Some("bwrap --cmd {cmd}".to_string()),
+            permission_mode: None,
         };
         let merged = apply_team_policy_override(base, &team);
         assert!(merged.approve_edits);
@@ -885,6 +897,55 @@ mod tests {
                 format!("npm {subcommand} {arg}")
             };
             prop_assert!(policy.check_command(&cmd).is_ok());
+        }
+    }
+
+    #[test]
+    fn team_policy_locks_permission_mode() {
+        let base = PolicyConfig {
+            permission_mode: PermissionMode::Ask,
+            ..PolicyConfig::default()
+        };
+        let team = TeamPolicyFile {
+            approve_edits: None,
+            approve_bash: None,
+            allowlist: vec![],
+            deny_commands: vec![],
+            block_paths: vec![],
+            redact_patterns: vec![],
+            sandbox_mode: None,
+            sandbox_wrapper: None,
+            permission_mode: Some("locked".to_string()),
+        };
+        let merged = apply_team_policy_override(base, &team);
+        assert_eq!(merged.permission_mode, PermissionMode::Locked);
+    }
+
+    #[test]
+    fn team_policy_permission_mode_locked_flag() {
+        let _guard = team_policy_env_lock().lock().expect("env lock");
+        let dir = std::env::temp_dir().join("deepseek-policy-pm-lock");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("team-policy.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "permission_mode": "locked"
+            }))
+            .expect("serialize"),
+        )
+        .expect("write team policy");
+
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::set_var("DEEPSEEK_TEAM_POLICY_PATH", &path);
+        }
+        let locks = team_policy_locks().expect("locks");
+        assert!(locks.permission_mode_locked);
+        assert!(locks.has_permission_locks());
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_TEAM_POLICY_PATH");
         }
     }
 }

@@ -644,6 +644,7 @@ pub struct KeyBindings {
     pub toggle_mission_control: KeyEvent,
     pub toggle_artifacts: KeyEvent,
     pub toggle_plan_collapse: KeyEvent,
+    pub cycle_permission_mode: KeyEvent,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -662,6 +663,7 @@ struct KeyBindingsFile {
     toggle_mission_control: Option<String>,
     toggle_artifacts: Option<String>,
     toggle_plan_collapse: Option<String>,
+    cycle_permission_mode: Option<String>,
 }
 
 impl Default for KeyBindings {
@@ -680,6 +682,7 @@ impl Default for KeyBindings {
             toggle_mission_control: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
             toggle_artifacts: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
             toggle_plan_collapse: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            cycle_permission_mode: KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
         }
     }
 }
@@ -724,6 +727,9 @@ impl KeyBindings {
         }
         if let Some(value) = raw.toggle_plan_collapse {
             self.toggle_plan_collapse = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.cycle_permission_mode {
+            self.cycle_permission_mode = parse_key_event(&value)?;
         }
         Ok(self)
     }
@@ -851,7 +857,7 @@ where
 }
 
 pub fn run_tui_shell_with_bindings<F>(
-    status: UiStatus,
+    mut status: UiStatus,
     bindings: KeyBindings,
     theme: TuiTheme,
     mut on_submit: F,
@@ -1193,6 +1199,17 @@ where
             } else {
                 "Plan".to_string()
             };
+            continue;
+        }
+        if key == bindings.cycle_permission_mode {
+            let current = status.permission_mode.clone();
+            let next = match current.as_str() {
+                "ask" => "auto",
+                "auto" => "locked",
+                _ => "ask",
+            };
+            status.permission_mode = next.to_string();
+            info_line = format!("permission mode: {} -> {}", current, next);
             continue;
         }
         if key == bindings.background {
@@ -1672,5 +1689,14 @@ mod tests {
         assert_eq!(frames.len(), 10);
         // All frames are braille characters
         assert!(frames.iter().all(|f| f.chars().all(|c| c as u32 >= 0x2800)));
+    }
+
+    #[test]
+    fn default_keybindings_include_cycle_permission_mode() {
+        let bindings = KeyBindings::default();
+        assert_eq!(
+            bindings.cycle_permission_mode,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+        );
     }
 }
