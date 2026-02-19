@@ -1278,6 +1278,16 @@ impl Store {
         Ok(())
     }
 
+    pub fn total_session_cost(&self, session_id: Uuid) -> Result<f64> {
+        let conn = self.db()?;
+        let total: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(estimated_cost_usd), 0.0) FROM cost_ledger WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+
     pub fn insert_profile_run(&self, record: &ProfileRunRecord) -> Result<()> {
         let conn = self.db()?;
         conn.execute(
@@ -2758,6 +2768,8 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::NotebookEditedV1 { .. } => "NotebookEdited@v1",
         EventKind::PdfTextExtractedV1 { .. } => "PdfTextExtracted@v1",
         EventKind::IdeSessionStartedV1 { .. } => "IdeSessionStarted@v1",
+        EventKind::TurnLimitExceededV1 { .. } => "TurnLimitExceeded@v1",
+        EventKind::BudgetExceededV1 { .. } => "BudgetExceeded@v1",
     }
 }
 

@@ -210,6 +210,10 @@ pub struct AgentEngine {
     subagents: SubagentManager,
     /// Optional callback invoked for each streaming token chunk.
     stream_callback: Mutex<Option<deepseek_core::StreamCallback>>,
+    /// Maximum number of agent turns before stopping (CLI override).
+    max_turns: Option<u64>,
+    /// Maximum cost in USD before stopping (CLI override).
+    max_budget_usd: Option<f64>,
 }
 
 impl AgentEngine {
@@ -222,6 +226,8 @@ impl AgentEngine {
         let router = WeightedRouter::from_app_config(&cfg.router, &cfg.llm);
         let llm = Box::new(DeepSeekClient::new(cfg.llm.clone())?);
 
+        let max_turns = cfg.budgets.max_turns;
+        let max_budget_usd = cfg.budgets.max_budget_usd;
         Ok(Self {
             workspace: workspace.to_path_buf(),
             store,
@@ -234,7 +240,19 @@ impl AgentEngine {
             cfg,
             subagents: SubagentManager::default(),
             stream_callback: Mutex::new(None),
+            max_turns,
+            max_budget_usd,
         })
+    }
+
+    /// Override max turns limit (from CLI flag).
+    pub fn set_max_turns(&mut self, max: Option<u64>) {
+        self.max_turns = max;
+    }
+
+    /// Override max budget USD limit (from CLI flag).
+    pub fn set_max_budget_usd(&mut self, max: Option<f64>) {
+        self.max_budget_usd = max;
     }
 
     /// Set a streaming callback that will be invoked for each token chunk
@@ -531,6 +549,7 @@ impl AgentEngine {
             session.session_id,
             EventKind::PlanCreatedV1 { plan: plan.clone() },
         )?;
+        self.tool_host.fire_session_hooks("plancreated");
 
         Ok(plan)
     }
@@ -581,13 +600,50 @@ impl AgentEngine {
                     content: format!("[subagents]\n{}", summarize_subagent_notes(&subagent_notes)),
                 },
             )?;
+            self.tool_host.fire_session_hooks("notification");
         }
         let mut failure_streak = 0_u32;
         let mut execution_failed = false;
         let mut step_cursor = 0usize;
         let mut revision_budget = self.cfg.router.max_escalations_per_unit.max(1) as usize;
+        let mut turn_count: u64 = 0;
 
         while step_cursor < plan.steps.len() {
+            // Turn limit enforcement
+            turn_count += 1;
+            if let Some(max) = self.max_turns
+                && turn_count > max
+            {
+                self.emit(
+                    session.session_id,
+                    EventKind::TurnLimitExceededV1 {
+                        limit: max,
+                        actual: turn_count,
+                    },
+                )?;
+                self.tool_host.fire_session_hooks("budgetexceeded");
+                execution_failed = true;
+                break;
+            }
+            // Budget limit enforcement
+            if let Some(max_usd) = self.max_budget_usd {
+                let accumulated_cost = self
+                    .store
+                    .total_session_cost(session.session_id)
+                    .unwrap_or(0.0);
+                if accumulated_cost >= max_usd {
+                    self.emit(
+                        session.session_id,
+                        EventKind::BudgetExceededV1 {
+                            limit_usd: max_usd,
+                            actual_usd: accumulated_cost,
+                        },
+                    )?;
+                    self.tool_host.fire_session_hooks("budgetexceeded");
+                    execution_failed = true;
+                    break;
+                }
+            }
             let step = plan.steps[step_cursor].clone();
             let calls = self.calls_for_step(&step, &runtime_goal);
             let mut notes = Vec::new();
@@ -742,6 +798,7 @@ impl AgentEngine {
                         plan: revised.clone(),
                     },
                 )?;
+                self.tool_host.fire_session_hooks("planrevised");
                 plan = revised;
                 step_cursor = 0;
                 continue;
@@ -756,6 +813,7 @@ impl AgentEngine {
         }
         let mut verification_failures = 0_u32;
         if !execution_failed {
+            self.tool_host.fire_session_hooks("verificationstarted");
             for cmd in &plan.verification {
                 let proposal = self.tool_host.propose(ToolCall {
                     name: "bash.run".to_string(),
@@ -787,6 +845,7 @@ impl AgentEngine {
                     verification_failures += 1;
                 }
             }
+            self.tool_host.fire_session_hooks("verificationcompleted");
         }
 
         if verification_failures > 0 {
@@ -972,6 +1031,7 @@ impl AgentEngine {
                     goal: task.goal.clone(),
                 },
             )?;
+            self.tool_host.fire_session_hooks("subagentspawned");
             self.store.upsert_subagent_run(&SubagentRunRecord {
                 run_id: task.run_id,
                 name: task.name.clone(),
@@ -1120,6 +1180,7 @@ impl AgentEngine {
                         output: result.output.clone(),
                     },
                 )?;
+                self.tool_host.fire_session_hooks("subagentcompleted");
                 self.store.upsert_subagent_run(&SubagentRunRecord {
                     run_id: result.run_id,
                     name: meta.name,
@@ -1154,6 +1215,7 @@ impl AgentEngine {
                         error: error.clone(),
                     },
                 )?;
+                self.tool_host.fire_session_hooks("subagentcompleted");
                 self.store.upsert_subagent_run(&SubagentRunRecord {
                     run_id: result.run_id,
                     name: meta.name,
@@ -1395,6 +1457,7 @@ impl AgentEngine {
                         replay_pointer,
                     },
                 )?;
+                self.tool_host.fire_session_hooks("contextcompacted");
                 blocks.push(format!("[auto_compaction]\n{summary}"));
             }
         } else if !transcript.is_empty() {
@@ -1879,7 +1942,7 @@ impl AgentEngine {
         session_id: Uuid,
         input_tokens: u64,
         output_tokens: u64,
-    ) -> Result<()> {
+    ) -> Result<f64> {
         let estimated_cost_usd = (input_tokens as f64 / 1_000_000.0)
             * self.cfg.usage.cost_per_million_input
             + (output_tokens as f64 / 1_000_000.0) * self.cfg.usage.cost_per_million_output;
@@ -1890,7 +1953,8 @@ impl AgentEngine {
                 output_tokens,
                 estimated_cost_usd,
             },
-        )
+        )?;
+        Ok(estimated_cost_usd)
     }
 
     fn transition(&self, session: &mut Session, to: SessionState) -> Result<()> {

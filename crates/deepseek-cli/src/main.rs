@@ -65,6 +65,18 @@ struct Cli {
     #[arg(long, default_value = "text")]
     output_format: String,
 
+    /// Maximum number of agent turns before stopping.
+    #[arg(long)]
+    max_turns: Option<u64>,
+
+    /// Maximum cost in USD before stopping.
+    #[arg(long)]
+    max_budget_usd: Option<f64>,
+
+    /// Start from a GitHub PR context (fetches diff as prompt context).
+    #[arg(long)]
+    from_pr: Option<u64>,
+
     /// Prompt for print mode (positional, used when -p is set).
     #[arg(trailing_var_arg = true)]
     prompt_args: Vec<String>,
@@ -8830,7 +8842,20 @@ fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     let is_stream_json = cli.output_format == "stream-json";
     let is_text = !json_mode;
     ensure_llm_ready(cwd, json_mode)?;
-    let engine = AgentEngine::new(cwd)?;
+    let mut engine = AgentEngine::new(cwd)?;
+    engine.set_max_turns(cli.max_turns);
+    engine.set_max_budget_usd(cli.max_budget_usd);
+
+    // Handle --from-pr: fetch PR diff and prepend to prompt
+    let prompt = if let Some(pr_number) = cli.from_pr {
+        let diff = Command::new("gh")
+            .args(["pr", "diff", &pr_number.to_string()])
+            .output()?;
+        let pr_context = String::from_utf8_lossy(&diff.stdout);
+        format!("PR #{pr_number} diff:\n```\n{pr_context}\n```\n\n{prompt}")
+    } else {
+        prompt
+    };
 
     // Set up streaming callback for real-time output
     if is_text || is_stream_json {

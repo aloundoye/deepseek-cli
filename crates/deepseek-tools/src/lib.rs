@@ -34,6 +34,7 @@ const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
 const REVIEW_BLOCKED_TOOLS: &[&str] = &[
     "fs.write",
     "fs.edit",
+    "multi_edit",
     "patch.stage",
     "patch.apply",
     "bash.run",
@@ -830,6 +831,119 @@ impl LocalToolHost {
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
                 }))
             }
+            "multi_edit" => {
+                let files = call
+                    .args
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow!("files array missing"))?;
+                let checkpoint = self.create_checkpoint("multi_edit")?;
+                let mut results = Vec::new();
+                let mut total_replacements = 0usize;
+                let mut all_succeeded = true;
+
+                for file_entry in files {
+                    let path = file_entry
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("path missing in file entry"))?;
+                    self.policy.check_path(path)?;
+                    let full = self.workspace.join(path);
+                    let before = fs::read_to_string(&full)?;
+                    let mut after = before.clone();
+                    let mut file_replacements = 0usize;
+
+                    if let Some(edits) = file_entry.get("edits").and_then(|v| v.as_array()) {
+                        for edit in edits {
+                            match apply_single_edit(&mut after, edit) {
+                                Ok(count) => file_replacements += count,
+                                Err(e) => {
+                                    all_succeeded = false;
+                                    results.push(json!({
+                                        "path": path,
+                                        "edited": false,
+                                        "error": e.to_string()
+                                    }));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if after == before {
+                        results.push(json!({"path": path, "edited": false, "replacements": 0}));
+                        continue;
+                    }
+
+                    let diff = generate_unified_diff(path, &before, &after);
+                    fs::write(&full, &after)?;
+                    let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
+                    let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
+                    total_replacements += file_replacements;
+
+                    results.push(json!({
+                        "path": path,
+                        "edited": true,
+                        "replacements": file_replacements,
+                        "diff": diff,
+                        "before_sha256": before_sha,
+                        "after_sha256": after_sha,
+                    }));
+                }
+
+                // Run lint once after all edits
+                let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
+                    match self
+                        .runner
+                        .run(lint_cmd, &self.workspace, Duration::from_secs(30))
+                    {
+                        Ok(result) => {
+                            if result.status.unwrap_or(1) != 0 {
+                                Some(json!({
+                                    "lint_command": lint_cmd,
+                                    "lint_passed": false,
+                                    "lint_stdout": result.stdout,
+                                    "lint_stderr": result.stderr,
+                                }))
+                            } else {
+                                Some(json!({
+                                    "lint_command": lint_cmd,
+                                    "lint_passed": true,
+                                }))
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let mut result = json!({
+                    "results": results,
+                    "total_files": files.len(),
+                    "total_replacements": total_replacements,
+                    "all_succeeded": all_succeeded,
+                    "checkpoint_id": checkpoint.map(|id| id.to_string()),
+                });
+                if let Some(lint) = lint_output {
+                    result["lint"] = lint;
+                }
+                Ok(result)
+            }
+            "diagnostics.check" => {
+                let target = call.args.get("path").and_then(|v| v.as_str());
+                let (cmd, source) = detect_diagnostics_command(&self.workspace, target)?;
+                let result = self
+                    .runner
+                    .run(&cmd, &self.workspace, Duration::from_secs(60))?;
+                let diagnostics = parse_diagnostics(&result.stdout, &result.stderr, source);
+                Ok(json!({
+                    "diagnostics": diagnostics,
+                    "command": cmd,
+                    "success": result.status.unwrap_or(1) == 0,
+                    "source": source,
+                }))
+            }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
     }
@@ -1597,6 +1711,135 @@ fn generate_unified_diff(path: &str, before: &str, after: &str) -> String {
     out
 }
 
+fn detect_diagnostics_command(
+    workspace: &Path,
+    target: Option<&str>,
+) -> Result<(String, &'static str)> {
+    if workspace.join("Cargo.toml").exists() {
+        let cmd = match target {
+            Some(_) => "cargo check --message-format=json 2>&1".to_string(),
+            None => "cargo check --message-format=json 2>&1".to_string(),
+        };
+        return Ok((cmd, "rustc"));
+    }
+    if workspace.join("tsconfig.json").exists() {
+        return Ok(("npx tsc --noEmit --pretty false 2>&1".to_string(), "tsc"));
+    }
+    if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
+        let cmd = match target {
+            Some(path) => format!("ruff check {path} --output-format json 2>&1"),
+            None => "ruff check . --output-format json 2>&1".to_string(),
+        };
+        return Ok((cmd, "ruff"));
+    }
+    Err(anyhow!("no supported language project detected"))
+}
+
+fn parse_diagnostics(stdout: &str, stderr: &str, source: &str) -> Vec<serde_json::Value> {
+    match source {
+        "rustc" => parse_cargo_check_json(stdout),
+        "tsc" => parse_tsc_output(stderr),
+        "ruff" => parse_ruff_json(stdout),
+        _ => vec![],
+    }
+}
+
+fn parse_cargo_check_json(output: &str) -> Vec<serde_json::Value> {
+    let mut diagnostics = Vec::new();
+    for line in output.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("reason").and_then(|v| v.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        let level = message
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let text = message
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let spans = message.get("spans").and_then(|v| v.as_array());
+        let (file, line_num, col) = if let Some(spans) = spans
+            && let Some(span) = spans.first()
+        {
+            (
+                span.get("file_name").and_then(|v| v.as_str()).unwrap_or(""),
+                span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0),
+                span.get("column_start")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            )
+        } else {
+            ("", 0, 0)
+        };
+        diagnostics.push(json!({
+            "level": level,
+            "message": text,
+            "file": file,
+            "line": line_num,
+            "column": col,
+        }));
+    }
+    diagnostics
+}
+
+fn parse_tsc_output(output: &str) -> Vec<serde_json::Value> {
+    let mut diagnostics = Vec::new();
+    let re = regex::Regex::new(r"^(.+)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.+)$").ok();
+    let Some(re) = re else {
+        return diagnostics;
+    };
+    for line in output.lines() {
+        if let Some(caps) = re.captures(line) {
+            diagnostics.push(json!({
+                "level": "error",
+                "message": caps.get(5).map(|m| m.as_str()).unwrap_or(""),
+                "file": caps.get(1).map(|m| m.as_str()).unwrap_or(""),
+                "line": caps.get(2).map(|m| m.as_str()).unwrap_or("0").parse::<u64>().unwrap_or(0),
+                "column": caps.get(3).map(|m| m.as_str()).unwrap_or("0").parse::<u64>().unwrap_or(0),
+                "code": caps.get(4).map(|m| m.as_str()).unwrap_or(""),
+            }));
+        }
+    }
+    diagnostics
+}
+
+fn parse_ruff_json(output: &str) -> Vec<serde_json::Value> {
+    let mut diagnostics = Vec::new();
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return diagnostics;
+    };
+    for entry in entries {
+        let file = entry.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+        let code = entry.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let location = entry.get("location");
+        let line_num = location
+            .and_then(|l| l.get("row"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let col = location
+            .and_then(|l| l.get("column"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        diagnostics.push(json!({
+            "level": "warning",
+            "message": message,
+            "file": file,
+            "line": line_num,
+            "column": col,
+            "code": code,
+        }));
+    }
+    diagnostics
+}
+
 fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<usize> {
     if let (Some(search), Some(replace)) = (
         edit.get("search").and_then(|v| v.as_str()),
@@ -1776,6 +2019,7 @@ impl LocalToolHost {
             },
         };
         self.store.append_event(&event)?;
+        self.fire_session_hooks("checkpointcreated");
         Ok(Some(checkpoint.checkpoint_id))
     }
 }
@@ -2226,5 +2470,172 @@ mod tests {
                 .contains("must include {cmd}")
         );
         assert!(runner.captured().is_empty());
+    }
+
+    #[test]
+    fn multi_edit_modifies_multiple_files() {
+        let (workspace, host) = temp_host();
+        fs::write(workspace.join("a.txt"), "hello world\n").expect("seed a");
+        fs::write(workspace.join("b.txt"), "foo bar\n").expect("seed b");
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "multi_edit".to_string(),
+                args: json!({
+                    "files": [
+                        {"path": "a.txt", "edits": [{"search": "hello", "replace": "hi"}]},
+                        {"path": "b.txt", "edits": [{"search": "foo", "replace": "baz"}]}
+                    ]
+                }),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        assert_eq!(result.output["total_files"], 2);
+        assert!(result.output["total_replacements"].as_u64().unwrap() >= 2);
+        assert_eq!(
+            fs::read_to_string(workspace.join("a.txt")).expect("a"),
+            "hi world\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("b.txt")).expect("b"),
+            "baz bar\n"
+        );
+    }
+
+    #[test]
+    fn multi_edit_returns_diffs_and_shas() {
+        let (workspace, host) = temp_host();
+        fs::write(workspace.join("c.txt"), "old value\n").expect("seed c");
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "multi_edit".to_string(),
+                args: json!({
+                    "files": [
+                        {"path": "c.txt", "edits": [{"search": "old", "replace": "new"}]}
+                    ]
+                }),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        let results = result.output["results"].as_array().expect("results");
+        assert_eq!(results.len(), 1);
+        let entry = &results[0];
+        assert_eq!(entry["edited"], true);
+        assert!(entry["diff"].as_str().unwrap().contains("--- a/c.txt"));
+        assert!(entry["before_sha256"].as_str().is_some());
+        assert!(entry["after_sha256"].as_str().is_some());
+    }
+
+    #[test]
+    fn multi_edit_blocked_in_review_mode() {
+        let (workspace, mut host) = temp_host();
+        host.set_review_mode(true);
+        fs::write(workspace.join("d.txt"), "data\n").expect("seed d");
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "multi_edit".to_string(),
+                args: json!({
+                    "files": [
+                        {"path": "d.txt", "edits": [{"search": "data", "replace": "new"}]}
+                    ]
+                }),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("review mode")
+        );
+    }
+
+    #[test]
+    fn multi_edit_skips_unmodified_files() {
+        let (workspace, host) = temp_host();
+        fs::write(workspace.join("e.txt"), "keep me\n").expect("seed e");
+        fs::write(workspace.join("f.txt"), "change me\n").expect("seed f");
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "multi_edit".to_string(),
+                args: json!({
+                    "files": [
+                        {"path": "e.txt", "edits": [{"search": "missing", "replace": "gone"}]},
+                        {"path": "f.txt", "edits": [{"search": "change", "replace": "changed"}]}
+                    ]
+                }),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        let results = result.output["results"].as_array().expect("results");
+        // e.txt had an error (search not found), f.txt was edited
+        let f_entry = results
+            .iter()
+            .find(|r| r["path"] == "f.txt")
+            .expect("f.txt");
+        assert_eq!(f_entry["edited"], true);
+        assert_eq!(
+            fs::read_to_string(workspace.join("e.txt")).expect("e"),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn diagnostics_check_detects_rust_project() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-tools-diag-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname = \"test\"\n").expect("cargo");
+
+        let (cmd, source) = detect_diagnostics_command(&workspace, None).expect("detect");
+        assert_eq!(source, "rustc");
+        assert!(cmd.contains("cargo check"));
+    }
+
+    #[test]
+    fn diagnostics_check_is_read_only() {
+        let policy = PolicyEngine::new(deepseek_policy::PolicyConfig {
+            permission_mode: deepseek_policy::PermissionMode::Plan,
+            ..deepseek_policy::PolicyConfig::default()
+        });
+        let call = ToolCall {
+            name: "diagnostics.check".to_string(),
+            args: json!({}),
+            requires_approval: false,
+        };
+        assert!(!policy.requires_approval(&call));
+    }
+
+    #[test]
+    fn parse_cargo_check_json_extracts_errors() {
+        let output = r#"{"reason":"compiler-message","message":{"level":"error","message":"unused variable","spans":[{"file_name":"src/main.rs","line_start":10,"column_start":5}]}}"#;
+        let diagnostics = parse_cargo_check_json(output);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["level"], "error");
+        assert_eq!(diagnostics[0]["file"], "src/main.rs");
+        assert_eq!(diagnostics[0]["line"], 10);
+    }
+
+    #[test]
+    fn parse_tsc_output_extracts_errors() {
+        let output = "src/app.ts(42,13): error TS2304: Cannot find name 'foo'.";
+        let diagnostics = parse_tsc_output(output);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["level"], "error");
+        assert_eq!(diagnostics[0]["file"], "src/app.ts");
+        assert_eq!(diagnostics[0]["line"], 42);
+        assert_eq!(diagnostics[0]["column"], 13);
+        assert_eq!(diagnostics[0]["code"], "TS2304");
     }
 }
