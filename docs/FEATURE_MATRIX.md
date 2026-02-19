@@ -12,19 +12,19 @@
 |--------|-------|
 | Workspace crates | 19 |
 | CLI subcommands | 14 (spec-required) + extras (profile, rewind, export, serve, etc.) |
-| Global flags | 8 (`-p`, `--output-format`, `-c`, `-r`, `--fork-session`, `--model`, `--json`, `--print`) |
+| Global flags | 11 (`-p`, `--output-format`, `-c`, `-r`, `--fork-session`, `--model`, `--json`, `--print`, `--max-turns`, `--max-budget-usd`, `--from-pr`) |
 | Slash commands | 26 |
 | Keyboard shortcuts | 12 |
-| Built-in tools | 16 (fs.read, fs.write, fs.edit, fs.glob, fs.grep, web.fetch, web.search, git.*, bash.run, index.query, patch.stage, patch.apply, notebook.read, notebook.edit) |
+| Built-in tools | 18 (fs.read, fs.write, fs.edit, fs.glob, fs.grep, web.fetch, web.search, git.*, bash.run, index.query, patch.stage, patch.apply, notebook.read, notebook.edit, multi_edit, diagnostics.check) |
 | Session states | 8 |
-| Event types | 63 |
-| Permission modes | 3 (ask / auto / locked) |
-| Hook phases | 5 |
+| Event types | 65 |
+| Permission modes | 4 (ask / auto / plan / locked) |
+| Hook phases | 15 |
 | Subagent types | 3 (Explore / Plan / Task) |
 | Config sections | 16 |
 | CI workflows | 10 |
 | Cross-compile targets | 6 |
-| Test count (approx.) | 167 test functions across 20 source files |
+| Test count (approx.) | 181+ test functions across 20 source files |
 
 ---
 
@@ -118,6 +118,9 @@
 | 4.13 | `--fork-session` | DONE | `crates/deepseek-cli/src/main.rs` -- `#[arg(long = "fork-session")] fork_session: Option<String>` | Fork session tests | `cargo test -p deepseek-cli --test cli_json` | Clone conversation + state into new session |
 | 4.13 | `--model` | DONE | `crates/deepseek-cli/src/main.rs` -- `#[arg(long)] model: Option<String>` | Model override tests | `cargo test -p deepseek-cli --test cli_json` | Per-invocation model override, validated |
 | 4.13 | `--output-format stream-json` | DONE | `crates/deepseek-cli/src/main.rs` -- stream-json path emits `{"type":"content","text":"..."}` per chunk | Stream JSON tests | `cargo test -p deepseek-cli --test cli_json` | For programmatic consumption |
+| -- | `--max-turns` | DONE | `crates/deepseek-cli/src/main.rs` -- `#[arg(long)] max_turns: Option<u64>` | `max_turns_limits_execution_steps` | `cargo test -p deepseek-agent` | Limits agent turn count; `TurnLimitExceededV1` event; fires `budgetexceeded` hook |
+| -- | `--max-budget-usd` | DONE | `crates/deepseek-cli/src/main.rs` -- `#[arg(long)] max_budget_usd: Option<f64>` | `max_budget_usd_stops_on_cost_limit` | `cargo test -p deepseek-agent` | Stops agent when cost threshold exceeded; `BudgetExceededV1` event; queries `total_session_cost()` from store |
+| -- | `--from-pr` | DONE | `crates/deepseek-cli/src/main.rs` -- `#[arg(long)] from_pr: Option<u64>` | `from_pr_prepends_diff_to_prompt` | `cargo test -p deepseek-cli --test cli_json` | Fetches PR diff via `gh pr diff` and prepends to prompt context |
 
 ### 7. Slash Commands (Spec 2.4)
 
@@ -163,7 +166,7 @@
 | 2.7 | Ctrl+B -- background | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::Char('b')` with Ctrl modifier | TUI flow tests | `cargo test -p deepseek-ui` | `BackgroundJobStartedV1` event |
 | 2.7 | Ctrl+O -- toggle transcript | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::Char('o')` with Ctrl modifier, `toggle_raw` | TUI flow tests | `cargo test -p deepseek-ui` | Show raw thinking/reasoning content |
 | 2.7 | Ctrl+C -- cancel | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::Char('c')` with Ctrl modifier | TUI flow tests | `cargo test -p deepseek-ui` | Cancel current operation |
-| 2.7 | Shift+Tab -- cycle permission mode | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::BackTab` with `KeyModifiers::SHIFT`, calls `PermissionMode::cycle()` | `statusline_permission_modes` | `cargo test -p deepseek-ui` | ask -> auto -> locked -> ask; `PermissionModeChangedV1` event |
+| 2.7 | Shift+Tab -- cycle permission mode | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::BackTab` with `KeyModifiers::SHIFT`, calls `PermissionMode::cycle()` | `statusline_permission_modes` | `cargo test -p deepseek-ui` | ask -> auto -> plan -> locked -> ask; `PermissionModeChangedV1` event |
 | 2.7 | Ctrl+T -- toggle Mission Control | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::Char('t')` with Ctrl modifier, `toggle_mission_control` | TUI flow tests | `cargo test -p deepseek-ui` | Tasks/subagents pane |
 | 2.7 | Ctrl+A -- toggle Artifacts pane | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::Char('a')` with Ctrl modifier, `toggle_artifacts` | TUI flow tests | `cargo test -p deepseek-ui` | Displays `.deepseek/artifacts/<task-id>/` bundles |
 
@@ -181,7 +184,7 @@
 
 | Spec Section | Feature | Status | Implementation | Tests | Verification Command | Notes |
 |---|---|---|---|---|---|---|
-| 4.8 | 60 event types in EventKind | DONE | `crates/deepseek-core/src/lib.rs` -- `enum EventKind` with 60 variants (verified by grep count) | Event serialization roundtrip tests | `cargo test -p deepseek-core` | Includes SessionStartedV1, SessionResumedV1, ToolDeniedV1 |
+| 4.8 | 65 event types in EventKind | DONE | `crates/deepseek-core/src/lib.rs` -- `enum EventKind` with 65 variants | Event serialization roundtrip tests | `cargo test -p deepseek-core` | Includes SessionStartedV1, SessionResumedV1, ToolDeniedV1, TurnLimitExceededV1, BudgetExceededV1 |
 | 4.8 | EventEnvelope structure | DONE | `crates/deepseek-core/src/lib.rs` -- `struct EventEnvelope { seq_no, at, session_id, kind }` | Serialization tests | `cargo test -p deepseek-core` | Tagged enum with serde `#[serde(tag = "type", content = "payload")]` |
 | 4.8 | Append-only events.jsonl | DONE | `crates/deepseek-store/src/lib.rs` -- `append_event()` writes to `.deepseek/events.jsonl` | `rebuild_projection_from_events_is_deterministic` | `cargo test -p deepseek-store` | Canonical event log, one JSON per line |
 | 4.8 | SQLite projections | DONE | `crates/deepseek-store/src/lib.rs` -- 6 migration levels; tables: events, sessions, plans, plugin_state, approvals_ledger, verification_runs, router_stats, usage_ledger, context_compactions, autopilot_runs, hook_executions, plugin_catalog_cache, checkpoints, transcript_exports, background_jobs, replay_cassettes, subagent_runs, provider_metrics | Store tests | `cargo test -p deepseek-store` | Fast querying via rusqlite |
@@ -192,9 +195,10 @@
 
 | Spec Section | Feature | Status | Implementation | Tests | Verification Command | Notes |
 |---|---|---|---|---|---|---|
-| 2.12 | 3 permission modes (ask/auto/locked) | DONE | `crates/deepseek-policy/src/lib.rs` -- `enum PermissionMode { Ask, Auto, Locked }` with `from_str_lossy()`, `as_str()`, `Display` | `permission_mode_cycles_correctly` | `cargo test -p deepseek-policy` | Default: Ask |
-| 2.12 | `cycle()` method | DONE | `crates/deepseek-policy/src/lib.rs` -- `PermissionMode::cycle()`: Ask -> Auto -> Locked -> Ask | `permission_mode_cycles_correctly` | `cargo test -p deepseek-policy` | Used by Shift+Tab UI handler |
-| 2.12 | Status bar colored indicators | DONE | `crates/deepseek-ui/src/lib.rs` -- `render_statusline_spans()` with `[ASK]` (Yellow), `[AUTO]` (Green), `[LOCKED]` (Red) | `styled_statusline_spans_include_mode_badge` | `cargo test -p deepseek-ui` | Bold text on colored background |
+| 2.12 | 4 permission modes (ask/auto/plan/locked) | DONE | `crates/deepseek-policy/src/lib.rs` -- `enum PermissionMode { Ask, Auto, Plan, Locked }` with `from_str_lossy()`, `as_str()`, `Display` | `permission_mode_cycles_correctly`, `permission_mode_from_str_lossy` | `cargo test -p deepseek-policy` | Default: Ask |
+| 2.12 | Plan permission mode | DONE | `crates/deepseek-policy/src/lib.rs` -- `PermissionMode::Plan`: reads allowed, writes need approval | `plan_mode_requires_approval_for_writes`, `plan_mode_allows_reads`, `plan_mode_dry_run_needs_approval` | `cargo test -p deepseek-policy` | Read-only tools pass through, all writes require approval |
+| 2.12 | `cycle()` method | DONE | `crates/deepseek-policy/src/lib.rs` -- `PermissionMode::cycle()`: Ask -> Auto -> Plan -> Locked -> Ask | `permission_mode_cycles_correctly` | `cargo test -p deepseek-policy` | Used by Shift+Tab UI handler |
+| 2.12 | Status bar colored indicators | DONE | `crates/deepseek-ui/src/lib.rs` -- `render_statusline_spans()` with `[ASK]` (Yellow), `[AUTO]` (Green), `[PLAN]` (Blue), `[LOCKED]` (Red) | `styled_statusline_spans_include_mode_badge` | `cargo test -p deepseek-ui` | Bold text on colored background |
 | 2.12 | `PermissionModeChangedV1` event | DONE | `crates/deepseek-core/src/lib.rs` -- `EventKind::PermissionModeChangedV1 { from, to }` | Event tests | `cargo test -p deepseek-core` | Recorded on every mode change |
 | 2.12 | Dry-run evaluator | DONE | `crates/deepseek-policy/src/lib.rs` -- `dry_run(&self, call: &ToolCall) -> PermissionDryRunResult` | `policy_dry_run_*` tests | `cargo test -p deepseek-policy` | Returns Allowed / AutoApproved / NeedsApproval / Denied(reason) |
 | 2.11 | Team policy override | DONE | `crates/deepseek-policy/src/lib.rs` -- `load_team_policy_override()`, `apply_team_policy_override()`, reads `team-policy.json` | `team_policy_override_replaces_allowlist_and_forces_modes` | `cargo test -p deepseek-policy` | Merges team policy into base config |
@@ -241,7 +245,9 @@
 | 4.5 | Auto-lint after edit | DONE | `crates/deepseek-tools/src/lib.rs` -- `lint_after_edit: Option<String>` runs linter after `fs.edit` | Lint integration tests | `cargo test -p deepseek-tools` | Diagnostics included in tool result JSON; `policy.lint_after_edit` config |
 | 4.5 | Plugin system | DONE | `crates/deepseek-tools/src/plugins.rs` -- `PluginManager`, `CatalogPlugin`, `PluginVerifyResult`, signature verification | `plugin_*` tests (2 tests) | `cargo test -p deepseek-tools` | Catalog sync, signed verification; `PluginInstalledV1`, `PluginVerifiedV1` events |
 | 4.5 | Shell runner | DONE | `crates/deepseek-tools/src/shell.rs` -- `PlatformShellRunner` trait impl, `ShellRunResult` | `shell_runner_*` tests | `cargo test -p deepseek-tools` | Cross-platform shell execution |
-| 4.5 | Review mode enforcement | DONE | `crates/deepseek-tools/src/lib.rs` -- `REVIEW_BLOCKED_TOOLS` = [fs.write, fs.edit, patch.stage, patch.apply, bash.run] | Review mode tests | `cargo test -p deepseek-tools` | `set_review_mode(true)` activates |
+| 4.5 | `multi_edit` tool | DONE | `crates/deepseek-tools/src/lib.rs` -- match `"multi_edit"`, edits multiple files in one tool call with diffs, SHA-256, lint | `multi_edit_modifies_multiple_files`, `multi_edit_returns_diffs_and_shas`, `multi_edit_blocked_in_review_mode`, `multi_edit_skips_unmodified_files` | `cargo test -p deepseek-tools` | Processes files array with edits; generates per-file diff/SHA; blocked in review mode |
+| 4.5 | `diagnostics.check` tool | DONE | `crates/deepseek-tools/src/lib.rs` -- match `"diagnostics.check"`, detects Rust/TS/Python projects, runs compiler/linter, parses output | `diagnostics_check_detects_rust_project`, `diagnostics_check_is_read_only`, `parse_cargo_check_json_extracts_errors`, `parse_tsc_output_extracts_errors` | `cargo test -p deepseek-tools` | Auto-detects: cargo check (Rust), tsc (TypeScript), ruff (Python); read-only tool |
+| 4.5 | Review mode enforcement | DONE | `crates/deepseek-tools/src/lib.rs` -- `REVIEW_BLOCKED_TOOLS` = [fs.write, fs.edit, patch.stage, patch.apply, bash.run, multi_edit] | Review mode tests | `cargo test -p deepseek-tools` | `set_review_mode(true)` activates |
 | 4.5 | Tool events | DONE | `crates/deepseek-core/src/lib.rs` -- `ToolProposedV1`, `ToolApprovedV1`, `ToolResultV1`, `ToolDeniedV1` | Event tests | `cargo test -p deepseek-core` | Complete tool lifecycle in event log |
 
 ### 15. Patch Staging & Application (Spec 4.6)
@@ -288,7 +294,7 @@
 
 | Spec Section | Feature | Status | Implementation | Tests | Verification Command | Notes |
 |---|---|---|---|---|---|---|
-| 4.10 | 5 hook phases | DONE | `crates/deepseek-hooks/src/lib.rs` -- `HookContext.phase`: SessionStart, PreToolUse, PostToolUse, PostToolUseFailure, Stop | `executes_hook_scripts` | `cargo test -p deepseek-hooks` | All 5 from spec |
+| 4.10 | 15 hook phases | DONE | `crates/deepseek-hooks/src/lib.rs` -- `HookContext.phase`: sessionstart, pretooluse, posttooluse, posttooluse_failure, stop + 10 new phases fired from agent/tools | `executes_hook_scripts` | `cargo test -p deepseek-hooks` | Original 5 + notification, subagentspawned, subagentcompleted, contextcompacted, plancreated, planrevised, checkpointcreated, verificationstarted, verificationcompleted, budgetexceeded |
 | 4.10 | HookRuntime execution | DONE | `crates/deepseek-hooks/src/lib.rs` -- `HookRuntime::run(paths, ctx, timeout)` with exit code tracking, timeout support | `executes_hook_scripts` | `cargo test -p deepseek-hooks` | Supports .sh, .ps1, .py, native binary |
 | 4.10 | Environment variables | DONE | `crates/deepseek-hooks/src/lib.rs` -- `DEEPSEEK_HOOK_PHASE`, `DEEPSEEK_WORKSPACE`, `DEEPSEEK_TOOL_NAME`, `DEEPSEEK_TOOL_ARGS_JSON`, `DEEPSEEK_TOOL_RESULT_JSON` | `executes_hook_scripts` | `cargo test -p deepseek-hooks` | Full context passed via env |
 | 4.10 | PreToolUse blocking | DONE | `crates/deepseek-hooks/src/lib.rs` -- Non-zero exit from PreToolUse hook blocks tool call | Hook integration tests | `cargo test -p deepseek-hooks` | Custom approval logic in hooks |
@@ -440,8 +446,8 @@
 | deepseek-agent | 39 | `cargo test -p deepseek-agent` |
 | deepseek-cli (integration) | 35 | `cargo test -p deepseek-cli --test cli_json` |
 | deepseek-llm | 20 | `cargo test -p deepseek-llm` |
-| deepseek-policy | 19 | `cargo test -p deepseek-policy` |
-| deepseek-tools | 15 | `cargo test -p deepseek-tools` |
+| deepseek-policy | 23 | `cargo test -p deepseek-policy` |
+| deepseek-tools | 23 | `cargo test -p deepseek-tools` |
 | deepseek-ui | 11 | `cargo test -p deepseek-ui` |
 | deepseek-core | 5 | `cargo test -p deepseek-core` |
 | deepseek-subagent | 4 | `cargo test -p deepseek-subagent` |
@@ -458,7 +464,7 @@
 | deepseek-testkit | 1 | `cargo test -p deepseek-testkit` |
 | deepseek-tools/shell | 1 | `cargo test -p deepseek-tools` |
 | deepseek-jsonrpc | 6 | `cargo test -p deepseek-jsonrpc` |
-| **Total** | **~173** | `cargo test --workspace --all-targets` |
+| **Total** | **~185** | `cargo test --workspace --all-targets` |
 
 ---
 
@@ -509,6 +515,6 @@ cargo run --bin deepseek -- --json status
 
 ## Audit Conclusion
 
-Every feature specified in `specs.md` has a corresponding implementation in the codebase. Claude Code feature parity additions include: image base64 encoding in `fs.read` for multimodal models, PDF text extraction with page ranges, Jupyter notebook editing (`notebook.read`/`notebook.edit` tools), multimodal content in LLM payloads (`ImageContent` struct), and a JSON-RPC 2.0 server mode (`deepseek serve`) for IDE integration (VS Code/JetBrains). The workspace now has 19 crates, 63 event types, 16 built-in tools, and ~173 test functions.
+Every feature specified in `specs.md` has a corresponding implementation in the codebase. Claude Code feature parity additions include: image base64 encoding in `fs.read` for multimodal models, PDF text extraction with page ranges, Jupyter notebook editing (`notebook.read`/`notebook.edit` tools), multimodal content in LLM payloads (`ImageContent` struct), a JSON-RPC 2.0 server mode (`deepseek serve`) for IDE integration (VS Code/JetBrains), Plan permission mode (reads allowed, writes need approval), MultiEdit tool (edit multiple files in one call), diagnostics tool (LSP-lite compiler/linter checks for Rust/TS/Python), budget enforcement (`--max-turns`, `--max-budget-usd`), PR context injection (`--from-pr`), and 15 hook lifecycle phases. The workspace now has 19 crates, 65 event types, 18 built-in tools, 4 permission modes, 15 hook phases, and ~185 test functions.
 
 **Status: COMPLETE -- zero open gaps.**

@@ -9,6 +9,7 @@ use std::path::{Component, Path};
 pub enum PermissionMode {
     Ask,
     Auto,
+    Plan,
     Locked,
 }
 
@@ -16,6 +17,7 @@ impl PermissionMode {
     pub fn from_str_lossy(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => PermissionMode::Auto,
+            "plan" => PermissionMode::Plan,
             "locked" => PermissionMode::Locked,
             _ => PermissionMode::Ask,
         }
@@ -25,6 +27,7 @@ impl PermissionMode {
         match self {
             PermissionMode::Ask => "ask",
             PermissionMode::Auto => "auto",
+            PermissionMode::Plan => "plan",
             PermissionMode::Locked => "locked",
         }
     }
@@ -33,7 +36,8 @@ impl PermissionMode {
     pub fn cycle(&self) -> Self {
         match self {
             PermissionMode::Ask => PermissionMode::Auto,
-            PermissionMode::Auto => PermissionMode::Locked,
+            PermissionMode::Auto => PermissionMode::Plan,
+            PermissionMode::Plan => PermissionMode::Locked,
             PermissionMode::Locked => PermissionMode::Ask,
         }
     }
@@ -241,6 +245,10 @@ impl PolicyEngine {
                 // In locked mode, all non-read tools require approval (and will be denied).
                 !is_read_only_tool(&call.name)
             }
+            PermissionMode::Plan => {
+                // In plan mode, reads are allowed; writes need approval.
+                !is_read_only_tool(&call.name)
+            }
             PermissionMode::Auto => {
                 // In auto mode, allowlisted tools auto-approve; others still need approval.
                 if call.name == "bash.run" {
@@ -280,6 +288,13 @@ impl PolicyEngine {
                     PermissionDryRunResult::Denied(
                         "locked mode blocks all non-read operations".to_string(),
                     )
+                }
+            }
+            PermissionMode::Plan => {
+                if is_read_only_tool(&call.name) {
+                    PermissionDryRunResult::Allowed
+                } else {
+                    PermissionDryRunResult::NeedsApproval
                 }
             }
             PermissionMode::Auto => {
@@ -348,6 +363,8 @@ fn is_read_only_tool(name: &str) -> bool {
             | "git.log"
             | "web.fetch"
             | "web.search"
+            | "notebook.read"
+            | "diagnostics.check"
     )
 }
 
@@ -827,7 +844,8 @@ mod tests {
     #[test]
     fn permission_mode_cycles_correctly() {
         assert_eq!(PermissionMode::Ask.cycle(), PermissionMode::Auto);
-        assert_eq!(PermissionMode::Auto.cycle(), PermissionMode::Locked);
+        assert_eq!(PermissionMode::Auto.cycle(), PermissionMode::Plan);
+        assert_eq!(PermissionMode::Plan.cycle(), PermissionMode::Locked);
         assert_eq!(PermissionMode::Locked.cycle(), PermissionMode::Ask);
     }
 
@@ -835,6 +853,7 @@ mod tests {
     fn permission_mode_from_str_lossy_handles_variants() {
         assert_eq!(PermissionMode::from_str_lossy("ask"), PermissionMode::Ask);
         assert_eq!(PermissionMode::from_str_lossy("auto"), PermissionMode::Auto);
+        assert_eq!(PermissionMode::from_str_lossy("plan"), PermissionMode::Plan);
         assert_eq!(
             PermissionMode::from_str_lossy("locked"),
             PermissionMode::Locked
@@ -848,9 +867,97 @@ mod tests {
             PermissionMode::Auto
         );
         assert_eq!(
+            PermissionMode::from_str_lossy("  Plan "),
+            PermissionMode::Plan
+        );
+        assert_eq!(
             PermissionMode::from_str_lossy("invalid"),
             PermissionMode::Ask
         );
+    }
+
+    #[test]
+    fn plan_mode_requires_approval_for_writes() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Plan,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let write_call = ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let edit_call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let bash_call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "cargo test"}),
+            requires_approval: false,
+        };
+        assert!(policy.requires_approval(&write_call));
+        assert!(policy.requires_approval(&edit_call));
+        assert!(policy.requires_approval(&bash_call));
+    }
+
+    #[test]
+    fn plan_mode_allows_reads() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Plan,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let read_call = ToolCall {
+            name: "fs.read".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let grep_call = ToolCall {
+            name: "fs.grep".to_string(),
+            args: json!({"pattern": "test"}),
+            requires_approval: false,
+        };
+        let notebook_read = ToolCall {
+            name: "notebook.read".to_string(),
+            args: json!({"path": "test.ipynb"}),
+            requires_approval: false,
+        };
+        let diagnostics_call = ToolCall {
+            name: "diagnostics.check".to_string(),
+            args: json!({}),
+            requires_approval: false,
+        };
+        assert!(!policy.requires_approval(&read_call));
+        assert!(!policy.requires_approval(&grep_call));
+        assert!(!policy.requires_approval(&notebook_read));
+        assert!(!policy.requires_approval(&diagnostics_call));
+    }
+
+    #[test]
+    fn plan_mode_dry_run_needs_approval() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Plan,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let write_call = ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let read_call = ToolCall {
+            name: "fs.read".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        assert_eq!(
+            policy.dry_run(&write_call),
+            PermissionDryRunResult::NeedsApproval
+        );
+        assert_eq!(policy.dry_run(&read_call), PermissionDryRunResult::Allowed);
     }
 
     proptest! {

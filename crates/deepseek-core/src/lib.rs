@@ -537,6 +537,14 @@ pub enum EventKind {
         transport: String,
         client_info: String,
     },
+    TurnLimitExceededV1 {
+        limit: u64,
+        actual: u64,
+    },
+    BudgetExceededV1 {
+        limit_usd: f64,
+        actual_usd: f64,
+    },
 }
 
 pub trait Planner {
@@ -1067,6 +1075,8 @@ impl Default for IndexConfig {
 pub struct BudgetsConfig {
     pub max_turn_duration_secs: u64,
     pub max_reasoner_tokens_per_session: u64,
+    pub max_turns: Option<u64>,
+    pub max_budget_usd: Option<f64>,
 }
 
 impl Default for BudgetsConfig {
@@ -1074,6 +1084,8 @@ impl Default for BudgetsConfig {
         Self {
             max_turn_duration_secs: 300,
             max_reasoner_tokens_per_session: 1_000_000,
+            max_turns: None,
+            max_budget_usd: None,
         }
     }
 }
