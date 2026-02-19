@@ -244,10 +244,10 @@ impl PolicyEngine {
             PermissionMode::Auto => {
                 // In auto mode, allowlisted tools auto-approve; others still need approval.
                 if call.name == "bash.run" {
-                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
-                        if self.check_command(cmd).is_ok() {
-                            return false; // allowlisted command, auto-approve
-                        }
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+                        && self.check_command(cmd).is_ok()
+                    {
+                        return false; // allowlisted command, auto-approve
                     }
                     true
                 } else if is_read_only_tool(&call.name) {
@@ -277,17 +277,19 @@ impl PolicyEngine {
                 if is_read_only_tool(&call.name) {
                     PermissionDryRunResult::Allowed
                 } else {
-                    PermissionDryRunResult::Denied("locked mode blocks all non-read operations".to_string())
+                    PermissionDryRunResult::Denied(
+                        "locked mode blocks all non-read operations".to_string(),
+                    )
                 }
             }
             PermissionMode::Auto => {
                 if is_read_only_tool(&call.name) {
                     PermissionDryRunResult::Allowed
                 } else if call.name == "bash.run" {
-                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
-                        if self.check_command(cmd).is_ok() {
-                            return PermissionDryRunResult::AutoApproved;
-                        }
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+                        && self.check_command(cmd).is_ok()
+                    {
+                        return PermissionDryRunResult::AutoApproved;
                     }
                     PermissionDryRunResult::NeedsApproval
                 } else {
@@ -772,7 +774,12 @@ mod tests {
         };
         assert!(policy.requires_approval(&write_call));
         assert!(!policy.requires_approval(&read_call));
-        assert_eq!(policy.dry_run(&write_call), PermissionDryRunResult::Denied("locked mode blocks all non-read operations".to_string()));
+        assert_eq!(
+            policy.dry_run(&write_call),
+            PermissionDryRunResult::Denied(
+                "locked mode blocks all non-read operations".to_string()
+            )
+        );
         assert_eq!(policy.dry_run(&read_call), PermissionDryRunResult::Allowed);
     }
 
@@ -795,8 +802,14 @@ mod tests {
         };
         assert!(!policy.requires_approval(&allowed_bash));
         assert!(policy.requires_approval(&blocked_bash));
-        assert_eq!(policy.dry_run(&allowed_bash), PermissionDryRunResult::AutoApproved);
-        assert_eq!(policy.dry_run(&blocked_bash), PermissionDryRunResult::NeedsApproval);
+        assert_eq!(
+            policy.dry_run(&allowed_bash),
+            PermissionDryRunResult::AutoApproved
+        );
+        assert_eq!(
+            policy.dry_run(&blocked_bash),
+            PermissionDryRunResult::NeedsApproval
+        );
     }
 
     #[test]
@@ -810,10 +823,22 @@ mod tests {
     fn permission_mode_from_str_lossy_handles_variants() {
         assert_eq!(PermissionMode::from_str_lossy("ask"), PermissionMode::Ask);
         assert_eq!(PermissionMode::from_str_lossy("auto"), PermissionMode::Auto);
-        assert_eq!(PermissionMode::from_str_lossy("locked"), PermissionMode::Locked);
-        assert_eq!(PermissionMode::from_str_lossy("LOCKED"), PermissionMode::Locked);
-        assert_eq!(PermissionMode::from_str_lossy("  Auto "), PermissionMode::Auto);
-        assert_eq!(PermissionMode::from_str_lossy("invalid"), PermissionMode::Ask);
+        assert_eq!(
+            PermissionMode::from_str_lossy("locked"),
+            PermissionMode::Locked
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("LOCKED"),
+            PermissionMode::Locked
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("  Auto "),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("invalid"),
+            PermissionMode::Ask
+        );
     }
 
     proptest! {

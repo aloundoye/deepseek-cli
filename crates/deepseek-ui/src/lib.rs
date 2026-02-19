@@ -181,7 +181,9 @@ fn render_statusline_spans(status: &UiStatus) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
             format!(" {} ", status.model),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
@@ -260,7 +262,171 @@ fn render_statusline_spans(status: &UiStatus) -> Vec<Span<'static>> {
     spans
 }
 
-fn style_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
+/// Check if a word is a keyword in common programming languages.
+fn syntax_keyword_color(word: &str) -> Option<Color> {
+    match word {
+        // Rust keywords
+        "fn" | "let" | "mut" | "const" | "static" | "struct" | "enum" | "impl" | "trait"
+        | "pub" | "mod" | "use" | "crate" | "super" | "self" | "Self" | "match" | "if" | "else"
+        | "loop" | "while" | "for" | "in" | "break" | "continue" | "return" | "async" | "await"
+        | "move" | "where" | "type" | "unsafe" | "dyn" | "ref" | "as" | "extern" => {
+            Some(Color::Magenta)
+        }
+        // Python keywords
+        "def" | "class" | "import" | "from" | "try" | "except" | "finally" | "with" | "yield"
+        | "lambda" | "pass" | "raise" | "global" | "nonlocal" | "elif" | "del" | "assert"
+        | "is" | "not" | "and" | "or" => Some(Color::Magenta),
+        // JS/TS keywords
+        "function" | "var" | "new" | "this" | "typeof" | "instanceof" | "throw" | "catch"
+        | "switch" | "case" | "default" | "export" | "interface" | "extends" | "implements"
+        | "abstract" | "override" => Some(Color::Magenta),
+        // Common types
+        "String" | "Vec" | "Option" | "Result" | "Box" | "Arc" | "Rc" | "HashMap" | "HashSet"
+        | "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64"
+        | "u128" | "f32" | "f64" | "usize" | "isize" | "str" | "char" | "int" | "float"
+        | "dict" | "list" | "tuple" | "set" | "bytes" | "number" | "string" | "boolean"
+        | "void" | "any" | "never" => Some(Color::Yellow),
+        // Literals
+        "true" | "false" | "True" | "False" | "None" | "null" | "undefined" | "nil" | "Ok"
+        | "Err" | "Some" => Some(Color::Cyan),
+        _ => None,
+    }
+}
+
+/// Apply syntax highlighting to a line of code inside a code block.
+fn highlight_code_line(line: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    let mut last = 0;
+
+    while let Some(&(i, ch)) = chars.peek() {
+        // String literals
+        if ch == '"' || ch == '\'' {
+            if i > last {
+                spans.push(Span::styled(
+                    line[last..i].to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            let quote = ch;
+            chars.next();
+            let start = i;
+            while let Some(&(j, c)) = chars.peek() {
+                chars.next();
+                if c == quote && (j == 0 || line.as_bytes().get(j - 1) != Some(&b'\\')) {
+                    break;
+                }
+            }
+            let end = chars.peek().map_or(line.len(), |&(j, _)| j);
+            spans.push(Span::styled(
+                line[start..end].to_string(),
+                Style::default().fg(Color::Green),
+            ));
+            last = end;
+            continue;
+        }
+        // Line comments
+        if ch == '/' && line.get(i + 1..i + 2) == Some("/") {
+            if i > last {
+                spans.push(Span::styled(
+                    line[last..i].to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            spans.push(Span::styled(
+                line[i..].to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            last = line.len();
+            break;
+        }
+        // Hash comments (Python, shell)
+        if ch == '#' {
+            if i > last {
+                spans.push(Span::styled(
+                    line[last..i].to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            spans.push(Span::styled(
+                line[i..].to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            last = line.len();
+            break;
+        }
+        // Numbers
+        if ch.is_ascii_digit() && (i == 0 || !line.as_bytes()[i - 1].is_ascii_alphanumeric()) {
+            if i > last {
+                spans.push(Span::styled(
+                    line[last..i].to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            let start = i;
+            while let Some(&(_, c)) = chars.peek() {
+                if !c.is_ascii_digit() && c != '.' && c != 'x' && c != '_' {
+                    break;
+                }
+                chars.next();
+            }
+            let end = chars.peek().map_or(line.len(), |&(j, _)| j);
+            spans.push(Span::styled(
+                line[start..end].to_string(),
+                Style::default().fg(Color::LightCyan),
+            ));
+            last = end;
+            continue;
+        }
+        // Identifiers / keywords
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            if i > last {
+                spans.push(Span::styled(
+                    line[last..i].to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            let start = i;
+            while let Some(&(_, c)) = chars.peek() {
+                if !c.is_ascii_alphanumeric() && c != '_' {
+                    break;
+                }
+                chars.next();
+            }
+            let end = chars.peek().map_or(line.len(), |&(j, _)| j);
+            let word = &line[start..end];
+            if let Some(color) = syntax_keyword_color(word) {
+                spans.push(Span::styled(
+                    word.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    word.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            last = end;
+            continue;
+        }
+        chars.next();
+    }
+    if last < line.len() {
+        spans.push(Span::styled(
+            line[last..].to_string(),
+            Style::default().fg(Color::White),
+        ));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::White),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn style_transcript_line(entry: &TranscriptEntry, in_code_block: bool) -> Line<'static> {
     let (prefix, prefix_style, body_style) = match entry.kind {
         MessageKind::User => (
             "❯ ",
@@ -269,11 +435,7 @@ fn style_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::White),
         ),
-        MessageKind::Assistant => (
-            "  ",
-            Style::default(),
-            Style::default().fg(Color::White),
-        ),
+        MessageKind::Assistant => ("  ", Style::default(), Style::default().fg(Color::White)),
         MessageKind::System => (
             "⚙ ",
             Style::default().fg(Color::DarkGray),
@@ -291,20 +453,26 @@ fn style_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
         ),
         MessageKind::Error => (
             "✗ ",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Red),
         ),
     };
 
-    // Simple markdown-like styling for assistant messages
     let text = &entry.text;
+
+    // Apply syntax highlighting inside code blocks
+    if in_code_block && entry.kind == MessageKind::Assistant && !text.starts_with("```") {
+        return highlight_code_line(text);
+    }
+
+    // Simple markdown-like styling for assistant messages
     if entry.kind == MessageKind::Assistant {
         if text.starts_with("```") {
             return Line::from(vec![Span::styled(
                 text.clone(),
-                Style::default().fg(Color::DarkGray),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
             )]);
         }
         if text.starts_with("# ") || text.starts_with("## ") || text.starts_with("### ") {
@@ -317,10 +485,7 @@ fn style_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
         }
         if text.starts_with("- ") || text.starts_with("* ") {
             return Line::from(vec![
-                Span::styled(
-                    "  • ".to_string(),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled("  • ".to_string(), Style::default().fg(Color::Cyan)),
                 Span::styled(text[2..].to_string(), body_style),
             ]);
         }
@@ -336,8 +501,8 @@ fn render_context_gauge(status: &UiStatus, area: Rect, frame: &mut ratatui::Fram
     if status.context_max_tokens == 0 {
         return;
     }
-    let ratio = (status.context_used_tokens as f64 / status.context_max_tokens as f64)
-        .clamp(0.0, 1.0);
+    let ratio =
+        (status.context_used_tokens as f64 / status.context_max_tokens as f64).clamp(0.0, 1.0);
     let color = if ratio > 0.8 {
         Color::Red
     } else if ratio > 0.6 {
@@ -476,6 +641,9 @@ pub struct KeyBindings {
     pub toggle_raw: KeyEvent,
     pub history_prev: KeyEvent,
     pub paste_hint: KeyEvent,
+    pub toggle_mission_control: KeyEvent,
+    pub toggle_artifacts: KeyEvent,
+    pub toggle_plan_collapse: KeyEvent,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -491,6 +659,9 @@ struct KeyBindingsFile {
     toggle_raw: Option<String>,
     history_prev: Option<String>,
     paste_hint: Option<String>,
+    toggle_mission_control: Option<String>,
+    toggle_artifacts: Option<String>,
+    toggle_plan_collapse: Option<String>,
 }
 
 impl Default for KeyBindings {
@@ -506,6 +677,9 @@ impl Default for KeyBindings {
             toggle_raw: KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             history_prev: KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             paste_hint: KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            toggle_mission_control: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            toggle_artifacts: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            toggle_plan_collapse: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
         }
     }
 }
@@ -541,6 +715,15 @@ impl KeyBindings {
         }
         if let Some(value) = raw.paste_hint {
             self.paste_hint = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.toggle_mission_control {
+            self.toggle_mission_control = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.toggle_artifacts {
+            self.toggle_artifacts = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.toggle_plan_collapse {
+            self.toggle_plan_collapse = parse_key_event(&value)?;
         }
         Ok(self)
     }
@@ -601,6 +784,60 @@ impl TuiTheme {
     }
 }
 
+pub fn load_artifact_lines(workspace: &Path) -> Vec<String> {
+    let artifacts_dir = workspace.join(".deepseek").join("artifacts");
+    let mut lines = Vec::new();
+    if !artifacts_dir.exists() {
+        lines.push("No artifacts found.".to_string());
+        lines.push(format!("Directory: {}", artifacts_dir.display()));
+        return lines;
+    }
+    let mut entries: Vec<_> = fs::read_dir(&artifacts_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    if entries.is_empty() {
+        lines.push("No task artifacts found.".to_string());
+        return lines;
+    }
+    for entry in entries {
+        let task_dir = entry.path();
+        let task_id = entry.file_name().to_string_lossy().to_string();
+        lines.push(format!("## Task: {task_id}"));
+        for name in &["plan.md", "diff.patch", "verification.md"] {
+            let file_path = task_dir.join(name);
+            if file_path.exists() {
+                let size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                lines.push(format!("  {name} ({size} bytes)"));
+                // Show first few lines as preview
+                if let Ok(content) = fs::read_to_string(&file_path) {
+                    for (i, line) in content.lines().take(5).enumerate() {
+                        lines.push(format!("    {}", line));
+                        if i == 4 {
+                            lines.push("    ...".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Also show any other files in the task directory
+        if let Ok(files) = fs::read_dir(&task_dir) {
+            for file in files.filter_map(|f| f.ok()) {
+                let fname = file.file_name().to_string_lossy().to_string();
+                if !["plan.md", "diff.patch", "verification.md"].contains(&fname.as_str()) {
+                    let size = fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
+                    lines.push(format!("  {fname} ({size} bytes)"));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+    lines
+}
+
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
@@ -630,9 +867,11 @@ where
 
     let mut shell = ChatShell::default();
     let mut input = String::new();
-    let mut info_line =
-        String::from("Ctrl+C exit | Tab autocomplete | Ctrl+O toggle pane | Ctrl+B background | Shift+Enter newline");
+    let mut info_line = String::from(
+        "Ctrl+C exit | Tab autocomplete | Ctrl+O toggle pane | Ctrl+B background | Shift+Enter newline",
+    );
     let mut right_pane = RightPane::Plan;
+    let mut right_pane_collapsed = false;
     let mut history: VecDeque<String> = VecDeque::new();
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
@@ -656,26 +895,30 @@ where
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),    // context gauge
-                    Constraint::Min(8),       // body (transcript + side pane)
+                    Constraint::Length(1),      // context gauge
+                    Constraint::Min(8),         // body (transcript + side pane)
                     Constraint::Percentage(18), // tool output
-                    Constraint::Length(3),    // input
-                    Constraint::Length(1),    // status bar
-                    Constraint::Length(1),    // info/help line
+                    Constraint::Length(3),      // input
+                    Constraint::Length(1),      // status bar
+                    Constraint::Length(1),      // info/help line
                 ])
                 .split(area);
 
             // Context usage gauge
             render_context_gauge(&status, vertical[0], frame);
 
-            // Body: Transcript (left 72%) + Right pane (28%)
+            // Body: Transcript (left) + Right pane (collapsible)
             let body = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                .constraints(if right_pane_collapsed {
+                    [Constraint::Percentage(100), Constraint::Percentage(0)]
+                } else {
+                    [Constraint::Percentage(72), Constraint::Percentage(28)]
+                })
                 .split(vertical[1]);
 
-            // Transcript with styled entries
-            let transcript_lines: Vec<Line<'_>> = shell
+            // Transcript with styled entries and syntax highlighting
+            let visible_entries: Vec<&TranscriptEntry> = shell
                 .transcript
                 .iter()
                 .rev()
@@ -683,7 +926,16 @@ where
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
-                .map(|entry| style_transcript_line(entry))
+                .collect();
+            let mut in_code_block = false;
+            let transcript_lines: Vec<Line<'_>> = visible_entries
+                .iter()
+                .map(|entry| {
+                    if entry.kind == MessageKind::Assistant && entry.text.starts_with("```") {
+                        in_code_block = !in_code_block;
+                    }
+                    style_transcript_line(entry, in_code_block)
+                })
                 .collect();
 
             let transcript_title = if let Some(ref tool) = shell.active_tool {
@@ -703,13 +955,11 @@ where
                                     .add_modifier(Modifier::BOLD),
                             ))
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(
-                                if shell.active_tool.is_some() {
-                                    Color::Yellow
-                                } else {
-                                    theme.primary
-                                },
-                            )),
+                            .border_style(Style::default().fg(if shell.active_tool.is_some() {
+                                Color::Yellow
+                            } else {
+                                theme.primary
+                            })),
                     )
                     .wrap(Wrap { trim: false }),
                 body[0],
@@ -729,10 +979,7 @@ where
                                     .add_modifier(Modifier::BOLD),
                             ))
                         } else if l.starts_with("- [x]") {
-                            Line::from(Span::styled(
-                                l.clone(),
-                                Style::default().fg(Color::Green),
-                            ))
+                            Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
                         } else if l.starts_with("- [ ]") {
                             Line::from(Span::styled(
                                 l.clone(),
@@ -746,7 +993,9 @@ where
                 RightPane::Tools => shell
                     .tool_lines
                     .iter()
-                    .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Yellow))))
+                    .map(|l| {
+                        Line::from(Span::styled(l.clone(), Style::default().fg(Color::Yellow)))
+                    })
                     .collect(),
                 RightPane::MissionControl => shell
                     .mission_control_lines
@@ -891,7 +1140,59 @@ where
         }
         if key == bindings.toggle_raw {
             right_pane = right_pane.cycle();
+            right_pane_collapsed = false;
+            // Load artifacts on-demand when switching to Artifacts pane
+            if right_pane == RightPane::Artifacts && shell.artifact_lines.is_empty() {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                shell.artifact_lines = load_artifact_lines(&cwd);
+            }
             info_line = format!("pane: {}", right_pane.title());
+            continue;
+        }
+        if key == bindings.toggle_mission_control {
+            if right_pane == RightPane::MissionControl && !right_pane_collapsed {
+                right_pane_collapsed = true;
+            } else {
+                right_pane = RightPane::MissionControl;
+                right_pane_collapsed = false;
+            }
+            info_line = if right_pane_collapsed {
+                "Mission Control: collapsed".to_string()
+            } else {
+                "Mission Control".to_string()
+            };
+            continue;
+        }
+        if key == bindings.toggle_artifacts {
+            if right_pane == RightPane::Artifacts && !right_pane_collapsed {
+                right_pane_collapsed = true;
+            } else {
+                right_pane = RightPane::Artifacts;
+                right_pane_collapsed = false;
+                if shell.artifact_lines.is_empty() {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    shell.artifact_lines = load_artifact_lines(&cwd);
+                }
+            }
+            info_line = if right_pane_collapsed {
+                "Artifacts: collapsed".to_string()
+            } else {
+                "Artifacts".to_string()
+            };
+            continue;
+        }
+        if key == bindings.toggle_plan_collapse {
+            if right_pane == RightPane::Plan {
+                right_pane_collapsed = !right_pane_collapsed;
+            } else {
+                right_pane = RightPane::Plan;
+                right_pane_collapsed = false;
+            }
+            info_line = if right_pane_collapsed {
+                "Plan: collapsed".to_string()
+            } else {
+                "Plan".to_string()
+            };
             continue;
         }
         if key == bindings.background {

@@ -28,6 +28,10 @@ pub struct SubagentTask {
     pub goal: String,
     pub role: SubagentRole,
     pub team: String,
+    /// When true, the subagent should only use read-only operations.
+    /// Set automatically on retry when a permission denial is detected.
+    #[serde(default)]
+    pub read_only_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +44,9 @@ pub struct SubagentResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    /// True if the result was produced under read-only fallback constraints.
+    #[serde(default)]
+    pub used_read_only_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,9 +91,10 @@ impl SubagentManager {
                 handles.push(thread::spawn(move || {
                     let run_id = task.run_id;
                     let mut attempts = 0usize;
+                    let mut current_task = task.clone();
                     loop {
                         attempts += 1;
-                        match worker(task.clone()) {
+                        match worker(current_task.clone()) {
                             Ok(output) => {
                                 return SubagentResult {
                                     run_id,
@@ -97,9 +105,22 @@ impl SubagentManager {
                                     success: true,
                                     output,
                                     error: None,
+                                    used_read_only_fallback: current_task.read_only_fallback,
                                 };
                             }
-                            Err(err) if attempts <= retries => continue,
+                            Err(err) if attempts <= retries => {
+                                let err_msg = err.to_string().to_ascii_lowercase();
+                                // Detect permission denial errors and fall back to read-only
+                                if err_msg.contains("permission denied")
+                                    || err_msg.contains("approval denied")
+                                    || err_msg.contains("locked mode")
+                                    || err_msg.contains("policy blocked")
+                                    || err_msg.contains("not allowed")
+                                {
+                                    current_task.read_only_fallback = true;
+                                }
+                                continue;
+                            }
                             Err(err) => {
                                 return SubagentResult {
                                     run_id,
@@ -110,6 +131,7 @@ impl SubagentManager {
                                     success: false,
                                     output: String::new(),
                                     error: Some(err.to_string()),
+                                    used_read_only_fallback: current_task.read_only_fallback,
                                 };
                             }
                         }
@@ -173,6 +195,7 @@ mod tests {
                 goal: "analyze".to_string(),
                 role: SubagentRole::Task,
                 team: "default".to_string(),
+                read_only_fallback: false,
             })
             .collect::<Vec<_>>();
 
@@ -204,6 +227,7 @@ mod tests {
             goal: "recover".to_string(),
             role: SubagentRole::Task,
             team: "execution".to_string(),
+            read_only_fallback: false,
         };
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_w = Arc::clone(&attempts);
@@ -234,6 +258,7 @@ mod tests {
                 goal: "x".to_string(),
                 role,
                 team: team.to_string(),
+                read_only_fallback: false,
             });
         }
         let results = manager.run_tasks(tasks, |task| Ok(format!("ok:{}", task.name)));
@@ -243,5 +268,37 @@ mod tests {
         assert!(lines[0].contains("explore"));
         assert!(lines[1].contains("planning"));
         assert!(lines[2].contains("execution"));
+    }
+
+    #[test]
+    fn approval_denied_triggers_read_only_fallback() {
+        let mut manager = SubagentManager::new(1);
+        manager.max_retries_per_task = 2;
+        let task = SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: "edit-file".to_string(),
+            goal: "fix bug".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+            read_only_fallback: false,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_w = Arc::clone(&attempts);
+        let results = manager.run_tasks(vec![task], move |task| {
+            let count = attempts_w.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                anyhow::bail!("permission denied: fs.write blocked by policy")
+            }
+            // On retry, the task should have read_only_fallback set
+            assert!(
+                task.read_only_fallback,
+                "expected read_only_fallback on retry"
+            );
+            Ok("read-only result".to_string())
+        });
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert!(results[0].used_read_only_fallback);
+        assert_eq!(results[0].attempts, 2);
     }
 }
