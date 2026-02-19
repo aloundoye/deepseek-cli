@@ -554,6 +554,29 @@ impl Store {
         Ok(None)
     }
 
+    pub fn load_session(&self, session_id: Uuid) -> Result<Option<Session>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, workspace_root, baseline_commit, status, budgets, active_plan_id
+             FROM sessions WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![session_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(Session {
+                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                workspace_root: row.get(1)?,
+                baseline_commit: row.get(2)?,
+                status: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                budgets: serde_json::from_str(&row.get::<_, String>(4)?)?,
+                active_plan_id: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|v| Uuid::parse_str(&v))
+                    .transpose()?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn save_plan(&self, session_id: Uuid, plan: &Plan) -> Result<()> {
         let plan_dir = self.root.join("plans");
         fs::create_dir_all(&plan_dir)?;

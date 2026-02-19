@@ -532,6 +532,20 @@ pub struct LlmResponse {
     pub tool_calls: Vec<LlmToolCall>,
 }
 
+/// A single chunk emitted during streaming.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// A content text delta.
+    ContentDelta(String),
+    /// A reasoning/thinking text delta.
+    ReasoningDelta(String),
+    /// Streaming is done; the final assembled response follows.
+    Done,
+}
+
+/// Callback type for receiving streaming chunks.
+pub type StreamCallback = Box<dyn FnMut(StreamChunk) + Send>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -745,6 +759,8 @@ pub struct PolicyConfig {
     pub redact_patterns: Vec<String>,
     pub sandbox_mode: String,
     pub sandbox_wrapper: Option<String>,
+    /// Optional lint command to run automatically after fs.edit (e.g., "cargo fmt --check").
+    pub lint_after_edit: Option<String>,
 }
 
 impl Default for PolicyConfig {
@@ -776,6 +792,7 @@ impl Default for PolicyConfig {
             ],
             sandbox_mode: "allowlist".to_string(),
             sandbox_wrapper: None,
+            lint_after_edit: None,
         }
     }
 }

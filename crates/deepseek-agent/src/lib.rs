@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 use uuid::Uuid;
@@ -208,6 +208,8 @@ pub struct AgentEngine {
     policy: PolicyEngine,
     cfg: AppConfig,
     subagents: SubagentManager,
+    /// Optional callback invoked for each streaming token chunk.
+    stream_callback: Mutex<Option<deepseek_core::StreamCallback>>,
 }
 
 impl AgentEngine {
@@ -231,7 +233,16 @@ impl AgentEngine {
             policy,
             cfg,
             subagents: SubagentManager::default(),
+            stream_callback: Mutex::new(None),
         })
+    }
+
+    /// Set a streaming callback that will be invoked for each token chunk
+    /// during LLM completions.
+    pub fn set_stream_callback(&self, cb: deepseek_core::StreamCallback) {
+        if let Ok(mut guard) = self.stream_callback.lock() {
+            *guard = Some(cb);
+        }
     }
 
     pub fn ensure_session(&self) -> Result<Session> {
@@ -541,6 +552,10 @@ impl AgentEngine {
         non_urgent: bool,
     ) -> Result<String> {
         let mut session = self.ensure_session()?;
+
+        // Fire "sessionstart" hooks (spec 2.9 extended hooks)
+        self.tool_host.fire_session_hooks("sessionstart");
+
         self.emit(
             session.session_id,
             EventKind::TurnAddedV1 {
@@ -1314,7 +1329,25 @@ impl AgentEngine {
         }
 
         let started = Instant::now();
-        let response = self.llm.complete(req)?;
+        let response = {
+            let has_cb = self
+                .stream_callback
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if has_cb {
+                let cb = self
+                    .stream_callback
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take())
+                    .unwrap();
+                // Callback is consumed; for multi-call flows we don't re-stream
+                self.llm.complete_streaming(req, cb)
+            } else {
+                self.llm.complete(req)
+            }
+        }?;
         let latency_ms = started.elapsed().as_millis() as u64;
         self.store.insert_provider_metric(&ProviderMetricRecord {
             provider: self.cfg.llm.provider.clone(),
