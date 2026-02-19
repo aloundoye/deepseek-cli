@@ -29,6 +29,15 @@ use uuid::Uuid;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
 
+/// Tools that are forbidden during review mode (read-only pipeline).
+const REVIEW_BLOCKED_TOOLS: &[&str] = &[
+    "fs.write",
+    "fs.edit",
+    "patch.stage",
+    "patch.apply",
+    "bash.run",
+];
+
 pub struct LocalToolHost {
     workspace: PathBuf,
     policy: PolicyEngine,
@@ -42,6 +51,7 @@ pub struct LocalToolHost {
     hooks_enabled: bool,
     visual_verification_enabled: bool,
     lint_after_edit: Option<String>,
+    review_mode: bool,
 }
 
 impl LocalToolHost {
@@ -81,10 +91,27 @@ impl LocalToolHost {
             hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
             visual_verification_enabled: cfg.experiments.visual_verification,
             lint_after_edit,
+            review_mode: false,
         })
     }
 
+    /// Enable review mode (read-only pipeline).
+    pub fn set_review_mode(&mut self, enabled: bool) {
+        self.review_mode = enabled;
+    }
+
+    pub fn is_review_mode(&self) -> bool {
+        self.review_mode
+    }
+
     fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
+        // Enforce review mode: block all non-read tools
+        if self.review_mode && REVIEW_BLOCKED_TOOLS.contains(&call.name.as_str()) {
+            return Err(anyhow!(
+                "tool '{}' is blocked during review mode (read-only pipeline)",
+                call.name
+            ));
+        }
         match call.name.as_str() {
             "fs.list" => {
                 let dir = call.args.get("dir").and_then(|v| v.as_str()).unwrap_or(".");
@@ -535,6 +562,84 @@ impl LocalToolHost {
                     "content": content,
                     "truncated": truncated,
                     "bytes": body.len()
+                }))
+            }
+            "web.search" => {
+                let query = call
+                    .args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("query missing"))?;
+                let max_results = call
+                    .args
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as usize;
+
+                // Check cache first
+                let query_hash = format!("{:x}", sha2::Sha256::digest(query.as_bytes()));
+                if let Ok(Some(cached)) = self.store.get_web_search_cache(&query_hash) {
+                    return Ok(json!({
+                        "query": query,
+                        "results": serde_json::from_str::<serde_json::Value>(&cached.results_json).unwrap_or(json!([])),
+                        "cached": true,
+                        "results_count": cached.results_count,
+                        "provenance": {
+                            "source": "cache",
+                            "cached_at": cached.cached_at,
+                        }
+                    }));
+                }
+
+                // Perform web search via HTML scraping of a search engine
+                let search_url = format!(
+                    "https://html.duckduckgo.com/html/?q={}",
+                    url_encode_query(query)
+                );
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .user_agent("deepseek-cli/0.1")
+                    .build()?;
+                let resp = client.get(&search_url).send()?;
+                let body = resp.text()?;
+
+                // Parse search results from HTML
+                let results = parse_search_results(&body, max_results);
+                let results_json = serde_json::to_string(&results)?;
+                let results_count = results.len() as u64;
+
+                // Cache the results
+                let _ = self.store.set_web_search_cache(&deepseek_store::WebSearchCacheRecord {
+                    query_hash: query_hash.clone(),
+                    query: query.to_string(),
+                    results_json: results_json.clone(),
+                    results_count,
+                    cached_at: chrono::Utc::now().to_rfc3339(),
+                    ttl_seconds: 900, // 15 minutes
+                });
+
+                // Emit event
+                let seq = self.store.next_seq_no(uuid::Uuid::nil()).unwrap_or(1);
+                let _ = self.store.append_event(&deepseek_core::EventEnvelope {
+                    seq_no: seq,
+                    at: chrono::Utc::now(),
+                    session_id: uuid::Uuid::nil(),
+                    kind: deepseek_core::EventKind::WebSearchExecutedV1 {
+                        query: query.to_string(),
+                        results_count,
+                        cached: false,
+                    },
+                });
+
+                Ok(json!({
+                    "query": query,
+                    "results": results,
+                    "cached": false,
+                    "results_count": results_count,
+                    "provenance": {
+                        "source": "duckduckgo",
+                        "searched_at": chrono::Utc::now().to_rfc3339(),
+                    }
                 }))
             }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
@@ -1058,6 +1163,98 @@ fn strip_html_tags(html: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+/// Parse search results from DuckDuckGo HTML response.
+fn parse_search_results(html: &str, max_results: usize) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    // Simple parsing: look for result links and snippets in DuckDuckGo HTML
+    // DuckDuckGo HTML uses class="result__a" for links and "result__snippet" for snippets
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+    while results.len() < max_results {
+        // Find next result link
+        let link_marker = "class=\"result__a\"";
+        let link_pos = match lower[pos..].find(link_marker) {
+            Some(p) => pos + p,
+            None => break,
+        };
+        // Extract href
+        let href_start = match html[..link_pos].rfind("href=\"") {
+            Some(p) => p + 6,
+            None => {
+                pos = link_pos + link_marker.len();
+                continue;
+            }
+        };
+        let href_end = match html[href_start..].find('"') {
+            Some(p) => href_start + p,
+            None => {
+                pos = link_pos + link_marker.len();
+                continue;
+            }
+        };
+        let url = html[href_start..href_end].to_string();
+        // Extract title (text within the <a> tag)
+        let tag_close = match html[link_pos..].find('>') {
+            Some(p) => link_pos + p + 1,
+            None => {
+                pos = link_pos + link_marker.len();
+                continue;
+            }
+        };
+        let tag_end = match html[tag_close..].find("</a>") {
+            Some(p) => tag_close + p,
+            None => {
+                pos = link_pos + link_marker.len();
+                continue;
+            }
+        };
+        let title = strip_html_tags(&html[tag_close..tag_end]);
+        // Extract snippet
+        let snippet_marker = "class=\"result__snippet\"";
+        let snippet = if let Some(sp) = lower[tag_end..].find(snippet_marker) {
+            let snippet_pos = tag_end + sp;
+            let snippet_start = match html[snippet_pos..].find('>') {
+                Some(p) => snippet_pos + p + 1,
+                None => tag_end,
+            };
+            let snippet_end = match html[snippet_start..].find("</") {
+                Some(p) => snippet_start + p,
+                None => snippet_start,
+            };
+            strip_html_tags(&html[snippet_start..snippet_end])
+        } else {
+            String::new()
+        };
+        if !url.is_empty() && !title.is_empty() {
+            results.push(json!({
+                "title": title.trim(),
+                "url": url,
+                "snippet": snippet.trim(),
+            }));
+        }
+        pos = tag_end;
+    }
+    results
+}
+
+/// URL-encode a string (percent encoding). Simple implementation for search queries.
+fn url_encode_query(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    encoded
 }
 
 fn generate_unified_diff(path: &str, before: &str, after: &str) -> String {

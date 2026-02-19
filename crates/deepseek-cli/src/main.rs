@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use deepseek_agent::AgentEngine;
 use deepseek_core::{
     AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventEnvelope,
-    EventKind, Session, SessionBudgets, SessionState, normalize_deepseek_model,
+    EventKind, Session, SessionBudgets, SessionState, ToolHost, normalize_deepseek_model,
     normalize_deepseek_profile, runtime_dir,
 };
 use deepseek_diff::PatchStore;
@@ -45,12 +45,16 @@ struct Cli {
     print_mode: bool,
 
     /// Resume last session and continue conversation.
-    #[arg(long = "continue")]
+    #[arg(long = "continue", short = 'c')]
     continue_session: bool,
 
     /// Resume a specific session by ID.
-    #[arg(long = "resume")]
+    #[arg(long = "resume", short = 'r')]
     resume_session: Option<String>,
+
+    /// Fork an existing session: clone conversation + state into a new session.
+    #[arg(long = "fork-session")]
+    fork_session: Option<String>,
 
     /// Override the LLM model for this invocation.
     #[arg(long)]
@@ -144,6 +148,19 @@ enum Commands {
     Clean(CleanArgs),
     /// Code review: analyze diffs and provide structured feedback.
     Review(ReviewArgs),
+    /// Execute a shell command under policy enforcement.
+    Exec(ExecArgs),
+    /// Manage the task queue.
+    Tasks {
+        #[command(subcommand)]
+        command: TasksCmd,
+    },
+    /// Web search from CLI with provenance metadata.
+    Search(SearchArgs),
+    /// Fork a session into a new one.
+    Fork(ForkArgs),
+    /// Inspect context window token usage breakdown.
+    Context(ContextArgs),
 }
 
 #[derive(Args)]
@@ -343,6 +360,54 @@ struct CompactArgs {
 
 #[derive(Args, Default)]
 struct DoctorArgs {}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// Command to execute under policy enforcement.
+    command: String,
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
+}
+
+#[derive(Subcommand)]
+enum TasksCmd {
+    /// List all tasks in the queue.
+    List,
+    /// Show details for a specific task.
+    Show(TaskShowArgs),
+    /// Cancel a task.
+    Cancel(TaskCancelArgs),
+}
+
+#[derive(Args)]
+struct TaskShowArgs {
+    /// Task ID.
+    id: String,
+}
+
+#[derive(Args)]
+struct TaskCancelArgs {
+    /// Task ID.
+    id: String,
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    /// Search query.
+    query: String,
+    /// Maximum number of results.
+    #[arg(long, default_value_t = 10)]
+    max_results: u64,
+}
+
+#[derive(Args)]
+struct ForkArgs {
+    /// Session ID to fork from.
+    session_id: String,
+}
+
+#[derive(Args, Default)]
+struct ContextArgs {}
 
 #[derive(Subcommand)]
 enum MemoryCmd {
@@ -887,6 +952,11 @@ fn main() -> Result<()> {
         Commands::Plugins { command } => run_plugins(&cwd, command, cli.json),
         Commands::Clean(args) => run_clean(&cwd, args, cli.json),
         Commands::Review(args) => run_review(&cwd, args, cli.json),
+        Commands::Exec(args) => run_exec(&cwd, args, cli.json),
+        Commands::Tasks { command } => run_tasks(&cwd, command, cli.json),
+        Commands::Search(args) => run_search(&cwd, args, cli.json),
+        Commands::Fork(args) => run_fork(&cwd, args, cli.json),
+        Commands::Context(_) => run_context(&cwd, cli.json),
     }
 }
 
@@ -2184,6 +2254,87 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         }
                     }
                 },
+                SlashCommand::Context => {
+                    run_context(cwd, json_mode)?;
+                }
+                SlashCommand::Sandbox(args) => {
+                    if json_mode {
+                        print_json(&json!({"sandbox_mode": cfg.policy.sandbox_mode, "args": args}))?;
+                    } else {
+                        println!("Sandbox mode: {}", cfg.policy.sandbox_mode);
+                        if !args.is_empty() {
+                            println!("(sandbox config changes not yet implemented in REPL)");
+                        }
+                    }
+                }
+                SlashCommand::Agents => {
+                    if json_mode {
+                        print_json(&json!({"agents": "subagent listing"}))?;
+                    } else {
+                        println!("Subagent status: use 'deepseek background list' for running agents.");
+                    }
+                }
+                SlashCommand::Tasks(_args) => {
+                    run_tasks(cwd, TasksCmd::List, json_mode)?;
+                }
+                SlashCommand::Review(args) => {
+                    if json_mode {
+                        print_json(&json!({"review": "use 'deepseek review' subcommand", "args": args}))?;
+                    } else {
+                        println!("Use 'deepseek review [--diff|--staged|--pr N]' for code review.");
+                        println!("Presets: security, perf, style, PR-ready");
+                    }
+                }
+                SlashCommand::Search(args) => {
+                    let query = args.join(" ");
+                    if query.is_empty() {
+                        println!("Usage: /search <query>");
+                    } else {
+                        run_search(cwd, SearchArgs { query, max_results: 10 }, json_mode)?;
+                    }
+                }
+                SlashCommand::TerminalSetup => {
+                    if json_mode {
+                        print_json(&json!({"terminal_setup": "configured"}))?;
+                    } else {
+                        println!("Terminal setup:");
+                        println!("  Shell: {}", std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()));
+                        println!("  TERM:  {}", std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string()));
+                        let (cols, rows) = std::process::Command::new("stty")
+                            .arg("size")
+                            .stderr(std::process::Stdio::inherit())
+                            .output()
+                            .ok()
+                            .and_then(|o| {
+                                let s = String::from_utf8_lossy(&o.stdout);
+                                let mut parts = s.split_whitespace();
+                                let r: u16 = parts.next()?.parse().ok()?;
+                                let c: u16 = parts.next()?.parse().ok()?;
+                                Some((c, r))
+                            })
+                            .unwrap_or((80, 24));
+                        println!("  Cols:  {}", cols);
+                        println!("  Rows:  {}", rows);
+                    }
+                }
+                SlashCommand::Keybindings => {
+                    let kb_path = AppConfig::keybindings_path()
+                        .unwrap_or_else(|| PathBuf::from("~/.deepseek/keybindings.json"));
+                    if json_mode {
+                        print_json(&json!({"keybindings_path": kb_path.to_string_lossy()}))?;
+                    } else {
+                        println!("Keybindings: {}", kb_path.display());
+                        if kb_path.exists() {
+                            let content = fs::read_to_string(&kb_path)?;
+                            println!("{content}");
+                        } else {
+                            println!("(no custom keybindings configured)");
+                        }
+                    }
+                }
+                SlashCommand::Doctor => {
+                    run_doctor(cwd, DoctorArgs {}, json_mode)?;
+                }
                 SlashCommand::Unknown { name, .. } => {
                     if json_mode {
                         print_json(&json!({"error": format!("unknown slash command: /{name}")}))?;
@@ -2443,6 +2594,25 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     Ok(cmd) => serde_json::to_string_pretty(&visual_payload(cwd, cmd)?)?,
                     Err(err) => format!("visual parse error: {err}"),
                 },
+                SlashCommand::Context => "Use 'deepseek context' for token breakdown.".to_string(),
+                SlashCommand::Sandbox(_) => format!("Sandbox mode: {}", AppConfig::load(cwd).unwrap_or_default().policy.sandbox_mode),
+                SlashCommand::Agents => "Use 'deepseek background list' for subagent status.".to_string(),
+                SlashCommand::Tasks(_) => "Use 'deepseek tasks list' for task queue.".to_string(),
+                SlashCommand::Review(_) => "Use 'deepseek review' subcommand for code review.".to_string(),
+                SlashCommand::Search(args) => {
+                    let query = args.join(" ");
+                    if query.is_empty() {
+                        "Usage: /search <query>".to_string()
+                    } else {
+                        format!("Search '{}': use 'deepseek search' subcommand.", query)
+                    }
+                }
+                SlashCommand::TerminalSetup => "Use /terminal-setup in interactive mode.".to_string(),
+                SlashCommand::Keybindings => {
+                    let path = AppConfig::keybindings_path().unwrap_or_default();
+                    format!("Keybindings: {}", path.display())
+                }
+                SlashCommand::Doctor => "Use 'deepseek doctor' for diagnostics.".to_string(),
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
             };
             return Ok(out);
@@ -3120,6 +3290,12 @@ fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Resu
         estimated_cost_usd,
         background_jobs,
         autopilot_running,
+        permission_mode: projection.permission_mode.clone().unwrap_or_else(|| cfg.policy.permission_mode.clone()),
+        active_tasks: projection.task_ids.len(),
+        context_used_tokens: usage.input_tokens + usage.output_tokens,
+        context_max_tokens: cfg.llm.context_window_tokens,
+        session_turns: projection.transcript.len(),
+        working_directory: cwd.display().to_string(),
     })
 }
 
@@ -8774,6 +8950,243 @@ fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Result<()> {
         }))?;
     } else {
         println!("{output}");
+    }
+    Ok(())
+}
+
+fn run_exec(cwd: &Path, args: ExecArgs, json_mode: bool) -> Result<()> {
+    let config = AppConfig::load(cwd).unwrap_or_default();
+    let policy = deepseek_policy::PolicyEngine::from_app_config(&config.policy);
+
+    // Check command against policy
+    policy.check_command(&args.command).map_err(|e| anyhow!("policy denied command: {e}"))?;
+
+    let _store = Store::new(cwd)?;
+    let tool_host = deepseek_tools::LocalToolHost::new(cwd, policy)?;
+
+    let call = deepseek_core::ToolCall {
+        name: "bash.run".to_string(),
+        args: json!({"cmd": args.command, "timeout": args.timeout}),
+        requires_approval: false,
+    };
+    let proposal = tool_host.propose(call);
+    let result = tool_host.execute(deepseek_core::ApprovedToolCall {
+        invocation_id: proposal.invocation_id,
+        call: proposal.call,
+    });
+
+    if json_mode {
+        print_json(&json!({
+            "command": args.command,
+            "success": result.success,
+            "output": result.output,
+        }))?;
+    } else {
+        if let Some(stdout) = result.output.get("stdout").and_then(|v| v.as_str()) {
+            print!("{stdout}");
+        }
+        if let Some(stderr) = result.output.get("stderr").and_then(|v| v.as_str()) {
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Result<()> {
+    let store = Store::new(cwd)?;
+    match command {
+        TasksCmd::List => {
+            let tasks = store.list_tasks(None)?;
+            if json_mode {
+                print_json(&json!({"tasks": tasks}))?;
+            } else {
+                if tasks.is_empty() {
+                    println!("No tasks in queue.");
+                } else {
+                    println!("{:<36}  {:<10}  {:<4}  {}", "ID", "STATUS", "PRI", "TITLE");
+                    println!("{}", "-".repeat(80));
+                    for task in &tasks {
+                        println!(
+                            "{:<36}  {:<10}  {:<4}  {}",
+                            task.task_id, task.status, task.priority, task.title
+                        );
+                    }
+                    println!("\n{} task(s) total.", tasks.len());
+                }
+            }
+        }
+        TasksCmd::Show(args) => {
+            let task_id = Uuid::parse_str(&args.id)?;
+            let tasks = store.list_tasks(None)?;
+            let task = tasks
+                .iter()
+                .find(|t| t.task_id == task_id)
+                .ok_or_else(|| anyhow!("task not found: {}", args.id))?;
+            if json_mode {
+                print_json(&serde_json::to_value(task)?)?;
+            } else {
+                println!("Task:     {}", task.task_id);
+                println!("Title:    {}", task.title);
+                println!("Status:   {}", task.status);
+                println!("Priority: {}", task.priority);
+                if let Some(outcome) = &task.outcome {
+                    println!("Outcome:  {outcome}");
+                }
+                if let Some(path) = &task.artifact_path {
+                    println!("Artifacts: {path}");
+                }
+                println!("Created:  {}", task.created_at);
+                println!("Updated:  {}", task.updated_at);
+            }
+        }
+        TasksCmd::Cancel(args) => {
+            let task_id = Uuid::parse_str(&args.id)?;
+            store.update_task_status(task_id, "cancelled", Some("cancelled by user"))?;
+            if json_mode {
+                print_json(&json!({"task_id": args.id, "status": "cancelled"}))?;
+            } else {
+                println!("Task {task_id} cancelled.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_search(cwd: &Path, args: SearchArgs, json_mode: bool) -> Result<()> {
+    let _store = Store::new(cwd)?;
+    let config = AppConfig::load(cwd).unwrap_or_default();
+    let policy = deepseek_policy::PolicyEngine::from_app_config(&config.policy);
+    let tool_host = deepseek_tools::LocalToolHost::new(cwd, policy)?;
+
+    let call = deepseek_core::ToolCall {
+        name: "web.search".to_string(),
+        args: json!({"query": args.query, "max_results": args.max_results}),
+        requires_approval: false,
+    };
+    let proposal = tool_host.propose(call);
+    let result = tool_host.execute(deepseek_core::ApprovedToolCall {
+        invocation_id: proposal.invocation_id,
+        call: proposal.call,
+    });
+
+    if json_mode {
+        print_json(&result.output)?;
+    } else {
+        if let Some(results) = result.output.get("results").and_then(|v| v.as_array()) {
+            for (i, r) in results.iter().enumerate() {
+                let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+                println!("{}. {}", i + 1, title);
+                println!("   {url}");
+                if !snippet.is_empty() {
+                    println!("   {snippet}");
+                }
+                println!();
+            }
+            let cached = result
+                .output
+                .get("cached")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if cached {
+                println!("(results from cache)");
+            }
+        } else {
+            println!("No results found.");
+        }
+    }
+    Ok(())
+}
+
+fn run_fork(cwd: &Path, args: ForkArgs, json_mode: bool) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let session_id = Uuid::parse_str(&args.session_id)?;
+
+    // Try to acquire lock on source session to prevent concurrent forks
+    let holder = format!("fork-{}", std::process::id());
+    if !store.try_acquire_session_lock(session_id, &holder)? {
+        return Err(anyhow!(
+            "session {} is locked by another process",
+            args.session_id
+        ));
+    }
+
+    let forked = store.fork_session(session_id)?;
+    store.release_session_lock(session_id, &holder)?;
+
+    if json_mode {
+        print_json(&json!({
+            "forked_from": args.session_id,
+            "new_session_id": forked.session_id.to_string(),
+            "status": "idle",
+        }))?;
+    } else {
+        println!(
+            "Forked session {} → {}",
+            args.session_id, forked.session_id
+        );
+        println!("New session is ready. Use --resume {} to continue.", forked.session_id);
+    }
+    Ok(())
+}
+
+fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
+    let config = AppConfig::load(cwd).unwrap_or_default();
+    let store = Store::new(cwd)?;
+
+    let context_window = config.llm.context_window_tokens;
+    let compact_threshold = config.context.auto_compact_threshold;
+
+    // Load latest session to compute token usage
+    let session = store.load_latest_session()?;
+    let (session_tokens, compactions) = if let Some(ref s) = session {
+        let usage = store.usage_summary(Some(s.session_id), None)?;
+        let compactions = store.list_context_compactions(Some(s.session_id))?;
+        (usage.input_tokens + usage.output_tokens, compactions.len())
+    } else {
+        (0, 0)
+    };
+
+    let utilization = if context_window > 0 {
+        (session_tokens as f64 / context_window as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    if json_mode {
+        print_json(&json!({
+            "context_window_tokens": context_window,
+            "auto_compact_threshold": compact_threshold,
+            "session_tokens_used": session_tokens,
+            "utilization_pct": format!("{utilization:.1}"),
+            "compactions": compactions,
+            "breakdown": {
+                "system_prompt": "~2000",
+                "conversation": session_tokens,
+                "tools": "variable",
+                "memory": "variable",
+            }
+        }))?;
+    } else {
+        println!("Context Window Inspector");
+        println!("========================");
+        println!("Window size:       {} tokens", context_window);
+        println!("Compact threshold: {:.0}%", compact_threshold * 100.0);
+        println!("Session tokens:    {session_tokens}");
+        println!("Utilization:       {utilization:.1}%");
+        println!("Compactions:       {compactions}");
+        println!();
+        println!("Breakdown (estimated):");
+        println!("  System prompt:   ~2,000 tokens");
+        println!("  Conversation:    {session_tokens} tokens");
+        println!("  Tools/results:   variable");
+        println!("  Memory (DEEPSEEK.md): variable");
+        if utilization > (compact_threshold as f64 * 100.0) {
+            println!("\n⚠ Context is above compact threshold. Use /compact to free space.");
+        }
     }
     Ok(())
 }

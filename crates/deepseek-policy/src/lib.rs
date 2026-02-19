@@ -5,6 +5,46 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionMode {
+    Ask,
+    Auto,
+    Locked,
+}
+
+impl PermissionMode {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => PermissionMode::Auto,
+            "locked" => PermissionMode::Locked,
+            _ => PermissionMode::Ask,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PermissionMode::Ask => "ask",
+            PermissionMode::Auto => "auto",
+            PermissionMode::Locked => "locked",
+        }
+    }
+
+    /// Cycle to the next mode: ask → auto → locked → ask.
+    pub fn cycle(&self) -> Self {
+        match self {
+            PermissionMode::Ask => PermissionMode::Auto,
+            PermissionMode::Auto => PermissionMode::Locked,
+            PermissionMode::Locked => PermissionMode::Ask,
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     pub approve_edits: bool,
@@ -15,6 +55,7 @@ pub struct PolicyConfig {
     pub redact_patterns: Vec<String>,
     pub sandbox_mode: String,
     pub sandbox_wrapper: Option<String>,
+    pub permission_mode: PermissionMode,
 }
 
 impl Default for PolicyConfig {
@@ -60,6 +101,7 @@ impl Default for PolicyConfig {
             ],
             sandbox_mode: "allowlist".to_string(),
             sandbox_wrapper: None,
+            permission_mode: PermissionMode::Ask,
         }
     }
 }
@@ -82,6 +124,7 @@ pub enum PolicyError {
 pub struct PolicyEngine {
     cfg: PolicyConfig,
     secret_regexes: Vec<Regex>,
+    permission_mode: PermissionMode,
 }
 
 impl PolicyEngine {
@@ -98,9 +141,11 @@ impl PolicyEngine {
                 .filter_map(|pattern| Regex::new(&pattern).ok())
                 .collect::<Vec<_>>();
         }
+        let permission_mode = cfg.permission_mode;
         Self {
             cfg,
             secret_regexes,
+            permission_mode,
         }
     }
 
@@ -131,6 +176,7 @@ impl PolicyEngine {
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            permission_mode: PermissionMode::from_str_lossy(&cfg.permission_mode),
         };
         if let Some(team_policy) = load_team_policy_override() {
             mapped = apply_team_policy_override(mapped, &team_policy);
@@ -190,14 +236,117 @@ impl PolicyEngine {
     }
 
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
-        (call.name == "patch.apply" && self.cfg.approve_edits)
-            || (call.name == "bash.run" && self.cfg.approve_bash)
-            || call.requires_approval
+        match self.permission_mode {
+            PermissionMode::Locked => {
+                // In locked mode, all non-read tools require approval (and will be denied).
+                !is_read_only_tool(&call.name)
+            }
+            PermissionMode::Auto => {
+                // In auto mode, allowlisted tools auto-approve; others still need approval.
+                if call.name == "bash.run" {
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
+                        if self.check_command(cmd).is_ok() {
+                            return false; // allowlisted command, auto-approve
+                        }
+                    }
+                    true
+                } else if is_read_only_tool(&call.name) {
+                    false
+                } else {
+                    // For edits/writes: auto mode doesn't prompt
+                    false
+                }
+            }
+            PermissionMode::Ask => {
+                (call.name == "patch.apply" && self.cfg.approve_edits)
+                    || (call.name == "bash.run" && self.cfg.approve_bash)
+                    || call.requires_approval
+            }
+        }
+    }
+
+    /// Check if a tool call would be blocked in locked mode.
+    pub fn is_blocked_in_locked_mode(&self, call: &ToolCall) -> bool {
+        !is_read_only_tool(&call.name)
+    }
+
+    /// Dry-run evaluator: returns what would happen to a tool call under the current mode.
+    pub fn dry_run(&self, call: &ToolCall) -> PermissionDryRunResult {
+        match self.permission_mode {
+            PermissionMode::Locked => {
+                if is_read_only_tool(&call.name) {
+                    PermissionDryRunResult::Allowed
+                } else {
+                    PermissionDryRunResult::Denied("locked mode blocks all non-read operations".to_string())
+                }
+            }
+            PermissionMode::Auto => {
+                if is_read_only_tool(&call.name) {
+                    PermissionDryRunResult::Allowed
+                } else if call.name == "bash.run" {
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
+                        if self.check_command(cmd).is_ok() {
+                            return PermissionDryRunResult::AutoApproved;
+                        }
+                    }
+                    PermissionDryRunResult::NeedsApproval
+                } else {
+                    PermissionDryRunResult::AutoApproved
+                }
+            }
+            PermissionMode::Ask => {
+                if self.requires_approval(call) {
+                    PermissionDryRunResult::NeedsApproval
+                } else {
+                    PermissionDryRunResult::Allowed
+                }
+            }
+        }
+    }
+
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
+    }
+
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.permission_mode = mode;
     }
 
     pub fn sandbox_mode(&self) -> &str {
         &self.cfg.sandbox_mode
     }
+}
+
+/// Result of a dry-run evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDryRunResult {
+    /// Tool call is allowed (read-only or no gate).
+    Allowed,
+    /// Tool call would be auto-approved (auto mode).
+    AutoApproved,
+    /// Tool call needs user approval.
+    NeedsApproval,
+    /// Tool call would be denied.
+    Denied(String),
+}
+
+/// Returns true if the tool is read-only (never modifies state).
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.read"
+            | "fs.list"
+            | "fs.glob"
+            | "fs.grep"
+            | "fs.search_rg"
+            | "index.query"
+            | "git.status"
+            | "git.diff"
+            | "git.show"
+            | "git.log"
+            | "web.fetch"
+            | "web.search"
+    )
 }
 
 impl Default for PolicyEngine {
@@ -515,6 +664,7 @@ mod tests {
             redact_patterns: vec!["token".to_string()],
             sandbox_mode: "allowlist".to_string(),
             sandbox_wrapper: None,
+            permission_mode: PermissionMode::Ask,
         };
         let team = TeamPolicyFile {
             approve_edits: Some("ask".to_string()),
@@ -601,6 +751,69 @@ mod tests {
         unsafe {
             std::env::remove_var("DEEPSEEK_TEAM_POLICY_PATH");
         }
+    }
+
+    #[test]
+    fn locked_mode_blocks_all_non_read_operations() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Locked,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let write_call = ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let read_call = ToolCall {
+            name: "fs.read".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        assert!(policy.requires_approval(&write_call));
+        assert!(!policy.requires_approval(&read_call));
+        assert_eq!(policy.dry_run(&write_call), PermissionDryRunResult::Denied("locked mode blocks all non-read operations".to_string()));
+        assert_eq!(policy.dry_run(&read_call), PermissionDryRunResult::Allowed);
+    }
+
+    #[test]
+    fn auto_mode_auto_approves_allowlisted_bash() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Auto,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let allowed_bash = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "cargo test --workspace"}),
+            requires_approval: false,
+        };
+        let blocked_bash = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "unknown_command foo"}),
+            requires_approval: false,
+        };
+        assert!(!policy.requires_approval(&allowed_bash));
+        assert!(policy.requires_approval(&blocked_bash));
+        assert_eq!(policy.dry_run(&allowed_bash), PermissionDryRunResult::AutoApproved);
+        assert_eq!(policy.dry_run(&blocked_bash), PermissionDryRunResult::NeedsApproval);
+    }
+
+    #[test]
+    fn permission_mode_cycles_correctly() {
+        assert_eq!(PermissionMode::Ask.cycle(), PermissionMode::Auto);
+        assert_eq!(PermissionMode::Auto.cycle(), PermissionMode::Locked);
+        assert_eq!(PermissionMode::Locked.cycle(), PermissionMode::Ask);
+    }
+
+    #[test]
+    fn permission_mode_from_str_lossy_handles_variants() {
+        assert_eq!(PermissionMode::from_str_lossy("ask"), PermissionMode::Ask);
+        assert_eq!(PermissionMode::from_str_lossy("auto"), PermissionMode::Auto);
+        assert_eq!(PermissionMode::from_str_lossy("locked"), PermissionMode::Locked);
+        assert_eq!(PermissionMode::from_str_lossy("LOCKED"), PermissionMode::Locked);
+        assert_eq!(PermissionMode::from_str_lossy("  Auto "), PermissionMode::Auto);
+        assert_eq!(PermissionMode::from_str_lossy("invalid"), PermissionMode::Ask);
     }
 
     proptest! {
