@@ -34,7 +34,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Background execution** | Long-running tasks can be backgrounded (Ctrl+B) and resumed. |
 | **Print mode (`-p`)** | Non-interactive headless mode for CI/CD and scripting. Reads prompt from arg or stdin pipe. Supports `--output-format` (text/json/stream-json). |
 | **Session continue** | `--continue` resumes last session; `--resume <ID>` resumes a specific session. Full conversation context is restored. |
-| **Model/provider override** | `--model` and `--provider` flags for per-invocation overrides. |
+| **Model override** | `--model` flag for per-invocation model override (e.g., `deepseek-chat` or `deepseek-reasoner`). |
 
 ### 2.2 File System Operations
 
@@ -199,7 +199,7 @@ The CLI supports three runtime permission modes that govern how tool calls are a
 | **Automatic “max thinking”** | Seamlessly escalate to `deepseek-reasoner` when complexity requires it. |
 | **Prompt caching** | 90% discount on repeated input tokens; implement aggressive caching. |
 | **Off-peak scheduling** | Option to defer non-urgent tasks to cheaper rate periods. |
-| **Multi-provider support** | Pluggable backends via `llm.provider`: `deepseek` (default), `openai`, `anthropic`, `custom`, `local`, `ollama`. All use OpenAI-compatible chat format. Inspired by Codex CLI and Aider's model-agnostic approach. |
+| **DeepSeek-only provider** | Single-provider design: all API calls go to DeepSeek (`deepseek-chat` / `deepseek-reasoner`). No multi-LLM abstraction layer. Configuration knob `llm.provider` is reserved for future extensibility but currently only accepts `"deepseek"`. |
 | **Performance monitoring** | `/profile` command showing time breakdown. |
 | **Integration marketplace** | Community repository of MCP plugins. |
 
@@ -215,7 +215,7 @@ crates/
   ui/           # TUI (ratatui + crossterm), theme, layout, keybindings
   core/         # Shared config types, session loop, scheduling
   agent/        # Planner, Executor, Subagent orchestration, session hooks
-  llm/          # Multi-provider LLM client, streaming, retries, caching
+  llm/          # DeepSeek API client, streaming, retries, caching
   router/       # Model routing + auto max-think policy
   tools/        # Tool registry, sandboxed execution, web.fetch, auto-lint
   mcp/          # MCP server management and protocol handling
@@ -396,7 +396,7 @@ In addition to the REPL, the CLI supports one-shot commands:
 
 **Per-invocation overrides:**
 - `--model <name>` overrides `llm.base_model` for this run.
-- `--provider <name>` overrides `llm.provider` for this run.
+- `llm.provider` is reserved but must be `"deepseek"` (the only supported provider).
 
 ---
 
@@ -458,7 +458,7 @@ In addition to the REPL, the CLI supports one-shot commands:
 [llm]
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
-provider = "deepseek"              # deepseek | openai | anthropic | custom | local | ollama
+provider = "deepseek"              # Only "deepseek" is supported
 profile = "v3_2"
 context_window_tokens = 128000
 temperature = 0.2
