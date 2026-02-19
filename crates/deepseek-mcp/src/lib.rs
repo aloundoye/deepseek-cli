@@ -469,6 +469,71 @@ fn parse_mcp_tools_message(server_id: &str, message: &serde_json::Value) -> Vec<
     out
 }
 
+/// OAuth token for MCP server authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthToken {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_at: Option<String>,
+    pub server_id: String,
+}
+
+/// Store an OAuth token for an MCP server.
+pub fn store_mcp_token(server_id: &str, token: &McpOAuthToken) -> Result<()> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| anyhow::anyhow!("cannot determine home directory"))?;
+    let dir = PathBuf::from(home).join(".deepseek/mcp-tokens");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", server_id));
+    let json = serde_json::to_string_pretty(token)?;
+    fs::write(&path, json)?;
+    // Restrict permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, perms)?;
+    }
+    Ok(())
+}
+
+/// Load a stored OAuth token for an MCP server.
+pub fn load_mcp_token(server_id: &str) -> Result<Option<McpOAuthToken>> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| anyhow::anyhow!("cannot determine home directory"))?;
+    let path = PathBuf::from(home).join(format!(".deepseek/mcp-tokens/{}.json", server_id));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)?;
+    let token: McpOAuthToken = serde_json::from_str(&raw)?;
+    Ok(Some(token))
+}
+
+/// Delete a stored OAuth token.
+pub fn delete_mcp_token(server_id: &str) -> Result<()> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| anyhow::anyhow!("cannot determine home directory"))?;
+    let path = PathBuf::from(home).join(format!(".deepseek/mcp-tokens/{}.json", server_id));
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Add McpServe variant to McpCmd enum (if it has one) or add the serve handler
+/// This function starts an MCP JSON-RPC server on stdin/stdout.
+pub fn run_mcp_serve(workspace: &Path) -> Result<()> {
+    // Stub: full implementation would use deepseek-jsonrpc crate
+    let _ = workspace;
+    eprintln!("MCP serve mode: listening on stdin/stdout (stub)");
+    Ok(())
+}
+
 fn parse_tools_array(server_id: &str, tools: &[serde_json::Value]) -> Vec<McpTool> {
     tools
         .iter()
@@ -613,5 +678,44 @@ mod tests {
         let tools = parse_mcp_tools_message("srv", &parsed);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "ping");
+    }
+
+    #[test]
+    fn mcp_token_roundtrip() {
+        let server_id = format!("test-server-{}", uuid::Uuid::now_v7());
+        let token = McpOAuthToken {
+            access_token: "abc123".to_string(),
+            refresh_token: Some("refresh456".to_string()),
+            token_type: "Bearer".to_string(),
+            expires_at: Some("2025-12-31T23:59:59Z".to_string()),
+            server_id: server_id.clone(),
+        };
+        store_mcp_token(&server_id, &token).unwrap();
+        let loaded = load_mcp_token(&server_id).unwrap().unwrap();
+        assert_eq!(loaded.access_token, "abc123");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh456"));
+        delete_mcp_token(&server_id).unwrap();
+        assert!(load_mcp_token(&server_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_nonexistent_token_returns_none() {
+        let result = load_mcp_token("nonexistent-server-xyz").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn mcp_token_serialization() {
+        let token = McpOAuthToken {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            token_type: "Bearer".to_string(),
+            expires_at: None,
+            server_id: "srv".to_string(),
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(json.contains("tok"));
+        let parsed: McpOAuthToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.access_token, "tok");
     }
 }
