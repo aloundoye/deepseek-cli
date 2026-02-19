@@ -3450,6 +3450,7 @@ fn subagent_request_for_task(
         SubagentRole::Plan => (LlmUnit::Planner, max_think_model.to_string(), 3072),
         SubagentRole::Explore => (LlmUnit::Planner, base_model.to_string(), 2048),
         SubagentRole::Task => (LlmUnit::Executor, base_model.to_string(), 2048),
+        SubagentRole::Custom(_) => (LlmUnit::Executor, base_model.to_string(), 2048),
     };
     let prompt = format!(
         "You are a coding subagent.\n\
@@ -3520,6 +3521,7 @@ fn subagent_team_for_role(role: &SubagentRole) -> &'static str {
         SubagentRole::Explore => "explore",
         SubagentRole::Plan => "planning",
         SubagentRole::Task => "execution",
+        SubagentRole::Custom(_) => "custom",
     }
 }
 
@@ -4018,6 +4020,7 @@ fn subagent_arbitration_priority(role: &SubagentRole) -> u8 {
         SubagentRole::Task => 0,
         SubagentRole::Plan => 1,
         SubagentRole::Explore => 2,
+        SubagentRole::Custom(_) => 3,
     }
 }
 
@@ -4027,6 +4030,7 @@ fn subagent_arbitration_score(result: &deepseek_subagent::SubagentResult, target
         SubagentRole::Task => 0.20,
         SubagentRole::Plan => 0.14,
         SubagentRole::Explore => 0.08,
+        SubagentRole::Custom(_) => 0.15,
     };
     let output = result.output.to_ascii_lowercase();
     let target_lc = target.to_ascii_lowercase();
@@ -4090,6 +4094,7 @@ fn subagent_probe_call(task: &SubagentTask, root_goal: &str) -> Option<ToolCall>
             args: json!({}),
             requires_approval: false,
         }),
+        SubagentRole::Custom(_) => None,
     }
 }
 

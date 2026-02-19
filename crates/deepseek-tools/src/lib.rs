@@ -964,7 +964,13 @@ impl LocalToolHost {
         if is_isolated_sandbox_mode(&self.sandbox_mode) {
             return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
         }
-        self.run_cmd(cmd, timeout_secs)
+        // Apply OS-level sandbox if enabled
+        let sandbox_cfg = AppConfig::load(&self.workspace)
+            .unwrap_or_default()
+            .policy
+            .sandbox;
+        let sandboxed_cmd = sandbox_wrap_command(&self.workspace, cmd, &sandbox_cfg);
+        self.run_cmd(&sandboxed_cmd, timeout_secs)
     }
 
     fn run_cmd_in_isolated_sandbox(
@@ -1899,6 +1905,113 @@ fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<u
     ))
 }
 
+/// Generate a macOS Seatbelt sandbox profile.
+#[allow(dead_code)]
+fn build_seatbelt_profile(workspace: &Path, config: &deepseek_core::SandboxConfig) -> String {
+    let workspace_str = workspace.to_string_lossy();
+    let mut profile = String::from("(version 1)\n(deny default)\n");
+    profile.push_str("(allow process*)\n");
+    profile.push_str("(allow file-read* (subpath \"/usr\") (subpath \"/lib\") (subpath \"/bin\") (subpath \"/System\"))\n");
+    profile.push_str(&format!(
+        "(allow file-read* file-write* (subpath \"{}\"))\n",
+        workspace_str
+    ));
+    // Allow /tmp access
+    profile
+        .push_str("(allow file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\"))\n");
+    // Network access
+    if config.network.block_all {
+        profile.push_str("(deny network*)\n");
+    } else if !config.network.allowed_domains.is_empty() {
+        // Allow network but note: Seatbelt doesn't support per-domain filtering natively.
+        // Allow all network when specific domains are requested (filtering done at app level).
+        profile.push_str("(allow network*)\n");
+    } else {
+        profile.push_str("(allow network*)\n");
+    }
+    profile
+}
+
+/// Wrap a command with macOS Seatbelt sandbox.
+#[allow(dead_code)]
+fn seatbelt_wrap(cmd: &str, profile: &str) -> String {
+    // Escape single quotes in profile
+    let escaped_profile = profile.replace('\'', "'\\''");
+    format!("sandbox-exec -p '{}' -- {}", escaped_profile, cmd)
+}
+
+/// Build a Linux bubblewrap (bwrap) sandboxed command.
+#[allow(dead_code)]
+fn build_bwrap_command(
+    workspace: &Path,
+    cmd: &str,
+    config: &deepseek_core::SandboxConfig,
+) -> String {
+    let workspace_str = workspace.to_string_lossy();
+    let mut parts = vec![
+        "bwrap".to_string(),
+        "--die-with-parent".to_string(),
+        "--new-session".to_string(),
+    ];
+    // Read-only system paths
+    for sys_path in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
+        parts.push("--ro-bind".to_string());
+        parts.push(sys_path.to_string());
+        parts.push(sys_path.to_string());
+    }
+    // Read-write workspace
+    parts.push("--bind".to_string());
+    parts.push(workspace_str.to_string());
+    parts.push(workspace_str.to_string());
+    // Tmp
+    parts.push("--tmpfs".to_string());
+    parts.push("/tmp".to_string());
+    // Network
+    if config.network.block_all {
+        parts.push("--unshare-net".to_string());
+    }
+    // Proc and dev
+    parts.push("--proc".to_string());
+    parts.push("/proc".to_string());
+    parts.push("--dev".to_string());
+    parts.push("/dev".to_string());
+    parts.push("--".to_string());
+    parts.push(cmd.to_string());
+    parts.join(" ")
+}
+
+/// Wrap a command with the appropriate OS-level sandbox if enabled.
+#[allow(clippy::needless_return)]
+fn sandbox_wrap_command(
+    workspace: &Path,
+    cmd: &str,
+    config: &deepseek_core::SandboxConfig,
+) -> String {
+    if !config.enabled {
+        return cmd.to_string();
+    }
+    // Check if command is excluded
+    for excluded in &config.excluded_commands {
+        if cmd.starts_with(excluded) || cmd.contains(excluded) {
+            return cmd.to_string();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let profile = build_seatbelt_profile(workspace, config);
+        return seatbelt_wrap(cmd, &profile);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return build_bwrap_command(workspace, cmd, config);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = workspace;
+        cmd.to_string()
+    }
+}
+
 impl LocalToolHost {
     /// Fire "stop" hooks when the agent run completes.
     pub fn fire_stop_hooks(&self) {
@@ -2637,5 +2750,109 @@ mod tests {
         assert_eq!(diagnostics[0]["line"], 42);
         assert_eq!(diagnostics[0]["column"], 13);
         assert_eq!(diagnostics[0]["code"], "TS2304");
+    }
+
+    #[test]
+    fn seatbelt_profile_allows_workspace() {
+        let workspace = std::path::Path::new("/tmp/test-project");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig {
+                allowed_domains: vec![],
+                block_all: false,
+            },
+            excluded_commands: vec![],
+        };
+        let profile = super::build_seatbelt_profile(workspace, &config);
+        assert!(profile.contains("/tmp/test-project"));
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow process*)"));
+    }
+
+    #[test]
+    fn seatbelt_profile_blocks_network() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig {
+                allowed_domains: vec![],
+                block_all: true,
+            },
+            excluded_commands: vec![],
+        };
+        let profile = super::build_seatbelt_profile(workspace, &config);
+        assert!(profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn bwrap_command_includes_workspace() {
+        let workspace = std::path::Path::new("/home/user/project");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig {
+                allowed_domains: vec![],
+                block_all: false,
+            },
+            excluded_commands: vec![],
+        };
+        let result = super::build_bwrap_command(workspace, "ls -la", &config);
+        assert!(result.contains("bwrap"));
+        assert!(result.contains("/home/user/project"));
+        assert!(result.contains("ls -la"));
+    }
+
+    #[test]
+    fn bwrap_unshares_network_when_blocked() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig {
+                allowed_domains: vec![],
+                block_all: true,
+            },
+            excluded_commands: vec![],
+        };
+        let result = super::build_bwrap_command(workspace, "echo hi", &config);
+        assert!(result.contains("--unshare-net"));
+    }
+
+    #[test]
+    fn sandbox_disabled_passes_through() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let result = super::sandbox_wrap_command(workspace, "echo hello", &config);
+        assert_eq!(result, "echo hello");
+    }
+
+    #[test]
+    fn sandbox_excluded_command_passes_through() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig::default(),
+            excluded_commands: vec!["cargo".to_string()],
+        };
+        let result = super::sandbox_wrap_command(workspace, "cargo test", &config);
+        assert_eq!(result, "cargo test");
+    }
+
+    #[test]
+    fn seatbelt_wrap_formats_correctly() {
+        let profile = "(version 1)\n(deny default)";
+        let result = super::seatbelt_wrap("echo test", profile);
+        assert!(result.starts_with("sandbox-exec"));
+        assert!(result.contains("echo test"));
+    }
+
+    #[test]
+    fn bwrap_includes_proc_and_dev() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig::default();
+        let result = super::build_bwrap_command(workspace, "ls", &config);
+        assert!(result.contains("--proc"));
+        assert!(result.contains("--dev"));
     }
 }

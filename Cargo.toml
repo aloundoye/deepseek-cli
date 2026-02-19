@@ -19,6 +19,7 @@ members = [
   "crates/deepseek-skills",
   "crates/deepseek-hooks",
   "crates/deepseek-jsonrpc",
+  "crates/deepseek-chrome",
 ]
 resolver = "2"
 

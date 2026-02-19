@@ -2770,6 +2770,9 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::IdeSessionStartedV1 { .. } => "IdeSessionStarted@v1",
         EventKind::TurnLimitExceededV1 { .. } => "TurnLimitExceeded@v1",
         EventKind::BudgetExceededV1 { .. } => "BudgetExceeded@v1",
+        EventKind::TaskUpdatedV1 { .. } => "TaskUpdated@v1",
+        EventKind::TaskDeletedV1 { .. } => "TaskDeleted@v1",
+        EventKind::ExitPlanModeV1 { .. } => "ExitPlanMode@v1",
     }
 }
 

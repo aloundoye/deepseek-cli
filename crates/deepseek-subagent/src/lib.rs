@@ -9,6 +9,7 @@ pub enum SubagentRole {
     Explore,
     Plan,
     Task,
+    Custom(String),
 }
 
 impl SubagentRole {
@@ -17,6 +18,7 @@ impl SubagentRole {
             Self::Explore => 0,
             Self::Plan => 1,
             Self::Task => 2,
+            Self::Custom(_) => 3,
         }
     }
 }
@@ -47,6 +49,123 @@ pub struct SubagentResult {
     /// True if the result was produced under read-only fallback constraints.
     #[serde(default)]
     pub used_read_only_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomAgentDef {
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+    pub model: Option<String>,
+    pub max_turns: Option<u64>,
+}
+
+/// Load custom agent definitions from .deepseek/agents/*.md and ~/.deepseek/agents/*.md
+pub fn load_agent_defs(workspace: &std::path::Path) -> Result<Vec<CustomAgentDef>> {
+    let mut defs = Vec::new();
+    let project_dir = workspace.join(".deepseek/agents");
+    if project_dir.is_dir() {
+        load_agent_defs_from_dir(&project_dir, &mut defs)?;
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let global_dir = std::path::PathBuf::from(home).join(".deepseek/agents");
+        if global_dir.is_dir() {
+            load_agent_defs_from_dir(&global_dir, &mut defs)?;
+        }
+    }
+    Ok(defs)
+}
+
+fn load_agent_defs_from_dir(dir: &std::path::Path, out: &mut Vec<CustomAgentDef>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        if let Some(def) = parse_agent_def(&raw, &path) {
+            out.push(def);
+        }
+    }
+    Ok(())
+}
+
+fn parse_agent_def(raw: &str, path: &std::path::Path) -> Option<CustomAgentDef> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let end_idx = trimmed[3..].find("---")?;
+    let frontmatter = &trimmed[3..3 + end_idx];
+    let body = trimmed[3 + end_idx + 3..].trim().to_string();
+
+    let mut name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("custom")
+        .to_string();
+    let mut description = String::new();
+    let mut tools = Vec::new();
+    let mut disallowed_tools = Vec::new();
+    let mut model = None;
+    let mut max_turns = None;
+
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("name:") {
+            name = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+        } else if let Some(value) = line.strip_prefix("description:") {
+            description = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+        } else if let Some(value) = line.strip_prefix("model:") {
+            model = Some(
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
+            );
+        } else if let Some(value) = line.strip_prefix("max_turns:") {
+            max_turns = value.trim().parse().ok();
+        } else if let Some(value) = line.strip_prefix("tools:") {
+            tools = value
+                .trim()
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        } else if let Some(value) = line.strip_prefix("disallowed_tools:") {
+            disallowed_tools = value
+                .trim()
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+
+    Some(CustomAgentDef {
+        name,
+        description,
+        prompt: body,
+        tools,
+        disallowed_tools,
+        model,
+        max_turns,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +298,114 @@ impl SubagentManager {
     }
 }
 
+/// Teammate execution mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TeammateMode {
+    /// Run teammates in the same process using thread pool.
+    InProcess,
+    /// Run teammates in tmux windows.
+    Tmux,
+    /// Automatically choose based on environment.
+    #[default]
+    Auto,
+}
+
+impl TeammateMode {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "in-process" | "in_process" | "inprocess" => Self::InProcess,
+            "tmux" => Self::Tmux,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// A message between team members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMessage {
+    pub from: String,
+    pub to: String,
+    pub content: String,
+    pub timestamp: String,
+}
+
+/// Shared state for a team of agents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamState {
+    pub messages: Vec<TeamMessage>,
+    pub completed_tasks: Vec<String>,
+}
+
+impl TeamState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn send_message(&mut self, from: &str, to: &str, content: &str) {
+        self.messages.push(TeamMessage {
+            from: from.to_string(),
+            to: to.to_string(),
+            content: content.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+
+    pub fn messages_for(&self, recipient: &str) -> Vec<&TeamMessage> {
+        self.messages
+            .iter()
+            .filter(|m| m.to == recipient || m.to == "*")
+            .collect()
+    }
+
+    pub fn mark_completed(&mut self, task_name: &str) {
+        self.completed_tasks.push(task_name.to_string());
+    }
+}
+
+/// Coordinator for a team of agents working together.
+pub struct TeamCoordinator {
+    pub manager: SubagentManager,
+    pub mode: TeammateMode,
+    pub shared_state: std::sync::Arc<std::sync::Mutex<TeamState>>,
+}
+
+impl TeamCoordinator {
+    pub fn new(mode: TeammateMode, max_concurrency: usize) -> Self {
+        Self {
+            manager: SubagentManager::new(max_concurrency),
+            mode,
+            shared_state: std::sync::Arc::new(std::sync::Mutex::new(TeamState::new())),
+        }
+    }
+
+    /// Break down a goal into subtasks and distribute to teammates.
+    pub fn distribute_tasks<F>(&self, tasks: Vec<SubagentTask>, worker: F) -> Vec<SubagentResult>
+    where
+        F: Fn(SubagentTask) -> Result<String> + Send + Sync + 'static,
+    {
+        let shared = self.shared_state.clone();
+        self.manager.run_tasks(tasks, move |task| {
+            let result = worker(task.clone())?;
+            if let Ok(mut state) = shared.lock() {
+                state.mark_completed(&task.name);
+            }
+            Ok(result)
+        })
+    }
+
+    /// Get the current team state.
+    pub fn state(&self) -> TeamState {
+        self.shared_state.lock().unwrap().clone()
+    }
+
+    /// Send a message from one teammate to another.
+    pub fn send_message(&self, from: &str, to: &str, content: &str) {
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.send_message(from, to, content);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +527,67 @@ mod tests {
         assert!(results[0].success);
         assert!(results[0].used_read_only_fallback);
         assert_eq!(results[0].attempts, 2);
+    }
+
+    #[test]
+    fn teammate_mode_parse() {
+        assert_eq!(TeammateMode::parse("in-process"), TeammateMode::InProcess);
+        assert_eq!(TeammateMode::parse("tmux"), TeammateMode::Tmux);
+        assert_eq!(TeammateMode::parse("auto"), TeammateMode::Auto);
+        assert_eq!(TeammateMode::parse("unknown"), TeammateMode::Auto);
+    }
+
+    #[test]
+    fn team_state_messaging() {
+        let mut state = TeamState::new();
+        state.send_message("lead", "worker-1", "analyze file.rs");
+        state.send_message("lead", "worker-2", "review tests");
+        state.send_message("worker-1", "lead", "done with analysis");
+
+        let for_worker1 = state.messages_for("worker-1");
+        assert_eq!(for_worker1.len(), 1);
+        assert_eq!(for_worker1[0].content, "analyze file.rs");
+
+        let for_lead = state.messages_for("lead");
+        assert_eq!(for_lead.len(), 1);
+    }
+
+    #[test]
+    fn team_state_broadcast() {
+        let mut state = TeamState::new();
+        state.send_message("lead", "*", "everyone stop");
+        let for_anyone = state.messages_for("worker-1");
+        assert_eq!(for_anyone.len(), 1);
+    }
+
+    #[test]
+    fn team_coordinator_distributes_tasks() {
+        let coordinator = TeamCoordinator::new(TeammateMode::InProcess, 2);
+        let tasks = (0..3)
+            .map(|i| SubagentTask {
+                run_id: Uuid::now_v7(),
+                name: format!("task-{i}"),
+                goal: "do work".to_string(),
+                role: SubagentRole::Task,
+                team: "alpha".to_string(),
+                read_only_fallback: false,
+            })
+            .collect();
+
+        let results =
+            coordinator.distribute_tasks(tasks, |task| Ok(format!("completed:{}", task.name)));
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.success));
+        let state = coordinator.state();
+        assert_eq!(state.completed_tasks.len(), 3);
+    }
+
+    #[test]
+    fn team_coordinator_sends_messages() {
+        let coordinator = TeamCoordinator::new(TeammateMode::Auto, 1);
+        coordinator.send_message("lead", "worker", "hello");
+        let state = coordinator.state();
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].from, "lead");
     }
 }

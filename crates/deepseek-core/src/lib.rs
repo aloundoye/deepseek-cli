@@ -545,6 +545,16 @@ pub enum EventKind {
         limit_usd: f64,
         actual_usd: f64,
     },
+    TaskUpdatedV1 {
+        task_id: String,
+        status: String,
+    },
+    TaskDeletedV1 {
+        task_id: String,
+    },
+    ExitPlanModeV1 {
+        session_id: Uuid,
+    },
 }
 
 pub trait Planner {
@@ -822,6 +832,21 @@ impl Default for RouterConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub network: SandboxNetworkConfig,
+    pub excluded_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxNetworkConfig {
+    pub allowed_domains: Vec<String>,
+    pub block_all: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicyConfig {
@@ -836,6 +861,9 @@ pub struct PolicyConfig {
     pub permission_mode: String,
     /// Optional lint command to run automatically after fs.edit (e.g., "cargo fmt --check").
     pub lint_after_edit: Option<String>,
+    /// OS-level sandbox configuration.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for PolicyConfig {
@@ -869,6 +897,7 @@ impl Default for PolicyConfig {
             sandbox_wrapper: None,
             permission_mode: "ask".to_string(),
             lint_after_edit: None,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -911,6 +940,47 @@ impl Default for PluginCatalogConfig {
             refresh_hours: 24,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagedSettings {
+    pub disable_bypass_permissions_mode: bool,
+    pub allow_managed_permission_rules_only: bool,
+    pub forced_permission_mode: Option<String>,
+    pub blocked_tools: Vec<String>,
+}
+
+pub fn managed_settings_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(PathBuf::from(
+            "/Library/Application Support/DeepSeekCode/managed-settings.json",
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(PathBuf::from("/etc/deepseek-code/managed-settings.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(PathBuf::from(
+            "C:\\Program Files\\DeepSeekCode\\managed-settings.json",
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+pub fn load_managed_settings() -> Option<ManagedSettings> {
+    let path = managed_settings_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

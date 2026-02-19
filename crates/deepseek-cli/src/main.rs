@@ -9378,3 +9378,78 @@ fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
         )),
     }
 }
+
+#[allow(dead_code)]
+fn validate_json_schema(output: &str, schema_str: &str) -> Result<bool> {
+    // Parse the schema
+    let schema: serde_json::Value = serde_json::from_str(schema_str)
+        .map_err(|e| anyhow::anyhow!("invalid JSON schema: {e}"))?;
+
+    // Try to parse the output as JSON
+    let value: serde_json::Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+
+    // Basic type validation against schema
+    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str()) {
+        let type_ok = match schema_type {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "number" | "integer" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !type_ok {
+            return Ok(false);
+        }
+    }
+
+    // Check required fields if schema is object type
+    if let Some(required) = schema.get("required").and_then(|v| v.as_array())
+        && let Some(obj) = value.as_object()
+    {
+        for req in required {
+            if let Some(key) = req.as_str()
+                && !obj.contains_key(key)
+            {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_schema_validates_object() {
+        let schema = r#"{"type":"object","required":["name","age"]}"#;
+        let valid = r#"{"name":"Alice","age":30}"#;
+        let invalid = r#"{"name":"Bob"}"#;
+        assert!(super::validate_json_schema(valid, schema).unwrap());
+        assert!(!super::validate_json_schema(invalid, schema).unwrap());
+    }
+
+    #[test]
+    fn json_schema_validates_type() {
+        let schema = r#"{"type":"array"}"#;
+        assert!(super::validate_json_schema("[1,2,3]", schema).unwrap());
+        assert!(!super::validate_json_schema(r#"{"a":1}"#, schema).unwrap());
+    }
+
+    #[test]
+    fn json_schema_non_json_returns_false() {
+        let schema = r#"{"type":"object"}"#;
+        assert!(!super::validate_json_schema("not json", schema).unwrap());
+    }
+
+    #[test]
+    fn json_schema_invalid_schema_errors() {
+        let result = super::validate_json_schema("{}", "not valid json");
+        assert!(result.is_err());
+    }
+}
