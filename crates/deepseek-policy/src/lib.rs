@@ -14,6 +14,7 @@ pub struct PolicyConfig {
     pub denied_command_prefixes: Vec<String>,
     pub redact_patterns: Vec<String>,
     pub sandbox_mode: String,
+    pub sandbox_wrapper: Option<String>,
 }
 
 impl Default for PolicyConfig {
@@ -58,6 +59,7 @@ impl Default for PolicyConfig {
                     .to_string(),
             ],
             sandbox_mode: "allowlist".to_string(),
+            sandbox_wrapper: None,
         }
     }
 }
@@ -124,6 +126,11 @@ impl PolicyEngine {
             } else {
                 cfg.sandbox_mode.trim().to_ascii_lowercase()
             },
+            sandbox_wrapper: cfg
+                .sandbox_wrapper
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         };
         if let Some(team_policy) = load_team_policy_override() {
             mapped = apply_team_policy_override(mapped, &team_policy);
@@ -287,10 +294,48 @@ struct TeamPolicyFile {
     redact_patterns: Vec<String>,
     #[serde(default)]
     sandbox_mode: Option<String>,
+    #[serde(default)]
+    sandbox_wrapper: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TeamPolicyLocks {
+    pub path: String,
+    pub approve_edits_locked: bool,
+    pub approve_bash_locked: bool,
+    pub allowlist_locked: bool,
+    pub sandbox_mode_locked: bool,
+}
+
+impl TeamPolicyLocks {
+    pub fn has_permission_locks(&self) -> bool {
+        self.approve_edits_locked
+            || self.approve_bash_locked
+            || self.allowlist_locked
+            || self.sandbox_mode_locked
+    }
+}
+
+pub fn team_policy_locks() -> Option<TeamPolicyLocks> {
+    let (path, team) = load_team_policy_override_with_path()?;
+    Some(TeamPolicyLocks {
+        path: path.to_string_lossy().to_string(),
+        approve_edits_locked: team.approve_edits.is_some(),
+        approve_bash_locked: team.approve_bash.is_some(),
+        allowlist_locked: !team.allowlist.is_empty(),
+        sandbox_mode_locked: team
+            .sandbox_mode
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+    })
 }
 
 fn load_team_policy_override() -> Option<TeamPolicyFile> {
-    let path = std::env::var("DEEPSEEK_TEAM_POLICY_PATH")
+    load_team_policy_override_with_path().map(|(_, team)| team)
+}
+
+fn resolve_team_policy_path() -> Option<std::path::PathBuf> {
+    std::env::var("DEEPSEEK_TEAM_POLICY_PATH")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -299,12 +344,17 @@ fn load_team_policy_override() -> Option<TeamPolicyFile> {
             std::env::var("HOME")
                 .ok()
                 .map(|home| std::path::PathBuf::from(home).join(".deepseek/team-policy.json"))
-        })?;
+        })
+}
+
+fn load_team_policy_override_with_path() -> Option<(std::path::PathBuf, TeamPolicyFile)> {
+    let path = resolve_team_policy_path()?;
     if !path.exists() {
         return None;
     }
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    let raw = fs::read_to_string(&path).ok()?;
+    let team = serde_json::from_str(&raw).ok()?;
+    Some((path, team))
 }
 
 fn apply_team_policy_override(mut base: PolicyConfig, team: &TeamPolicyFile) -> PolicyConfig {
@@ -345,13 +395,28 @@ fn apply_team_policy_override(mut base: PolicyConfig, team: &TeamPolicyFile) -> 
             base.sandbox_mode = normalized;
         }
     }
+    if let Some(wrapper) = team.sandbox_wrapper.as_deref() {
+        let normalized = wrapper.trim().to_string();
+        base.sandbox_wrapper = if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        };
+    }
     base
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
+
+    fn team_policy_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn denies_path_traversal_and_secret_dirs() {
@@ -449,6 +514,7 @@ mod tests {
             denied_command_prefixes: vec!["rm".to_string()],
             redact_patterns: vec!["token".to_string()],
             sandbox_mode: "allowlist".to_string(),
+            sandbox_wrapper: None,
         };
         let team = TeamPolicyFile {
             approve_edits: Some("ask".to_string()),
@@ -458,12 +524,17 @@ mod tests {
             block_paths: vec!["**/secrets".to_string()],
             redact_patterns: vec!["password".to_string()],
             sandbox_mode: Some("workspace-write".to_string()),
+            sandbox_wrapper: Some("bwrap --cmd {cmd}".to_string()),
         };
         let merged = apply_team_policy_override(base, &team);
         assert!(merged.approve_edits);
         assert!(merged.approve_bash);
         assert_eq!(merged.allowlist, vec!["npm *"]);
         assert_eq!(merged.sandbox_mode, "workspace-write");
+        assert_eq!(
+            merged.sandbox_wrapper,
+            Some("bwrap --cmd {cmd}".to_string())
+        );
         assert!(
             merged
                 .denied_command_prefixes
@@ -486,11 +557,96 @@ mod tests {
 
     #[test]
     fn sandbox_mode_maps_from_app_config() {
+        let _guard = team_policy_env_lock().lock().expect("env lock");
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_TEAM_POLICY_PATH");
+        }
         let cfg = deepseek_core::PolicyConfig {
             sandbox_mode: "read-only".to_string(),
             ..deepseek_core::PolicyConfig::default()
         };
         let policy = PolicyEngine::from_app_config(&cfg);
         assert_eq!(policy.sandbox_mode(), "read-only");
+    }
+
+    #[test]
+    fn team_policy_locks_reflect_locked_fields() {
+        let _guard = team_policy_env_lock().lock().expect("env lock");
+        let dir = std::env::temp_dir().join("deepseek-policy-locks");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("team-policy.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "approve_bash": "never",
+                "allowlist": ["git status"],
+                "sandbox_mode": "workspace-write"
+            }))
+            .expect("serialize"),
+        )
+        .expect("write team policy");
+
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::set_var("DEEPSEEK_TEAM_POLICY_PATH", &path);
+        }
+        let locks = team_policy_locks().expect("locks");
+        assert!(!locks.approve_edits_locked);
+        assert!(locks.approve_bash_locked);
+        assert!(locks.allowlist_locked);
+        assert!(locks.sandbox_mode_locked);
+        assert!(locks.has_permission_locks());
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_TEAM_POLICY_PATH");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn parent_dir_paths_are_always_rejected(
+            head in "[a-z]{1,8}",
+            tail in "[a-z]{1,8}",
+        ) {
+            let policy = PolicyEngine::default();
+            let candidate = format!("{head}/../{tail}");
+            prop_assert!(matches!(
+                policy.check_path(&candidate),
+                Err(PolicyError::PathTraversal)
+            ));
+        }
+
+        #[test]
+        fn commands_with_shell_injection_tokens_are_rejected(
+            left in "[a-zA-Z0-9 _\\-]{0,24}",
+            right in "[a-zA-Z0-9 _\\-]{0,24}",
+            token in prop::sample::select(vec![";", "&&", "||", "|", "`", "$("]),
+        ) {
+            let policy = PolicyEngine::default();
+            let cmd = format!("{left}{token}{right}");
+            prop_assert!(matches!(
+                policy.check_command(&cmd),
+                Err(PolicyError::CommandInjection)
+            ));
+        }
+
+        #[test]
+        fn wildcard_allowlist_accepts_npm_subcommands(
+            subcommand in "[a-z]{1,10}",
+            arg in "[a-z0-9\\-]{0,10}",
+        ) {
+            let cfg = PolicyConfig {
+                allowlist: vec!["npm *".to_string()],
+                ..PolicyConfig::default()
+            };
+            let policy = PolicyEngine::new(cfg);
+            let cmd = if arg.is_empty() {
+                format!("npm {subcommand}")
+            } else {
+                format!("npm {subcommand} {arg}")
+            };
+            prop_assert!(policy.check_command(&cmd).is_ok());
+        }
     }
 }

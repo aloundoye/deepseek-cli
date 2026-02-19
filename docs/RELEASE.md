@@ -23,15 +23,16 @@ Each tagged release (`vX.Y.Z`) publishes:
 All assets are generated from `cargo build --release --bin deepseek`.
 
 ## Release steps
-1. Ensure CI is green on default branch.
+1. Ensure CI is green on default branch (`ci.yml`, `replay-regression.yml`, `performance-gates.yml`, `security-gates.yml`).
 2. Bump version metadata as needed.
-3. Create and push tag:
+3. Run manual release drill (`release-readiness.yml`) and confirm installer dry-runs + rollback rehearsal artifacts.
+4. Create and push tag:
    - `git tag vX.Y.Z`
    - `git push origin vX.Y.Z`
-4. GitHub Actions `release.yml` builds artifacts, SBOM, and provenance attestation, then creates the release.
-5. Validate checksums and run installer smoke checks.
-6. Homebrew tap update workflow (`homebrew.yml`) publishes formula update.
-7. Winget update workflow (`winget.yml`) publishes manifest update.
+5. GitHub Actions `release.yml` builds artifacts, SBOM, and provenance attestation, then creates the release.
+6. Validate checksums and run installer smoke checks.
+7. Homebrew tap update workflow (`homebrew.yml`) publishes formula update.
+8. Winget update workflow (`winget.yml`) publishes manifest update.
 
 ## Installer smoke checks
 macOS/Linux:
@@ -45,6 +46,12 @@ Windows:
 ```powershell
 ./scripts/install.ps1 -DryRun -Version vX.Y.Z
 ```
+
+## Live API readiness checks
+- Run `live-deepseek-smoke.yml` with `DEEPSEEK_API_KEY` secret configured.
+- Verify:
+  - `ask`, `plan`, and bounded `autopilot` commands succeed end-to-end.
+  - first-token streaming latency gate remains within budget.
 
 Package manager smoke checks:
 

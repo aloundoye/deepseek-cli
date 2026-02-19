@@ -1,0 +1,93 @@
+name: Replay Regression
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  replay-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build deepseek binary
+        run: cargo build --bin deepseek
+
+      - name: Start mock DeepSeek API
+        run: |
+          python3 scripts/mock_deepseek_api.py --port 18765 > /tmp/deepseek-mock.log 2>&1 &
+          echo $! > /tmp/deepseek-mock.pid
+          sleep 1
+
+      - name: Replay cassette regression
+        env:
+          DEEPSEEK_API_KEY: test-api-key
+          MOCK_ENDPOINT: http://127.0.0.1:18765/chat/completions
+        run: |
+          set -euo pipefail
+          trap 'kill "$(cat /tmp/deepseek-mock.pid)" >/dev/null 2>&1 || true' EXIT
+
+          workspace="$(mktemp -d)"
+          mkdir -p "$workspace/.deepseek"
+          cat > "$workspace/.deepseek/settings.local.json" <<JSON
+          {
+            "llm": {
+              "provider": "deepseek",
+              "profile": "v3_2",
+              "endpoint": "${MOCK_ENDPOINT}",
+              "api_key_env": "DEEPSEEK_API_KEY",
+              "stream": false
+            }
+          }
+          JSON
+
+          (
+            cd "$workspace"
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json ask "Create replay regression fixture." > ask.json
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json status > status.json
+          )
+
+          session_id="$(python3 - <<PY
+          import json, pathlib
+          status = json.loads(pathlib.Path("${workspace}/status.json").read_text())
+          session_id = status.get("session_id")
+          if not session_id:
+              raise SystemExit("missing session_id in status output")
+          print(session_id)
+          PY
+          )"
+
+          (
+            cd "$workspace"
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json replay run --session-id "$session_id" --deterministic true > replay_run.json
+            "${GITHUB_WORKSPACE}/target/debug/deepseek" --json replay list --session-id "$session_id" --limit 5 > replay_list.json
+          )
+
+          python3 - <<PY
+          import json, pathlib
+          replay = json.loads(pathlib.Path("${workspace}/replay_run.json").read_text())
+          if not replay.get("deterministic"):
+              raise SystemExit("replay_run did not execute deterministically")
+          rows = json.loads(pathlib.Path("${workspace}/replay_list.json").read_text())
+          if not isinstance(rows, list) or not rows:
+              raise SystemExit("replay list is empty")
+          if not any(row.get("session_id") == "${session_id}" for row in rows):
+              raise SystemExit("replay list does not include requested session")
+          PY
+
+      - name: Upload replay artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-regression-logs
+          path: |
+            /tmp/deepseek-mock.log

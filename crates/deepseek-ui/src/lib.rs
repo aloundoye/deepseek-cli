@@ -215,18 +215,71 @@ pub fn load_keybindings(path: &Path) -> Result<KeyBindings> {
     KeyBindings::default().apply_overrides(parsed)
 }
 
+fn parse_theme_color(name: &str) -> Color {
+    match name.to_ascii_lowercase().as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "white" => Color::White,
+        "gray" | "grey" => Color::Gray,
+        "darkgray" | "darkgrey" => Color::DarkGray,
+        "lightred" => Color::LightRed,
+        "lightgreen" => Color::LightGreen,
+        "lightyellow" => Color::LightYellow,
+        "lightblue" => Color::LightBlue,
+        "lightmagenta" => Color::LightMagenta,
+        "lightcyan" => Color::LightCyan,
+        _ => Color::Cyan,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiTheme {
+    pub primary: Color,
+    pub secondary: Color,
+    pub error: Color,
+}
+
+impl Default for TuiTheme {
+    fn default() -> Self {
+        Self {
+            primary: Color::Cyan,
+            secondary: Color::Yellow,
+            error: Color::Red,
+        }
+    }
+}
+
+impl TuiTheme {
+    pub fn from_config(primary: &str, secondary: &str, error: &str) -> Self {
+        Self {
+            primary: parse_theme_color(primary),
+            secondary: parse_theme_color(secondary),
+            error: parse_theme_color(error),
+        }
+    }
+}
+
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
 {
-    run_tui_shell_with_bindings(status, KeyBindings::default(), move |prompt| {
-        on_submit(prompt)
-    })
+    run_tui_shell_with_bindings(
+        status,
+        KeyBindings::default(),
+        TuiTheme::default(),
+        move |prompt| on_submit(prompt),
+    )
 }
 
 pub fn run_tui_shell_with_bindings<F>(
     status: UiStatus,
     bindings: KeyBindings,
+    theme: TuiTheme,
     mut on_submit: F,
 ) -> Result<()>
 where
@@ -317,7 +370,7 @@ where
                     Block::default()
                         .title("Input")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(theme.primary)),
                 ),
                 vertical[2],
             );

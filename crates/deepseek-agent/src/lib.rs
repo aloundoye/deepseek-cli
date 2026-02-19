@@ -109,8 +109,7 @@ impl Planner for SchemaPlanner {
             goal: ctx.user_prompt,
             assumptions: vec![
                 "Workspace is writable".to_string(),
-                "DeepSeek API key is configured or offline fallback is explicitly enabled"
-                    .to_string(),
+                "DeepSeek API key is configured".to_string(),
             ],
             steps,
             verification: vec![
@@ -828,6 +827,9 @@ impl AgentEngine {
             verification_failures,
             run_succeeded,
         )?;
+
+        // Fire "stop" hooks at agent completion (spec 2.9)
+        self.tool_host.fire_stop_hooks();
 
         let projection = self.store.rebuild_from_events(session.session_id)?;
         Ok(format!(
@@ -3444,15 +3446,25 @@ fn plan_subagent_execution_lanes(
         let mut dependencies = Vec::new();
 
         for target in &targets {
-            if let Some(previous_phase) = target_last_phase.get(target).copied() {
+            for (known_target, previous_phase) in &target_last_phase {
+                if !target_patterns_overlap(target, known_target) {
+                    continue;
+                }
                 phase = phase.max(previous_phase.saturating_add(1));
-                dependencies.push(format!("{target}@phase{}", previous_phase + 1));
+                dependencies.push(format!("{known_target}@phase{}", previous_phase + 1));
+                if let Some(owner) = target_owner.get(known_target)
+                    && owner != &team
+                {
+                    dependencies.push(format!("{known_target}@owner={owner}"));
+                }
             }
-            if let Some(owner) = target_owner.get(target)
-                && owner != &team
-            {
-                dependencies.push(format!("{target}@owner={owner}"));
-            }
+        }
+        if targets.is_empty()
+            && matches!(role, SubagentRole::Task)
+            && let Some(previous_phase) = target_last_phase.values().copied().max()
+        {
+            phase = phase.max(previous_phase.saturating_add(1));
+            dependencies.push(format!("unscoped@phase{}", previous_phase + 1));
         }
         dependencies.sort();
         dependencies.dedup();
@@ -3489,6 +3501,45 @@ fn plan_subagent_execution_lanes(
             .then(a.title.cmp(&b.title))
     });
     lanes
+}
+
+fn target_patterns_overlap(a: &str, b: &str) -> bool {
+    let normalize = |value: &str| value.trim().trim_end_matches('/').to_ascii_lowercase();
+    let a = normalize(a);
+    let b = normalize(b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == "." || b == "." {
+        return true;
+    }
+    if a == b {
+        return true;
+    }
+    if a.starts_with(&(b.clone() + "/")) || b.starts_with(&(a.clone() + "/")) {
+        return true;
+    }
+    let wildcard_prefix = |value: &str| {
+        value
+            .split('*')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    if a.contains('*') {
+        let prefix = wildcard_prefix(&a);
+        if !prefix.is_empty() && (b == prefix || b.starts_with(&(prefix.clone() + "/"))) {
+            return true;
+        }
+    }
+    if b.contains('*') {
+        let prefix = wildcard_prefix(&b);
+        if !prefix.is_empty() && (a == prefix || a.starts_with(&(prefix.clone() + "/"))) {
+            return true;
+        }
+    }
+    false
 }
 
 fn summarize_subagent_execution_lanes(
@@ -4959,6 +5010,70 @@ mod tests {
     }
 
     #[test]
+    fn subagent_lane_planner_serializes_overlapping_directory_targets() {
+        let steps = vec![
+            PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Task touching src tree".to_string(),
+                intent: "task".to_string(),
+                tools: vec!["fs.edit".to_string()],
+                files: vec!["src".to_string()],
+                done: false,
+            },
+            PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Task touching file in src".to_string(),
+                intent: "task".to_string(),
+                tools: vec!["fs.edit".to_string()],
+                files: vec!["src/main.rs".to_string()],
+                done: false,
+            },
+        ];
+        let lanes = plan_subagent_execution_lanes(&steps, 8);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].phase, 0);
+        assert_eq!(lanes[1].phase, 1);
+        assert!(
+            lanes[1]
+                .dependencies
+                .iter()
+                .any(|dep| dep.contains("src@phase1"))
+        );
+    }
+
+    #[test]
+    fn subagent_lane_planner_serializes_unscoped_task_after_targeted_tasks() {
+        let steps = vec![
+            PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Edit scoped file".to_string(),
+                intent: "task".to_string(),
+                tools: vec!["fs.edit".to_string()],
+                files: vec!["src/lib.rs".to_string()],
+                done: false,
+            },
+            PlanStep {
+                step_id: Uuid::now_v7(),
+                title: "Follow-up generic task".to_string(),
+                intent: "task".to_string(),
+                tools: vec!["bash.run".to_string()],
+                files: vec![],
+                done: false,
+            },
+        ];
+        let lanes = plan_subagent_execution_lanes(&steps, 8);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].phase, 0);
+        assert_eq!(lanes[1].phase, 1);
+        assert!(
+            lanes[1]
+                .dependencies
+                .iter()
+                .any(|dep| dep.contains("unscoped@phase1"))
+        );
+    }
+
+    #[test]
     fn subagent_lane_summary_includes_phase_and_lane_metadata() {
         let run_id = Uuid::now_v7();
         let mut map = HashMap::new();
@@ -4980,5 +5095,13 @@ mod tests {
         assert_eq!(summary.len(), 1);
         assert!(summary[0].contains("subagent_phase 2"));
         assert!(summary[0].contains("lane=execution:src/api.rs"));
+    }
+
+    #[test]
+    fn target_patterns_overlap_detects_prefix_and_wildcards() {
+        assert!(target_patterns_overlap("src", "src/main.rs"));
+        assert!(target_patterns_overlap("src/*.rs", "src/lib.rs"));
+        assert!(target_patterns_overlap("src/lib.rs", "src/lib.rs"));
+        assert!(!target_patterns_overlap("docs", "src/lib.rs"));
     }
 }

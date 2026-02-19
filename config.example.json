@@ -3,9 +3,11 @@
     "base_model": "deepseek-chat",
     "max_think_model": "deepseek-reasoner",
     "provider": "deepseek",
+    "profile": "v3_2",
     "context_window_tokens": 1000000,
     "temperature": 0.2,
     "endpoint": "https://api.deepseek.com/chat/completions",
+    "api_key": null,
     "api_key_env": "DEEPSEEK_API_KEY",
     "fast_mode": false,
     "language": "en",
@@ -13,8 +15,7 @@
     "timeout_seconds": 60,
     "max_retries": 3,
     "retry_base_ms": 400,
-    "stream": true,
-    "offline_fallback": false
+    "stream": true
   },
   "router": {
     "auto_max_think": true,
@@ -53,7 +54,8 @@
       "\\b\\d{3}-\\d{2}-\\d{4}\\b",
       "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b"
     ],
-    "sandbox_mode": "allowlist"
+    "sandbox_mode": "allowlist",
+    "sandbox_wrapper": null
   },
   "plugins": {
     "enabled": true,
@@ -116,6 +118,16 @@
   },
   "index": {
     "enabled": true,
-    "engine": "tantivy"
+    "engine": "tantivy",
+    "watch_files": true
+  },
+  "budgets": {
+    "max_turn_duration_secs": 300,
+    "max_reasoner_tokens_per_session": 1000000
+  },
+  "theme": {
+    "primary": "Cyan",
+    "secondary": "Yellow",
+    "error": "Red"
   }
 }

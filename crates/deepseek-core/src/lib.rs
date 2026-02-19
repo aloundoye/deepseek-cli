@@ -9,6 +9,38 @@ pub type Result<T> = anyhow::Result<T>;
 // DeepSeek V3.2 API model aliases.
 pub const DEEPSEEK_V32_CHAT_MODEL: &str = "deepseek-chat";
 pub const DEEPSEEK_V32_REASONER_MODEL: &str = "deepseek-reasoner";
+pub const DEEPSEEK_PROFILE_V32: &str = "v3_2";
+pub const DEEPSEEK_PROFILE_V32_SPECIALE: &str = "v3_2_speciale";
+pub const DEEPSEEK_V32_SPECIALE_END_DATE: &str = "2025-12-15";
+
+pub fn normalize_deepseek_model(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "deepseek-chat" | "deepseek-v3.2" | "deepseek-v3.2-chat" | "v3.2" | "v3_2" => {
+            Some(DEEPSEEK_V32_CHAT_MODEL)
+        }
+        "deepseek-reasoner"
+        | "deepseek-v3.2-reasoner"
+        | "reasoner"
+        | "v3.2-reasoner"
+        | "v3_2_reasoner" => Some(DEEPSEEK_V32_REASONER_MODEL),
+        "deepseek-v3.2-speciale" | "deepseek-v3.2-special" | "v3.2-speciale" | "v3_2_speciale" => {
+            Some(DEEPSEEK_V32_CHAT_MODEL)
+        }
+        _ => None,
+    }
+}
+
+pub fn normalize_deepseek_profile(profile: &str) -> Option<&'static str> {
+    let normalized = profile.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "v3_2" | "v3.2" | "v32" | "deepseek-v3.2" => Some(DEEPSEEK_PROFILE_V32),
+        "v3_2_speciale" | "v3.2-speciale" | "v32-speciale" | "deepseek-v3.2-speciale" => {
+            Some(DEEPSEEK_PROFILE_V32_SPECIALE)
+        }
+        _ => None,
+    }
+}
 
 pub fn runtime_dir(workspace: &Path) -> PathBuf {
     workspace.join(".deepseek")
@@ -24,6 +56,55 @@ pub enum SessionState {
     Completed,
     Paused,
     Failed,
+}
+
+pub fn is_valid_session_state_transition(from: &SessionState, to: &SessionState) -> bool {
+    if from == to {
+        return true;
+    }
+    match from {
+        SessionState::Idle => matches!(
+            to,
+            SessionState::Planning | SessionState::Paused | SessionState::Failed
+        ),
+        SessionState::Planning => matches!(
+            to,
+            SessionState::ExecutingStep
+                | SessionState::Verifying
+                | SessionState::Paused
+                | SessionState::Failed
+        ),
+        SessionState::ExecutingStep => matches!(
+            to,
+            SessionState::AwaitingApproval
+                | SessionState::Verifying
+                | SessionState::Planning
+                | SessionState::Completed
+                | SessionState::Paused
+                | SessionState::Failed
+        ),
+        SessionState::AwaitingApproval => matches!(
+            to,
+            SessionState::ExecutingStep
+                | SessionState::Planning
+                | SessionState::Paused
+                | SessionState::Failed
+        ),
+        SessionState::Verifying => matches!(
+            to,
+            SessionState::Planning
+                | SessionState::ExecutingStep
+                | SessionState::Completed
+                | SessionState::Paused
+                | SessionState::Failed
+        ),
+        SessionState::Completed => matches!(to, SessionState::Idle | SessionState::Planning),
+        SessionState::Paused => matches!(
+            to,
+            SessionState::Planning | SessionState::ExecutingStep | SessionState::Failed
+        ),
+        SessionState::Failed => matches!(to, SessionState::Planning | SessionState::Idle),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,9 +511,25 @@ pub struct LlmRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+fn default_finish_reason() -> String {
+    "stop".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub text: String,
+    #[serde(default = "default_finish_reason")]
     pub finish_reason: String,
+    #[serde(default)]
+    pub reasoning_content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<LlmToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -452,6 +549,8 @@ pub struct AppConfig {
     pub experiments: ExperimentsConfig,
     pub telemetry: TelemetryConfig,
     pub index: IndexConfig,
+    pub budgets: BudgetsConfig,
+    pub theme: ThemeConfig,
 }
 
 impl AppConfig {
@@ -566,9 +665,11 @@ pub struct LlmConfig {
     pub base_model: String,
     pub max_think_model: String,
     pub provider: String,
+    pub profile: String,
     pub context_window_tokens: u64,
     pub temperature: f32,
     pub endpoint: String,
+    pub api_key: Option<String>,
     pub api_key_env: String,
     pub fast_mode: bool,
     pub language: String,
@@ -577,7 +678,6 @@ pub struct LlmConfig {
     pub max_retries: u8,
     pub retry_base_ms: u64,
     pub stream: bool,
-    pub offline_fallback: bool,
 }
 
 impl Default for LlmConfig {
@@ -586,9 +686,11 @@ impl Default for LlmConfig {
             base_model: DEEPSEEK_V32_CHAT_MODEL.to_string(),
             max_think_model: DEEPSEEK_V32_REASONER_MODEL.to_string(),
             provider: "deepseek".to_string(),
+            profile: DEEPSEEK_PROFILE_V32.to_string(),
             context_window_tokens: 1_000_000,
             temperature: 0.2,
             endpoint: "https://api.deepseek.com/chat/completions".to_string(),
+            api_key: None,
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             fast_mode: false,
             language: "en".to_string(),
@@ -597,7 +699,6 @@ impl Default for LlmConfig {
             max_retries: 3,
             retry_base_ms: 400,
             stream: true,
-            offline_fallback: false,
         }
     }
 }
@@ -643,6 +744,7 @@ pub struct PolicyConfig {
     pub block_paths: Vec<String>,
     pub redact_patterns: Vec<String>,
     pub sandbox_mode: String,
+    pub sandbox_wrapper: Option<String>,
 }
 
 impl Default for PolicyConfig {
@@ -673,6 +775,7 @@ impl Default for PolicyConfig {
                 "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b".to_string(),
             ],
             sandbox_mode: "allowlist".to_string(),
+            sandbox_wrapper: None,
         }
     }
 }
@@ -861,6 +964,7 @@ pub struct TelemetryConfig {
 pub struct IndexConfig {
     pub enabled: bool,
     pub engine: String,
+    pub watch_files: bool,
 }
 
 impl Default for IndexConfig {
@@ -868,6 +972,131 @@ impl Default for IndexConfig {
         Self {
             enabled: true,
             engine: "tantivy".to_string(),
+            watch_files: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BudgetsConfig {
+    pub max_turn_duration_secs: u64,
+    pub max_reasoner_tokens_per_session: u64,
+}
+
+impl Default for BudgetsConfig {
+    fn default() -> Self {
+        Self {
+            max_turn_duration_secs: 300,
+            max_reasoner_tokens_per_session: 1_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub primary: String,
+    pub secondary: String,
+    pub error: String,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            primary: "Cyan".to_string(),
+            secondary: "Yellow".to_string(),
+            error: "Red".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    fn model_alias_strategy() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("deepseek-chat"),
+            Just("deepseek-v3.2"),
+            Just("v3.2"),
+            Just("v3_2"),
+            Just("deepseek-reasoner"),
+            Just("deepseek-v3.2-reasoner"),
+            Just("reasoner"),
+            Just("deepseek-v3.2-speciale"),
+            Just("v3_2_speciale"),
+        ]
+    }
+
+    fn session_state_strategy() -> impl Strategy<Value = SessionState> {
+        prop_oneof![
+            Just(SessionState::Idle),
+            Just(SessionState::Planning),
+            Just(SessionState::ExecutingStep),
+            Just(SessionState::AwaitingApproval),
+            Just(SessionState::Verifying),
+            Just(SessionState::Completed),
+            Just(SessionState::Paused),
+            Just(SessionState::Failed),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn deepseek_model_normalization_is_case_and_whitespace_tolerant(
+            alias in model_alias_strategy(),
+            left_ws in 0usize..3,
+            right_ws in 0usize..3,
+            upper in any::<bool>(),
+        ) {
+            let source = if upper {
+                alias.to_ascii_uppercase()
+            } else {
+                alias.to_string()
+            };
+            let candidate = format!("{}{}{}", " ".repeat(left_ws), source, " ".repeat(right_ws));
+            prop_assert!(normalize_deepseek_model(&candidate).is_some());
+        }
+
+        #[test]
+        fn merge_json_value_is_idempotent_for_flat_objects(
+            base in prop::collection::btree_map("[a-z]{1,8}", any::<i64>(), 0..12),
+            overlay in prop::collection::btree_map("[a-z]{1,8}", any::<i64>(), 0..12),
+        ) {
+            let mut base_value = json!(base);
+            let overlay_value = json!(overlay);
+            merge_json_value(&mut base_value, &overlay_value);
+            let once = base_value.clone();
+            merge_json_value(&mut base_value, &overlay_value);
+            prop_assert_eq!(base_value, once);
+        }
+
+        #[test]
+        fn completed_state_does_not_jump_directly_to_execution(
+            to in session_state_strategy()
+        ) {
+            if matches!(to, SessionState::ExecutingStep | SessionState::AwaitingApproval | SessionState::Verifying) {
+                prop_assert!(!is_valid_session_state_transition(&SessionState::Completed, &to));
+            }
+        }
+    }
+
+    #[test]
+    fn session_state_transition_allows_expected_recovery_paths() {
+        assert!(is_valid_session_state_transition(
+            &SessionState::Failed,
+            &SessionState::Planning
+        ));
+        assert!(is_valid_session_state_transition(
+            &SessionState::Paused,
+            &SessionState::ExecutingStep
+        ));
+        assert!(!is_valid_session_state_transition(
+            &SessionState::Idle,
+            &SessionState::Completed
+        ));
     }
 }

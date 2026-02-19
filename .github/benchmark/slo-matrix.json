@@ -1,0 +1,11 @@
+{
+  "name": "slo-gate",
+  "runs": [
+    {
+      "id": "slo-smoke",
+      "pack": "smoke",
+      "cases": 2,
+      "seed": 301
+    }
+  ]
+}

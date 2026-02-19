@@ -6,3 +6,4 @@
 # Safety: nested repos should never be committed
 **/.git/
 .agent/
+.DS_Store

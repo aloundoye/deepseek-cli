@@ -33,6 +33,7 @@ pub struct LocalToolHost {
     workspace: PathBuf,
     policy: PolicyEngine,
     sandbox_mode: String,
+    sandbox_wrapper: Option<String>,
     patches: PatchStore,
     index: IndexService,
     store: Store,
@@ -54,6 +55,12 @@ impl LocalToolHost {
     ) -> Result<Self> {
         let cfg = AppConfig::load(workspace).unwrap_or_default();
         let sandbox_mode = policy.sandbox_mode().to_ascii_lowercase();
+        let sandbox_wrapper = cfg
+            .policy
+            .sandbox_wrapper
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Ok(Self {
             workspace: workspace.to_path_buf(),
             patches: PatchStore::new(workspace)?,
@@ -61,6 +68,7 @@ impl LocalToolHost {
             store: Store::new(workspace)?,
             policy,
             sandbox_mode,
+            sandbox_wrapper,
             runner,
             plugins: PluginManager::new(workspace).ok(),
             hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
@@ -302,6 +310,7 @@ impl LocalToolHost {
                     }));
                 }
 
+                let diff = generate_unified_diff(path, &before, &after);
                 let checkpoint = self.create_checkpoint("fs_edit")?;
                 fs::write(&full, &after)?;
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
@@ -310,6 +319,7 @@ impl LocalToolHost {
                     "path": path,
                     "edited": true,
                     "replacements": replacements,
+                    "diff": diff,
                     "before_sha256": before_sha,
                     "after_sha256": after_sha,
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
@@ -436,7 +446,7 @@ impl LocalToolHost {
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-                self.run_cmd(cmd, timeout)
+                self.run_bash_cmd(cmd, timeout)
             }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
@@ -454,12 +464,51 @@ impl LocalToolHost {
         }))
     }
 
+    fn run_bash_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
+        if is_isolated_sandbox_mode(&self.sandbox_mode) {
+            return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
+        }
+        self.run_cmd(cmd, timeout_secs)
+    }
+
+    fn run_cmd_in_isolated_sandbox(
+        &self,
+        cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value> {
+        let workspace =
+            std::fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
+        if let Some(template) = self.sandbox_wrapper.as_deref() {
+            let wrapped = render_wrapper_template(template, &workspace, cmd)?;
+            return self.run_cmd(&wrapped, timeout_secs);
+        }
+        if let Ok(template) = std::env::var("DEEPSEEK_SANDBOX_WRAPPER")
+            && !template.trim().is_empty()
+        {
+            let wrapped = render_wrapper_template(template.trim(), &workspace, cmd)?;
+            return self.run_cmd(&wrapped, timeout_secs);
+        }
+        if let Some(wrapped) = auto_isolated_wrapper_command(&workspace, cmd) {
+            return self.run_cmd(&wrapped, timeout_secs);
+        }
+        Err(anyhow!(
+            "sandbox_mode={} requires an OS-level wrapper (set policy.sandbox_wrapper or DEEPSEEK_SANDBOX_WRAPPER) or install bwrap/firejail/sandbox-exec",
+            self.sandbox_mode
+        ))
+    }
+
     fn enforce_sandbox_mode(&self, cmd: &str) -> Result<()> {
         match self.sandbox_mode.as_str() {
             "read-only" | "readonly" => {
                 if command_has_mutating_intent(cmd) {
                     return Err(anyhow!(
                         "sandbox_mode=read-only blocked mutating command: {}",
+                        cmd
+                    ));
+                }
+                if command_has_network_egress_intent(cmd) {
+                    return Err(anyhow!(
+                        "sandbox_mode=read-only blocked network command: {}",
                         cmd
                     ));
                 }
@@ -471,6 +520,15 @@ impl LocalToolHost {
                         cmd
                     ));
                 }
+                if command_has_network_egress_intent(cmd) {
+                    return Err(anyhow!(
+                        "sandbox_mode=workspace-write blocked network command: {}",
+                        cmd
+                    ));
+                }
+            }
+            "isolated" | "container" | "os-sandbox" | "os_sandbox" => {
+                // Defer strict containment to the configured OS-level wrapper.
             }
             _ => {}
         }
@@ -538,6 +596,87 @@ fn walk_paths(root: &Path, workspace: &Path, respect_gitignore: bool) -> Vec<Pat
 
 fn normalize_rel_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn is_isolated_sandbox_mode(mode: &str) -> bool {
+    matches!(mode, "isolated" | "container" | "os-sandbox" | "os_sandbox")
+}
+
+fn render_wrapper_template(template: &str, workspace: &Path, cmd: &str) -> Result<String> {
+    if !template.contains("{cmd}") {
+        return Err(anyhow!(
+            "sandbox wrapper template must include {{cmd}} placeholder"
+        ));
+    }
+    let workspace_q = shell_quote(workspace.to_string_lossy().as_ref());
+    let cmd_q = shell_quote(cmd);
+    Ok(template
+        .replace("{workspace}", &workspace_q)
+        .replace("{cmd}", &cmd_q))
+}
+
+fn auto_isolated_wrapper_command(workspace: &Path, cmd: &str) -> Option<String> {
+    let workspace_q = shell_quote(workspace.to_string_lossy().as_ref());
+    let cmd_q = shell_quote(cmd);
+
+    if cfg!(target_os = "linux") {
+        if command_in_path("bwrap") {
+            return Some(format!(
+                "bwrap --die-with-parent --new-session --unshare-all --proc /proc --dev /dev --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /etc /etc --tmpfs /tmp --bind {workspace_q} {workspace_q} --chdir {workspace_q} /bin/sh -lc {cmd_q}"
+            ));
+        }
+        if command_in_path("firejail") {
+            return Some(format!(
+                "firejail --quiet --net=none --private={workspace_q} sh -lc {cmd_q}"
+            ));
+        }
+    }
+    if cfg!(target_os = "macos") && command_in_path("sandbox-exec") {
+        let workspace_profile = workspace
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let profile = format!(
+            "(version 1) \
+             (deny default) \
+             (allow process*) \
+             (allow file-read* (subpath \"/usr\")) \
+             (allow file-read* (subpath \"/bin\")) \
+             (allow file-read* (subpath \"/System\")) \
+             (allow file-read* (subpath \"/Library\")) \
+             (allow file-read* (subpath \"/private/tmp\")) \
+             (allow file-write* (subpath \"/private/tmp\")) \
+             (allow file-read* file-write* (subpath \"{workspace_profile}\"))"
+        );
+        return Some(format!(
+            "sandbox-exec -p {} /bin/sh -lc {}",
+            shell_quote(&profile),
+            cmd_q
+        ));
+    }
+    None
+}
+
+fn command_in_path(command: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let separators = if cfg!(target_os = "windows") {
+        vec![".exe", ".cmd", ".bat", ""]
+    } else {
+        vec![""]
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        separators
+            .iter()
+            .map(|suffix| dir.join(format!("{command}{suffix}")))
+            .any(|candidate| candidate.exists() && candidate.is_file())
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    let escaped = value.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
 }
 
 fn shell_tokens(cmd: &str) -> Vec<String> {
@@ -642,6 +781,41 @@ fn command_has_mutating_intent(cmd: &str) -> bool {
     false
 }
 
+fn command_has_network_egress_intent(cmd: &str) -> bool {
+    let tokens = shell_tokens(cmd);
+    if tokens.is_empty() {
+        return false;
+    }
+    let command = tokens[0].as_str();
+    if matches!(
+        command,
+        "curl"
+            | "wget"
+            | "scp"
+            | "sftp"
+            | "ssh"
+            | "nc"
+            | "ncat"
+            | "telnet"
+            | "ftp"
+            | "rsync"
+            | "http"
+    ) {
+        return true;
+    }
+    if command == "git"
+        && tokens.get(1).is_some_and(|sub| {
+            matches!(
+                sub.as_str(),
+                "push" | "fetch" | "pull" | "clone" | "ls-remote"
+            )
+        })
+    {
+        return true;
+    }
+    false
+}
+
 fn token_to_absolute_path(token: &str) -> Option<PathBuf> {
     let token = token.trim();
     if token.is_empty() || token.starts_with('-') {
@@ -743,6 +917,116 @@ fn collect_lines(
         .collect()
 }
 
+fn generate_unified_diff(path: &str, before: &str, after: &str) -> String {
+    let old_lines: Vec<&str> = before.lines().collect();
+    let new_lines: Vec<&str> = after.lines().collect();
+    let n = old_lines.len();
+    let m = new_lines.len();
+
+    // LCS dynamic programming table
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            if old_lines[i - 1] == new_lines[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+
+    // Backtrack to produce edit operations: Equal / Delete / Insert
+    #[derive(Clone, Copy, PartialEq)]
+    enum Op {
+        Equal,
+        Delete,
+        Insert,
+    }
+    let mut ops: Vec<(Op, usize)> = Vec::new(); // (op, line index in old or new)
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && old_lines[i - 1] == new_lines[j - 1] {
+            ops.push((Op::Equal, i - 1));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            ops.push((Op::Insert, j - 1));
+            j -= 1;
+        } else {
+            ops.push((Op::Delete, i - 1));
+            i -= 1;
+        }
+    }
+    ops.reverse();
+
+    // Group into hunks with 3 lines of context
+    let context = 3usize;
+    let mut hunks: Vec<(usize, usize)> = Vec::new(); // (start, end) indices into ops
+    let mut hunk_start: Option<usize> = None;
+    let mut last_change: Option<usize> = None;
+
+    for (idx, &(op, _)) in ops.iter().enumerate() {
+        if op != Op::Equal {
+            if let Some(prev) = last_change {
+                if idx.saturating_sub(prev) > context * 2 {
+                    // Close previous hunk
+                    let end = (prev + context).min(ops.len() - 1);
+                    hunks.push((hunk_start.unwrap(), end));
+                    hunk_start = Some(idx.saturating_sub(context));
+                }
+            } else {
+                hunk_start = Some(idx.saturating_sub(context));
+            }
+            last_change = Some(idx);
+        }
+    }
+    if let (Some(start), Some(prev)) = (hunk_start, last_change) {
+        let end = (prev + context).min(ops.len() - 1);
+        hunks.push((start, end));
+    }
+
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    for (hunk_start, hunk_end) in &hunks {
+        // Count old/new line numbers at hunk boundaries
+        let mut old_start = 1usize;
+        let mut new_start = 1usize;
+        for &(op, _) in ops.iter().take(*hunk_start) {
+            match op {
+                Op::Equal | Op::Delete => old_start += 1,
+                _ => {}
+            }
+            match op {
+                Op::Equal | Op::Insert => new_start += 1,
+                _ => {}
+            }
+        }
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        for &(op, _) in ops.iter().take(hunk_end + 1).skip(*hunk_start) {
+            match op {
+                Op::Equal | Op::Delete => old_count += 1,
+                _ => {}
+            }
+            match op {
+                Op::Equal | Op::Insert => new_count += 1,
+                _ => {}
+            }
+        }
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start, old_count, new_start, new_count
+        ));
+        for &(op, line_idx) in ops.iter().take(hunk_end + 1).skip(*hunk_start) {
+            match op {
+                Op::Equal => out.push_str(&format!(" {}\n", old_lines[line_idx])),
+                Op::Delete => out.push_str(&format!("-{}\n", old_lines[line_idx])),
+                Op::Insert => out.push_str(&format!("+{}\n", new_lines[line_idx])),
+            }
+        }
+    }
+    out
+}
+
 fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<usize> {
     if let (Some(search), Some(replace)) = (
         edit.get("search").and_then(|v| v.as_str()),
@@ -803,6 +1087,11 @@ fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<u
 }
 
 impl LocalToolHost {
+    /// Fire "stop" hooks when the agent run completes.
+    pub fn fire_stop_hooks(&self) {
+        self.execute_hooks("stop", None, None);
+    }
+
     fn execute_hooks(
         &self,
         phase: &str,
@@ -1076,6 +1365,28 @@ mod tests {
     }
 
     #[test]
+    fn fs_edit_includes_unified_diff_in_result() {
+        let (workspace, host) = temp_host();
+        fs::write(workspace.join("demo.rs"), "fn old() {}\n").expect("seed");
+
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "fs.edit".to_string(),
+                args: json!({"path":"demo.rs","search":"old","replace":"new","all":false}),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        assert_eq!(result.output["edited"], true);
+        let diff = result.output["diff"].as_str().expect("diff field");
+        assert!(diff.contains("--- a/demo.rs"));
+        assert!(diff.contains("+++ b/demo.rs"));
+        assert!(diff.contains("-fn old() {}"));
+        assert!(diff.contains("+fn new() {}"));
+    }
+
+    #[test]
     fn fs_glob_respects_gitignore_rules() {
         let (workspace, host) = temp_host();
         fs::create_dir_all(workspace.join("ignored")).expect("ignored dir");
@@ -1239,5 +1550,106 @@ mod tests {
         });
         assert!(result.success);
         assert_eq!(runner.captured(), vec!["cat note.txt".to_string()]);
+    }
+
+    #[test]
+    fn read_only_sandbox_blocks_network_commands() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-tools-ro-net-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["curl *".to_string()];
+        cfg.policy.sandbox_mode = "read-only".to_string();
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"curl https://example.com"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blocked network command")
+        );
+        assert!(runner.captured().is_empty());
+    }
+
+    #[test]
+    fn isolated_sandbox_uses_configured_wrapper_template() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-tools-iso-wrap-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("note.txt"), "hello").expect("note");
+
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["cat *".to_string()];
+        cfg.policy.sandbox_mode = "isolated".to_string();
+        cfg.policy.sandbox_wrapper =
+            Some("sandboxctl --workspace {workspace} --cmd {cmd}".to_string());
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"cat note.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(result.success);
+        let normalized_workspace =
+            std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+        let expected = render_wrapper_template(
+            "sandboxctl --workspace {workspace} --cmd {cmd}",
+            &normalized_workspace,
+            "cat note.txt",
+        )
+        .expect("render");
+        assert_eq!(runner.captured(), vec![expected]);
+    }
+
+    #[test]
+    fn isolated_sandbox_requires_cmd_placeholder_in_wrapper_template() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-tools-iso-bad-wrap-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["cat *".to_string()];
+        cfg.policy.sandbox_mode = "isolated".to_string();
+        cfg.policy.sandbox_wrapper = Some("sandboxctl --workspace {workspace}".to_string());
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"cat note.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must include {cmd}")
+        );
+        assert!(runner.captured().is_empty());
     }
 }

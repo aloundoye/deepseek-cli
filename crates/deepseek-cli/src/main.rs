@@ -3,25 +3,29 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use deepseek_agent::AgentEngine;
 use deepseek_core::{
-    AppConfig, EventEnvelope, EventKind, Session, SessionBudgets, SessionState, runtime_dir,
+    AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventEnvelope,
+    EventKind, Session, SessionBudgets, SessionState, normalize_deepseek_model,
+    normalize_deepseek_profile, runtime_dir,
 };
 use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
 use deepseek_mcp::{McpManager, McpServer, McpTransport};
 use deepseek_memory::{ExportFormat, MemoryManager};
+use deepseek_policy::{TeamPolicyLocks, team_policy_locks};
 use deepseek_skills::SkillManager;
 use deepseek_store::{AutopilotRunRecord, BackgroundJobRecord, ReplayCassetteRecord, Store};
 use deepseek_tools::PluginManager;
 use deepseek_ui::{
-    KeyBindings, SlashCommand, UiStatus, load_keybindings, render_statusline,
+    KeyBindings, SlashCommand, TuiTheme, UiStatus, load_keybindings, render_statusline,
     run_tui_shell_with_bindings,
 };
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
-use std::fs;
-use std::fs::File;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -408,6 +412,16 @@ struct GitPrArgs {
 struct GitResolveArgs {
     #[arg(long)]
     file: Option<String>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    all: bool,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    stage: bool,
+    #[arg(
+        long = "continue",
+        default_value_t = false,
+        action = clap::ArgAction::SetTrue
+    )]
+    continue_after: bool,
     #[arg(long, default_value = "list")]
     strategy: String,
 }
@@ -443,6 +457,7 @@ struct SkillRunArgs {
 #[derive(Subcommand)]
 enum ReplayCmd {
     Run(ReplayRunArgs),
+    List(ReplayListArgs),
 }
 
 #[derive(Args)]
@@ -451,6 +466,14 @@ struct ReplayRunArgs {
     session_id: String,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     deterministic: bool,
+}
+
+#[derive(Args)]
+struct ReplayListArgs {
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
 }
 
 #[derive(Subcommand)]
@@ -512,6 +535,18 @@ struct VisualAnalyzeArgs {
     min_image_artifacts: usize,
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     strict: bool,
+    #[arg(long)]
+    baseline: Option<String>,
+    #[arg(long = "write-baseline")]
+    write_baseline: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    max_new_artifacts: usize,
+    #[arg(long, default_value_t = 0)]
+    max_missing_artifacts: usize,
+    #[arg(long, default_value_t = 0)]
+    max_changed_artifacts: usize,
+    #[arg(long = "expect", alias = "expectations")]
+    expectations: Option<String>,
 }
 
 #[derive(Args, Default)]
@@ -579,6 +614,8 @@ enum BenchmarkCmd {
     ListPacks,
     ShowPack(BenchmarkShowPackArgs),
     ImportPack(BenchmarkImportPackArgs),
+    SyncPublic(BenchmarkSyncPublicArgs),
+    PublishParity(BenchmarkPublishParityArgs),
     RunMatrix(BenchmarkRunMatrixArgs),
 }
 
@@ -594,12 +631,41 @@ struct BenchmarkImportPackArgs {
 }
 
 #[derive(Args)]
+struct BenchmarkSyncPublicArgs {
+    catalog: String,
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+}
+
+#[derive(Args)]
+struct BenchmarkPublishParityArgs {
+    #[arg(long)]
+    matrix: Option<String>,
+    #[arg(long = "output-dir")]
+    output_dir: Option<String>,
+    #[arg(long = "compare")]
+    compare: Vec<String>,
+    #[arg(long = "require-agent", value_delimiter = ',')]
+    require_agent: Vec<String>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    strict: bool,
+    #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
+    signing_key_env: String,
+}
+
+#[derive(Args)]
 struct BenchmarkRunMatrixArgs {
     matrix: String,
     #[arg(long)]
     output: Option<String>,
     #[arg(long = "compare")]
     compare: Vec<String>,
+    #[arg(long = "report-output")]
+    report_output: Option<String>,
+    #[arg(long = "require-agent", value_delimiter = ',')]
+    require_agent: Vec<String>,
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     strict: bool,
     #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
@@ -792,21 +858,49 @@ fn run_autopilot_cmd(cwd: &Path, args: AutopilotArgs, json_mode: bool) -> Result
 
 fn ensure_llm_ready(cwd: &Path, json_mode: bool) -> Result<()> {
     let cfg = AppConfig::ensure(cwd)?;
-    ensure_llm_ready_with_cfg(&cfg, json_mode)
+    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)
 }
 
-fn ensure_llm_ready_with_cfg(cfg: &AppConfig, json_mode: bool) -> Result<()> {
+fn ensure_llm_ready_with_cfg(cwd: Option<&Path>, cfg: &AppConfig, json_mode: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     let provider = cfg.llm.provider.trim().to_ascii_lowercase();
-    if provider != "deepseek" && provider != "openai" {
+    if provider != "deepseek" {
         return Err(anyhow!(
-            "unsupported llm.provider='{}' (supported: deepseek, openai)",
+            "unsupported llm.provider='{}' (supported: deepseek)",
             cfg.llm.provider
         ));
     }
-    if cfg.llm.offline_fallback {
-        return Ok(());
+    let profile = normalize_deepseek_profile(&cfg.llm.profile).ok_or_else(|| {
+        anyhow!(
+            "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+            cfg.llm.profile
+        )
+    })?;
+    if normalize_deepseek_model(&cfg.llm.base_model).is_none() {
+        return Err(anyhow!(
+            "unsupported llm.base_model='{}' (supported aliases: deepseek-chat, deepseek-reasoner, deepseek-v3.2, deepseek-v3.2-speciale)",
+            cfg.llm.base_model
+        ));
+    }
+    if normalize_deepseek_model(&cfg.llm.max_think_model).is_none() {
+        return Err(anyhow!(
+            "unsupported llm.max_think_model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
+            cfg.llm.max_think_model
+        ));
+    }
+    let base_lower = cfg.llm.base_model.trim().to_ascii_lowercase();
+    if base_lower.contains("speciale") && profile != DEEPSEEK_PROFILE_V32_SPECIALE {
+        return Err(anyhow!(
+            "llm.base_model='{}' requires llm.profile='v3_2_speciale'",
+            cfg.llm.base_model
+        ));
+    }
+    if profile == DEEPSEEK_PROFILE_V32_SPECIALE && !json_mode {
+        eprintln!(
+            "warning: llm.profile=v3_2_speciale is documented as a limited release ending on {}. Use v3_2 if unavailable.",
+            DEEPSEEK_V32_SPECIALE_END_DATE
+        );
     }
 
     let env_key = cfg.llm.api_key_env.trim();
@@ -823,16 +917,27 @@ fn ensure_llm_ready_with_cfg(cfg: &AppConfig, json_mode: bool) -> Result<()> {
         return Ok(());
     }
 
-    let interactive_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if let Some(configured_key) = cfg
+        .llm
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        // SAFETY: We set process-local environment for this CLI process before worker threads start.
+        unsafe {
+            std::env::set_var(env_key, configured_key);
+        }
+        return Ok(());
+    }
+
+    let interactive_tty = std::io::stderr().is_terminal();
     if json_mode || !interactive_tty {
-        return Err(anyhow!(
-            "{} is required when llm.offline_fallback=false. Set it and retry.",
-            env_key
-        ));
+        return Err(anyhow!("{} is required. Set it and retry.", env_key));
     }
 
     eprintln!(
-        "API key is required to use provider '{}' (offline fallback is disabled).",
+        "API key is required to use provider '{}'.",
         cfg.llm.provider
     );
     let prompt = format!("Enter {}: ", env_key);
@@ -845,6 +950,64 @@ fn ensure_llm_ready_with_cfg(cfg: &AppConfig, json_mode: bool) -> Result<()> {
     unsafe {
         std::env::set_var(env_key, trimmed);
     }
+    if let Some(cwd) = cwd {
+        maybe_persist_api_key(cwd, env_key, trimmed)?;
+    }
+    Ok(())
+}
+
+fn maybe_persist_api_key(cwd: &Path, env_key: &str, api_key: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return Ok(());
+    }
+    eprint!(
+        "Save API key to {} for this workspace? [Y/n]: ",
+        AppConfig::project_local_settings_path(cwd).display()
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let normalized = answer.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "n" | "no") {
+        return Ok(());
+    }
+
+    let local_path = AppConfig::project_local_settings_path(cwd);
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut root = if local_path.exists() {
+        let raw = fs::read_to_string(&local_path)?;
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let map = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("settings.local.json root must be an object"))?;
+    let llm_value = map.entry("llm".to_string()).or_insert_with(|| json!({}));
+    if !llm_value.is_object() {
+        *llm_value = json!({});
+    }
+    if let Some(llm) = llm_value.as_object_mut() {
+        llm.insert("api_key".to_string(), json!(api_key));
+        llm.insert("api_key_env".to_string(), json!(env_key));
+    }
+    fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&local_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&local_path, perms)?;
+    }
+    eprintln!("saved API key in {}", local_path.display());
     Ok(())
 }
 
@@ -1136,9 +1299,19 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
         if !json_mode {
             println!("autopilot iteration {iteration_no}");
         }
+        let iteration_prompt = build_autopilot_iteration_prompt(
+            &args.prompt,
+            iteration_no,
+            consecutive_failures,
+            last_error.as_deref(),
+        );
 
-        match engine.run_once_with_mode_and_priority(&args.prompt, args.tools, args.max_think, true)
-        {
+        match engine.run_once_with_mode_and_priority(
+            &iteration_prompt,
+            args.tools,
+            args.max_think,
+            true,
+        ) {
             Ok(output) => {
                 completed_iterations += 1;
                 consecutive_failures = 0;
@@ -1597,6 +1770,24 @@ fn autopilot_deadline(args: &AutopilotStartArgs) -> Result<Option<Instant>> {
     Ok(Some(Instant::now() + Duration::from_secs(seconds.max(1))))
 }
 
+fn build_autopilot_iteration_prompt(
+    prompt: &str,
+    iteration: u64,
+    consecutive_failures: u64,
+    last_error: Option<&str>,
+) -> String {
+    if consecutive_failures == 0 {
+        return prompt.to_string();
+    }
+    let context = last_error
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown error");
+    format!(
+        "{prompt}\n\n[autopilot_recovery]\niteration={iteration}\nconsecutive_failures={consecutive_failures}\nlast_error={context}\npriority=recover_and_continue"
+    )
+}
+
 fn write_autopilot_heartbeat(path: &Path, payload: &serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1609,7 +1800,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
     use std::io::{IsTerminal, Write, stdin, stdout};
 
     let cfg = AppConfig::ensure(cwd)?;
-    ensure_llm_ready_with_cfg(&cfg, json_mode)?;
+    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
     let engine = AgentEngine::new(cwd)?;
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
@@ -1953,7 +2144,8 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     let mut force_max_think = false;
     let status = current_ui_status(cwd, cfg, force_max_think)?;
     let bindings = load_tui_keybindings(cwd, cfg);
-    run_tui_shell_with_bindings(status, bindings, |prompt| {
+    let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
+    run_tui_shell_with_bindings(status, bindings, theme, |prompt| {
         if let Some(cmd) = SlashCommand::parse(prompt) {
             let out = match cmd {
                 SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual".to_string(),
@@ -2376,6 +2568,12 @@ fn parse_visual_cmd(args: Vec<String>) -> Result<VisualCmd> {
             min_artifacts: 1,
             min_image_artifacts: 1,
             strict: false,
+            baseline: None,
+            write_baseline: None,
+            max_new_artifacts: 0,
+            max_missing_artifacts: 0,
+            max_changed_artifacts: 0,
+            expectations: None,
         };
         let mut idx = 1usize;
         while idx < args.len() {
@@ -2420,10 +2618,58 @@ fn parse_visual_cmd(args: Vec<String>) -> Result<VisualCmd> {
                         .map_err(|_| anyhow!("invalid min-image-artifacts '{}'", value))?
                         .max(1);
                 }
+                "--baseline" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --baseline <path>"))?;
+                    parsed.baseline = Some(value.clone());
+                }
+                "--write-baseline" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --write-baseline <path>"))?;
+                    parsed.write_baseline = Some(value.clone());
+                }
+                "--max-new-artifacts" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --max-new-artifacts <n>"))?;
+                    parsed.max_new_artifacts = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid max-new-artifacts '{}'", value))?;
+                }
+                "--max-missing-artifacts" => {
+                    idx += 1;
+                    let value = args.get(idx).ok_or_else(|| {
+                        anyhow!("usage: /visual analyze --max-missing-artifacts <n>")
+                    })?;
+                    parsed.max_missing_artifacts = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid max-missing-artifacts '{}'", value))?;
+                }
+                "--max-changed-artifacts" => {
+                    idx += 1;
+                    let value = args.get(idx).ok_or_else(|| {
+                        anyhow!("usage: /visual analyze --max-changed-artifacts <n>")
+                    })?;
+                    parsed.max_changed_artifacts = value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid max-changed-artifacts '{}'", value))?;
+                }
+                "--expect" | "--expectations" => {
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("usage: /visual analyze --expect <path>"))?;
+                    parsed.expectations = Some(value.clone());
+                }
                 "--strict" => parsed.strict = true,
                 _ => {
                     return Err(anyhow!(
-                        "unknown /visual analyze option: {} (expected --limit/--min-bytes/--min-artifacts/--min-image-artifacts/--strict)",
+                        "unknown /visual analyze option: {} (expected --limit/--min-bytes/--min-artifacts/--min-image-artifacts/--baseline/--write-baseline/--max-new-artifacts/--max-missing-artifacts/--max-changed-artifacts/--expect/--strict)",
                         args[idx]
                     ));
                 }
@@ -2434,7 +2680,7 @@ fn parse_visual_cmd(args: Vec<String>) -> Result<VisualCmd> {
     }
 
     Err(anyhow!(
-        "use /visual list [--limit <n>] | /visual analyze [--limit <n>] [--min-bytes <n>] [--min-artifacts <n>] [--min-image-artifacts <n>] [--strict]"
+        "use /visual list [--limit <n>] | /visual analyze [--limit <n>] [--min-bytes <n>] [--min-artifacts <n>] [--min-image-artifacts <n>] [--baseline <path>] [--write-baseline <path>] [--max-new-artifacts <n>] [--max-missing-artifacts <n>] [--max-changed-artifacts <n>] [--expect <path>] [--strict]"
     ))
 }
 
@@ -2921,7 +3167,7 @@ fn run_profile(cwd: &Path, args: ProfileArgs, json_mode: bool) -> Result<()> {
     });
 
     let payload = if args.benchmark {
-        ensure_llm_ready_with_cfg(&cfg, json_mode)?;
+        ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
         let engine = AgentEngine::new(cwd)?;
         let suite_path = args.benchmark_suite.as_deref().map(Path::new);
         if suite_path.is_some() && args.benchmark_pack.is_some() {
@@ -3127,6 +3373,28 @@ struct BenchmarkMatrixRunSpec {
     seed: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct BenchmarkPublicCatalog {
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    packs: Vec<BenchmarkCatalogPack>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct BenchmarkCatalogPack {
+    name: String,
+    source: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    corpus_id: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
 fn built_in_benchmark_cases() -> Vec<BenchmarkCase> {
     vec![
         BenchmarkCase {
@@ -3273,11 +3541,12 @@ fn built_in_parity_benchmark_cases() -> Vec<BenchmarkCase> {
 
 fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
     let raw = fs::read_to_string(path)?;
-    let mut cases = if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-    {
+    parse_benchmark_cases(&raw, path.to_string_lossy().as_ref())
+}
+
+fn parse_benchmark_cases(raw: &str, source_hint: &str) -> Result<Vec<BenchmarkCase>> {
+    let looks_like_jsonl = source_hint.to_ascii_lowercase().ends_with(".jsonl");
+    let mut cases = if looks_like_jsonl {
         let mut parsed = Vec::new();
         for (line_no, line) in raw.lines().enumerate() {
             let trimmed = line.trim();
@@ -3287,7 +3556,7 @@ fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
             let case: BenchmarkCase = serde_json::from_str(trimmed).map_err(|err| {
                 anyhow!(
                     "invalid benchmark case at {}:{}: {err}",
-                    path.display(),
+                    source_hint,
                     line_no + 1
                 )
             })?;
@@ -3295,7 +3564,7 @@ fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
         }
         parsed
     } else {
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let value: serde_json::Value = serde_json::from_str(raw)?;
         let items = if let Some(arr) = value.as_array() {
             arr.clone()
         } else if let Some(arr) = value.get("cases").and_then(|v| v.as_array()) {
@@ -3310,7 +3579,7 @@ fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
             let case: BenchmarkCase = serde_json::from_value(item).map_err(|err| {
                 anyhow!(
                     "invalid benchmark case at {}:{}: {err}",
-                    path.display(),
+                    source_hint,
                     idx + 1
                 )
             })?;
@@ -3336,6 +3605,33 @@ fn load_benchmark_cases(path: &Path) -> Result<Vec<BenchmarkCase>> {
         return Err(anyhow!("benchmark suite has no valid cases"));
     }
     Ok(cases)
+}
+
+fn is_remote_source(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+fn resolve_local_source_path(cwd: &Path, source: &str) -> PathBuf {
+    let raw = source.trim();
+    if let Some(path) = raw.strip_prefix("file://") {
+        return PathBuf::from(path);
+    }
+    let candidate = PathBuf::from(raw);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    }
+}
+
+fn load_benchmark_cases_from_source(cwd: &Path, source: &str) -> Result<Vec<BenchmarkCase>> {
+    if is_remote_source(source) {
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+        let raw = client.get(source).send()?.error_for_status()?.text()?;
+        return parse_benchmark_cases(&raw, source);
+    }
+    let path = resolve_local_source_path(cwd, source);
+    load_benchmark_cases(&path)
 }
 
 fn built_in_benchmark_pack(name: &str) -> Option<(&'static str, Vec<BenchmarkCase>)> {
@@ -3504,6 +3800,97 @@ fn list_benchmark_packs(cwd: &Path) -> Result<Vec<serde_json::Value>> {
             .cmp(b["name"].as_str().unwrap_or_default())
     });
     Ok(out)
+}
+
+fn write_imported_benchmark_pack(
+    cwd: &Path,
+    name: &str,
+    source: &str,
+    kind: &str,
+    cases: Vec<BenchmarkCase>,
+    mut metadata: serde_json::Value,
+) -> Result<(PathBuf, serde_json::Value)> {
+    let dir = benchmark_pack_dir(cwd);
+    fs::create_dir_all(&dir)?;
+    let destination = dir.join(format!("{}.json", sanitize_pack_name(name)));
+    let mut payload = json!({
+        "name": name,
+        "kind": kind,
+        "source": source,
+        "imported_at": Utc::now().to_rfc3339(),
+        "cases": cases,
+    });
+    if let (Some(obj), Some(extra)) = (payload.as_object_mut(), metadata.as_object_mut()) {
+        for (key, value) in std::mem::take(extra) {
+            obj.insert(key, value);
+        }
+    }
+    fs::write(&destination, serde_json::to_vec_pretty(&payload)?)?;
+    Ok((destination, payload))
+}
+
+fn parse_public_benchmark_catalog(raw: &str) -> Result<BenchmarkPublicCatalog> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    if let Some(packs) = value.as_array() {
+        let parsed = packs
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<BenchmarkCatalogPack>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(BenchmarkPublicCatalog {
+            schema: Some("deepseek.benchmark.catalog.v1".to_string()),
+            packs: parsed,
+        });
+    }
+    let mut catalog: BenchmarkPublicCatalog = serde_json::from_value(value)?;
+    if catalog.schema.is_none() {
+        catalog.schema = Some("deepseek.benchmark.catalog.v1".to_string());
+    }
+    Ok(catalog)
+}
+
+fn resolve_catalog_source(cwd: &Path, catalog_source: &str, entry_source: &str) -> String {
+    if is_remote_source(entry_source) {
+        return entry_source.to_string();
+    }
+    let candidate = PathBuf::from(entry_source);
+    if candidate.is_absolute() {
+        return candidate.to_string_lossy().to_string();
+    }
+    if is_remote_source(catalog_source)
+        && let Ok(base) = reqwest::Url::parse(catalog_source)
+        && let Ok(joined) = base.join(entry_source)
+    {
+        return joined.to_string();
+    }
+    let catalog_path = resolve_local_source_path(cwd, catalog_source);
+    let parent = catalog_path.parent().unwrap_or(cwd);
+    parent.join(entry_source).to_string_lossy().to_string()
+}
+
+fn default_parity_matrix_spec() -> serde_json::Value {
+    json!({
+        "name": "parity-publication",
+        "runs": [
+            {"id": "parity-pack", "pack": "parity", "cases": 8, "seed": 211},
+            {"id": "ops-pack", "pack": "ops", "cases": 3, "seed": 223},
+            {"id": "smoke-pack", "pack": "smoke", "cases": 2, "seed": 227}
+        ]
+    })
+}
+
+fn ensure_parity_matrix_file(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&default_parity_matrix_spec())?,
+    )?;
+    Ok(true)
 }
 
 fn run_profile_benchmark(
@@ -4208,6 +4595,53 @@ fn compare_benchmark_with_peers(
 }
 
 fn run_benchmark_matrix(cwd: &Path, args: BenchmarkRunMatrixArgs, json_mode: bool) -> Result<()> {
+    let payload = benchmark_matrix_payload(cwd, &args, json_mode)?;
+    if let Some(output) = args.output.as_deref() {
+        let output_path = PathBuf::from(output);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(output_path, serde_json::to_vec_pretty(&payload)?)?;
+    }
+    if let Some(output) = args.report_output.as_deref() {
+        let output_path = PathBuf::from(output);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let report = payload
+            .get("report_markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        fs::write(output_path, report)?;
+    }
+
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "benchmark matrix={} runs={} total_cases={} weighted_success_rate={:.3} weighted_quality_rate={:.3} worst_p95={}ms",
+            payload["name"].as_str().unwrap_or_default(),
+            payload["summary"]["total_runs"].as_u64().unwrap_or(0),
+            payload["summary"]["total_cases"].as_u64().unwrap_or(0),
+            payload["summary"]["weighted_success_rate"]
+                .as_f64()
+                .unwrap_or(0.0),
+            payload["summary"]["weighted_quality_rate"]
+                .as_f64()
+                .unwrap_or(0.0),
+            payload["summary"]["worst_p95_latency_ms"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+    }
+    Ok(())
+}
+
+fn benchmark_matrix_payload(
+    cwd: &Path,
+    args: &BenchmarkRunMatrixArgs,
+    json_mode: bool,
+) -> Result<serde_json::Value> {
     ensure_llm_ready(cwd, json_mode)?;
     let matrix_path = PathBuf::from(&args.matrix);
     let spec = load_benchmark_matrix_spec(&matrix_path)?;
@@ -4296,6 +4730,27 @@ fn run_benchmark_matrix(cwd: &Path, args: BenchmarkRunMatrixArgs, json_mode: boo
             ));
         }
     }
+    if !args.require_agent.is_empty() {
+        let available_agents = collect_matrix_agents(peer_comparison.as_ref());
+        let required = args
+            .require_agent
+            .iter()
+            .map(|agent| agent.trim().to_ascii_lowercase())
+            .filter(|agent| !agent.is_empty())
+            .collect::<BTreeSet<_>>();
+        let missing = required
+            .iter()
+            .filter(|agent| !available_agents.contains(*agent))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "benchmark matrix missing required agents: {} (available={})",
+                missing.join(", "),
+                available_agents.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
 
     let mut payload = json!({
         "schema": "deepseek.benchmark.matrix.v1",
@@ -4311,35 +4766,11 @@ fn run_benchmark_matrix(cwd: &Path, args: BenchmarkRunMatrixArgs, json_mode: boo
     {
         object.insert("peer_comparison".to_string(), peer_comparison);
     }
-
-    if let Some(output) = args.output.as_deref() {
-        let output_path = PathBuf::from(output);
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(output_path, serde_json::to_vec_pretty(&payload)?)?;
+    let report_markdown = render_benchmark_matrix_report(&payload);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("report_markdown".to_string(), json!(report_markdown));
     }
-
-    if json_mode {
-        print_json(&payload)?;
-    } else {
-        println!(
-            "benchmark matrix={} runs={} total_cases={} weighted_success_rate={:.3} weighted_quality_rate={:.3} worst_p95={}ms",
-            payload["name"].as_str().unwrap_or_default(),
-            payload["summary"]["total_runs"].as_u64().unwrap_or(0),
-            payload["summary"]["total_cases"].as_u64().unwrap_or(0),
-            payload["summary"]["weighted_success_rate"]
-                .as_f64()
-                .unwrap_or(0.0),
-            payload["summary"]["weighted_quality_rate"]
-                .as_f64()
-                .unwrap_or(0.0),
-            payload["summary"]["worst_p95_latency_ms"]
-                .as_u64()
-                .unwrap_or(0),
-        );
-    }
-    Ok(())
+    Ok(payload)
 }
 
 fn load_benchmark_matrix_spec(path: &Path) -> Result<BenchmarkMatrixSpec> {
@@ -4650,6 +5081,165 @@ fn compare_benchmark_matrix_with_peers(
         "manifest_coverage_warnings": coverage_warnings,
         "case_count_warnings": case_count_warnings,
     }))
+}
+
+fn collect_matrix_agents(peer_comparison: Option<&serde_json::Value>) -> BTreeSet<String> {
+    let mut agents = BTreeSet::new();
+    agents.insert("deepseek-cli".to_string());
+    if let Some(peer) = peer_comparison {
+        for row in peer
+            .get("ranking")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(agent) = row.get("agent").and_then(|v| v.as_str()) {
+                agents.insert(agent.trim().to_ascii_lowercase());
+            }
+        }
+    }
+    agents
+}
+
+fn render_benchmark_matrix_report(payload: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "# Benchmark Matrix Report: {}",
+        payload["name"].as_str().unwrap_or("benchmark-matrix")
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "- Generated at: {}",
+        payload["generated_at"].as_str().unwrap_or_default()
+    ));
+    lines.push(format!(
+        "- Source: {}",
+        payload["source"].as_str().unwrap_or_default()
+    ));
+    lines.push(format!(
+        "- Runs: {}",
+        payload["summary"]["total_runs"].as_u64().unwrap_or(0)
+    ));
+    lines.push(format!(
+        "- Cases: {}",
+        payload["summary"]["total_cases"].as_u64().unwrap_or(0)
+    ));
+    lines.push(format!(
+        "- Weighted success rate: {:.3}",
+        payload["summary"]["weighted_success_rate"]
+            .as_f64()
+            .unwrap_or(0.0)
+    ));
+    lines.push(format!(
+        "- Weighted quality rate: {:.3}",
+        payload["summary"]["weighted_quality_rate"]
+            .as_f64()
+            .unwrap_or(0.0)
+    ));
+    lines.push(format!(
+        "- Worst p95 latency: {} ms",
+        payload["summary"]["worst_p95_latency_ms"]
+            .as_u64()
+            .unwrap_or(0)
+    ));
+    lines.push(String::new());
+
+    lines.push("## Runs".to_string());
+    lines.push(String::new());
+    lines.push("| Run | Corpus | Cases | Success | Quality | p95 ms |".to_string());
+    lines.push("|---|---:|---:|---:|---:|---:|".to_string());
+    for run in payload["runs"].as_array().into_iter().flatten() {
+        let bench = run.get("benchmark").unwrap_or(run);
+        let corpus = bench
+            .get("corpus_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let cases = bench
+            .get("executed_cases")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let succeeded = bench.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0);
+        let success_rate = if cases == 0 {
+            0.0
+        } else {
+            succeeded as f64 / cases as f64
+        };
+        let quality_rate = bench
+            .get("quality_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| benchmark_quality_rate(bench));
+        let p95 = bench
+            .get("p95_latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        lines.push(format!(
+            "| {} | {} | {} | {:.3} | {:.3} | {} |",
+            run["id"].as_str().unwrap_or("run"),
+            corpus,
+            cases,
+            success_rate,
+            quality_rate,
+            p95
+        ));
+    }
+    lines.push(String::new());
+
+    if let Some(peer) = payload.get("peer_comparison") {
+        lines.push("## Peer Ranking".to_string());
+        lines.push(String::new());
+        lines.push(
+            "| Rank | Agent | Cases | Weighted Success | Weighted Quality | Worst p95 ms |"
+                .to_string(),
+        );
+        lines.push("|---:|---|---:|---:|---:|---:|".to_string());
+        for (idx, row) in peer
+            .get("ranking")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            lines.push(format!(
+                "| {} | {} | {} | {:.3} | {:.3} | {} |",
+                idx + 1,
+                row["agent"].as_str().unwrap_or_default(),
+                row["total_cases"].as_u64().unwrap_or(0),
+                row["weighted_success_rate"].as_f64().unwrap_or(0.0),
+                row["weighted_quality_rate"].as_f64().unwrap_or(0.0),
+                row["worst_p95_latency_ms"].as_u64().unwrap_or(0),
+            ));
+        }
+        let manifest_warnings = peer
+            .get("manifest_coverage_warnings")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let case_warnings = peer
+            .get("case_count_warnings")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !manifest_warnings.is_empty() || !case_warnings.is_empty() {
+            lines.push(String::new());
+            lines.push("## Peer Compatibility Warnings".to_string());
+            for warning in manifest_warnings {
+                lines.push(format!("- {warning}"));
+            }
+            for warning in case_warnings {
+                lines.push(format!("- {warning}"));
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Result<()> {
@@ -5004,6 +5594,7 @@ fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "state": session.status,
             "active_plan_id": session.active_plan_id,
             "model": {
+                "profile": cfg.llm.profile,
                 "base": cfg.llm.base_model,
                 "max_think": cfg.llm.max_think_model,
             },
@@ -5032,6 +5623,7 @@ fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "session_id": null,
             "state": "none",
             "model": {
+                "profile": cfg.llm.profile,
                 "base": cfg.llm.base_model,
                 "max_think": cfg.llm.max_think_model,
             },
@@ -5056,9 +5648,10 @@ fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         print_json(&payload)?;
     } else {
         println!(
-            "session={} state={} model={}/{} context={:.1}% pending_approvals={} plugins={}/{}",
+            "session={} state={} model={}/{}/{} context={:.1}% pending_approvals={} plugins={}/{}",
             payload["session_id"].as_str().unwrap_or("none"),
             payload["state"].as_str().unwrap_or("unknown"),
+            payload["model"]["profile"].as_str().unwrap_or_default(),
             payload["model"]["base"].as_str().unwrap_or_default(),
             payload["model"]["max_think"].as_str().unwrap_or_default(),
             payload["context_usage_percent"].as_f64().unwrap_or(0.0),
@@ -5274,9 +5867,16 @@ fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
         .ok()
         .or_else(|| std::env::var("ComSpec").ok())
         .unwrap_or_else(|| "unknown".to_string());
-    let api_key_set = std::env::var(&cfg.llm.api_key_env)
+    let api_key_env_set = std::env::var(&cfg.llm.api_key_env)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
+    let api_key_configured = cfg
+        .llm
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let profile = normalize_deepseek_profile(&cfg.llm.profile).unwrap_or("invalid");
 
     let checks = json!({
         "git": command_exists("git"),
@@ -5286,10 +5886,16 @@ fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
     });
 
     let mut warnings = Vec::new();
-    if !api_key_set && !cfg.llm.offline_fallback {
+    if !api_key_env_set && !api_key_configured {
         warnings.push(format!(
-            "{} not set and offline_fallback=false",
+            "{} not set and llm.api_key not configured",
             cfg.llm.api_key_env
+        ));
+    }
+    if profile == DEEPSEEK_PROFILE_V32_SPECIALE {
+        warnings.push(format!(
+            "llm.profile=v3_2_speciale is a limited release profile (documented end date: {})",
+            DEEPSEEK_V32_SPECIALE_END_DATE
         ));
     }
     if checks["git"].as_bool() != Some(true) {
@@ -5320,9 +5926,10 @@ fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
         },
         "llm": {
             "endpoint": cfg.llm.endpoint,
+            "profile": cfg.llm.profile,
             "api_key_env": cfg.llm.api_key_env,
-            "api_key_set": api_key_set,
-            "offline_fallback": cfg.llm.offline_fallback,
+            "api_key_env_set": api_key_env_set,
+            "api_key_configured": api_key_configured,
             "base_model": cfg.llm.base_model,
             "max_think_model": cfg.llm.max_think_model,
         },
@@ -5353,16 +5960,17 @@ fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
                 .unwrap_or("unavailable")
         );
         println!(
-            "llm: base={} max={} endpoint={} api_key_set={} offline_fallback={}",
+            "llm: profile={} base={} max={} endpoint={} api_key_env_set={} api_key_configured={}",
+            payload["llm"]["profile"].as_str().unwrap_or_default(),
             payload["llm"]["base_model"].as_str().unwrap_or_default(),
             payload["llm"]["max_think_model"]
                 .as_str()
                 .unwrap_or_default(),
             payload["llm"]["endpoint"].as_str().unwrap_or_default(),
-            payload["llm"]["api_key_set"].as_bool().unwrap_or(false),
-            payload["llm"]["offline_fallback"]
+            payload["llm"]["api_key_env_set"].as_bool().unwrap_or(false),
+            payload["llm"]["api_key_configured"]
                 .as_bool()
-                .unwrap_or(false)
+                .unwrap_or(false),
         );
         println!(
             "plugins: enabled={} installed={}",
@@ -5386,17 +5994,8 @@ fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
 
 fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()> {
     let service = IndexService::new(cwd)?;
-    let session = Store::new(cwd)?.load_latest_session()?.unwrap_or(Session {
-        session_id: Uuid::now_v7(),
-        workspace_root: cwd.to_string_lossy().to_string(),
-        baseline_commit: None,
-        status: SessionState::Idle,
-        budgets: SessionBudgets {
-            per_turn_seconds: 120,
-            max_think_tokens: 8192,
-        },
-        active_plan_id: None,
-    });
+    let store = Store::new(cwd)?;
+    let session = ensure_session_record(cwd, &store)?;
 
     match cmd {
         IndexCmd::Build => {
@@ -5456,10 +6055,11 @@ fn run_config(cwd: &Path, cmd: ConfigCmd, json_mode: bool) -> Result<()> {
 
     match cmd {
         ConfigCmd::Show => {
+            let display_cfg = redact_config_for_display(&cfg)?;
             if json_mode {
-                print_json(&cfg)?;
+                print_json(&display_cfg)?;
             } else {
-                println!("{}", fs::read_to_string(cfg_path)?);
+                println!("{}", serde_json::to_string_pretty(&display_cfg)?);
             }
         }
         ConfigCmd::Edit => {
@@ -5502,19 +6102,15 @@ fn run_benchmark(cwd: &Path, cmd: BenchmarkCmd, json_mode: bool) -> Result<()> {
             }
         }
         BenchmarkCmd::ImportPack(args) => {
-            let source = Path::new(&args.source);
-            let cases = load_benchmark_cases(source)?;
-            let dir = benchmark_pack_dir(cwd);
-            fs::create_dir_all(&dir)?;
-            let destination = dir.join(format!("{}.json", sanitize_pack_name(&args.name)));
-            let payload = json!({
-                "name": args.name,
-                "kind": "imported",
-                "source": source.display().to_string(),
-                "imported_at": Utc::now().to_rfc3339(),
-                "cases": cases,
-            });
-            fs::write(&destination, serde_json::to_vec_pretty(&payload)?)?;
+            let cases = load_benchmark_cases_from_source(cwd, &args.source)?;
+            let (destination, payload) = write_imported_benchmark_pack(
+                cwd,
+                &args.name,
+                &args.source,
+                "imported",
+                cases,
+                json!({}),
+            )?;
             if json_mode {
                 print_json(&json!({
                     "imported": true,
@@ -5533,9 +6129,165 @@ fn run_benchmark(cwd: &Path, cmd: BenchmarkCmd, json_mode: bool) -> Result<()> {
                 );
             }
         }
+        BenchmarkCmd::SyncPublic(args) => {
+            let raw = if is_remote_source(&args.catalog) {
+                let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+                client
+                    .get(&args.catalog)
+                    .send()?
+                    .error_for_status()?
+                    .text()?
+            } else {
+                let catalog_path = resolve_local_source_path(cwd, &args.catalog);
+                fs::read_to_string(catalog_path)?
+            };
+            let catalog = parse_public_benchmark_catalog(&raw)?;
+            let catalog_schema = catalog.schema.clone();
+            let selected = args
+                .only
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect::<HashSet<_>>();
+            let mut imported = Vec::new();
+            for entry in catalog.packs {
+                if entry.name.trim().is_empty() || entry.source.trim().is_empty() {
+                    continue;
+                }
+                if !selected.is_empty() && !selected.contains(&entry.name.to_ascii_lowercase()) {
+                    continue;
+                }
+                let target_name = args.prefix.as_deref().map_or_else(
+                    || entry.name.clone(),
+                    |prefix| format!("{}{}", prefix, entry.name),
+                );
+                let resolved_source = resolve_catalog_source(cwd, &args.catalog, &entry.source);
+                let cases = load_benchmark_cases_from_source(cwd, &resolved_source)?;
+                let (path, payload) = write_imported_benchmark_pack(
+                    cwd,
+                    &target_name,
+                    &resolved_source,
+                    entry.kind.as_deref().unwrap_or("public"),
+                    cases,
+                    json!({
+                        "catalog": args.catalog,
+                        "catalog_schema": catalog_schema,
+                        "description": entry.description,
+                        "corpus_id": entry.corpus_id,
+                        "tags": entry.tags,
+                    }),
+                )?;
+                imported.push(json!({
+                    "name": payload["name"],
+                    "kind": payload["kind"],
+                    "source": payload["source"],
+                    "cases": payload["cases"].as_array().map(|rows| rows.len()).unwrap_or(0),
+                    "path": path,
+                }));
+            }
+            let payload = json!({
+                "catalog": args.catalog,
+                "imported": imported,
+                "count": imported.len(),
+            });
+            if json_mode {
+                print_json(&payload)?;
+            } else {
+                println!(
+                    "synced {} public benchmark packs from {}",
+                    payload["count"].as_u64().unwrap_or(0),
+                    args.catalog
+                );
+            }
+        }
+        BenchmarkCmd::PublishParity(args) => {
+            return run_benchmark_publish_parity(cwd, args, json_mode);
+        }
         BenchmarkCmd::RunMatrix(args) => {
             return run_benchmark_matrix(cwd, args, json_mode);
         }
+    }
+    Ok(())
+}
+
+fn run_benchmark_publish_parity(
+    cwd: &Path,
+    args: BenchmarkPublishParityArgs,
+    json_mode: bool,
+) -> Result<()> {
+    let matrix_path = args
+        .matrix
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir(cwd).join("benchmark-matrix-parity.json"));
+    let matrix_created = ensure_parity_matrix_file(&matrix_path)?;
+    let output_dir = args
+        .output_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir(cwd).join("reports/parity"));
+    fs::create_dir_all(&output_dir)?;
+
+    let matrix_args = BenchmarkRunMatrixArgs {
+        matrix: matrix_path.to_string_lossy().to_string(),
+        output: None,
+        compare: args.compare.clone(),
+        report_output: None,
+        require_agent: args.require_agent.clone(),
+        strict: args.strict,
+        signing_key_env: args.signing_key_env.clone(),
+    };
+    let payload = benchmark_matrix_payload(cwd, &matrix_args, json_mode)?;
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let stamped_json = output_dir.join(format!("{timestamp}.json"));
+    let stamped_md = output_dir.join(format!("{timestamp}.md"));
+    let latest_json = output_dir.join("latest.json");
+    let latest_md = output_dir.join("latest.md");
+    fs::write(&stamped_json, serde_json::to_vec_pretty(&payload)?)?;
+    let report = payload
+        .get("report_markdown")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    fs::write(&stamped_md, &report)?;
+    fs::write(&latest_json, serde_json::to_vec_pretty(&payload)?)?;
+    fs::write(&latest_md, &report)?;
+
+    let history_path = output_dir.join("history.jsonl");
+    let mut history = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&history_path)?;
+    let history_entry = json!({
+        "generated_at": Utc::now().to_rfc3339(),
+        "matrix_path": matrix_path,
+        "report_json": stamped_json,
+        "report_markdown": stamped_md,
+        "summary": payload.get("summary").cloned().unwrap_or(json!({})),
+    });
+    writeln!(history, "{}", serde_json::to_string(&history_entry)?)?;
+
+    let result = json!({
+        "published": true,
+        "matrix_created": matrix_created,
+        "matrix_path": matrix_path,
+        "output_dir": output_dir,
+        "stamped_json": stamped_json,
+        "stamped_markdown": stamped_md,
+        "latest_json": latest_json,
+        "latest_markdown": latest_md,
+        "history": history_path,
+        "matrix_payload": payload,
+    });
+    if json_mode {
+        print_json(&result)?;
+    } else {
+        println!(
+            "published parity report: {} (latest: {})",
+            result["stamped_markdown"].as_str().unwrap_or_default(),
+            result["latest_markdown"].as_str().unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -5564,6 +6316,12 @@ fn run_permissions(cwd: &Path, cmd: PermissionsCmd, json_mode: bool) -> Result<(
                 AppConfig::config_path(cwd).display()
             );
         }
+        if payload["team_policy"]["active"].as_bool().unwrap_or(false) {
+            println!(
+                "team policy lock active at {}",
+                payload["team_policy"]["path"].as_str().unwrap_or_default()
+            );
+        }
     }
     Ok(())
 }
@@ -5571,9 +6329,20 @@ fn run_permissions(cwd: &Path, cmd: PermissionsCmd, json_mode: bool) -> Result<(
 fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<serde_json::Value> {
     let mut cfg = AppConfig::ensure(cwd)?;
     let mut updated = false;
+    let team_locks = team_policy_locks();
     match cmd {
         PermissionsCmd::Show => {}
         PermissionsCmd::Set(args) => {
+            if let Some(locks) = team_locks.as_ref() {
+                let locked_fields = locked_permission_fields_for_set(&args, locks);
+                if !locked_fields.is_empty() {
+                    return Err(anyhow!(
+                        "team policy at {} locks permissions fields: {}",
+                        locks.path,
+                        locked_fields.join(", ")
+                    ));
+                }
+            }
             if let Some(mode) = args.approve_bash {
                 let value = mode.as_str().to_string();
                 if cfg.policy.approve_bash != value {
@@ -5631,8 +6400,39 @@ fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<serde_json::Va
             "sandbox_mode": cfg.policy.sandbox_mode,
             "allowlist_entries": cfg.policy.allowlist.len(),
             "allowlist": cfg.policy.allowlist,
-        }
+        },
+        "team_policy": team_locks
+            .as_ref()
+            .map(|locks| json!({
+                "active": true,
+                "path": locks.path,
+                "approve_edits_locked": locks.approve_edits_locked,
+                "approve_bash_locked": locks.approve_bash_locked,
+                "allowlist_locked": locks.allowlist_locked,
+                "sandbox_mode_locked": locks.sandbox_mode_locked,
+            }))
+            .unwrap_or_else(|| json!({"active": false}))
     }))
+}
+
+fn locked_permission_fields_for_set(
+    args: &PermissionsSetArgs,
+    locks: &TeamPolicyLocks,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if locks.approve_bash_locked && args.approve_bash.is_some() {
+        fields.push("approve_bash");
+    }
+    if locks.approve_edits_locked && args.approve_edits.is_some() {
+        fields.push("approve_edits");
+    }
+    if locks.sandbox_mode_locked && args.sandbox_mode.is_some() {
+        fields.push("sandbox_mode");
+    }
+    if locks.allowlist_locked && (args.clear_allowlist || !args.allow.is_empty()) {
+        fields.push("allowlist");
+    }
+    fields
 }
 
 fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
@@ -5986,19 +6786,16 @@ fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
             let strategy = args.strategy.to_ascii_lowercase();
             if strategy == "list" {
                 let output = run_process(cwd, "git", &["diff", "--name-only", "--diff-filter=U"])?;
-                let conflicts = output
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
+                let conflicts = parse_conflict_files(&output);
                 let suggestions = conflicts
                     .iter()
                     .map(|path| {
                         json!({
                             "file": path,
                             "ours": format!("deepseek git resolve --strategy ours --file {path}"),
-                            "theirs": format!("deepseek git resolve --strategy theirs --file {path}")
+                            "theirs": format!("deepseek git resolve --strategy theirs --file {path}"),
+                            "ours_all": "deepseek git resolve --strategy ours --all --stage",
+                            "theirs_all": "deepseek git resolve --strategy theirs --all --stage"
                         })
                     })
                     .collect::<Vec<_>>();
@@ -6022,21 +6819,67 @@ fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
                     }
                 }
             } else {
-                let file = args
-                    .file
-                    .ok_or_else(|| anyhow!("--file is required for strategy '{}'", strategy))?;
                 if strategy != "ours" && strategy != "theirs" {
                     return Err(anyhow!("unsupported strategy '{}'", strategy));
                 }
-                let output = run_process(
-                    cwd,
-                    "git",
-                    &["checkout", &format!("--{strategy}"), "--", &file],
-                )?;
-                if json_mode {
-                    print_json(&json!({"strategy": strategy, "file": file, "output": output}))?;
+                let files =
+                    if args.all {
+                        let output =
+                            run_process(cwd, "git", &["diff", "--name-only", "--diff-filter=U"])?;
+                        parse_conflict_files(&output)
+                    } else {
+                        vec![args.file.ok_or_else(|| {
+                            anyhow!("--file is required for strategy '{}'", strategy)
+                        })?]
+                    };
+                if files.is_empty() {
+                    return Err(anyhow!("no unresolved conflicts found"));
+                }
+
+                let mut outputs = Vec::new();
+                for file in &files {
+                    let output = run_process(
+                        cwd,
+                        "git",
+                        &["checkout", &format!("--{strategy}"), "--", file],
+                    )?;
+                    outputs.push(json!({"file": file, "output": output}));
+                }
+
+                if args.stage {
+                    for file in &files {
+                        run_process(cwd, "git", &["add", "--", file])?;
+                    }
+                }
+
+                let continued = if args.continue_after {
+                    Some(run_git_continue(cwd)?)
                 } else {
-                    println!("{output}");
+                    None
+                };
+                if json_mode {
+                    print_json(&json!({
+                        "strategy": strategy,
+                        "resolved_files": files,
+                        "count": outputs.len(),
+                        "stage": args.stage,
+                        "continued": continued,
+                        "outputs": outputs
+                    }))?;
+                } else {
+                    println!(
+                        "resolved {} conflict file(s) with strategy={} stage={}",
+                        outputs.len(),
+                        strategy,
+                        args.stage
+                    );
+                    if let Some(continued) = &continued {
+                        println!(
+                            "continued {}: {}",
+                            continued["action"].as_str().unwrap_or_default(),
+                            continued["output"].as_str().unwrap_or_default()
+                        );
+                    }
                 }
             }
         }
@@ -6096,6 +6939,41 @@ fn parse_git_status_summary(porcelain: &str) -> GitStatusSummary {
         }
     }
     summary
+}
+
+fn parse_conflict_files(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+}
+
+fn run_git_continue(cwd: &Path) -> Result<serde_json::Value> {
+    let candidates = [
+        ("merge", vec!["merge", "--continue"]),
+        ("rebase", vec!["rebase", "--continue"]),
+        ("cherry-pick", vec!["cherry-pick", "--continue"]),
+    ];
+    let mut errors = Vec::new();
+    for (action, args) in candidates {
+        match run_process(cwd, "git", &args) {
+            Ok(output) => {
+                return Ok(json!({
+                    "action": action,
+                    "output": output
+                }));
+            }
+            Err(err) => {
+                errors.push(format!("{action}: {err}"));
+            }
+        }
+    }
+    Err(anyhow!(
+        "no continuation command succeeded: {}",
+        errors.join(" | ")
+    ))
 }
 
 fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<()> {
@@ -6251,6 +7129,31 @@ fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<()> {
                 print_json(&payload)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
+            }
+        }
+        ReplayCmd::List(args) => {
+            let store = Store::new(cwd)?;
+            let session_id = if let Some(raw) = args.session_id.as_deref() {
+                Some(Uuid::parse_str(raw)?)
+            } else {
+                None
+            };
+            let rows = store.list_replay_cassettes(session_id, args.limit)?;
+            if json_mode {
+                print_json(&rows)?;
+            } else if rows.is_empty() {
+                println!("no replay cassettes found");
+            } else {
+                for row in rows {
+                    println!(
+                        "{} session={} deterministic={} events={} created_at={}",
+                        row.cassette_id,
+                        row.session_id,
+                        row.deterministic,
+                        row.events_count,
+                        row.created_at
+                    );
+                }
             }
         }
     }
@@ -6458,7 +7361,7 @@ fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde_json::Valu
                 return Err(anyhow!("background run-agent prompt is empty"));
             }
             let cfg = AppConfig::ensure(cwd)?;
-            ensure_llm_ready_with_cfg(&cfg, true)?;
+            ensure_llm_ready_with_cfg(Some(cwd), &cfg, true)?;
             let exe = std::env::current_exe()?;
             let mut command = Command::new(exe);
             command.arg("ask").arg(&prompt);
@@ -6622,6 +7525,73 @@ fn terminate_background_pid(pid: u32) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VisualBaselineEntry {
+    path: String,
+    mime: String,
+    size_bytes: u64,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    image_like: bool,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VisualBaselineFile {
+    schema: String,
+    generated_at: String,
+    workspace: String,
+    artifacts: Vec<VisualBaselineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VisualExpectationRule {
+    path_glob: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    min_count: Option<usize>,
+    #[serde(default)]
+    max_count: Option<usize>,
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    min_bytes: Option<u64>,
+    #[serde(default)]
+    min_width: Option<u32>,
+    #[serde(default)]
+    min_height: Option<u32>,
+    #[serde(default)]
+    max_width: Option<u32>,
+    #[serde(default)]
+    max_height: Option<u32>,
+    #[serde(default)]
+    required_path_substrings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VisualExpectationFile {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    rules: Vec<VisualExpectationRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VisualSemanticEntry {
+    path: String,
+    mime: String,
+    size_bytes: u64,
+    image_like: bool,
+    exists: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
 fn run_visual(cwd: &Path, cmd: VisualCmd, json_mode: bool) -> Result<()> {
     let payload = visual_payload(cwd, cmd)?;
     if json_mode {
@@ -6682,36 +7652,73 @@ fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::Value> {
             let mut tiny_artifacts = Vec::new();
             let mut image_like_count = 0usize;
             let mut existing_count = 0usize;
+            let mut baseline_entries = Vec::new();
+            let mut semantic_entries = Vec::new();
 
             for artifact in artifacts {
                 let full = resolve_visual_artifact_path(cwd, &artifact.path);
+                let artifact_path = artifact.path.clone();
+                let artifact_mime = artifact.mime.clone();
                 let metadata = fs::metadata(&full).ok();
                 let exists = metadata.is_some();
                 let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                let sha256 = if exists {
+                    fs::read(&full).ok().map(|bytes| sha256_hex(&bytes))
+                } else {
+                    None
+                };
                 if exists {
                     existing_count = existing_count.saturating_add(1);
                 } else {
-                    missing_paths.push(artifact.path.clone());
+                    missing_paths.push(artifact_path.clone());
                 }
                 let image_like =
-                    artifact.mime.starts_with("image/") || artifact.mime == "application/pdf";
+                    artifact_mime.starts_with("image/") || artifact_mime == "application/pdf";
+                let (width, height) = if image_like && exists {
+                    read_visual_dimensions(&full, &artifact_mime)
+                        .map(|(w, h)| (Some(w), Some(h)))
+                        .unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
                 if image_like {
                     image_like_count = image_like_count.saturating_add(1);
                     if exists && size_bytes < args.min_bytes {
-                        tiny_artifacts.push(artifact.path.clone());
+                        tiny_artifacts.push(artifact_path.clone());
                     }
                 }
 
                 rows.push(json!({
                     "artifact_id": artifact.artifact_id,
-                    "path": artifact.path,
+                    "path": artifact_path,
                     "full_path": full,
-                    "mime": artifact.mime,
+                    "mime": artifact_mime,
                     "created_at": artifact.created_at,
                     "exists": exists,
                     "size_bytes": size_bytes,
                     "image_like": image_like,
+                    "sha256": sha256,
+                    "width": width,
+                    "height": height,
                 }));
+                baseline_entries.push(VisualBaselineEntry {
+                    path: artifact_path.clone(),
+                    mime: artifact_mime.clone(),
+                    size_bytes,
+                    sha256,
+                    image_like,
+                    width,
+                    height,
+                });
+                semantic_entries.push(VisualSemanticEntry {
+                    path: artifact_path,
+                    mime: artifact_mime,
+                    size_bytes,
+                    image_like,
+                    exists,
+                    width,
+                    height,
+                });
             }
 
             let total = rows.len();
@@ -6741,6 +7748,131 @@ fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::Value> {
                     args.min_bytes
                 ));
             }
+            let mut baseline_diff = json!(null);
+            let mut new_artifacts = Vec::new();
+            let mut missing_from_current = Vec::new();
+            let mut changed_artifacts = Vec::new();
+            if let Some(path) = args.baseline.as_deref() {
+                let baseline_path = PathBuf::from(path);
+                let baseline = read_visual_baseline_file(&baseline_path)?;
+                let current_by_path = baseline_entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| (entry.path.clone(), entry))
+                    .collect::<HashMap<_, _>>();
+                let baseline_by_path = baseline
+                    .artifacts
+                    .iter()
+                    .cloned()
+                    .map(|entry| (entry.path.clone(), entry))
+                    .collect::<HashMap<_, _>>();
+
+                for (path, current) in &current_by_path {
+                    let Some(previous) = baseline_by_path.get(path) else {
+                        new_artifacts.push(path.clone());
+                        continue;
+                    };
+                    if current.sha256 != previous.sha256
+                        || current.mime != previous.mime
+                        || current.width != previous.width
+                        || current.height != previous.height
+                    {
+                        changed_artifacts.push(path.clone());
+                    }
+                }
+                for path in baseline_by_path.keys() {
+                    if !current_by_path.contains_key(path) {
+                        missing_from_current.push(path.clone());
+                    }
+                }
+                new_artifacts.sort();
+                missing_from_current.sort();
+                changed_artifacts.sort();
+                baseline_diff = json!({
+                    "source": baseline_path,
+                    "schema": baseline.schema,
+                    "new_artifacts": new_artifacts,
+                    "missing_artifacts": missing_from_current,
+                    "changed_artifacts": changed_artifacts,
+                });
+
+                if baseline_diff["new_artifacts"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0)
+                    > args.max_new_artifacts
+                {
+                    warnings.push(format!(
+                        "new_artifacts={} above allowed maximum {}",
+                        baseline_diff["new_artifacts"]
+                            .as_array()
+                            .map(|rows| rows.len())
+                            .unwrap_or(0),
+                        args.max_new_artifacts
+                    ));
+                }
+                if baseline_diff["missing_artifacts"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0)
+                    > args.max_missing_artifacts
+                {
+                    warnings.push(format!(
+                        "missing_artifacts={} above allowed maximum {}",
+                        baseline_diff["missing_artifacts"]
+                            .as_array()
+                            .map(|rows| rows.len())
+                            .unwrap_or(0),
+                        args.max_missing_artifacts
+                    ));
+                }
+                if baseline_diff["changed_artifacts"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0)
+                    > args.max_changed_artifacts
+                {
+                    warnings.push(format!(
+                        "changed_artifacts={} above allowed maximum {}",
+                        baseline_diff["changed_artifacts"]
+                            .as_array()
+                            .map(|rows| rows.len())
+                            .unwrap_or(0),
+                        args.max_changed_artifacts
+                    ));
+                }
+            }
+            let semantic = if let Some(path) = args.expectations.as_deref() {
+                let expectation_path = PathBuf::from(path);
+                let semantic = evaluate_visual_semantics(&semantic_entries, &expectation_path)?;
+                let failures = semantic
+                    .get("failures")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| rows.len())
+                    .unwrap_or(0);
+                if failures > 0 {
+                    warnings.push(format!("semantic_expectations_failed={}", failures));
+                }
+                json!(semantic)
+            } else {
+                json!(null)
+            };
+            let baseline_written = if let Some(path) = args.write_baseline.as_deref() {
+                let output = PathBuf::from(path);
+                write_visual_baseline_file(
+                    &output,
+                    cwd,
+                    VisualBaselineFile {
+                        schema: "deepseek.visual.baseline.v1".to_string(),
+                        generated_at: Utc::now().to_rfc3339(),
+                        workspace: cwd.to_string_lossy().to_string(),
+                        artifacts: baseline_entries.clone(),
+                    },
+                )?;
+                Some(output)
+            } else {
+                None
+            };
             let ok = warnings.is_empty();
             let payload = json!({
                 "ok": ok,
@@ -6756,6 +7888,9 @@ fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::Value> {
                 "warnings": warnings,
                 "missing_paths": missing_paths,
                 "tiny_artifacts": tiny_artifacts,
+                "baseline_diff": baseline_diff,
+                "semantic": semantic,
+                "baseline_written": baseline_written,
                 "artifacts": rows,
             });
             if args.strict && !ok {
@@ -6783,6 +7918,314 @@ fn resolve_visual_artifact_path(cwd: &Path, artifact_path: &str) -> PathBuf {
     } else {
         cwd.join(candidate)
     }
+}
+
+fn read_visual_baseline_file(path: &Path) -> Result<VisualBaselineFile> {
+    let raw = fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    if let Some(artifacts) = value.as_array() {
+        let rows = artifacts
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<VisualBaselineEntry>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(VisualBaselineFile {
+            schema: "deepseek.visual.baseline.v1".to_string(),
+            generated_at: String::new(),
+            workspace: String::new(),
+            artifacts: rows,
+        });
+    }
+    let mut baseline: VisualBaselineFile = serde_json::from_value(value)?;
+    if baseline.schema.trim().is_empty() {
+        baseline.schema = "deepseek.visual.baseline.v1".to_string();
+    }
+    Ok(baseline)
+}
+
+fn write_visual_baseline_file(
+    path: &Path,
+    cwd: &Path,
+    mut baseline: VisualBaselineFile,
+) -> Result<()> {
+    if baseline.schema.trim().is_empty() {
+        baseline.schema = "deepseek.visual.baseline.v1".to_string();
+    }
+    if baseline.workspace.trim().is_empty() {
+        baseline.workspace = cwd.to_string_lossy().to_string();
+    }
+    if baseline.generated_at.trim().is_empty() {
+        baseline.generated_at = Utc::now().to_rfc3339();
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&baseline)?)?;
+    Ok(())
+}
+
+fn read_visual_expectation_file(path: &Path) -> Result<VisualExpectationFile> {
+    let raw = fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    if let Some(rules) = value.as_array() {
+        let parsed = rules
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<VisualExpectationRule>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(VisualExpectationFile {
+            schema: "deepseek.visual.expectation.v1".to_string(),
+            rules: parsed,
+        });
+    }
+    let mut parsed: VisualExpectationFile = serde_json::from_value(value)?;
+    if parsed.schema.trim().is_empty() {
+        parsed.schema = "deepseek.visual.expectation.v1".to_string();
+    }
+    Ok(parsed)
+}
+
+fn evaluate_visual_semantics(
+    entries: &[VisualSemanticEntry],
+    expectation_path: &Path,
+) -> Result<serde_json::Value> {
+    let expectations = read_visual_expectation_file(expectation_path)?;
+    let mut failures = Vec::new();
+    let mut results = Vec::new();
+    let mut passed = 0usize;
+
+    for (idx, rule) in expectations.rules.iter().enumerate() {
+        let label = rule
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("rule-{}", idx + 1));
+        let glob = glob::Pattern::new(&rule.path_glob)
+            .map_err(|err| anyhow!("invalid expectation glob '{}': {}", rule.path_glob, err))?;
+        let mut matched = entries
+            .iter()
+            .filter(|entry| glob.matches(&entry.path))
+            .collect::<Vec<_>>();
+        matched.sort_by(|a, b| a.path.cmp(&b.path));
+        let existing = matched
+            .iter()
+            .filter(|entry| entry.exists)
+            .copied()
+            .collect::<Vec<_>>();
+        let min_count = rule.min_count.unwrap_or(1);
+        let mut rule_failures = Vec::new();
+        if existing.len() < min_count {
+            rule_failures.push(format!(
+                "{} matched {} artifacts (minimum required {})",
+                label,
+                existing.len(),
+                min_count
+            ));
+        }
+        if let Some(max_count) = rule.max_count
+            && existing.len() > max_count
+        {
+            rule_failures.push(format!(
+                "{} matched {} artifacts (maximum allowed {})",
+                label,
+                existing.len(),
+                max_count
+            ));
+        }
+
+        for entry in existing {
+            if let Some(expected_mime) = rule.mime.as_deref()
+                && !entry.mime.eq_ignore_ascii_case(expected_mime)
+            {
+                rule_failures.push(format!(
+                    "{}:{} mime {} did not match {}",
+                    label, entry.path, entry.mime, expected_mime
+                ));
+            }
+            if let Some(min_bytes) = rule.min_bytes
+                && entry.size_bytes < min_bytes
+            {
+                rule_failures.push(format!(
+                    "{}:{} size {} below minimum {}",
+                    label, entry.path, entry.size_bytes, min_bytes
+                ));
+            }
+            if let Some(min_width) = rule.min_width {
+                match entry.width {
+                    Some(width) if width >= min_width => {}
+                    Some(width) => rule_failures.push(format!(
+                        "{}:{} width {} below minimum {}",
+                        label, entry.path, width, min_width
+                    )),
+                    None => rule_failures.push(format!(
+                        "{}:{} width unavailable for semantic check",
+                        label, entry.path
+                    )),
+                }
+            }
+            if let Some(min_height) = rule.min_height {
+                match entry.height {
+                    Some(height) if height >= min_height => {}
+                    Some(height) => rule_failures.push(format!(
+                        "{}:{} height {} below minimum {}",
+                        label, entry.path, height, min_height
+                    )),
+                    None => rule_failures.push(format!(
+                        "{}:{} height unavailable for semantic check",
+                        label, entry.path
+                    )),
+                }
+            }
+            if let Some(max_width) = rule.max_width
+                && let Some(width) = entry.width
+                && width > max_width
+            {
+                rule_failures.push(format!(
+                    "{}:{} width {} above maximum {}",
+                    label, entry.path, width, max_width
+                ));
+            }
+            if let Some(max_height) = rule.max_height
+                && let Some(height) = entry.height
+                && height > max_height
+            {
+                rule_failures.push(format!(
+                    "{}:{} height {} above maximum {}",
+                    label, entry.path, height, max_height
+                ));
+            }
+            for needle in &rule.required_path_substrings {
+                let normalized = needle.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    continue;
+                }
+                if !entry.path.to_ascii_lowercase().contains(&normalized) {
+                    rule_failures.push(format!(
+                        "{}:{} path missing required semantic token '{}'",
+                        label, entry.path, normalized
+                    ));
+                }
+            }
+        }
+
+        let ok = rule_failures.is_empty();
+        if ok {
+            passed = passed.saturating_add(1);
+        } else {
+            failures.extend(rule_failures.iter().cloned());
+        }
+        results.push(json!({
+            "name": label,
+            "path_glob": rule.path_glob,
+            "matched": matched.len(),
+            "matched_existing": matched.iter().filter(|entry| entry.exists).count(),
+            "ok": ok,
+            "failures": rule_failures,
+        }));
+    }
+
+    Ok(json!({
+        "source": expectation_path,
+        "schema": expectations.schema,
+        "rules_total": expectations.rules.len(),
+        "rules_passed": passed,
+        "rules_failed": expectations.rules.len().saturating_sub(passed),
+        "failures": failures,
+        "results": results,
+    }))
+}
+
+fn read_visual_dimensions(path: &Path, mime: &str) -> Option<(u32, u32)> {
+    let bytes = fs::read(path).ok()?;
+    if mime.eq_ignore_ascii_case("image/png") {
+        return parse_png_dimensions(&bytes);
+    }
+    if mime.eq_ignore_ascii_case("image/jpeg") || mime.eq_ignore_ascii_case("image/jpg") {
+        return parse_jpeg_dimensions(&bytes);
+    }
+    if mime.eq_ignore_ascii_case("image/gif") {
+        return parse_gif_dimensions(&bytes);
+    }
+    parse_png_dimensions(&bytes)
+        .or_else(|| parse_jpeg_dimensions(&bytes))
+        .or_else(|| parse_gif_dimensions(&bytes))
+}
+
+fn parse_png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 {
+        return None;
+    }
+    let signature = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes[..8] != signature {
+        return None;
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((width, height))
+}
+
+fn parse_gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 10 {
+        return None;
+    }
+    if !bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a") {
+        return None;
+    }
+    let width = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+    let height = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+    Some((width, height))
+}
+
+fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut idx = 2usize;
+    while idx + 9 < bytes.len() {
+        if bytes[idx] != 0xff {
+            idx += 1;
+            continue;
+        }
+        while idx < bytes.len() && bytes[idx] == 0xff {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
+            break;
+        }
+        let marker = bytes[idx];
+        idx += 1;
+        if marker == 0xd8 || marker == 0xd9 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if idx + 1 >= bytes.len() {
+            break;
+        }
+        let segment_len = ((bytes[idx] as usize) << 8) | bytes[idx + 1] as usize;
+        if segment_len < 2 || idx + segment_len > bytes.len() {
+            break;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) && segment_len >= 7
+        {
+            let height = u16::from_be_bytes([bytes[idx + 3], bytes[idx + 4]]) as u32;
+            let width = u16::from_be_bytes([bytes[idx + 5], bytes[idx + 6]]) as u32;
+            return Some((width, height));
+        }
+        idx += segment_len;
+    }
+    None
 }
 
 fn run_teleport(cwd: &Path, args: TeleportArgs, json_mode: bool) -> Result<()> {
@@ -6928,6 +8371,16 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+fn redact_config_for_display(cfg: &AppConfig) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(cfg)?;
+    if let Some(llm) = value.get_mut("llm").and_then(|entry| entry.as_object_mut())
+        && llm.contains_key("api_key")
+    {
+        llm.insert("api_key".to_string(), json!("***REDACTED***"));
+    }
+    Ok(value)
+}
+
 fn append_control_event(cwd: &Path, kind: EventKind) -> Result<()> {
     let store = Store::new(cwd)?;
     let session = ensure_session_record(cwd, &store)?;
@@ -6945,14 +8398,15 @@ fn ensure_session_record(cwd: &Path, store: &Store) -> Result<Session> {
     if let Some(existing) = store.load_latest_session()? {
         return Ok(existing);
     }
+    let cfg = AppConfig::load(cwd).unwrap_or_default();
     let session = Session {
         session_id: Uuid::now_v7(),
         workspace_root: cwd.to_string_lossy().to_string(),
         baseline_commit: None,
         status: SessionState::Idle,
         budgets: SessionBudgets {
-            per_turn_seconds: 120,
-            max_think_tokens: 8192,
+            per_turn_seconds: cfg.budgets.max_turn_duration_secs,
+            max_think_tokens: cfg.budgets.max_reasoner_tokens_per_session as u32,
         },
         active_plan_id: None,
     };

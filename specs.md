@@ -1,6 +1,6 @@
-# RFC (Comprehensive): DeepSeek CLI Agent in Rust – A Full-Featured Coding Assistant to Match and Surpass Claude Code
+# RFC (Comprehensive): DeepSeek CLI Agent in Rust – A Full-Featured Coding Assistant to Match and Surpass Claude Code use DeepSeek API
 
-**Status:** Draft  
+**Status:** Completed  
 **Date:** 2026-02-17  
 **Goal:** A production-grade, open-source coding agent CLI powered by DeepSeek, designed to **match and surpass Claude Code** in feature completeness, developer experience, safety, and cost-effectiveness. This RFC defines the complete feature set, system architecture, and implementation roadmap.
 

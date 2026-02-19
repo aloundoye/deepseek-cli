@@ -3,9 +3,12 @@
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 provider = "deepseek"
+profile = "v3_2"
 context_window_tokens = 1000000
 temperature = 0.2
 endpoint = "https://api.deepseek.com/chat/completions"
+# Optional workspace-local key override (prefer env in CI/prod):
+# api_key = "dsk-..."
 api_key_env = "DEEPSEEK_API_KEY"
 fast_mode = false
 language = "en"
@@ -14,7 +17,6 @@ timeout_seconds = 60
 max_retries = 3
 retry_base_ms = 400
 stream = true
-offline_fallback = false
 
 [router]
 auto_max_think = true
@@ -39,6 +41,9 @@ redact_patterns = [
   "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b",
 ]
 sandbox_mode = "allowlist"
+# Optional OS-level sandbox wrapper for `sandbox_mode = "isolated"`:
+# sandbox_wrapper = "bwrap --die-with-parent --new-session --unshare-all --bind {workspace} {workspace} --chdir {workspace} /bin/sh -lc {cmd}"
+sandbox_wrapper = ""
 
 [plugins]
 enabled = true
@@ -96,3 +101,13 @@ enabled = false
 [index]
 enabled = true
 engine = "tantivy"
+watch_files = true
+
+[budgets]
+max_turn_duration_secs = 300
+max_reasoner_tokens_per_session = 1000000
+
+[theme]
+primary = "Cyan"
+secondary = "Yellow"
+error = "Red"

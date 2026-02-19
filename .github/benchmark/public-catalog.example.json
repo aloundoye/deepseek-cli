@@ -1,0 +1,21 @@
+{
+  "schema": "deepseek.benchmark.catalog.v1",
+  "packs": [
+    {
+      "name": "swe-bench-lite",
+      "source": "https://example.com/benchmarks/swe-bench-lite.json",
+      "kind": "public",
+      "description": "Public SWE-lite planning corpus.",
+      "corpus_id": "public-swe-bench-lite",
+      "tags": ["public", "swe", "planning"]
+    },
+    {
+      "name": "ops-playbooks",
+      "source": "https://example.com/benchmarks/ops-playbooks.jsonl",
+      "kind": "public",
+      "description": "Operational recovery and incident response corpus.",
+      "corpus_id": "public-ops-playbooks",
+      "tags": ["public", "ops", "incident"]
+    }
+  ]
+}

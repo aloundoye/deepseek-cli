@@ -1238,6 +1238,64 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_replay_cassettes(
+        &self,
+        session_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ReplayCassetteRecord>> {
+        let conn = self.db()?;
+        let bounded_limit = limit.clamp(1, 500) as i64;
+        let mut out = Vec::new();
+        if let Some(session_id) = session_id {
+            let mut stmt = conn.prepare(
+                "SELECT cassette_id, session_id, deterministic, events_count, payload_json, created_at
+                 FROM replay_cassettes
+                 WHERE session_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![session_id.to_string(), bounded_limit], |r| {
+                Ok(ReplayCassetteRecord {
+                    cassette_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    deterministic: r.get::<_, i64>(2)? != 0,
+                    events_count: r.get::<_, i64>(3)? as u64,
+                    payload_json: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+            return Ok(out);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT cassette_id, session_id, deterministic, events_count, payload_json, created_at
+             FROM replay_cassettes
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![bounded_limit], |r| {
+            Ok(ReplayCassetteRecord {
+                cassette_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                deterministic: r.get::<_, i64>(2)? != 0,
+                events_count: r.get::<_, i64>(3)? as u64,
+                payload_json: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn set_skill_registry(&self, record: &SkillRegistryRecord) -> Result<()> {
         let conn = self.db()?;
         conn.execute(

@@ -1,0 +1,23 @@
+{
+  "name": "scheduled-parity",
+  "runs": [
+    {
+      "id": "parity-pack",
+      "pack": "parity",
+      "cases": 8,
+      "seed": 211
+    },
+    {
+      "id": "ops-pack",
+      "pack": "ops",
+      "cases": 3,
+      "seed": 223
+    },
+    {
+      "id": "smoke-pack",
+      "pack": "smoke",
+      "cases": 2,
+      "seed": 227
+    }
+  ]
+}
