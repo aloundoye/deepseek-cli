@@ -609,14 +609,16 @@ impl LocalToolHost {
                 let results_count = results.len() as u64;
 
                 // Cache the results
-                let _ = self.store.set_web_search_cache(&deepseek_store::WebSearchCacheRecord {
-                    query_hash: query_hash.clone(),
-                    query: query.to_string(),
-                    results_json: results_json.clone(),
-                    results_count,
-                    cached_at: chrono::Utc::now().to_rfc3339(),
-                    ttl_seconds: 900, // 15 minutes
-                });
+                let _ = self
+                    .store
+                    .set_web_search_cache(&deepseek_store::WebSearchCacheRecord {
+                        query_hash: query_hash.clone(),
+                        query: query.to_string(),
+                        results_json: results_json.clone(),
+                        results_count,
+                        cached_at: chrono::Utc::now().to_rfc3339(),
+                        ttl_seconds: 900, // 15 minutes
+                    });
 
                 // Emit event
                 let seq = self.store.next_seq_no(uuid::Uuid::nil()).unwrap_or(1);

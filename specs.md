@@ -26,7 +26,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Cross-platform** | macOS 13.0+, Ubuntu 20.04+/Debian 10+, Windows 10+ (WSL/Git Bash). |
 | **Multiple installation methods** | Native binary, Homebrew, Winget, direct download. |
 | **Session persistence** | Resume sessions with `deepseek run`; checkpointing via event log. |
-| **Large context** | 128K token window (DeepSeek API limit), automatic context compression when nearing limits. |
+| **Large context** | 128K token default window (configurable up to 1M via `context_window_tokens`), automatic context compression when nearing threshold. |
 | **Project-wide awareness** | Indexes entire codebase; understands file structure and dependencies. |
 | **Checkpointing** | Auto-saves file edits; reversible via `/rewind` or keyboard shortcut. |
 | **Fast Mode** | Optimized API parameters for lower latency (configurable). |

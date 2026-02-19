@@ -331,6 +331,13 @@ pub struct UsageSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageByUnitSummary {
+    pub unit: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextCompactionRecord {
     pub summary_id: Uuid,
     pub session_id: Uuid,
@@ -936,6 +943,26 @@ impl Store {
             output_tokens: output_tokens.max(0) as u64,
             records: records.max(0) as u64,
         })
+    }
+
+    pub fn usage_by_unit(&self, session_id: Uuid) -> Result<Vec<UsageByUnitSummary>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT unit, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+             FROM usage_ledger WHERE session_id = ?1 GROUP BY unit ORDER BY unit",
+        )?;
+        let rows = stmt.query_map([session_id.to_string()], |r| {
+            Ok(UsageByUnitSummary {
+                unit: r.get(0)?,
+                input_tokens: r.get::<_, i64>(1)?.max(0) as u64,
+                output_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn list_recent_verification_runs(
@@ -1650,14 +1677,14 @@ impl Store {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .ok();
-        if let Some((existing_holder, heartbeat)) = existing {
-            if existing_holder != holder {
-                // Check if heartbeat is stale (> 60 seconds)
-                if let Ok(hb) = chrono::DateTime::parse_from_rfc3339(&heartbeat) {
-                    let age = Utc::now().signed_duration_since(hb.with_timezone(&Utc));
-                    if age.num_seconds() < 60 {
-                        return Ok(false); // Lock held by another process
-                    }
+        if let Some((existing_holder, heartbeat)) = existing
+            && existing_holder != holder
+        {
+            // Check if heartbeat is stale (> 60 seconds)
+            if let Ok(hb) = chrono::DateTime::parse_from_rfc3339(&heartbeat) {
+                let age = Utc::now().signed_duration_since(hb.with_timezone(&Utc));
+                if age.num_seconds() < 60 {
+                    return Ok(false); // Lock held by another process
                 }
             }
         }
@@ -1937,6 +1964,30 @@ impl Store {
              FROM artifacts WHERE task_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([task_id.to_string()], |r| {
+            Ok(ArtifactRecord {
+                artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                task_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                artifact_path: r.get(2)?,
+                files_json: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_all_artifacts(&self, limit: usize) -> Result<Vec<ArtifactRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT artifact_id, task_id, artifact_path, files_json, created_at
+             FROM artifacts ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
             Ok(ArtifactRecord {
                 artifact_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
                     .unwrap_or_else(|_| Uuid::nil()),
@@ -2642,9 +2693,7 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             proj.compaction_events = proj.compaction_events.saturating_add(1)
         }
         EventKind::AutopilotRunStartedV1 { run_id, .. } => proj.autopilot_runs.push(*run_id),
-        EventKind::PermissionModeChangedV1 { to, .. } => {
-            proj.permission_mode = Some(to.clone())
-        }
+        EventKind::PermissionModeChangedV1 { to, .. } => proj.permission_mode = Some(to.clone()),
         EventKind::TaskCreatedV1 { task_id, .. } => proj.task_ids.push(*task_id),
         EventKind::ReviewStartedV1 { review_id, .. } => proj.review_ids.push(*review_id),
         _ => {}

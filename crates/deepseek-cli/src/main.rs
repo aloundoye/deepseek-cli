@@ -2259,7 +2259,9 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                 }
                 SlashCommand::Sandbox(args) => {
                     if json_mode {
-                        print_json(&json!({"sandbox_mode": cfg.policy.sandbox_mode, "args": args}))?;
+                        print_json(
+                            &json!({"sandbox_mode": cfg.policy.sandbox_mode, "args": args}),
+                        )?;
                     } else {
                         println!("Sandbox mode: {}", cfg.policy.sandbox_mode);
                         if !args.is_empty() {
@@ -2271,7 +2273,9 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                     if json_mode {
                         print_json(&json!({"agents": "subagent listing"}))?;
                     } else {
-                        println!("Subagent status: use 'deepseek background list' for running agents.");
+                        println!(
+                            "Subagent status: use 'deepseek background list' for running agents."
+                        );
                     }
                 }
                 SlashCommand::Tasks(_args) => {
@@ -2279,7 +2283,9 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                 }
                 SlashCommand::Review(args) => {
                     if json_mode {
-                        print_json(&json!({"review": "use 'deepseek review' subcommand", "args": args}))?;
+                        print_json(
+                            &json!({"review": "use 'deepseek review' subcommand", "args": args}),
+                        )?;
                     } else {
                         println!("Use 'deepseek review [--diff|--staged|--pr N]' for code review.");
                         println!("Presets: security, perf, style, PR-ready");
@@ -2290,7 +2296,14 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                     if query.is_empty() {
                         println!("Usage: /search <query>");
                     } else {
-                        run_search(cwd, SearchArgs { query, max_results: 10 }, json_mode)?;
+                        run_search(
+                            cwd,
+                            SearchArgs {
+                                query,
+                                max_results: 10,
+                            },
+                            json_mode,
+                        )?;
                     }
                 }
                 SlashCommand::TerminalSetup => {
@@ -2298,8 +2311,14 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         print_json(&json!({"terminal_setup": "configured"}))?;
                     } else {
                         println!("Terminal setup:");
-                        println!("  Shell: {}", std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()));
-                        println!("  TERM:  {}", std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string()));
+                        println!(
+                            "  Shell: {}",
+                            std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string())
+                        );
+                        println!(
+                            "  TERM:  {}",
+                            std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string())
+                        );
                         let (cols, rows) = std::process::Command::new("stty")
                             .arg("size")
                             .stderr(std::process::Stdio::inherit())
@@ -3290,7 +3309,10 @@ fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Resu
         estimated_cost_usd,
         background_jobs,
         autopilot_running,
-        permission_mode: projection.permission_mode.clone().unwrap_or_else(|| cfg.policy.permission_mode.clone()),
+        permission_mode: projection
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| cfg.policy.permission_mode.clone()),
         active_tasks: projection.task_ids.len(),
         context_used_tokens: usage.input_tokens + usage.output_tokens,
         context_max_tokens: cfg.llm.context_window_tokens,
@@ -8959,7 +8981,9 @@ fn run_exec(cwd: &Path, args: ExecArgs, json_mode: bool) -> Result<()> {
     let policy = deepseek_policy::PolicyEngine::from_app_config(&config.policy);
 
     // Check command against policy
-    policy.check_command(&args.command).map_err(|e| anyhow!("policy denied command: {e}"))?;
+    policy
+        .check_command(&args.command)
+        .map_err(|e| anyhow!("policy denied command: {e}"))?;
 
     let _store = Store::new(cwd)?;
     let tool_host = deepseek_tools::LocalToolHost::new(cwd, policy)?;
@@ -8985,10 +9009,10 @@ fn run_exec(cwd: &Path, args: ExecArgs, json_mode: bool) -> Result<()> {
         if let Some(stdout) = result.output.get("stdout").and_then(|v| v.as_str()) {
             print!("{stdout}");
         }
-        if let Some(stderr) = result.output.get("stderr").and_then(|v| v.as_str()) {
-            if !stderr.is_empty() {
-                eprint!("{stderr}");
-            }
+        if let Some(stderr) = result.output.get("stderr").and_then(|v| v.as_str())
+            && !stderr.is_empty()
+        {
+            eprint!("{stderr}");
         }
     }
     Ok(())
@@ -9001,20 +9025,18 @@ fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Result<()> {
             let tasks = store.list_tasks(None)?;
             if json_mode {
                 print_json(&json!({"tasks": tasks}))?;
+            } else if tasks.is_empty() {
+                println!("No tasks in queue.");
             } else {
-                if tasks.is_empty() {
-                    println!("No tasks in queue.");
-                } else {
-                    println!("{:<36}  {:<10}  {:<4}  {}", "ID", "STATUS", "PRI", "TITLE");
-                    println!("{}", "-".repeat(80));
-                    for task in &tasks {
-                        println!(
-                            "{:<36}  {:<10}  {:<4}  {}",
-                            task.task_id, task.status, task.priority, task.title
-                        );
-                    }
-                    println!("\n{} task(s) total.", tasks.len());
+                println!("{:<36}  {:<10}  {:<4}  TITLE", "ID", "STATUS", "PRI");
+                println!("{}", "-".repeat(80));
+                for task in &tasks {
+                    println!(
+                        "{:<36}  {:<10}  {:<4}  {}",
+                        task.task_id, task.status, task.priority, task.title
+                    );
                 }
+                println!("\n{} task(s) total.", tasks.len());
             }
         }
         TasksCmd::Show(args) => {
@@ -9073,30 +9095,28 @@ fn run_search(cwd: &Path, args: SearchArgs, json_mode: bool) -> Result<()> {
 
     if json_mode {
         print_json(&result.output)?;
-    } else {
-        if let Some(results) = result.output.get("results").and_then(|v| v.as_array()) {
-            for (i, r) in results.iter().enumerate() {
-                let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
-                println!("{}. {}", i + 1, title);
-                println!("   {url}");
-                if !snippet.is_empty() {
-                    println!("   {snippet}");
-                }
-                println!();
+    } else if let Some(results) = result.output.get("results").and_then(|v| v.as_array()) {
+        for (i, r) in results.iter().enumerate() {
+            let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+            println!("{}. {}", i + 1, title);
+            println!("   {url}");
+            if !snippet.is_empty() {
+                println!("   {snippet}");
             }
-            let cached = result
-                .output
-                .get("cached")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if cached {
-                println!("(results from cache)");
-            }
-        } else {
-            println!("No results found.");
+            println!();
         }
+        let cached = result
+            .output
+            .get("cached")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if cached {
+            println!("(results from cache)");
+        }
+    } else {
+        println!("No results found.");
     }
     Ok(())
 }
@@ -9124,11 +9144,11 @@ fn run_fork(cwd: &Path, args: ForkArgs, json_mode: bool) -> Result<()> {
             "status": "idle",
         }))?;
     } else {
+        println!("Forked session {} → {}", args.session_id, forked.session_id);
         println!(
-            "Forked session {} → {}",
-            args.session_id, forked.session_id
+            "New session is ready. Use --resume {} to continue.",
+            forked.session_id
         );
-        println!("New session is ready. Use --resume {} to continue.", forked.session_id);
     }
     Ok(())
 }
@@ -9140,15 +9160,54 @@ fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
     let context_window = config.llm.context_window_tokens;
     let compact_threshold = config.context.auto_compact_threshold;
 
-    // Load latest session to compute token usage
+    // Load latest session to compute token usage with per-unit breakdown
     let session = store.load_latest_session()?;
-    let (session_tokens, compactions) = if let Some(ref s) = session {
+    let (session_tokens, compactions, unit_breakdown) = if let Some(ref s) = session {
         let usage = store.usage_summary(Some(s.session_id), None)?;
         let compactions = store.list_context_compactions(Some(s.session_id))?;
-        (usage.input_tokens + usage.output_tokens, compactions.len())
+        let by_unit = store.usage_by_unit(s.session_id)?;
+        (
+            usage.input_tokens + usage.output_tokens,
+            compactions.len(),
+            by_unit,
+        )
     } else {
-        (0, 0)
+        (0, 0, Vec::new())
     };
+
+    // Compute memory token estimate from DEEPSEEK.md content
+    let memory_tokens = {
+        let mem = deepseek_memory::MemoryManager::new(cwd).ok();
+        let text = mem
+            .and_then(|m| m.read_combined_memory().ok())
+            .unwrap_or_default();
+        // Rough estimate: ~4 characters per token for English text
+        (text.len() as u64) / 4
+    };
+
+    // Estimate system prompt tokens from config (model instructions, tool definitions, etc.)
+    // Count declared tools from config + built-in set to approximate system prompt size
+    let system_prompt_tokens = {
+        let base_instructions: u64 = 800; // core system instructions
+        let tool_defs: u64 = config.policy.allowlist.len() as u64 * 40; // ~40 tokens per tool definition
+        let safety_rules: u64 = 400; // permission/safety rules
+        base_instructions + tool_defs + safety_rules
+    };
+
+    // Compute per-unit tokens (Planner vs Executor)
+    let planner_tokens: u64 = unit_breakdown
+        .iter()
+        .filter(|u| u.unit.contains("Planner"))
+        .map(|u| u.input_tokens + u.output_tokens)
+        .sum();
+    let executor_tokens: u64 = unit_breakdown
+        .iter()
+        .filter(|u| u.unit.contains("Executor"))
+        .map(|u| u.input_tokens + u.output_tokens)
+        .sum();
+
+    // Conversation tokens = total minus system/memory overhead
+    let conversation_tokens = session_tokens.saturating_sub(system_prompt_tokens + memory_tokens);
 
     let utilization = if context_window > 0 {
         (session_tokens as f64 / context_window as f64) * 100.0
@@ -9164,10 +9223,11 @@ fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
             "utilization_pct": format!("{utilization:.1}"),
             "compactions": compactions,
             "breakdown": {
-                "system_prompt": "~2000",
-                "conversation": session_tokens,
-                "tools": "variable",
-                "memory": "variable",
+                "system_prompt": system_prompt_tokens,
+                "conversation": conversation_tokens,
+                "memory": memory_tokens,
+                "planner": planner_tokens,
+                "executor": executor_tokens,
             }
         }))?;
     } else {
@@ -9179,11 +9239,16 @@ fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
         println!("Utilization:       {utilization:.1}%");
         println!("Compactions:       {compactions}");
         println!();
-        println!("Breakdown (estimated):");
-        println!("  System prompt:   ~2,000 tokens");
-        println!("  Conversation:    {session_tokens} tokens");
-        println!("  Tools/results:   variable");
-        println!("  Memory (DEEPSEEK.md): variable");
+        println!("Breakdown:");
+        println!("  System prompt:       ~{system_prompt_tokens} tokens");
+        println!("  Memory (DEEPSEEK.md): ~{memory_tokens} tokens");
+        println!("  Conversation:         ~{conversation_tokens} tokens");
+        if planner_tokens > 0 {
+            println!("    Planner:            {planner_tokens} tokens");
+        }
+        if executor_tokens > 0 {
+            println!("    Executor:           {executor_tokens} tokens");
+        }
         if utilization > (compact_threshold as f64 * 100.0) {
             println!("\n⚠ Context is above compact threshold. Use /compact to free space.");
         }

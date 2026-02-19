@@ -910,6 +910,7 @@ impl AgentEngine {
                 goal,
                 role: lane.role.clone(),
                 team: lane.team.clone(),
+                read_only_fallback: false,
             };
             let specialization_hint =
                 self.load_subagent_specialization_hint(&lane.role, &lane.domain)?;
@@ -4350,6 +4351,7 @@ mod tests {
             goal: "decompose".to_string(),
             role: SubagentRole::Plan,
             team: "planning".to_string(),
+            read_only_fallback: false,
         };
         let req = subagent_request_for_task(
             &task,
@@ -4559,6 +4561,7 @@ mod tests {
             goal: "edit".to_string(),
             role: SubagentRole::Task,
             team: "execution".to_string(),
+            read_only_fallback: false,
         };
         let calls = subagent_delegated_calls(
             &task,
@@ -4582,6 +4585,7 @@ mod tests {
             success: true,
             output: "a".to_string(),
             error: None,
+            used_read_only_fallback: false,
         };
         let b = deepseek_subagent::SubagentResult {
             run_id: Uuid::now_v7(),
@@ -4592,6 +4596,7 @@ mod tests {
             success: true,
             output: "b".to_string(),
             error: None,
+            used_read_only_fallback: false,
         };
         let mut targets = HashMap::new();
         targets.insert(a.run_id, vec![shared.clone()]);
@@ -4669,6 +4674,7 @@ mod tests {
             goal: "search".to_string(),
             role: SubagentRole::Explore,
             team: "explore".to_string(),
+            read_only_fallback: false,
         };
         let plan = SubagentTask {
             role: SubagentRole::Plan,
@@ -4742,6 +4748,7 @@ mod tests {
             goal: "edit".to_string(),
             role: SubagentRole::Task,
             team: "execution".to_string(),
+            read_only_fallback: false,
         };
         let write_call = deepseek_core::ToolCall {
             name: "fs.write".to_string(),
@@ -4771,6 +4778,7 @@ mod tests {
             success: false,
             output: "blocked".to_string(),
             error: Some("approval".to_string()),
+            used_read_only_fallback: false,
         };
         let strong = deepseek_subagent::SubagentResult {
             run_id: Uuid::now_v7(),
@@ -4781,6 +4789,7 @@ mod tests {
             success: true,
             output: "updated src/lib.rs and added verification test".to_string(),
             error: None,
+            used_read_only_fallback: false,
         };
         assert!(
             subagent_arbitration_score(&strong, target) > subagent_arbitration_score(&weak, target)
