@@ -41,6 +41,7 @@ pub struct LocalToolHost {
     plugins: Option<PluginManager>,
     hooks_enabled: bool,
     visual_verification_enabled: bool,
+    lint_after_edit: Option<String>,
 }
 
 impl LocalToolHost {
@@ -61,6 +62,12 @@ impl LocalToolHost {
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let lint_after_edit = cfg
+            .policy
+            .lint_after_edit
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         Ok(Self {
             workspace: workspace.to_path_buf(),
             patches: PatchStore::new(workspace)?,
@@ -73,6 +80,7 @@ impl LocalToolHost {
             plugins: PluginManager::new(workspace).ok(),
             hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
             visual_verification_enabled: cfg.experiments.visual_verification,
+            lint_after_edit,
         })
     }
 
@@ -315,7 +323,35 @@ impl LocalToolHost {
                 fs::write(&full, &after)?;
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
-                Ok(json!({
+
+                // Auto-lint after edit (from Aider: lint-fix loop)
+                let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
+                    match self
+                        .runner
+                        .run(lint_cmd, &self.workspace, Duration::from_secs(30))
+                    {
+                        Ok(result) => {
+                            if result.status.unwrap_or(1) != 0 {
+                                Some(json!({
+                                    "lint_command": lint_cmd,
+                                    "lint_passed": false,
+                                    "lint_stdout": result.stdout,
+                                    "lint_stderr": result.stderr,
+                                }))
+                            } else {
+                                Some(json!({
+                                    "lint_command": lint_cmd,
+                                    "lint_passed": true,
+                                }))
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let mut result = json!({
                     "path": path,
                     "edited": true,
                     "replacements": replacements,
@@ -323,7 +359,11 @@ impl LocalToolHost {
                     "before_sha256": before_sha,
                     "after_sha256": after_sha,
                     "checkpoint_id": checkpoint.map(|id| id.to_string())
-                }))
+                });
+                if let Some(lint) = lint_output {
+                    result["lint"] = lint;
+                }
+                Ok(result)
             }
             "fs.search_rg" => {
                 let q = call
@@ -448,6 +488,55 @@ impl LocalToolHost {
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
                 self.run_bash_cmd(cmd, timeout)
             }
+            "web.fetch" => {
+                let url = call
+                    .args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("url missing"))?;
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(anyhow!("url must start with http:// or https://"));
+                }
+                let max_bytes = call
+                    .args
+                    .get("max_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(500_000) as usize;
+                let timeout = call
+                    .args
+                    .get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(timeout))
+                    .user_agent("deepseek-cli/0.1")
+                    .build()?;
+                let resp = client.get(url).send()?;
+                let status = resp.status().as_u16();
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let body = resp.text()?;
+                let truncated = body.len() > max_bytes;
+                let text = if truncated { &body[..max_bytes] } else { &body };
+                // Strip HTML tags for readable text extraction
+                let content = if content_type.contains("html") {
+                    strip_html_tags(text)
+                } else {
+                    text.to_string()
+                };
+                Ok(json!({
+                    "url": url,
+                    "status": status,
+                    "content_type": content_type,
+                    "content": content,
+                    "truncated": truncated,
+                    "bytes": body.len()
+                }))
+            }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
     }
@@ -552,7 +641,11 @@ impl ToolHost for LocalToolHost {
             Ok(output) => (true, output),
             Err(err) => (false, json!({"error": err.to_string()})),
         };
-        self.execute_hooks("posttooluse", Some(&call), Some(&output));
+        if success {
+            self.execute_hooks("posttooluse", Some(&call), Some(&output));
+        } else {
+            self.execute_hooks("posttooluse_failure", Some(&call), Some(&output));
+        }
         ToolResult {
             invocation_id: approved.invocation_id,
             success,
@@ -917,6 +1010,56 @@ fn collect_lines(
         .collect()
 }
 
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let lower = html.to_ascii_lowercase();
+    let chars: Vec<char> = html.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+
+    let mut i = 0;
+    while i < chars.len() {
+        if !in_tag && chars[i] == '<' {
+            in_tag = true;
+            // Check for script/style open/close
+            let remaining: String = lower_chars[i..].iter().take(20).collect();
+            if remaining.starts_with("<script") {
+                in_script = true;
+            } else if remaining.starts_with("</script") {
+                in_script = false;
+            } else if remaining.starts_with("<style") {
+                in_style = true;
+            } else if remaining.starts_with("</style") {
+                in_style = false;
+            }
+        } else if in_tag && chars[i] == '>' {
+            in_tag = false;
+        } else if !in_tag && !in_script && !in_style {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    // Collapse multiple blank lines
+    let mut result = String::with_capacity(out.len());
+    let mut blank_count = 0;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            result.push_str(trimmed);
+            result.push('\n');
+        }
+    }
+    result.trim().to_string()
+}
+
 fn generate_unified_diff(path: &str, before: &str, after: &str) -> String {
     let old_lines: Vec<&str> = before.lines().collect();
     let new_lines: Vec<&str> = after.lines().collect();
@@ -1090,6 +1233,11 @@ impl LocalToolHost {
     /// Fire "stop" hooks when the agent run completes.
     pub fn fire_stop_hooks(&self) {
         self.execute_hooks("stop", None, None);
+    }
+
+    /// Fire hooks for a specific lifecycle phase (sessionstart, notification, etc.).
+    pub fn fire_session_hooks(&self, phase: &str) {
+        self.execute_hooks(phase, None, None);
     }
 
     fn execute_hooks(

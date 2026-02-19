@@ -1,19 +1,24 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
-    normalize_deepseek_model, normalize_deepseek_profile,
+    DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest, LlmResponse, LlmToolCall, StreamCallback,
+    StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::BufRead;
 use std::thread;
 use std::time::Duration;
 
 pub trait LlmClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
+
+    /// Streaming variant that invokes `cb` for each token chunk as it arrives.
+    /// Returns the fully assembled `LlmResponse` once the stream ends.
+    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse>;
 }
 
 #[derive(Debug, Clone)]
@@ -145,33 +150,240 @@ impl DeepSeekClient {
         }
         Ok(normalized.to_string())
     }
+
+    /// Streaming variant: reads the SSE response line-by-line, invoking `cb`
+    /// for each content/reasoning delta, then returns the assembled response.
+    fn complete_streaming_inner(
+        &self,
+        req: &LlmRequest,
+        api_key: &str,
+        mut cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let mut payload = self.build_payload(req);
+        // Force streaming on for the HTTP request
+        payload["stream"] = json!(true);
+
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=self.cfg.max_retries {
+            let response = self
+                .client
+                .post(&self.cfg.endpoint)
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+
+                    if status.is_success() {
+                        // Read SSE line-by-line, invoking callback for each delta
+                        let mut content_out = String::new();
+                        let mut reasoning_out = String::new();
+                        let mut finish_reason: Option<String> = None;
+                        let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
+                        let mut completed_tool_calls = Vec::new();
+
+                        let reader = std::io::BufReader::new(resp);
+                        for line_result in reader.lines() {
+                            let line = match line_result {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    last_err = Some(anyhow!("stream read error: {e}"));
+                                    break;
+                                }
+                            };
+                            let trimmed = line.trim();
+                            if !trimmed.starts_with("data:") {
+                                continue;
+                            }
+                            let chunk = trimmed.trim_start_matches("data:").trim();
+                            if chunk == "[DONE]" {
+                                cb(StreamChunk::Done);
+                                break;
+                            }
+                            let value: Value = match serde_json::from_str(chunk) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let choice = value
+                                .get("choices")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first());
+                            let Some(choice) = choice else {
+                                continue;
+                            };
+                            if let Some(reason) =
+                                choice.get("finish_reason").and_then(|v| v.as_str())
+                            {
+                                finish_reason = Some(reason.to_string());
+                            }
+                            if let Some(delta) = choice.get("delta") {
+                                if let Some(content) = delta.get("content").and_then(|v| v.as_str())
+                                {
+                                    content_out.push_str(content);
+                                    cb(StreamChunk::ContentDelta(content.to_string()));
+                                }
+                                if let Some(reasoning) =
+                                    delta.get("reasoning_content").and_then(|v| v.as_str())
+                                {
+                                    reasoning_out.push_str(reasoning);
+                                    cb(StreamChunk::ReasoningDelta(reasoning.to_string()));
+                                }
+                                if let Some(tool_calls) =
+                                    delta.get("tool_calls").and_then(|v| v.as_array())
+                                {
+                                    merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
+                                }
+                            }
+                            if let Some(message) = choice.get("message") {
+                                if let Some(content) =
+                                    message.get("content").and_then(|v| v.as_str())
+                                {
+                                    content_out.push_str(content);
+                                    cb(StreamChunk::ContentDelta(content.to_string()));
+                                }
+                                if let Some(reasoning) =
+                                    message.get("reasoning_content").and_then(|v| v.as_str())
+                                {
+                                    reasoning_out.push_str(reasoning);
+                                    cb(StreamChunk::ReasoningDelta(reasoning.to_string()));
+                                }
+                                if let Some(tool_calls) = message.get("tool_calls") {
+                                    completed_tool_calls.extend(parse_tool_calls_array(tool_calls));
+                                }
+                            }
+                        }
+
+                        // If stream read failed, propagate the error
+                        if let Some(err) = last_err.take() {
+                            return Err(err);
+                        }
+
+                        let mut tool_calls: Vec<LlmToolCall> = tool_call_parts
+                            .into_iter()
+                            .filter_map(|(index, value)| {
+                                if value.name.trim().is_empty() {
+                                    return None;
+                                }
+                                Some(LlmToolCall {
+                                    id: value
+                                        .id
+                                        .unwrap_or_else(|| format!("tool_call_{}", index + 1)),
+                                    name: value.name,
+                                    arguments: value.arguments,
+                                })
+                            })
+                            .collect();
+                        if !completed_tool_calls.is_empty() {
+                            tool_calls.extend(completed_tool_calls);
+                        }
+
+                        let text = if !content_out.is_empty() {
+                            content_out
+                        } else {
+                            reasoning_out.clone()
+                        };
+                        return Ok(LlmResponse {
+                            text,
+                            finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
+                            reasoning_content: reasoning_out,
+                            tool_calls,
+                        });
+                    }
+
+                    let body = resp.text().unwrap_or_default();
+                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("deepseek streaming request failed without detailed error")))
+    }
 }
 
 impl LlmClient for DeepSeekClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek)",
+        let key = self
+            .resolve_api_key()
+            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
+
+        match provider.as_str() {
+            "deepseek" => {
+                let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
+                    anyhow!(
+                        "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+                        self.cfg.profile
+                    )
+                })?;
+                let mut normalized_req = req.clone();
+                normalized_req.model = self.resolve_request_model(&req.model, profile)?;
+                self.complete_inner(&normalized_req, &key)
+            }
+            "openai" => {
+                // OpenAI-compatible endpoint (default: https://api.openai.com/v1/chat/completions)
+                self.complete_inner(req, &key)
+            }
+            "anthropic" => {
+                // Anthropic uses a different header and format, but for the initial
+                // implementation we support Anthropic-compatible proxies that accept
+                // the OpenAI chat format (e.g., via litellm or similar).
+                self.complete_inner(req, &key)
+            }
+            "custom" | "local" | "ollama" => {
+                // Custom/local provider: send request as-is to configured endpoint
+                self.complete_inner(req, &key)
+            }
+            _ => Err(anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai, anthropic, custom, local, ollama)",
                 self.cfg.provider
-            ));
+            )),
         }
-        let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
-                self.cfg.profile
-            )
-        })?;
-        let mut normalized_req = req.clone();
-        normalized_req.model = self.resolve_request_model(&req.model, profile)?;
-        let key = self.resolve_api_key();
-        if let Some(key) = key {
-            return self.complete_inner(&normalized_req, &key);
+    }
+
+    fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
+        let provider = self.cfg.provider.to_ascii_lowercase();
+        let key = self
+            .resolve_api_key()
+            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
+
+        match provider.as_str() {
+            "deepseek" => {
+                let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
+                    anyhow!(
+                        "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+                        self.cfg.profile
+                    )
+                })?;
+                let mut normalized_req = req.clone();
+                normalized_req.model = self.resolve_request_model(&req.model, profile)?;
+                self.complete_streaming_inner(&normalized_req, &key, cb)
+            }
+            "openai" | "anthropic" | "custom" | "local" | "ollama" => {
+                self.complete_streaming_inner(req, &key, cb)
+            }
+            _ => Err(anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai, anthropic, custom, local, ollama)",
+                self.cfg.provider
+            )),
         }
-        Err(anyhow!(
-            "{} not set and llm.api_key is empty",
-            self.cfg.api_key_env
-        ))
     }
 }
 
@@ -546,9 +758,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_provider_is_rejected() {
+    fn truly_unsupported_provider_is_rejected() {
         let cfg = LlmConfig {
-            provider: "custom".to_string(),
+            provider: "invalid_provider_xyz".to_string(),
+            api_key: Some("test-key".to_string()),
             ..LlmConfig::default()
         };
         let client = DeepSeekClient::new(cfg).expect("client");
@@ -560,7 +773,7 @@ mod tests {
                 max_tokens: 128,
                 non_urgent: false,
             })
-            .expect_err("unsupported provider should fail");
+            .expect_err("truly unsupported provider should fail");
         assert!(err.to_string().contains("unsupported llm.provider"));
     }
 
@@ -568,6 +781,7 @@ mod tests {
     fn unsupported_profile_is_rejected() {
         let cfg = LlmConfig {
             profile: "unknown".to_string(),
+            api_key: Some("test-key".to_string()),
             ..LlmConfig::default()
         };
         let client = DeepSeekClient::new(cfg).expect("client");
@@ -585,7 +799,11 @@ mod tests {
 
     #[test]
     fn unsupported_model_is_rejected_before_network_call() {
-        let client = DeepSeekClient::new(LlmConfig::default()).expect("client");
+        let cfg = LlmConfig {
+            api_key: Some("test-key".to_string()),
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
         let err = client
             .complete(&LlmRequest {
                 unit: deepseek_core::LlmUnit::Planner,
@@ -600,7 +818,11 @@ mod tests {
 
     #[test]
     fn speciale_model_requires_speciale_profile() {
-        let client = DeepSeekClient::new(LlmConfig::default()).expect("client");
+        let cfg = LlmConfig {
+            api_key: Some("test-key".to_string()),
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
         let err = client
             .complete(&LlmRequest {
                 unit: deepseek_core::LlmUnit::Planner,
@@ -617,9 +839,38 @@ mod tests {
     }
 
     #[test]
-    fn openai_provider_is_rejected_for_deepseek_only_runtime() {
+    fn supported_providers_are_accepted() {
+        // Verify that openai, anthropic, custom, local, ollama are accepted providers
+        for provider in &["openai", "anthropic", "custom", "local", "ollama"] {
+            let cfg = LlmConfig {
+                provider: provider.to_string(),
+                api_key: Some("test-key".to_string()),
+                ..LlmConfig::default()
+            };
+            let client = DeepSeekClient::new(cfg).expect("client");
+            // These will fail at the network level, not at provider validation
+            let result = client.complete(&LlmRequest {
+                unit: deepseek_core::LlmUnit::Planner,
+                prompt: "hello".to_string(),
+                model: "test-model".to_string(),
+                max_tokens: 128,
+                non_urgent: false,
+            });
+            // Should fail with a network error, not "unsupported provider"
+            if let Err(e) = result {
+                assert!(
+                    !e.to_string().contains("unsupported llm.provider"),
+                    "provider '{provider}' should be accepted but got: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_api_key_is_rejected() {
         let cfg = LlmConfig {
-            provider: "openai".to_string(),
+            api_key: None,
+            api_key_env: "DEEPSEEK_NONEXISTENT_KEY_FOR_TEST".to_string(),
             ..LlmConfig::default()
         };
         let client = DeepSeekClient::new(cfg).expect("client");
@@ -627,12 +878,12 @@ mod tests {
             .complete(&LlmRequest {
                 unit: deepseek_core::LlmUnit::Planner,
                 prompt: "hello".to_string(),
-                model: "any".to_string(),
+                model: "deepseek-chat".to_string(),
                 max_tokens: 128,
                 non_urgent: false,
             })
-            .expect_err("openai provider should fail");
-        assert!(err.to_string().contains("supported: deepseek"));
+            .expect_err("missing API key should fail");
+        assert!(err.to_string().contains("not set and llm.api_key is empty"));
     }
 
     #[test]
@@ -936,5 +1187,65 @@ mod tests {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    #[test]
+    fn complete_streaming_invokes_callback_per_chunk() {
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n";
+        let server = start_mock_retry_server(vec![MockHttpResponse {
+            status: 200,
+            body: sse_body.to_string(),
+            retry_after: None,
+        }]);
+
+        let cfg = LlmConfig {
+            endpoint: server.endpoint.clone(),
+            stream: true,
+            api_key_env: "DEEPSEEK_API_KEY_STREAM_TEST".to_string(),
+            max_retries: 0,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY_STREAM_TEST", "test-key");
+        }
+
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let chunks_clone = Arc::clone(&chunks);
+        let cb: StreamCallback = Box::new(move |chunk| match chunk {
+            StreamChunk::ContentDelta(text) => {
+                chunks_clone.lock().unwrap().push(text);
+            }
+            StreamChunk::Done => {
+                chunks_clone.lock().unwrap().push("[DONE]".to_string());
+            }
+            _ => {}
+        });
+
+        let resp = client
+            .complete_streaming(
+                &LlmRequest {
+                    unit: deepseek_core::LlmUnit::Planner,
+                    prompt: "hello".to_string(),
+                    model: "deepseek-chat".to_string(),
+                    max_tokens: 128,
+                    non_urgent: false,
+                },
+                cb,
+            )
+            .expect("streaming response");
+
+        assert_eq!(resp.text, "hello");
+        let collected = chunks.lock().unwrap();
+        assert_eq!(collected.len(), 3); // "hel", "lo", "[DONE]"
+        assert_eq!(collected[0], "hel");
+        assert_eq!(collected[1], "lo");
+        assert_eq!(collected[2], "[DONE]");
+
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_API_KEY_STREAM_TEST");
+        }
     }
 }

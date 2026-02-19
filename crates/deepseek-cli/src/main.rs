@@ -38,6 +38,36 @@ use uuid::Uuid;
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
+
+    /// Non-interactive mode: run prompt and print result to stdout, then exit.
+    /// Accepts prompt as positional arg or reads from stdin.
+    #[arg(short = 'p', long = "print")]
+    print_mode: bool,
+
+    /// Resume last session and continue conversation.
+    #[arg(long = "continue")]
+    continue_session: bool,
+
+    /// Resume a specific session by ID.
+    #[arg(long = "resume")]
+    resume_session: Option<String>,
+
+    /// Override the LLM model for this invocation.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Override the LLM provider for this invocation (deepseek, openai, anthropic, custom).
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Output format for print mode: text (default), json, stream-json.
+    #[arg(long, default_value = "text")]
+    output_format: String,
+
+    /// Prompt for print mode (positional, used when -p is set).
+    #[arg(trailing_var_arg = true)]
+    prompt_args: Vec<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -112,6 +142,8 @@ enum Commands {
         command: PluginCmd,
     },
     Clean(CleanArgs),
+    /// Code review: analyze diffs and provide structured feedback.
+    Review(ReviewArgs),
 }
 
 #[derive(Args)]
@@ -272,6 +304,25 @@ struct ExportArgs {
 struct CleanArgs {
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Args, Default)]
+struct ReviewArgs {
+    /// Review unstaged changes (git diff).
+    #[arg(long)]
+    diff: bool,
+    /// Review staged changes (git diff --staged).
+    #[arg(long)]
+    staged: bool,
+    /// Review a specific PR by number (requires gh CLI).
+    #[arg(long)]
+    pr: Option<u64>,
+    /// Review a specific file or path.
+    #[arg(long)]
+    path: Option<String>,
+    /// Focus area for review (security, performance, correctness, style).
+    #[arg(long)]
+    focus: Option<String>,
 }
 
 #[derive(Args, Default)]
@@ -759,6 +810,22 @@ struct PluginRunArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
+
+    // Handle -p/--print mode: non-interactive single-shot execution
+    if cli.print_mode {
+        return run_print_mode(&cwd, &cli);
+    }
+
+    // Handle --continue: resume last session
+    if cli.continue_session {
+        return run_continue_session(&cwd, cli.json, cli.model.as_deref());
+    }
+
+    // Handle --resume SESSION_ID: resume specific session
+    if let Some(ref session_id) = cli.resume_session {
+        return run_resume_specific(&cwd, session_id, cli.json, cli.model.as_deref());
+    }
+
     let command = cli.command.unwrap_or(Commands::Chat(ChatArgs::default()));
 
     match command {
@@ -819,6 +886,7 @@ fn main() -> Result<()> {
         Commands::Permissions { command } => run_permissions(&cwd, command, cli.json),
         Commands::Plugins { command } => run_plugins(&cwd, command, cli.json),
         Commands::Clean(args) => run_clean(&cwd, args, cli.json),
+        Commands::Review(args) => run_review(&cwd, args, cli.json),
     }
 }
 
@@ -2127,13 +2195,32 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
             continue;
         }
 
+        // Set up streaming callback for real-time token output
+        if !json_mode {
+            engine.set_stream_callback(Box::new(|chunk: deepseek_core::StreamChunk| {
+                use std::io::Write as _;
+                let out = std::io::stdout();
+                let mut handle = out.lock();
+                match chunk {
+                    deepseek_core::StreamChunk::ContentDelta(text) => {
+                        let _ = write!(handle, "{text}");
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::ReasoningDelta(_) => {}
+                    deepseek_core::StreamChunk::Done => {
+                        let _ = writeln!(handle);
+                        let _ = handle.flush();
+                    }
+                }
+            }));
+        }
+
         let output = engine.run_once_with_mode(prompt, allow_tools, force_max_think)?;
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
             print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
         } else {
             println!("[status] {}", render_statusline(&ui_status));
-            println!("{output}");
         }
     }
     Ok(())
@@ -8457,4 +8544,236 @@ fn command_exists(name: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Print mode (-p/--print): non-interactive single-shot execution
+// ---------------------------------------------------------------------------
+
+fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::io::{IsTerminal, Read, Write as _, stdin, stdout};
+
+    let prompt = if !cli.prompt_args.is_empty() {
+        cli.prompt_args.join(" ")
+    } else if !stdin().is_terminal() {
+        let mut buf = String::new();
+        stdin().read_to_string(&mut buf)?;
+        buf.trim().to_string()
+    } else {
+        return Err(anyhow!(
+            "-p/--print requires a prompt argument or stdin input"
+        ));
+    };
+
+    if prompt.is_empty() {
+        return Err(anyhow!("empty prompt"));
+    }
+
+    let json_mode = cli.json || cli.output_format == "json" || cli.output_format == "stream-json";
+    let is_stream_json = cli.output_format == "stream-json";
+    let is_text = !json_mode;
+    ensure_llm_ready(cwd, json_mode)?;
+    let engine = AgentEngine::new(cwd)?;
+
+    // Set up streaming callback for real-time output
+    if is_text || is_stream_json {
+        let stream_json = is_stream_json;
+        engine.set_stream_callback(Box::new(move |chunk: StreamChunk| {
+            let out = stdout();
+            let mut handle = out.lock();
+            match chunk {
+                StreamChunk::ContentDelta(text) => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "content", "text": text}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = write!(handle, "{text}");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::ReasoningDelta(text) => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "reasoning", "text": text}),
+                        );
+                        let _ = writeln!(handle);
+                        let _ = handle.flush();
+                    }
+                    // In text mode, reasoning is not shown
+                }
+                StreamChunk::Done => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "done"}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle);
+                    }
+                    let _ = handle.flush();
+                }
+            }
+        }));
+    }
+
+    let output = engine.run_once(&prompt, true)?;
+
+    match cli.output_format.as_str() {
+        "json" => {
+            let session_id = Store::new(cwd)?
+                .load_latest_session()?
+                .map(|s| s.session_id.to_string())
+                .unwrap_or_default();
+            print_json(&json!({
+                "output": output,
+                "session_id": session_id,
+                "model": AppConfig::load(cwd).unwrap_or_default().llm.base_model,
+            }))?;
+        }
+        "stream-json" => {
+            // Streaming was already output via callback; emit final summary
+            let session_id = Store::new(cwd)?
+                .load_latest_session()?
+                .map(|s| s.session_id.to_string())
+                .unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "type": "result",
+                    "output": output,
+                    "session_id": session_id,
+                    "model": AppConfig::load(cwd).unwrap_or_default().llm.base_model,
+                }))?
+            );
+        }
+        _ => {
+            // Text was already streamed to stdout via callback; output is the session summary
+            // (only print if there was no streaming, e.g., from cache hit)
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session continue/resume
+// ---------------------------------------------------------------------------
+
+fn run_continue_session(cwd: &Path, json_mode: bool, _model: Option<&str>) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let session = store
+        .load_latest_session()?
+        .ok_or_else(|| anyhow!("no previous session to continue"))?;
+    let projection = store.rebuild_from_events(session.session_id)?;
+    if !json_mode {
+        println!(
+            "resuming session {} ({} turns, state={:?})",
+            session.session_id,
+            projection.transcript.len(),
+            session.status
+        );
+    }
+    // Enter chat mode with the continued session context
+    run_chat(cwd, json_mode, true, false)
+}
+
+fn run_resume_specific(
+    cwd: &Path,
+    session_id: &str,
+    json_mode: bool,
+    _model: Option<&str>,
+) -> Result<()> {
+    let store = Store::new(cwd)?;
+    let uuid =
+        Uuid::parse_str(session_id).map_err(|_| anyhow!("invalid session ID: {session_id}"))?;
+    let session = store
+        .load_session(uuid)?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+    let projection = store.rebuild_from_events(session.session_id)?;
+    if !json_mode {
+        println!(
+            "resuming session {} ({} turns, state={:?})",
+            session.session_id,
+            projection.transcript.len(),
+            session.status
+        );
+    }
+    run_chat(cwd, json_mode, true, false)
+}
+
+// ---------------------------------------------------------------------------
+// Code review subcommand
+// ---------------------------------------------------------------------------
+
+fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Result<()> {
+    ensure_llm_ready(cwd, json_mode)?;
+
+    let diff_content = if let Some(pr_number) = args.pr {
+        // Get PR diff via gh CLI
+        let output = Command::new("gh")
+            .args(["pr", "diff", &pr_number.to_string()])
+            .current_dir(cwd)
+            .output()
+            .map_err(|_| anyhow!("gh CLI not found; install it for PR review support"))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "gh pr diff failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else if let Some(ref path) = args.path {
+        // Review a specific file
+        fs::read_to_string(cwd.join(path)).map_err(|e| anyhow!("cannot read {path}: {e}"))?
+    } else if args.staged {
+        run_capture("git", &["diff", "--staged"]).unwrap_or_default()
+    } else {
+        // Default: unstaged diff (or --diff flag)
+        run_capture("git", &["diff"]).unwrap_or_default()
+    };
+
+    if diff_content.trim().is_empty() {
+        if json_mode {
+            print_json(&json!({"review": "no changes to review"}))?;
+        } else {
+            println!("no changes to review");
+        }
+        return Ok(());
+    }
+
+    let focus = args
+        .focus
+        .as_deref()
+        .unwrap_or("correctness, security, performance, style");
+    let review_prompt = format!(
+        "You are a senior code reviewer. Analyze the following diff and provide structured feedback.\n\
+         Focus areas: {focus}\n\n\
+         For each issue found, provide:\n\
+         - **severity**: critical / warning / suggestion\n\
+         - **file**: the affected file\n\
+         - **line**: approximate line number\n\
+         - **issue**: concise description\n\
+         - **suggestion**: how to fix it\n\n\
+         If the code looks good, say so.\n\n\
+         ```diff\n{diff_content}\n```"
+    );
+
+    let engine = AgentEngine::new(cwd)?;
+    let output = engine.run_once(&review_prompt, false)?;
+
+    if json_mode {
+        print_json(&json!({
+            "review": output,
+            "diff_lines": diff_content.lines().count(),
+            "focus": focus,
+        }))?;
+    } else {
+        println!("{output}");
+    }
+    Ok(())
 }

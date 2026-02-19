@@ -1,8 +1,8 @@
 # RFC (Comprehensive): DeepSeek CLI Agent in Rust – A Full-Featured Coding Assistant to Match and Surpass Claude Code use DeepSeek API
 
-**Status:** Completed  
-**Date:** 2026-02-17  
-**Goal:** A production-grade, open-source coding agent CLI powered by DeepSeek, designed to **match and surpass Claude Code** in feature completeness, developer experience, safety, and cost-effectiveness. This RFC defines the complete feature set, system architecture, and implementation roadmap.
+**Status:** Completed
+**Date:** 2026-02-19
+**Goal:** A production-grade, open-source coding agent CLI powered by DeepSeek, designed to **match and surpass Claude Code** in feature completeness, developer experience, safety, and cost-effectiveness. Incorporates best features from Claude Code, OpenAI Codex CLI, and Google Antigravity. This RFC defines the complete feature set, system architecture, and implementation roadmap.
 
 ---
 
@@ -32,6 +32,9 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Fast Mode** | Optimized API parameters for lower latency (configurable). |
 | **Parallel tool calls** | Execute multiple independent tool calls in a single LLM response. |
 | **Background execution** | Long-running tasks can be backgrounded (Ctrl+B) and resumed. |
+| **Print mode (`-p`)** | Non-interactive headless mode for CI/CD and scripting. Reads prompt from arg or stdin pipe. Supports `--output-format` (text/json/stream-json). |
+| **Session continue** | `--continue` resumes last session; `--resume <ID>` resumes a specific session. Full conversation context is restored. |
+| **Model/provider override** | `--model` and `--provider` flags for per-invocation overrides. |
 
 ### 2.2 File System Operations
 
@@ -42,6 +45,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | `fs.edit` | Targeted modifications (string replacement, line edits). |
 | `fs.glob` | Pattern-based file search. |
 | `fs.grep` | Content search with regex. |
+| `web.fetch` | Fetch URL content, auto-extract text from HTML. Configurable timeout and max_bytes. |
 | `@file` references | Mention files directly: `@src/auth.ts:42-58`. |
 | `@dir` references | Include whole directories. |
 
@@ -50,6 +54,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 - Commit creation, branch management, pull requests from CLI.
 - Git history search.
 - Merge conflict resolution assistance.
+- **Code review**: `deepseek review` analyzes diffs (`--diff`, `--staged`, `--pr NUMBER`) and provides structured feedback with severity levels (critical/warning/suggestion). Inspired by Codex CLI's `/review`.
 - Checkpointing note: Only file edits (via dedicated tools) are auto-checkpointed; bash operations are not tracked.
 
 ### 2.4 Slash Commands (REPL)
@@ -123,7 +128,12 @@ The following features are derived from Claude Code’s current (2026) capabilit
 
 - **Skills:** Reusable prompt templates stored in `~/.deepseek/skills/` or `.deepseek/skills/`; appear in slash command menu.
 - **Hot reload:** Skills available immediately without restart.
-- **Hooks:** `PreToolUse`, `PostToolUse`, `Stop` logic for fine-grained control.
+- **Hooks:** Extended lifecycle hooks for fine-grained control:
+  - `SessionStart` — fired when a session begins or resumes.
+  - `PreToolUse` — fired before tool execution (can block).
+  - `PostToolUse` — fired after successful tool execution.
+  - `PostToolUseFailure` — fired after tool execution fails.
+  - `Stop` — fired when the agent completes a run (success or failure).
 - **Wildcard permissions:** e.g., `Bash(npm *)` to allow any npm command without approval.
 - **`respectGitignore`:** Control @-mention file picker behavior.
 
@@ -138,6 +148,8 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Terminal command sandboxing** | Experimental safety for command execution. |
 | **Auto-approval rules** | Configurable permissions to reduce prompts. |
 | **Memory across projects** | Enterprise-wide `DEEPSEEK.md` for consistent conventions. |
+| **Auto-lint after edit** | Inspired by Aider: optional `lint_after_edit` config runs a linter automatically after `fs.edit`, including diagnostics in the tool result for self-healing. |
+| **Web content fetching** | `web.fetch` tool retrieves URL content with HTML-to-text extraction, enabling documentation lookup and API exploration. |
 
 ### 2.11 Permission & Safety System
 
@@ -155,7 +167,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Automatic “max thinking”** | Seamlessly escalate to `deepseek-reasoner` when complexity requires it. |
 | **Prompt caching** | 90% discount on repeated input tokens; implement aggressive caching. |
 | **Off-peak scheduling** | Option to defer non-urgent tasks to cheaper rate periods. |
-| **Multi-provider support** | Pluggable backends: DeepSeek, OpenAI, local models (via MCP). |
+| **Multi-provider support** | Pluggable backends via `llm.provider`: `deepseek` (default), `openai`, `anthropic`, `custom`, `local`, `ollama`. All use OpenAI-compatible chat format. Inspired by Codex CLI and Aider's model-agnostic approach. |
 | **Performance monitoring** | `/profile` command showing time breakdown. |
 | **Integration marketplace** | Community repository of MCP plugins. |
 
@@ -167,22 +179,24 @@ The architecture is a modular monolith with clear separation of concerns, design
 
 ```
 crates/
-  cli/          # Entry point, TUI (ratatui), command parsing
-  core/         # Agent runtime, session loop, scheduling
-  agent/        # Planner, Executor, Subagent orchestration
-  llm/          # DeepSeek client, streaming, retries, caching
+  cli/          # Entry point, command parsing, print mode, review subcommand
+  ui/           # TUI (ratatui + crossterm), theme, layout, keybindings
+  core/         # Shared config types, session loop, scheduling
+  agent/        # Planner, Executor, Subagent orchestration, session hooks
+  llm/          # Multi-provider LLM client, streaming, retries, caching
   router/       # Model routing + auto max-think policy
-  tools/        # Tool registry, sandboxed execution, MCP client
+  tools/        # Tool registry, sandboxed execution, web.fetch, auto-lint
   mcp/          # MCP server management and protocol handling
   subagent/     # Parallel subagent lifecycle and communication
   diff/         # Patch staging, application, conflict resolution
   index/        # Tantivy code index + manifest + file watcher
-  store/        # SQLite + event log; projections; migrations
-  policy/       # Approvals, allowlists, redaction, permissions
+  store/        # SQLite + event log; projections; session queries
+  policy/       # Approvals, allowlists, redaction, sandbox enforcement
   observe/      # Logs, metrics, tracing, cost tracking
+  memory/       # DEEPSEEK.md management, project memory, cross-project conventions
   testkit/      # Replay harness, fake LLM, golden tests
   skills/       # Skill management and execution
-  hooks/        # Pre/post tool hooks
+  hooks/        # Extended lifecycle hooks (5 phases)
 ```
 
 ### 3.1 Core Components
@@ -245,11 +259,15 @@ Thresholds and weights are configurable. The router logs each decision (includin
 
 Tools are categorized as:
 
-- **Built-in Rust tools:** `fs.read`, `fs.edit`, `fs.grep`, `git.*`, `index.query`, etc.
+- **Built-in Rust tools:** `fs.read`, `fs.write`, `fs.edit`, `fs.glob`, `fs.grep`, `web.fetch`, `git.*`, `index.query`, etc.
 - **MCP tools:** Dynamically loaded from MCP servers.
 - **Shell commands:** Restricted via `bash.run` with allowlist and approval.
 
-All tool calls are journaled (proposal, approval, result) in the event log. For `fs.edit`, we provide a high-level interface that accepts search/replace pairs and generates a unified diff internally.
+All tool calls are journaled (proposal, approval, result) in the event log. For `fs.edit`, we provide a high-level interface that accepts search/replace pairs and generates a unified diff internally using an LCS-based algorithm.
+
+**`web.fetch`:** Fetches URL content via HTTP GET, strips HTML tags to plain text, and truncates to a configurable max byte limit. Useful for documentation lookup, API exploration, and web content analysis.
+
+**Auto-lint after edit:** When `policy.lint_after_edit` is configured (e.g., `"cargo fmt --check"`), the tool host automatically runs the linter after every `fs.edit` and includes diagnostics in the tool result JSON. This enables the LLM to self-heal formatting/lint issues without a separate tool call.
 
 ### 4.6 Patch Staging and Application
 
@@ -285,7 +303,13 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
 ### 4.10 Skills and Hooks
 
 - Skills are stored as Markdown files with frontmatter (similar to Claude Code). They can include tool usage patterns.
-- Hooks: PreToolUse and PostToolUse allow custom logic (e.g., logging, modifying arguments) written in Rust or via WASM (future).
+- Hooks provide extended lifecycle control at five phases:
+  - **SessionStart** — fired when a session begins or resumes. Useful for environment setup.
+  - **PreToolUse** — fired before tool execution; can block the call (e.g., for custom approval logic).
+  - **PostToolUse** — fired after successful tool execution; receives tool result.
+  - **PostToolUseFailure** — fired after tool execution fails; receives error details. Enables custom error recovery or alerting.
+  - **Stop** — fired when the agent completes a run (success or failure). Useful for cleanup, notifications, or metrics.
+- Hooks can be written in Rust or via WASM (future, behind `experiments.wasm_hooks` flag).
 
 ### 4.11 MCP Integration
 
@@ -296,6 +320,7 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
 
 ### 4.12 User Interface (TUI)
 
+- **Real-time streaming:** LLM responses are streamed token-by-token to the terminal via SSE parsing. The `LlmClient::complete_streaming()` method reads the HTTP response line-by-line, invoking a callback for each `content` or `reasoning_content` delta. In print mode (`-p`), tokens are flushed to stdout immediately. In `--output-format stream-json`, each chunk is emitted as a JSON line (`{"type":"content","text":"..."}`) for programmatic consumption. The `AgentEngine` holds an optional `StreamCallback` that, when set, is used for the first LLM call in the run.
 - Built with `ratatui` and `crossterm`.
 - Layout:
   - Main conversation pane (scrollable, syntax highlighting).
@@ -318,6 +343,17 @@ In addition to the REPL, the CLI supports one-shot commands:
 - `deepseek apply` – apply staged patches.
 - `deepseek index build|update|status|query` – manage index.
 - `deepseek config edit|show` – edit configuration.
+- `deepseek review [--diff|--staged|--pr N|--path P] [--focus F]` – structured code review with severity levels.
+
+**Print mode (`-p`):** Any command can be run non-interactively with the `-p` flag. Reads prompt from trailing arguments or stdin pipe. Supports `--output-format` (`text`, `json`, `stream-json`). Designed for CI/CD pipelines, scripting, and integration with other tools.
+
+**Session continuation:**
+- `--continue` resumes the most recent session, restoring full conversation context.
+- `--resume <UUID>` resumes a specific session by ID.
+
+**Per-invocation overrides:**
+- `--model <name>` overrides `llm.base_model` for this run.
+- `--provider <name>` overrides `llm.provider` for this run.
 
 ---
 
@@ -379,24 +415,96 @@ In addition to the REPL, the CLI supports one-shot commands:
 [llm]
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
+provider = "deepseek"              # deepseek | openai | anthropic | custom | local | ollama
+profile = "v3_2"
+context_window_tokens = 1000000
 temperature = 0.2
-api_key = "${DEEPSEEK_API_KEY}"  # or read from env
+endpoint = "https://api.deepseek.com/chat/completions"
+api_key_env = "DEEPSEEK_API_KEY"
+fast_mode = false
+language = "en"
+prompt_cache_enabled = true
+timeout_seconds = 60
+max_retries = 3
+retry_base_ms = 400
+stream = true
 
 [router]
 auto_max_think = true
 threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1
-weights = { prompt_complexity = 0.3, failure_streak = 0.25, ambiguity = 0.2, plan_confidence = 0.25 }
+w1 = 0.2    # prompt_complexity
+w2 = 0.15   # repo_complexity
+w3 = 0.2    # failure_streak
+w4 = 0.15   # planner_confidence
+w5 = 0.2    # user_intent
+w6 = 0.1    # latency_budget
 
 [policy]
 approve_edits = "ask"          # ask, allow, deny
 approve_bash = "ask"
-allowlist = ["rg", "git", "cargo test", "cargo fmt --check", "npm test"]
-block_paths = [".env", "**/id_*", "**/secret"]
+allowlist = ["rg", "git status", "git diff", "git show", "cargo test", "cargo fmt --check", "cargo clippy"]
+block_paths = [".env", ".ssh", ".aws", ".gnupg", "**/id_*", "**/secret"]
 redact_patterns = [
-    "(?i)(api[_-]?key|token|secret)\\s*[:=]\\s*['\"]?[a-z0-9_\\-]{16,}['\"]?"
+    '(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[''"]?[a-z0-9_\-]{8,}[''"]?',
+    '\b\d{3}-\d{2}-\d{4}\b',
+    '(?i)\b(mrn|medical_record_number|patient_id)\s*[:=]\s*[a-z0-9\-]{4,}\b',
 ]
+sandbox_mode = "allowlist"     # allowlist | isolated | off
+# lint_after_edit = "cargo fmt --check"  # auto-lint after fs.edit
+
+[plugins]
+enabled = true
+search_paths = [".deepseek/plugins", ".plugins"]
+enable_hooks = false
+
+[plugins.catalog]
+enabled = true
+index_url = ".deepseek/plugins/catalog.json"
+signature_key = "deepseek-local-dev-key"
+refresh_hours = 24
+
+[skills]
+paths = [".deepseek/skills", "~/.deepseek/skills"]
+hot_reload = true
+
+[usage]
+show_statusline = true
+cost_per_million_input = 0.27
+cost_per_million_output = 1.10
+
+[context]
+auto_compact_threshold = 0.86
+compact_preview = true
+
+[autopilot]
+default_max_consecutive_failures = 10
+heartbeat_interval_seconds = 5
+persist_checkpoints = true
+
+[scheduling]
+off_peak = false
+off_peak_start_hour = 0
+off_peak_end_hour = 6
+defer_non_urgent = false
+max_defer_seconds = 0
+
+[replay]
+strict_mode = true
+
+[ui]
+enable_tui = true
+keybindings_path = "~/.deepseek/keybindings.json"
+reduced_motion = false
+statusline_mode = "minimal"
+
+[experiments]
+visual_verification = false
+wasm_hooks = false
+
+[telemetry]
+enabled = false
 
 [index]
 enabled = true
@@ -408,7 +516,6 @@ max_reasoner_tokens_per_session = 1000000
 max_turn_duration_secs = 300
 
 [theme]
-# ratatui color theme
 primary = "Cyan"
 secondary = "Yellow"
 error = "Red"

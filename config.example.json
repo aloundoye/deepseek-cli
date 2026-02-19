@@ -55,7 +55,8 @@
       "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b"
     ],
     "sandbox_mode": "allowlist",
-    "sandbox_wrapper": null
+    "sandbox_wrapper": null,
+    "lint_after_edit": null
   },
   "plugins": {
     "enabled": true,
