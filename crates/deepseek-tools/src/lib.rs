@@ -2,6 +2,7 @@ mod plugins;
 mod shell;
 
 use anyhow::{Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use deepseek_core::{
     AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ToolCall, ToolHost, ToolProposal,
@@ -36,6 +37,7 @@ const REVIEW_BLOCKED_TOOLS: &[&str] = &[
     "patch.stage",
     "patch.apply",
     "bash.run",
+    "notebook.edit",
 ];
 
 pub struct LocalToolHost {
@@ -158,6 +160,38 @@ impl LocalToolHost {
                         && (mime.starts_with("image/") || mime == "application/pdf")
                     {
                         self.emit_visual_artifact_event(path, mime);
+                    }
+                    // Return base64 for images so multimodal models can process them
+                    if mime.starts_with("image/") {
+                        let encoded = BASE64.encode(&bytes);
+                        return Ok(json!({
+                            "path": path,
+                            "mime": mime,
+                            "binary": true,
+                            "size_bytes": bytes.len(),
+                            "sha256": sha,
+                            "base64": encoded
+                        }));
+                    }
+                    // PDF text extraction
+                    if mime == "application/pdf" {
+                        let pages_arg = call.args.get("pages").and_then(|v| v.as_str());
+                        match extract_pdf_text(&full, pages_arg) {
+                            Ok(text) => {
+                                return Ok(json!({
+                                    "path": path,
+                                    "mime": mime,
+                                    "binary": true,
+                                    "size_bytes": bytes.len(),
+                                    "sha256": sha,
+                                    "content": text,
+                                    "pages": pages_arg.unwrap_or("all")
+                                }));
+                            }
+                            Err(_) => {
+                                // Fall through to generic binary return if extraction fails
+                            }
+                        }
                     }
                     return Ok(json!({
                         "path": path,
@@ -644,6 +678,158 @@ impl LocalToolHost {
                     }
                 }))
             }
+            "notebook.read" => {
+                let path = call
+                    .args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("path missing"))?;
+                self.policy.check_path(path)?;
+                let full = self.workspace.join(path);
+                let content = fs::read_to_string(&full)?;
+                let nb: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| anyhow!("invalid notebook JSON: {e}"))?;
+                let cells = nb
+                    .get("cells")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow!("notebook has no cells array"))?;
+                let cell_summaries: Vec<serde_json::Value> = cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cell)| {
+                        let cell_type = cell
+                            .get("cell_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let source = cell
+                            .get("source")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                            .or_else(|| {
+                                cell.get("source")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                            })
+                            .unwrap_or_default();
+                        let preview: String = source.chars().take(200).collect();
+                        json!({
+                            "index": i,
+                            "cell_type": cell_type,
+                            "source_preview": preview,
+                            "source_length": source.len()
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "path": path,
+                    "cells_count": cells.len(),
+                    "cells": cell_summaries
+                }))
+            }
+            "notebook.edit" => {
+                let path = call
+                    .args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("path missing"))?;
+                self.policy.check_path(path)?;
+                let full = self.workspace.join(path);
+                let content = fs::read_to_string(&full)?;
+                let mut nb: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| anyhow!("invalid notebook JSON: {e}"))?;
+                let operation = call
+                    .args
+                    .get("operation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("replace");
+                let cell_index =
+                    call.args
+                        .get("cell_index")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow!("cell_index missing"))? as usize;
+                let cells = nb
+                    .get_mut("cells")
+                    .and_then(|v| v.as_array_mut())
+                    .ok_or_else(|| anyhow!("notebook has no cells array"))?;
+                let checkpoint = self.create_checkpoint("notebook_edit")?;
+                match operation {
+                    "replace" => {
+                        if cell_index >= cells.len() {
+                            return Err(anyhow!(
+                                "cell_index {cell_index} out of range ({} cells)",
+                                cells.len()
+                            ));
+                        }
+                        let new_source = call
+                            .args
+                            .get("new_source")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow!("new_source missing for replace"))?;
+                        let source_lines: Vec<serde_json::Value> = new_source
+                            .lines()
+                            .map(|l| json!(format!("{l}\n")))
+                            .collect();
+                        cells[cell_index]["source"] = json!(source_lines);
+                        if let Some(ct) = call.args.get("cell_type").and_then(|v| v.as_str()) {
+                            cells[cell_index]["cell_type"] = json!(ct);
+                        }
+                    }
+                    "insert" => {
+                        if cell_index > cells.len() {
+                            return Err(anyhow!(
+                                "cell_index {cell_index} out of range for insert ({} cells)",
+                                cells.len()
+                            ));
+                        }
+                        let new_source = call
+                            .args
+                            .get("new_source")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let cell_type = call
+                            .args
+                            .get("cell_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("code");
+                        let source_lines: Vec<serde_json::Value> = new_source
+                            .lines()
+                            .map(|l| json!(format!("{l}\n")))
+                            .collect();
+                        let new_cell = json!({
+                            "cell_type": cell_type,
+                            "source": source_lines,
+                            "metadata": {},
+                            "outputs": [],
+                            "execution_count": null
+                        });
+                        cells.insert(cell_index, new_cell);
+                    }
+                    "delete" => {
+                        if cell_index >= cells.len() {
+                            return Err(anyhow!(
+                                "cell_index {cell_index} out of range ({} cells)",
+                                cells.len()
+                            ));
+                        }
+                        cells.remove(cell_index);
+                    }
+                    _ => return Err(anyhow!("unknown notebook operation: {operation}")),
+                }
+                let updated = serde_json::to_string_pretty(&nb)?;
+                fs::write(&full, &updated)?;
+                Ok(json!({
+                    "path": path,
+                    "operation": operation,
+                    "cell_index": cell_index,
+                    "cells_count": nb.get("cells").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                    "checkpoint_id": checkpoint.map(|id| id.to_string())
+                }))
+            }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
     }
@@ -1090,6 +1276,7 @@ fn guess_mime(path: &Path) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
+        "ipynb" => "application/x-ipynb+json",
         _ => "application/octet-stream",
     }
 }
@@ -1115,6 +1302,47 @@ fn collect_lines(
             }))
         })
         .collect()
+}
+
+fn extract_pdf_text(path: &Path, pages: Option<&str>) -> Result<String> {
+    let full_text =
+        pdf_extract::extract_text(path).map_err(|e| anyhow!("PDF extraction failed: {e}"))?;
+    match pages {
+        None => Ok(full_text),
+        Some(range) => {
+            let (start, end) = parse_page_range(range)?;
+            let page_texts: Vec<&str> = full_text.split('\x0C').collect();
+            let total = page_texts.len();
+            if start > total {
+                return Err(anyhow!("page {start} out of range ({total} pages)"));
+            }
+            let end_idx = end.min(total);
+            Ok(page_texts[(start - 1)..end_idx].join("\n--- page break ---\n"))
+        }
+    }
+}
+
+fn parse_page_range(range: &str) -> Result<(usize, usize)> {
+    if let Some((s, e)) = range.split_once('-') {
+        let start: usize = s
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("invalid range start"))?;
+        let end: usize = e.trim().parse().map_err(|_| anyhow!("invalid range end"))?;
+        if start == 0 || end < start {
+            return Err(anyhow!("invalid page range"));
+        }
+        Ok((start, end))
+    } else {
+        let p: usize = range
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("invalid page number"))?;
+        if p == 0 {
+            return Err(anyhow!("page must be >= 1"));
+        }
+        Ok((p, p))
+    }
 }
 
 fn strip_html_tags(html: &str) -> String {

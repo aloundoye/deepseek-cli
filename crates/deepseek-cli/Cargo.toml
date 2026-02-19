@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -32,6 +33,7 @@ deepseek-ui = { path = "../deepseek-ui" }
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-mcp = { path = "../deepseek-mcp" }
 deepseek-skills = { path = "../deepseek-skills" }
+deepseek-jsonrpc = { path = "../deepseek-jsonrpc" }
 
 [dev-dependencies]
 assert_cmd = "2"

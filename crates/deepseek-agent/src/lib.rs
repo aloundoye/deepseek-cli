@@ -325,6 +325,7 @@ impl AgentEngine {
                 model: decision.selected_model.clone(),
                 max_tokens: session.budgets.max_think_tokens,
                 non_urgent,
+                images: vec![],
             },
         )?;
         self.emit(
@@ -362,6 +363,7 @@ impl AgentEngine {
                     model: self.cfg.llm.max_think_model.clone(),
                     max_tokens: session.budgets.max_think_tokens,
                     non_urgent,
+                    images: vec![],
                 },
             )?;
             self.emit(
@@ -418,6 +420,7 @@ impl AgentEngine {
                     model: self.cfg.llm.max_think_model.clone(),
                     max_tokens: session.budgets.max_think_tokens,
                     non_urgent,
+                    images: vec![],
                 },
             )?;
             self.emit(
@@ -478,6 +481,7 @@ impl AgentEngine {
                     model: self.cfg.llm.max_think_model.clone(),
                     max_tokens: session.budgets.max_think_tokens,
                     non_urgent,
+                    images: vec![],
                 },
             )?;
             self.emit(
@@ -1241,6 +1245,7 @@ impl AgentEngine {
                 model: decision.selected_model.clone(),
                 max_tokens: 4096,
                 non_urgent,
+                images: vec![],
             },
         )?;
         self.emit(
@@ -1269,14 +1274,6 @@ impl AgentEngine {
         session_id: Uuid,
         req: &LlmRequest,
     ) -> Result<deepseek_core::LlmResponse> {
-        self.emit(
-            session_id,
-            EventKind::ProviderSelectedV1 {
-                provider: self.cfg.llm.provider.clone(),
-                model: req.model.clone(),
-            },
-        )?;
-
         if self.cfg.scheduling.off_peak {
             let hour = Utc::now().hour() as u8;
             let start = self.cfg.scheduling.off_peak_start_hour;
@@ -1307,12 +1304,12 @@ impl AgentEngine {
             }
         }
 
-        let cache_key = prompt_cache_key(&self.cfg.llm.provider, &req.model, &req.prompt);
+        let cache_key = prompt_cache_key(&req.model, &req.prompt);
         if self.cfg.llm.prompt_cache_enabled
             && let Some(cached) = self.read_prompt_cache(&cache_key)?
         {
             self.store.insert_provider_metric(&ProviderMetricRecord {
-                provider: self.cfg.llm.provider.clone(),
+                provider: "deepseek".to_string(),
                 model: req.model.clone(),
                 cache_key: Some(cache_key.clone()),
                 cache_hit: true,
@@ -1351,7 +1348,7 @@ impl AgentEngine {
         }?;
         let latency_ms = started.elapsed().as_millis() as u64;
         self.store.insert_provider_metric(&ProviderMetricRecord {
-            provider: self.cfg.llm.provider.clone(),
+            provider: "deepseek".to_string(),
             model: req.model.clone(),
             cache_key: Some(cache_key.clone()),
             cache_hit: false,
@@ -3329,10 +3326,9 @@ fn walk_workspace_files(
     out
 }
 
-fn prompt_cache_key(provider: &str, model: &str, prompt: &str) -> String {
+fn prompt_cache_key(model: &str, prompt: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(provider.as_bytes());
-    hasher.update(b":");
+    hasher.update(b"deepseek:");
     hasher.update(model.as_bytes());
     hasher.update(b":");
     hasher.update(prompt.as_bytes());
@@ -3417,6 +3413,7 @@ Return concise actionable findings only (max 6 bullet points).",
         model,
         max_tokens,
         non_urgent: false,
+        images: vec![],
     }
 }
 
@@ -4211,9 +4208,9 @@ mod tests {
 
     #[test]
     fn prompt_cache_key_is_stable() {
-        let a = prompt_cache_key("deepseek", "deepseek-chat", "hello");
-        let b = prompt_cache_key("deepseek", "deepseek-chat", "hello");
-        let c = prompt_cache_key("deepseek", "deepseek-chat", "hello!");
+        let a = prompt_cache_key("deepseek-chat", "hello");
+        let b = prompt_cache_key("deepseek-chat", "hello");
+        let c = prompt_cache_key("deepseek-chat", "hello!");
         assert_eq!(a, b);
         assert_ne!(a, c);
     }

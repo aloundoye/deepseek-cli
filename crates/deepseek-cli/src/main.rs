@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use deepseek_agent::AgentEngine;
 use deepseek_core::{
     AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventEnvelope,
@@ -11,7 +12,7 @@ use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
 use deepseek_mcp::{McpManager, McpServer, McpTransport};
 use deepseek_memory::{ExportFormat, MemoryManager};
-use deepseek_policy::{TeamPolicyLocks, team_policy_locks};
+use deepseek_policy::{PolicyEngine, TeamPolicyLocks, team_policy_locks};
 use deepseek_skills::SkillManager;
 use deepseek_store::{AutopilotRunRecord, BackgroundJobRecord, ReplayCassetteRecord, Store};
 use deepseek_tools::PluginManager;
@@ -59,10 +60,6 @@ struct Cli {
     /// Override the LLM model for this invocation.
     #[arg(long)]
     model: Option<String>,
-
-    /// Override the LLM provider for this invocation (deepseek, openai, anthropic, custom).
-    #[arg(long)]
-    provider: Option<String>,
 
     /// Output format for print mode: text (default), json, stream-json.
     #[arg(long, default_value = "text")]
@@ -161,6 +158,10 @@ enum Commands {
     Fork(ForkArgs),
     /// Inspect context window token usage breakdown.
     Context(ContextArgs),
+    /// Generate shell completion scripts.
+    Completions(CompletionsArgs),
+    /// Start JSON-RPC server for IDE integration.
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
@@ -408,6 +409,19 @@ struct ForkArgs {
 
 #[derive(Args, Default)]
 struct ContextArgs {}
+
+#[derive(Args)]
+struct CompletionsArgs {
+    /// Shell to generate completions for (bash, zsh, fish, powershell).
+    shell: String,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Transport to use: stdio (default).
+    #[arg(long, default_value = "stdio")]
+    transport: String,
+}
 
 #[derive(Subcommand)]
 enum MemoryCmd {
@@ -792,6 +806,12 @@ struct BenchmarkRunMatrixArgs {
 enum PermissionsCmd {
     Show,
     Set(PermissionsSetArgs),
+    DryRun(PermissionsDryRunArgs),
+}
+
+#[derive(Args)]
+struct PermissionsDryRunArgs {
+    tool_name: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -957,6 +977,8 @@ fn main() -> Result<()> {
         Commands::Search(args) => run_search(&cwd, args, cli.json),
         Commands::Fork(args) => run_fork(&cwd, args, cli.json),
         Commands::Context(_) => run_context(&cwd, cli.json),
+        Commands::Completions(args) => run_completions(args),
+        Commands::Serve(args) => run_serve(args, cli.json),
     }
 }
 
@@ -3015,9 +3037,18 @@ fn parse_permissions_cmd(args: Vec<String>) -> Result<PermissionsCmd> {
         }));
     }
 
+    if first == "dry-run" || first == "dryrun" {
+        let tool_name = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: /permissions dry-run <tool-name>"))?;
+        return Ok(PermissionsCmd::DryRun(PermissionsDryRunArgs {
+            tool_name: tool_name.clone(),
+        }));
+    }
+
     if first != "set" {
         return Err(anyhow!(
-            "use /permissions show|set|bash|edits|sandbox|allow|clear-allowlist"
+            "use /permissions show|set|bash|edits|sandbox|allow|clear-allowlist|dry-run"
         ));
     }
 
@@ -6581,6 +6612,15 @@ fn run_permissions(cwd: &Path, cmd: PermissionsCmd, json_mode: bool) -> Result<(
     let payload = permissions_payload(cwd, cmd)?;
     if json_mode {
         print_json(&payload)?;
+    } else if payload.get("dry_run").is_some() {
+        println!(
+            "dry-run: tool={} mode={} result={}",
+            payload["dry_run"]["tool"].as_str().unwrap_or_default(),
+            payload["dry_run"]["permission_mode"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["dry_run"]["result"].as_str().unwrap_or_default(),
+        );
     } else {
         println!(
             "permissions: bash={} edits={} sandbox={} allowlist={}",
@@ -6675,6 +6715,23 @@ fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<serde_json::Va
                 cfg.save(cwd)?;
             }
         }
+        PermissionsCmd::DryRun(args) => {
+            let engine = PolicyEngine::from_app_config(&cfg.policy);
+            let call = deepseek_core::ToolCall {
+                name: args.tool_name.clone(),
+                args: serde_json::json!({}),
+                requires_approval: false,
+            };
+            let result = engine.dry_run(&call);
+            let verdict = format!("{:?}", result);
+            return Ok(json!({
+                "dry_run": {
+                    "tool": args.tool_name,
+                    "permission_mode": cfg.policy.permission_mode,
+                    "result": verdict,
+                }
+            }));
+        }
     }
 
     Ok(json!({
@@ -6695,6 +6752,7 @@ fn permissions_payload(cwd: &Path, cmd: PermissionsCmd) -> Result<serde_json::Va
                 "approve_bash_locked": locks.approve_bash_locked,
                 "allowlist_locked": locks.allowlist_locked,
                 "sandbox_mode_locked": locks.sandbox_mode_locked,
+                "permission_mode_locked": locks.permission_mode_locked,
             }))
             .unwrap_or_else(|| json!({"active": false}))
     }))
@@ -9254,4 +9312,44 @@ fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_completions(args: CompletionsArgs) -> Result<()> {
+    let shell = match args.shell.to_ascii_lowercase().as_str() {
+        "bash" => Shell::Bash,
+        "zsh" => Shell::Zsh,
+        "fish" => Shell::Fish,
+        "powershell" | "pwsh" => Shell::PowerShell,
+        "elvish" => Shell::Elvish,
+        other => {
+            return Err(anyhow!(
+                "unsupported shell '{}' (supported: bash, zsh, fish, powershell)",
+                other
+            ));
+        }
+    };
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "deepseek", &mut std::io::stdout());
+    Ok(())
+}
+
+fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
+    match args.transport.as_str() {
+        "stdio" => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "starting", "transport": "stdio"})
+                );
+            } else {
+                eprintln!("deepseek: starting JSON-RPC server on stdio...");
+            }
+            let handler = deepseek_jsonrpc::DefaultRpcHandler;
+            deepseek_jsonrpc::run_stdio_server(&handler)
+        }
+        other => Err(anyhow!(
+            "unsupported transport '{}' (supported: stdio)",
+            other
+        )),
+    }
 }

@@ -487,10 +487,6 @@ pub enum EventKind {
         deterministic: bool,
         events_replayed: u64,
     },
-    ProviderSelectedV1 {
-        provider: String,
-        model: String,
-    },
     PromptCacheHitV1 {
         cache_key: String,
         model: String,
@@ -513,6 +509,34 @@ pub enum EventKind {
         bundle_id: Uuid,
         path: String,
     },
+    SessionStartedV1 {
+        session_id: Uuid,
+        workspace: String,
+    },
+    SessionResumedV1 {
+        session_id: Uuid,
+        events_replayed: u64,
+    },
+    ToolDeniedV1 {
+        invocation_id: Uuid,
+        tool_name: String,
+        reason: String,
+    },
+    NotebookEditedV1 {
+        path: String,
+        operation: String,
+        cell_index: u64,
+        cell_type: Option<String>,
+    },
+    PdfTextExtractedV1 {
+        path: String,
+        pages: String,
+        text_length: u64,
+    },
+    IdeSessionStartedV1 {
+        transport: String,
+        client_info: String,
+    },
 }
 
 pub trait Planner {
@@ -534,6 +558,12 @@ pub trait ToolHost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub mime: String,
+    pub base64_data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub unit: LlmUnit,
     pub prompt: String,
@@ -541,6 +571,8 @@ pub struct LlmRequest {
     pub max_tokens: u32,
     #[serde(default)]
     pub non_urgent: bool,
+    #[serde(default)]
+    pub images: Vec<ImageContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1151,5 +1183,30 @@ mod tests {
             &SessionState::Idle,
             &SessionState::Completed
         ));
+    }
+
+    #[test]
+    fn new_event_types_round_trip_via_serde() {
+        let events = vec![
+            EventKind::SessionStartedV1 {
+                session_id: Uuid::now_v7(),
+                workspace: "/tmp/test".to_string(),
+            },
+            EventKind::SessionResumedV1 {
+                session_id: Uuid::now_v7(),
+                events_replayed: 42,
+            },
+            EventKind::ToolDeniedV1 {
+                invocation_id: Uuid::now_v7(),
+                tool_name: "bash.run".to_string(),
+                reason: "locked mode".to_string(),
+            },
+        ];
+        for event in events {
+            let serialized = serde_json::to_string(&event).expect("serialize");
+            let deserialized: EventKind = serde_json::from_str(&serialized).expect("deserialize");
+            let re_serialized = serde_json::to_string(&deserialized).expect("re-serialize");
+            assert_eq!(serialized, re_serialized);
+        }
     }
 }
