@@ -2467,13 +2467,6 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::ProviderSelectedV1 { provider, model } => {
-                conn.execute(
-                    "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
-                     VALUES (?1, ?2, NULL, 0, 0, ?3)",
-                    params![provider, model, Utc::now().to_rfc3339()],
-                )?;
-            }
             EventKind::PromptCacheHitV1 { cache_key, model } => {
                 conn.execute(
                     "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
@@ -2746,7 +2739,6 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::BackgroundJobStoppedV1 { .. } => "BackgroundJobStopped@v1",
         EventKind::SkillLoadedV1 { .. } => "SkillLoaded@v1",
         EventKind::ReplayExecutedV1 { .. } => "ReplayExecuted@v1",
-        EventKind::ProviderSelectedV1 { .. } => "ProviderSelected@v1",
         EventKind::PromptCacheHitV1 { .. } => "PromptCacheHit@v1",
         EventKind::OffPeakScheduledV1 { .. } => "OffPeakScheduled@v1",
         EventKind::VisualArtifactCapturedV1 { .. } => "VisualArtifactCaptured@v1",
@@ -2760,6 +2752,12 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::TaskCreatedV1 { .. } => "TaskCreated@v1",
         EventKind::TaskCompletedV1 { .. } => "TaskCompleted@v1",
         EventKind::ArtifactBundledV1 { .. } => "ArtifactBundled@v1",
+        EventKind::SessionStartedV1 { .. } => "SessionStarted@v1",
+        EventKind::SessionResumedV1 { .. } => "SessionResumed@v1",
+        EventKind::ToolDeniedV1 { .. } => "ToolDenied@v1",
+        EventKind::NotebookEditedV1 { .. } => "NotebookEdited@v1",
+        EventKind::PdfTextExtractedV1 { .. } => "PdfTextExtracted@v1",
+        EventKind::IdeSessionStartedV1 { .. } => "IdeSessionStarted@v1",
     }
 }
 

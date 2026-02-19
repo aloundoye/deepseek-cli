@@ -25,3 +25,5 @@ deepseek-policy = { path = "../deepseek-policy" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-hooks = { path = "../deepseek-hooks" }
 deepseek-memory = { path = "../deepseek-memory" }
+base64.workspace = true
+pdf-extract.workspace = true

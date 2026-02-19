@@ -105,10 +105,18 @@ impl DeepSeekClient {
                 )
             }));
         }
-        messages.push(json!({
-            "role": "user",
-            "content": req.prompt
-        }));
+        if req.images.is_empty() {
+            messages.push(json!({"role": "user", "content": req.prompt}));
+        } else {
+            let mut parts = vec![json!({"type": "text", "text": req.prompt})];
+            for img in &req.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
+                }));
+            }
+            messages.push(json!({"role": "user", "content": parts}));
+        }
 
         let model = normalize_deepseek_model(&req.model).unwrap_or(req.model.as_str());
 
@@ -321,69 +329,48 @@ impl DeepSeekClient {
 impl LlmClient for DeepSeekClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" {
+            return Err(anyhow!(
+                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
+                self.cfg.provider
+            ));
+        }
         let key = self
             .resolve_api_key()
             .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
 
-        match provider.as_str() {
-            "deepseek" => {
-                let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
-                    anyhow!(
-                        "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
-                        self.cfg.profile
-                    )
-                })?;
-                let mut normalized_req = req.clone();
-                normalized_req.model = self.resolve_request_model(&req.model, profile)?;
-                self.complete_inner(&normalized_req, &key)
-            }
-            "openai" => {
-                // OpenAI-compatible endpoint (default: https://api.openai.com/v1/chat/completions)
-                self.complete_inner(req, &key)
-            }
-            "anthropic" => {
-                // Anthropic uses a different header and format, but for the initial
-                // implementation we support Anthropic-compatible proxies that accept
-                // the OpenAI chat format (e.g., via litellm or similar).
-                self.complete_inner(req, &key)
-            }
-            "custom" | "local" | "ollama" => {
-                // Custom/local provider: send request as-is to configured endpoint
-                self.complete_inner(req, &key)
-            }
-            _ => Err(anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai, anthropic, custom, local, ollama)",
-                self.cfg.provider
-            )),
-        }
+        let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+                self.cfg.profile
+            )
+        })?;
+        let mut normalized_req = req.clone();
+        normalized_req.model = self.resolve_request_model(&req.model, profile)?;
+        self.complete_inner(&normalized_req, &key)
     }
 
     fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
         let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" {
+            return Err(anyhow!(
+                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
+                self.cfg.provider
+            ));
+        }
         let key = self
             .resolve_api_key()
             .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
 
-        match provider.as_str() {
-            "deepseek" => {
-                let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
-                    anyhow!(
-                        "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
-                        self.cfg.profile
-                    )
-                })?;
-                let mut normalized_req = req.clone();
-                normalized_req.model = self.resolve_request_model(&req.model, profile)?;
-                self.complete_streaming_inner(&normalized_req, &key, cb)
-            }
-            "openai" | "anthropic" | "custom" | "local" | "ollama" => {
-                self.complete_streaming_inner(req, &key, cb)
-            }
-            _ => Err(anyhow!(
-                "unsupported llm.provider='{}' (supported: deepseek, openai, anthropic, custom, local, ollama)",
-                self.cfg.provider
-            )),
-        }
+        let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+                self.cfg.profile
+            )
+        })?;
+        let mut normalized_req = req.clone();
+        normalized_req.model = self.resolve_request_model(&req.model, profile)?;
+        self.complete_streaming_inner(&normalized_req, &key, cb)
     }
 }
 
@@ -740,6 +727,7 @@ mod tests {
             model: "deepseek-chat".to_string(),
             max_tokens: 16_000,
             non_urgent: false,
+            images: vec![],
         });
         assert_eq!(payload["max_tokens"], 2048);
     }
@@ -753,6 +741,7 @@ mod tests {
             model: "deepseek-v3.2".to_string(),
             max_tokens: 256,
             non_urgent: false,
+            images: vec![],
         });
         assert_eq!(payload["model"], "deepseek-chat");
     }
@@ -772,6 +761,7 @@ mod tests {
                 model: "any".to_string(),
                 max_tokens: 128,
                 non_urgent: false,
+                images: vec![],
             })
             .expect_err("truly unsupported provider should fail");
         assert!(err.to_string().contains("unsupported llm.provider"));
@@ -792,6 +782,7 @@ mod tests {
                 model: "deepseek-chat".to_string(),
                 max_tokens: 128,
                 non_urgent: false,
+                images: vec![],
             })
             .expect_err("unsupported profile should fail");
         assert!(err.to_string().contains("unsupported llm.profile"));
@@ -811,6 +802,7 @@ mod tests {
                 model: "not-a-deepseek-model".to_string(),
                 max_tokens: 128,
                 non_urgent: false,
+                images: vec![],
             })
             .expect_err("unsupported model should fail");
         assert!(err.to_string().contains("unsupported model"));
@@ -830,6 +822,7 @@ mod tests {
                 model: "deepseek-v3.2-speciale".to_string(),
                 max_tokens: 128,
                 non_urgent: false,
+                images: vec![],
             })
             .expect_err("speciale model should require speciale profile");
         assert!(
@@ -839,8 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_providers_are_accepted() {
-        // Verify that openai, anthropic, custom, local, ollama are accepted providers
+    fn non_deepseek_provider_is_rejected() {
         for provider in &["openai", "anthropic", "custom", "local", "ollama"] {
             let cfg = LlmConfig {
                 provider: provider.to_string(),
@@ -848,21 +840,20 @@ mod tests {
                 ..LlmConfig::default()
             };
             let client = DeepSeekClient::new(cfg).expect("client");
-            // These will fail at the network level, not at provider validation
-            let result = client.complete(&LlmRequest {
-                unit: deepseek_core::LlmUnit::Planner,
-                prompt: "hello".to_string(),
-                model: "test-model".to_string(),
-                max_tokens: 128,
-                non_urgent: false,
-            });
-            // Should fail with a network error, not "unsupported provider"
-            if let Err(e) = result {
-                assert!(
-                    !e.to_string().contains("unsupported llm.provider"),
-                    "provider '{provider}' should be accepted but got: {e}"
-                );
-            }
+            let err = client
+                .complete(&LlmRequest {
+                    unit: deepseek_core::LlmUnit::Planner,
+                    prompt: "hello".to_string(),
+                    model: "deepseek-chat".to_string(),
+                    max_tokens: 128,
+                    non_urgent: false,
+                    images: vec![],
+                })
+                .expect_err("non-deepseek provider should be rejected");
+            assert!(
+                err.to_string().contains("only 'deepseek' is supported"),
+                "provider '{provider}' should be rejected but got: {err}"
+            );
         }
     }
 
@@ -881,6 +872,7 @@ mod tests {
                 model: "deepseek-chat".to_string(),
                 max_tokens: 128,
                 non_urgent: false,
+                images: vec![],
             })
             .expect_err("missing API key should fail");
         assert!(err.to_string().contains("not set and llm.api_key is empty"));
@@ -899,6 +891,7 @@ mod tests {
             model: "deepseek-chat".to_string(),
             max_tokens: 128,
             non_urgent: false,
+            images: vec![],
         });
         let messages = payload["messages"].as_array().expect("messages");
         assert_eq!(messages[0]["role"], "system");
@@ -983,6 +976,7 @@ mod tests {
                 model: "deepseek-chat".to_string(),
                 max_tokens: 64,
                 non_urgent: false,
+                images: vec![],
             })
             .expect("response should eventually succeed");
         assert_eq!(out.text, "ok-after-retry");
@@ -1023,6 +1017,7 @@ mod tests {
                 model: "deepseek-chat".to_string(),
                 max_tokens: 64,
                 non_urgent: false,
+                images: vec![],
             })
             .expect_err("request should fail after retries are exhausted");
         assert!(err.to_string().contains("deepseek API error 429"));
@@ -1231,6 +1226,7 @@ mod tests {
                     model: "deepseek-chat".to_string(),
                     max_tokens: 128,
                     non_urgent: false,
+                    images: vec![],
                 },
                 cb,
             )
