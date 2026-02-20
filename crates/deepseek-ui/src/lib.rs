@@ -1379,18 +1379,19 @@ where
         let mut out = io::stdout();
         // Clear screen + scrollback + move cursor home
         out.write_all(b"\x1b[2J\x1b[3J\x1b[H")?;
-        // Welcome banner
-        writeln!(
-            out,
-            "\x1b[1;36m  deepseek\x1b[0m v{} \x1b[90m({})\x1b[0m",
-            env!("CARGO_PKG_VERSION"),
-            status.model,
-        )?;
-        writeln!(
-            out,
-            "\x1b[90m  cwd: {}\x1b[0m\n",
-            status.working_directory,
-        )?;
+
+        // ASCII art logo + info, styled like Claude Code
+        let version = env!("CARGO_PKG_VERSION");
+        let model = &status.model;
+        let cwd = &status.working_directory;
+
+        // Logo in blue, info text in white/gray
+        writeln!(out, "")?;
+        writeln!(out, "\x1b[1;34m   ▟█▙    \x1b[0m \x1b[1mDeepSeek CLI\x1b[0m v{version}")?;
+        writeln!(out, "\x1b[1;34m ▗ ▗  ▖ ▖ \x1b[0m \x1b[36m{model}\x1b[0m")?;
+        writeln!(out, "\x1b[1;34m           \x1b[0m \x1b[90m{cwd}\x1b[0m")?;
+        writeln!(out, "\x1b[1;34m   ▘▘▝▝   \x1b[0m")?;
+        writeln!(out, "")?;
         out.flush()?;
     }
 

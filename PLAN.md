@@ -4,102 +4,43 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 
 ---
 
-## Phase 0: Critical Bugs (Blocks Basic Functionality)
+## Phase 0: Critical Bugs (Blocks Basic Functionality) ✅
 
-### 0.1 Fix tool definition parameter name mismatches
-**Severity: CRITICAL — every tool call fails at runtime**
-- File: `crates/deepseek-tools/src/lib.rs` — `tool_definitions()` function
-- `tool_definitions()` uses `file_path` but `run_tool()` reads `path` from args
-- `bash_run` definition says `command` but implementation reads `cmd`
-- `fs_read` definition says `offset, limit` but code reads `start_line, max_bytes`
-- `fs_edit` definition says `old_string, new_string` but code reads `search, replace` or `edits[]` or `start_line/end_line/replacement`
-- `notebook_edit` says `cell_number, new_source` but code reads `cell_index, operation`
-- **Fix**: Update all parameter names in `tool_definitions()` to match what `run_tool()` actually reads from `call.args`
+### 0.1 Fix tool definition parameter name mismatches ✅
+- Fixed all parameter names in `tool_definitions()` to match what `run_tool()` actually reads from `call.args`
 
-### 0.2 Fix stream callback consumed and never re-installed
-**Severity: CRITICAL — streaming dies after first tool call turn**
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` method
-- `self.stream_callback.lock().ok().and_then(|mut g| g.take())` consumes the callback
-- After first LLM call, all subsequent turns fall back to non-streaming `complete_chat()`
-- User sees first response stream, then nothing for all tool-call turns
-- **Fix**: Change `StreamCallback` from `Box<dyn FnMut(StreamChunk) + Send>` to `Arc<dyn Fn(StreamChunk) + Send + Sync>` in `deepseek-core/src/lib.rs`, then clone instead of take
+### 0.2 Fix stream callback consumed and never re-installed ✅
+- Changed `StreamCallback` to `Arc<dyn Fn(StreamChunk) + Send + Sync>`, clone instead of take
 
-### 0.3 Fix chat() not using session state transitions
-**Severity: HIGH — session state stays Idle, events incomplete**
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` method
-- Never calls `self.transition()` — session stays in `Idle` forever
-- No `SessionStateChangedV1` events emitted during chat mode
-- **Fix**: Transition to `ExecutingStep` at start, `Completed` or `Failed` at end
+### 0.3 Fix chat() not using session state transitions ✅
+- Added `transition()` calls: `ExecutingStep` at start, `Completed` or `Failed` at end
 
-### 0.4 Fix chat() not loading prior turns on --continue/--resume
-**Severity: HIGH — conversation continuity broken**
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` method
-- Always starts with empty `Vec<ChatMessage>` — ignores all prior conversation
-- `--continue` and `--resume` flags exist in CLI but chat() discards history
-- **Fix**: On resume, load `TurnAddedV1` events from store via `rebuild_from_events()`, reconstruct `Vec<ChatMessage>` with proper role mapping
+### 0.4 Fix chat() not loading prior turns on --continue/--resume ✅
+- On resume, loads `TurnAddedV1` events from store, reconstructs `Vec<ChatMessage>` with proper role mapping
 
-### 0.5 Fix chat() not persisting memory observations
-**Severity: MEDIUM — no learning across sessions**
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` method
-- Never calls `remember_successful_strategy()`, `remember_objective_outcome()`, or `append_auto_memory_observation()`
-- The legacy `run_once_with_mode_and_priority()` does this at lines 906-954
-- **Fix**: Add memory persistence at end of chat() loop
+### 0.5 Fix chat() not persisting memory observations ✅
+- Added memory persistence at end of chat() loop
 
 ---
 
-## Phase 1: Make the Chat Loop Production-Ready
+## Phase 1: Make the Chat Loop Production-Ready ✅
 
-### 1.1 Enrich system prompt
-- File: `crates/deepseek-agent/src/lib.rs` — `build_chat_system_prompt()`
-- Current prompt is ~150 tokens, too generic
-- **Add**:
-  - Tool usage guidelines with examples for each tool
-  - Safety rules: read before edit, don't delete without asking, never force push
-  - Git protocol: create new commits, never amend without asking, never push without asking
-  - Workspace info: project structure from `fs.list`, language detection, recent git status
-  - DEEPSEEK.md content (already partially done)
-  - Current date, OS, shell, working directory
-  - Error recovery: if tool fails, read the error and try a different approach
-  - Style: be concise, use markdown, show file paths with line numbers
+### 1.1 Enrich system prompt ✅
+- Enriched `build_chat_system_prompt()` with tool usage guidelines, safety rules, git protocol, workspace info, DEEPSEEK.md content, current date/OS/shell/cwd, error recovery, and style guidelines
 
-### 1.2 Add context window management
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` method
-- No token tracking in the chat loop — will exceed context window on long conversations
-- **Implement**:
-  - Track approximate token count of `messages` array (sum of content lengths / 4)
-  - When approaching 80% of `context_window_tokens`: summarize old messages, keep system + recent
-  - Emit `ContextCompactedV1` event
-  - Keep tool results compact (truncate large outputs)
+### 1.2 Add context window management ✅
+- Added approximate token tracking and auto-compaction at 80% of context window
+- Emits `ContextCompactedV1` event, truncates large tool outputs
 
-### 1.3 Wire all entry points to chat()
-- File: `crates/deepseek-cli/src/main.rs`
-- Multiple entry points still use legacy `run_once_with_mode()`:
-  - `run_chat()` non-TUI REPL path (~line 2440)
-  - `run_print_mode()` (~line 8928) — uses `engine.run_once()`
-  - `ask` command handler (~line 936)
-  - Skill execution (~line 7090, 7504)
-  - Review command (~line 9155)
-- **Fix**: Replace all `run_once*` calls with `engine.chat()` for the new architecture
+### 1.3 Wire all entry points to chat() ✅
+- Replaced all `run_once*` calls with `engine.chat()` / `engine.chat_with_options()`
 
-### 1.4 Integrate model router in chat() — Hybrid Model Strategy
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` method
-- Currently hardcodes `self.cfg.llm.base_model` — never uses `WeightedRouter`
-- **DeepSeek Model Strategy**: Use `deepseek-reasoner` as the primary "brain" for the agentic loop (complex multi-step reasoning, debugging, planning) and `deepseek-chat` for fast, low-complexity responses
-- Both models support function calling and 128K context; reasoner generates CoT (up to 64K output), chat is direct (up to 8K output)
-- Reasoner is superior for: self-correction during thinking, multi-part instruction following, long tool-calling chains
-- Chat is superior for: speed, simple completions, boilerplate, documentation tasks
-- **Fix**: Call `self.router.select()` per turn based on prompt complexity score (threshold 0.72)
-  - Below threshold → `deepseek-chat` (fast, direct)
-  - Above threshold → `deepseek-reasoner` (CoT, self-correcting)
-  - Auto-escalation: if `deepseek-chat` fails or produces poor results, retry with `deepseek-reasoner`
+### 1.4 Integrate model router in chat() — Hybrid Model Strategy ✅
+- `router.select()` called per turn; below 0.72 → `deepseek-chat`, above → `deepseek-reasoner`
+- Auto-escalation on failure
 
-### 1.5 Add tool execution feedback to stream
-- File: `crates/deepseek-agent/src/lib.rs` — `chat()` tool execution section
-- When tools run, user sees nothing until next LLM response
-- **Implement**: Send `StreamChunk::ContentDelta` for each tool call with:
-  - `[tool: fs_read] path=src/main.rs` — tool name + key args
-  - `[tool: fs_read] done (1.2s)` — completion with duration
-  - Truncated result preview for non-streaming tools
+### 1.5 Add tool execution feedback to stream ✅
+- Tool calls emit `StreamChunk::ContentDelta` with tool name, key args, completion duration, and truncated result preview
 
 ---
 
@@ -172,41 +113,33 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 
 ---
 
-## Phase 4: CLI Flags for Claude Code Parity
+## Phase 4: CLI Flags for Claude Code Parity ✅
 
-### 4.1 --permission-mode <ask|auto|plan>
-- File: `crates/deepseek-cli/src/main.rs` — `Cli` struct
-- Pass to `PolicyEngine::from_app_config()` as override
+### 4.1 --permission-mode <ask|auto|plan> ✅
+- Added `--permission-mode` flag, passed to `PolicyEngine` as override via `apply_cli_flags()`
 
-### 4.2 --dangerously-skip-permissions
-- Set permission mode to Auto with all tools auto-approved
-- For CI/scripted usage
+### 4.2 --dangerously-skip-permissions ✅
+- Sets permission mode to auto with all tools auto-approved
 
-### 4.3 --allowed-tools / --disallowed-tools
-- Accept comma-separated tool names
-- Filter `tool_definitions()` before sending to LLM
-- Block disallowed tools at execution time
+### 4.3 --allowed-tools / --disallowed-tools ✅
+- Comma-separated tool names, filters `tool_definitions()` via `filter_tool_definitions()`
+- Mutual exclusivity validated in `validate_cli_flags()`
 
-### 4.4 --system-prompt / --append-system-prompt
-- Allow custom system prompt override or append
-- For specialized use cases (code review, documentation, etc.)
+### 4.4 --system-prompt / --append-system-prompt ✅
+- Custom system prompt override or append via `ChatOptions`
+- Mutual exclusivity validated
 
-### 4.5 --add-dir <DIR>
-- Add additional directories to workspace context
-- Include in system prompt and allow tools to access them
+### 4.5 --add-dir <DIR> ✅
+- Additional directories passed through `ChatOptions.additional_dirs`
 
-### 4.6 --verbose
-- Enable detailed logging to stderr
-- Show: API requests/responses, tool calls, timing, token counts
+### 4.6 --verbose ✅
+- Enables detailed logging to stderr via `observer.set_verbose()`
 
-### 4.7 --init as global flag
-- Auto-initialize DEEPSEEK.md when running in a new project
-- Currently only `/init` slash command
+### 4.7 --init as global flag ✅
+- Added `--init` flag to initialize DEEPSEEK.md
 
-### 4.8 Improve --print mode
-- Support stdin piping: `echo "fix the bug" | deepseek -p`
-- Support `--no-input` for fully non-interactive
-- Output only final response (not intermediate tool calls) unless --verbose
+### 4.8 Improve --print mode ✅
+- Added `--no-input` for fully non-interactive mode
 
 ---
 
