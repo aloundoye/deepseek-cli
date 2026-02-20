@@ -3,6 +3,7 @@ use chrono::Utc;
 use deepseek_core::runtime_dir;
 use deepseek_store::{CheckpointRecord, Store, TranscriptExportRecord};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,17 @@ impl ExportFormat {
 pub struct MemoryManager {
     workspace: PathBuf,
     store: Store,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoMemoryObservation {
+    pub objective: String,
+    pub summary: String,
+    pub success: bool,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub recorded_at: Option<String>,
 }
 
 impl MemoryManager {
@@ -92,7 +104,91 @@ impl MemoryManager {
                 project_trimmed
             ));
         }
+        if let Some(auto_path) = self.auto_memory_path()
+            && auto_path.exists()
+            && let Ok(text) = fs::read_to_string(&auto_path)
+        {
+            let snippet = tail_lines(&text, 200);
+            let trimmed = snippet.trim();
+            if !trimmed.is_empty() {
+                chunks.push(format!("[auto:{}]\n{}", auto_path.display(), trimmed));
+            }
+        }
         Ok(chunks.join("\n\n"))
+    }
+
+    pub fn auto_memory_path(&self) -> Option<PathBuf> {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())?;
+        let canonical = self
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace.clone());
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        Some(
+            PathBuf::from(home)
+                .join(".deepseek")
+                .join("projects")
+                .join(hash)
+                .join("memory")
+                .join("MEMORY.md"),
+        )
+    }
+
+    pub fn append_auto_memory_observation(&self, observation: AutoMemoryObservation) -> Result<()> {
+        let path = self
+            .auto_memory_path()
+            .ok_or_else(|| anyhow!("HOME/USERPROFILE is not set; cannot persist auto memory"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut existing = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            format!(
+                "# Auto Memory\n\nWorkspace: {}\n\n",
+                self.workspace.to_string_lossy()
+            )
+        };
+
+        let objective = truncate_line(observation.objective.trim(), 180);
+        let summary = truncate_line(observation.summary.trim(), 220);
+        let status = if observation.success {
+            "success"
+        } else {
+            "failure"
+        };
+        let recorded_at = observation
+            .recorded_at
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+        let patterns = if observation.patterns.is_empty() {
+            infer_patterns(&objective, &summary, observation.success)
+        } else {
+            observation
+                .patterns
+                .into_iter()
+                .map(|line| truncate_line(line.trim(), 160))
+                .filter(|line| !line.is_empty())
+                .take(8)
+                .collect::<Vec<_>>()
+        };
+
+        existing.push_str(&format!("## {recorded_at} ({status})\n"));
+        existing.push_str(&format!("- objective: {objective}\n"));
+        existing.push_str(&format!("- summary: {summary}\n"));
+        for pattern in patterns {
+            existing.push_str(&format!("- pattern: {pattern}\n"));
+        }
+        existing.push('\n');
+
+        let pruned = prune_auto_memory_lines(&existing, 260);
+        fs::write(path, pruned)?;
+        Ok(())
     }
 
     pub fn write_memory(&self, content: &str) -> Result<()> {
@@ -277,6 +373,78 @@ fn has_ignored_component(path: &Path) -> bool {
     })
 }
 
+fn truncate_line(input: &str, max_chars: usize) -> String {
+    let mut out = input.trim().replace('\n', " ");
+    if out.chars().count() <= max_chars {
+        return out;
+    }
+    out = out.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn infer_patterns(objective: &str, summary: &str, success: bool) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let objective_lc = objective.to_ascii_lowercase();
+    let summary_lc = summary.to_ascii_lowercase();
+
+    if objective_lc.contains("test") || summary_lc.contains("test") {
+        patterns.push("Run targeted tests immediately after each change chunk.".to_string());
+    }
+    if objective_lc.contains("refactor") {
+        patterns.push(
+            "Refactors are safer when split into behavior-preserving checkpoints.".to_string(),
+        );
+    }
+    if summary_lc.contains("verification") || summary_lc.contains("lint") {
+        patterns.push(
+            "Capture verification output explicitly to avoid repeated failure loops.".to_string(),
+        );
+    }
+    if !success {
+        patterns
+            .push("On failure, revise plan scope before re-running the full pipeline.".to_string());
+    }
+    if patterns.is_empty() {
+        patterns.push(
+            "Prefer minimal, reviewable patches with explicit verification evidence.".to_string(),
+        );
+    }
+    patterns
+}
+
+fn prune_auto_memory_lines(content: &str, max_lines: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.len() <= max_lines {
+        let mut out = content.to_string();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return out;
+    }
+    let mut kept = Vec::new();
+    if let Some(first) = lines.first().copied() {
+        kept.push(first);
+    }
+    if lines.len() > 1 {
+        kept.push(lines[1]);
+    }
+    let reserve = max_lines.saturating_sub(kept.len());
+    let tail_start = lines.len().saturating_sub(reserve);
+    kept.extend_from_slice(&lines[tail_start..]);
+    let mut out = kept.join("\n");
+    out.push('\n');
+    out
+}
+
+fn tail_lines(content: &str, max_lines: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.len() <= max_lines {
+        return content.to_string();
+    }
+    lines[lines.len().saturating_sub(max_lines)..].join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +475,56 @@ mod tests {
             .expect("rewind");
         let restored = fs::read_to_string(workspace.join("a.txt")).expect("restored");
         assert_eq!(restored, "one");
+    }
+
+    #[test]
+    fn auto_memory_observations_are_persisted_and_loaded() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-memory-auto-{}", Uuid::now_v7()));
+        let home = std::env::temp_dir().join(format!("deepseek-memory-home-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&home).expect("home");
+
+        let previous_home = std::env::var("HOME").ok();
+        // SAFETY: test-only environment mutation.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        manager
+            .append_auto_memory_observation(AutoMemoryObservation {
+                objective: "Refactor parser and run tests".to_string(),
+                summary: "Verification failed on lint before tests".to_string(),
+                success: false,
+                patterns: vec![],
+                recorded_at: Some("2026-02-19T00:00:00Z".to_string()),
+            })
+            .expect("append");
+
+        let auto_path = manager.auto_memory_path().expect("auto path");
+        assert!(auto_path.exists());
+        let auto_text = fs::read_to_string(&auto_path).expect("auto memory");
+        assert!(auto_text.contains("Refactor parser"));
+        assert!(auto_text.contains("pattern:"));
+
+        let combined = manager.read_combined_memory().expect("combined");
+        assert!(combined.contains("[auto:"));
+        assert!(combined.contains("Refactor parser"));
+
+        match previous_home {
+            Some(value) => {
+                // SAFETY: test-only environment mutation.
+                unsafe {
+                    std::env::set_var("HOME", value);
+                }
+            }
+            None => {
+                // SAFETY: test-only environment mutation.
+                unsafe {
+                    std::env::remove_var("HOME");
+                }
+            }
+        }
     }
 }

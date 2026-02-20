@@ -17,6 +17,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// RAII guard that restores the terminal on drop (including panics).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
@@ -45,6 +55,7 @@ pub enum SlashCommand {
     Tasks(Vec<String>),
     Review(Vec<String>),
     Search(Vec<String>),
+    Vim(Vec<String>),
     TerminalSetup,
     Keybindings,
     Doctor,
@@ -88,6 +99,7 @@ impl SlashCommand {
             "tasks" => Self::Tasks(args),
             "review" => Self::Review(args),
             "search" => Self::Search(args),
+            "vim" => Self::Vim(args),
             "terminal-setup" => Self::TerminalSetup,
             "keybindings" => Self::Keybindings,
             "doctor" => Self::Doctor,
@@ -567,6 +579,25 @@ impl RightPane {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimMode {
+    Insert,
+    Normal,
+    Visual,
+    Command,
+}
+
+impl VimMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "INSERT",
+            Self::Normal => "NORMAL",
+            Self::Visual => "VISUAL",
+            Self::Command => "COMMAND",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatShell {
     pub transcript: Vec<TranscriptEntry>,
@@ -853,19 +884,23 @@ where
         KeyBindings::default(),
         TuiTheme::default(),
         move |prompt| on_submit(prompt),
+        || None,
     )
 }
 
-pub fn run_tui_shell_with_bindings<F>(
+pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
     theme: TuiTheme,
     mut on_submit: F,
+    mut refresh_status: S,
 ) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
+    S: FnMut() -> Option<UiStatus>,
 {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -873,8 +908,11 @@ where
 
     let mut shell = ChatShell::default();
     let mut input = String::new();
+    let mut cursor_pos: usize = 0;
+    let mut history_cursor: Option<usize> = None;
+    let mut saved_input = String::new();
     let mut info_line = String::from(
-        "Ctrl+C exit | Tab autocomplete | Ctrl+O toggle pane | Ctrl+B background | Shift+Enter newline",
+        "Ctrl+C exit | Tab autocomplete | Ctrl+O toggle pane | Ctrl+B background | Shift+Enter newline | /vim",
     );
     let mut right_pane = RightPane::Plan;
     let mut right_pane_collapsed = false;
@@ -882,11 +920,17 @@ where
     let mut last_escape_at: Option<Instant> = None;
     let mut cursor_visible;
     let mut tick_count: usize = 0;
+    let mut vim_enabled = false;
+    let mut vim_mode = VimMode::Insert;
+    let mut vim_command_buffer = String::new();
+    let mut vim_visual_anchor: Option<usize> = None;
+    let mut vim_yank_buffer = String::new();
+    let mut vim_pending_operator: Option<char> = None;
 
     loop {
         tick_count = tick_count.wrapping_add(1);
         shell.spinner_tick = tick_count;
-        cursor_visible = tick_count % 8 < 5;
+        cursor_visible = tick_count % 16 < 8;
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -1091,17 +1135,26 @@ where
                 vertical[2],
             );
 
-            // Input with blinking cursor
-            let input_display = if cursor_visible {
-                format!("{}█", input)
+            // Input with blinking cursor at cursor_pos
+            let input_display = if vim_enabled && vim_mode == VimMode::Command {
+                let cursor_ch = if cursor_visible { "█" } else { " " };
+                format!(":{}{}", vim_command_buffer, cursor_ch)
             } else {
-                format!("{} ", input)
+                let before = &input[..cursor_pos.min(input.len())];
+                let after = &input[cursor_pos.min(input.len())..];
+                let cursor_ch = if cursor_visible { "█" } else { " " };
+                format!("{}{}{}", before, cursor_ch, after)
+            };
+            let input_title = if vim_enabled {
+                format!(" deepseek [{}] ", vim_mode.label())
+            } else {
+                " deepseek ".to_string()
             };
             frame.render_widget(
                 Paragraph::new(input_display).block(
                     Block::default()
                         .title(Span::styled(
-                            " deepseek ",
+                            input_title,
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
@@ -1128,21 +1181,272 @@ where
             );
         })?;
 
-        if !event::poll(Duration::from_millis(120))? {
+        if !event::poll(Duration::from_millis(33))? {
             continue;
         }
         let input_event = event::read()?;
         if let Event::Paste(pasted) = &input_event {
-            input.push_str(pasted);
+            input.insert_str(cursor_pos.min(input.len()), pasted);
+            cursor_pos = (cursor_pos + pasted.len()).min(input.len());
             info_line = "pasted input".to_string();
             continue;
         }
-        let Event::Key(key) = input_event else {
+        let Event::Key(mut key) = input_event else {
             continue;
         };
 
         if key == bindings.exit {
             break;
+        }
+        let mut vim_quit_after_submit = false;
+        if vim_enabled {
+            let mut vim_consumed = false;
+            match vim_mode {
+                VimMode::Insert => {
+                    if key.code == KeyCode::Esc {
+                        vim_mode = VimMode::Normal;
+                        vim_pending_operator = None;
+                        info_line = "-- NORMAL --".to_string();
+                        vim_consumed = true;
+                    }
+                }
+                VimMode::Normal => {
+                    match key.code {
+                        KeyCode::Char('i') => {
+                            vim_mode = VimMode::Insert;
+                            vim_pending_operator = None;
+                            info_line = "-- INSERT --".to_string();
+                        }
+                        KeyCode::Char('a') => {
+                            cursor_pos = (cursor_pos + 1).min(input.len());
+                            vim_mode = VimMode::Insert;
+                            vim_pending_operator = None;
+                            info_line = "-- INSERT --".to_string();
+                        }
+                        KeyCode::Char('v') => {
+                            vim_mode = VimMode::Visual;
+                            vim_visual_anchor = Some(cursor_pos);
+                            vim_pending_operator = None;
+                            info_line = "-- VISUAL --".to_string();
+                        }
+                        KeyCode::Char(':') => {
+                            vim_mode = VimMode::Command;
+                            vim_command_buffer.clear();
+                            vim_pending_operator = None;
+                            info_line = ":".to_string();
+                        }
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            cursor_pos = cursor_pos.saturating_sub(1);
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            cursor_pos = (cursor_pos + 1).min(input.len());
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('0') | KeyCode::Home => {
+                            cursor_pos = 0;
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('$') | KeyCode::End => {
+                            cursor_pos = input.len();
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('w') => {
+                            cursor_pos = move_to_next_word_start(&input, cursor_pos);
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('b') => {
+                            cursor_pos = move_to_prev_word_start(&input, cursor_pos);
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('e') => {
+                            cursor_pos = move_to_word_end(&input, cursor_pos);
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('x') => {
+                            if cursor_pos < input.len() {
+                                input.remove(cursor_pos);
+                            }
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('p') => {
+                            if !vim_yank_buffer.is_empty() {
+                                let insert_at = (cursor_pos + 1).min(input.len());
+                                input.insert_str(insert_at, &vim_yank_buffer);
+                                cursor_pos = (insert_at + vim_yank_buffer.len()).min(input.len());
+                            }
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Char('d') => {
+                            if vim_pending_operator == Some('d') {
+                                input.clear();
+                                cursor_pos = 0;
+                                vim_pending_operator = None;
+                                info_line = "deleted line".to_string();
+                            } else {
+                                vim_pending_operator = Some('d');
+                                info_line = "d".to_string();
+                            }
+                        }
+                        KeyCode::Char('c') => {
+                            if vim_pending_operator == Some('c') {
+                                input.clear();
+                                cursor_pos = 0;
+                                vim_mode = VimMode::Insert;
+                                vim_pending_operator = None;
+                                info_line = "-- INSERT --".to_string();
+                            } else {
+                                vim_pending_operator = Some('c');
+                                info_line = "c".to_string();
+                            }
+                        }
+                        KeyCode::Char('y') => {
+                            if vim_pending_operator == Some('y') {
+                                vim_yank_buffer = input.clone();
+                                vim_pending_operator = None;
+                                info_line = "yanked line".to_string();
+                            } else {
+                                vim_pending_operator = Some('y');
+                                info_line = "y".to_string();
+                            }
+                        }
+                        KeyCode::Enter => {
+                            key = bindings.submit;
+                            vim_pending_operator = None;
+                        }
+                        KeyCode::Esc => {
+                            vim_pending_operator = None;
+                        }
+                        _ => {
+                            vim_pending_operator = None;
+                        }
+                    }
+                    vim_consumed = true;
+                }
+                VimMode::Visual => {
+                    if vim_visual_anchor.is_none() {
+                        vim_visual_anchor = Some(cursor_pos);
+                    }
+                    match key.code {
+                        KeyCode::Esc => {
+                            vim_mode = VimMode::Normal;
+                            vim_visual_anchor = None;
+                            info_line = "-- NORMAL --".to_string();
+                        }
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            cursor_pos = cursor_pos.saturating_sub(1);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            cursor_pos = (cursor_pos + 1).min(input.len());
+                        }
+                        KeyCode::Char('0') | KeyCode::Home => {
+                            cursor_pos = 0;
+                        }
+                        KeyCode::Char('$') | KeyCode::End => {
+                            cursor_pos = input.len();
+                        }
+                        KeyCode::Char('w') => {
+                            cursor_pos = move_to_next_word_start(&input, cursor_pos);
+                        }
+                        KeyCode::Char('b') => {
+                            cursor_pos = move_to_prev_word_start(&input, cursor_pos);
+                        }
+                        KeyCode::Char('e') => {
+                            cursor_pos = move_to_word_end(&input, cursor_pos);
+                        }
+                        KeyCode::Char('y') => {
+                            if let Some(anchor) = vim_visual_anchor {
+                                let selection =
+                                    extract_visual_selection(&input, anchor, cursor_pos);
+                                if !selection.is_empty() {
+                                    vim_yank_buffer = selection;
+                                }
+                            }
+                            vim_mode = VimMode::Normal;
+                            vim_visual_anchor = None;
+                            info_line = "-- NORMAL --".to_string();
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('c') => {
+                            if let Some(anchor) = vim_visual_anchor {
+                                let (start, end) = visual_bounds(input.len(), anchor, cursor_pos);
+                                if end > start {
+                                    input.replace_range(start..end, "");
+                                    cursor_pos = start.min(input.len());
+                                }
+                            }
+                            vim_visual_anchor = None;
+                            if key.code == KeyCode::Char('c') {
+                                vim_mode = VimMode::Insert;
+                                info_line = "-- INSERT --".to_string();
+                            } else {
+                                vim_mode = VimMode::Normal;
+                                info_line = "-- NORMAL --".to_string();
+                            }
+                        }
+                        KeyCode::Char(':') => {
+                            vim_mode = VimMode::Command;
+                            vim_command_buffer.clear();
+                            vim_visual_anchor = None;
+                            info_line = ":".to_string();
+                        }
+                        _ => {}
+                    }
+                    vim_consumed = true;
+                }
+                VimMode::Command => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            vim_mode = VimMode::Normal;
+                            vim_command_buffer.clear();
+                            info_line = "-- NORMAL --".to_string();
+                        }
+                        KeyCode::Backspace => {
+                            vim_command_buffer.pop();
+                        }
+                        KeyCode::Enter => {
+                            let cmd = vim_command_buffer.trim().to_ascii_lowercase();
+                            vim_command_buffer.clear();
+                            match cmd.as_str() {
+                                "" => {
+                                    vim_mode = VimMode::Normal;
+                                    info_line = "-- NORMAL --".to_string();
+                                }
+                                "q" => {
+                                    vim_quit_after_submit = true;
+                                    info_line = "quit requested".to_string();
+                                }
+                                "w" => {
+                                    vim_mode = VimMode::Normal;
+                                    key = bindings.submit;
+                                }
+                                "wq" | "x" => {
+                                    vim_mode = VimMode::Normal;
+                                    key = bindings.submit;
+                                    vim_quit_after_submit = true;
+                                }
+                                other => {
+                                    vim_mode = VimMode::Normal;
+                                    info_line = format!("unknown :{other}");
+                                }
+                            }
+                        }
+                        KeyCode::Char(ch) => {
+                            vim_command_buffer.push(ch);
+                        }
+                        _ => {}
+                    }
+                    vim_consumed = true;
+                }
+            }
+
+            if vim_consumed {
+                if vim_quit_after_submit && key != bindings.submit {
+                    break;
+                }
+                if key != bindings.submit {
+                    continue;
+                }
+            }
         }
         if key == bindings.toggle_raw {
             right_pane = right_pane.cycle();
@@ -1236,6 +1540,8 @@ where
             };
             shell.push_user(&background_cmd);
             input.clear();
+            cursor_pos = 0;
+            shell.active_tool = Some("processing...".to_string());
             match on_submit(&background_cmd) {
                 Ok(output) => {
                     shell.push_transcript(output);
@@ -1246,6 +1552,10 @@ where
                     shell.push_tool(text.clone());
                     info_line = text;
                 }
+            }
+            shell.active_tool = None;
+            if let Some(new_status) = refresh_status() {
+                status = new_status;
             }
             continue;
         }
@@ -1259,6 +1569,7 @@ where
             {
                 info_line = "rewind menu: use /rewind".to_string();
                 input = "/rewind".to_string();
+                cursor_pos = input.len();
                 last_escape_at = None;
                 continue;
             }
@@ -1269,6 +1580,7 @@ where
         if key == bindings.rewind_menu {
             info_line = "rewind menu: use /rewind".to_string();
             input = "/rewind".to_string();
+            cursor_pos = input.len();
             continue;
         }
         if key == bindings.autocomplete {
@@ -1301,31 +1613,90 @@ where
                     "tasks",
                     "review",
                     "search",
+                    "vim",
                     "terminal-setup",
                     "keybindings",
                     "doctor",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
+                    cursor_pos = input.len();
                 }
             } else if let Some(completed) = autocomplete_path_input(&input) {
                 input = completed;
+                cursor_pos = input.len();
             }
             continue;
         }
         if key == bindings.history_prev {
-            if let Some(last) = history.back() {
-                input = last.clone();
+            if !history.is_empty() {
+                if history_cursor.is_none() {
+                    saved_input = input.clone();
+                    history_cursor = Some(history.len() - 1);
+                } else if let Some(idx) = history_cursor
+                    && idx > 0
+                {
+                    history_cursor = Some(idx - 1);
+                }
+                if let Some(idx) = history_cursor
+                    && let Some(entry) = history.get(idx)
+                {
+                    input = entry.clone();
+                    cursor_pos = input.len();
+                }
+            }
+            continue;
+        }
+        if key.code == KeyCode::Down && key.modifiers == KeyModifiers::NONE {
+            if let Some(idx) = history_cursor {
+                if idx + 1 < history.len() {
+                    history_cursor = Some(idx + 1);
+                    if let Some(entry) = history.get(idx + 1) {
+                        input = entry.clone();
+                        cursor_pos = input.len();
+                    }
+                } else {
+                    history_cursor = None;
+                    input = saved_input.clone();
+                    cursor_pos = input.len();
+                }
             }
             continue;
         }
         if key == bindings.newline {
-            input.push('\n');
+            input.insert(cursor_pos.min(input.len()), '\n');
+            cursor_pos = (cursor_pos + 1).min(input.len());
             continue;
         }
         if key == bindings.submit {
             let prompt = input.trim().to_string();
             if prompt.is_empty() {
+                continue;
+            }
+            if let Some(result) = parse_vim_slash_command(&prompt) {
+                match result {
+                    Ok(vim_cmd) => {
+                        apply_vim_command(
+                            vim_cmd,
+                            &mut vim_enabled,
+                            &mut vim_mode,
+                            &mut vim_command_buffer,
+                            &mut vim_visual_anchor,
+                            &mut vim_pending_operator,
+                        );
+                        info_line = if vim_enabled {
+                            format!("vim mode on ({})", vim_mode.label())
+                        } else {
+                            "vim mode off".to_string()
+                        };
+                    }
+                    Err(msg) => {
+                        info_line = msg.to_string();
+                    }
+                }
+                input.clear();
+                cursor_pos = 0;
+                history_cursor = None;
                 continue;
             }
             history.push_back(prompt.clone());
@@ -1334,6 +1705,9 @@ where
             }
             shell.push_user(&prompt);
             input.clear();
+            cursor_pos = 0;
+            history_cursor = None;
+            shell.active_tool = Some("processing...".to_string());
             match on_submit(&prompt) {
                 Ok(output) => {
                     shell.push_transcript(output);
@@ -1345,20 +1719,53 @@ where
                     info_line = text;
                 }
             }
+            shell.active_tool = None;
+            if let Some(new_status) = refresh_status() {
+                status = new_status;
+            }
+            if vim_quit_after_submit {
+                break;
+            }
             continue;
         }
-        if let KeyCode::Backspace = key.code {
-            let _ = input.pop();
-            continue;
-        }
-        if let KeyCode::Char(ch) = key.code {
-            input.push(ch);
+        match key.code {
+            KeyCode::Backspace => {
+                if cursor_pos > 0 && cursor_pos <= input.len() {
+                    input.remove(cursor_pos - 1);
+                    cursor_pos -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if cursor_pos < input.len() {
+                    input.remove(cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                cursor_pos = cursor_pos.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                if cursor_pos < input.len() {
+                    cursor_pos += 1;
+                }
+            }
+            KeyCode::Home => {
+                cursor_pos = 0;
+            }
+            KeyCode::End => {
+                cursor_pos = input.len();
+            }
+            KeyCode::Char(ch) => {
+                input.insert(cursor_pos.min(input.len()), ch);
+                cursor_pos += 1;
+            }
+            _ => {}
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // TerminalGuard handles raw mode + alternate screen on drop.
+    // Just show cursor before the guard runs.
     terminal.show_cursor()?;
+    drop(_guard);
     Ok(())
 }
 
@@ -1464,6 +1871,149 @@ fn autocomplete_path_token(token: &str) -> Option<String> {
     let cut = display_token.len().saturating_sub(prefix.len());
     let base = &display_token[..cut];
     Some(format!("{base}{replacement}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimSlashCommand {
+    Toggle,
+    On,
+    Off,
+    SetMode(VimMode),
+}
+
+fn parse_vim_slash_command(prompt: &str) -> Option<Result<VimSlashCommand, &'static str>> {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with("/vim") {
+        return None;
+    }
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    if parts.len() == 1 {
+        return Some(Ok(VimSlashCommand::Toggle));
+    }
+    let arg = parts
+        .get(1)
+        .copied()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let cmd = match arg.as_str() {
+        "on" | "enable" => VimSlashCommand::On,
+        "off" | "disable" => VimSlashCommand::Off,
+        "normal" => VimSlashCommand::SetMode(VimMode::Normal),
+        "insert" => VimSlashCommand::SetMode(VimMode::Insert),
+        "visual" => VimSlashCommand::SetMode(VimMode::Visual),
+        "command" => VimSlashCommand::SetMode(VimMode::Command),
+        _ => {
+            return Some(Err("usage: /vim [on|off|normal|insert|visual|command]"));
+        }
+    };
+    Some(Ok(cmd))
+}
+
+fn apply_vim_command(
+    command: VimSlashCommand,
+    vim_enabled: &mut bool,
+    vim_mode: &mut VimMode,
+    vim_command_buffer: &mut String,
+    vim_visual_anchor: &mut Option<usize>,
+    vim_pending_operator: &mut Option<char>,
+) {
+    match command {
+        VimSlashCommand::Toggle => {
+            *vim_enabled = !*vim_enabled;
+            *vim_mode = if *vim_enabled {
+                VimMode::Normal
+            } else {
+                VimMode::Insert
+            };
+        }
+        VimSlashCommand::On => {
+            *vim_enabled = true;
+            *vim_mode = VimMode::Normal;
+        }
+        VimSlashCommand::Off => {
+            *vim_enabled = false;
+            *vim_mode = VimMode::Insert;
+        }
+        VimSlashCommand::SetMode(mode) => {
+            *vim_enabled = true;
+            *vim_mode = mode;
+        }
+    }
+    vim_command_buffer.clear();
+    *vim_visual_anchor = None;
+    *vim_pending_operator = None;
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn move_to_next_word_start(input: &str, cursor_pos: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut pos = cursor_pos.min(bytes.len());
+    if pos < bytes.len() && is_word_byte(bytes[pos]) {
+        while pos < bytes.len() && is_word_byte(bytes[pos]) {
+            pos += 1;
+        }
+    }
+    while pos < bytes.len() && !is_word_byte(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+fn move_to_prev_word_start(input: &str, cursor_pos: usize) -> usize {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut pos = cursor_pos.min(bytes.len());
+    pos = pos.saturating_sub(1);
+    while pos > 0 && !is_word_byte(bytes[pos]) {
+        pos -= 1;
+    }
+    while pos > 0 && is_word_byte(bytes[pos - 1]) {
+        pos -= 1;
+    }
+    pos
+}
+
+fn move_to_word_end(input: &str, cursor_pos: usize) -> usize {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut pos = cursor_pos.min(len);
+    if pos >= len {
+        return len;
+    }
+    if !is_word_byte(bytes[pos]) {
+        while pos < len && !is_word_byte(bytes[pos]) {
+            pos += 1;
+        }
+        if pos >= len {
+            return len;
+        }
+    }
+    while pos + 1 < len && is_word_byte(bytes[pos + 1]) {
+        pos += 1;
+    }
+    pos
+}
+
+fn visual_bounds(len: usize, anchor: usize, cursor_pos: usize) -> (usize, usize) {
+    let start = anchor.min(cursor_pos).min(len);
+    let mut end = anchor.max(cursor_pos).min(len);
+    if end < len {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn extract_visual_selection(input: &str, anchor: usize, cursor_pos: usize) -> String {
+    let (start, end) = visual_bounds(input.len(), anchor, cursor_pos);
+    if start >= end {
+        return String::new();
+    }
+    input[start..end].to_string()
 }
 
 #[cfg(test)]
@@ -1594,6 +2144,11 @@ mod tests {
             SlashCommand::parse("/keybindings"),
             Some(SlashCommand::Keybindings)
         );
+        assert_eq!(SlashCommand::parse("/vim"), Some(SlashCommand::Vim(vec![])));
+        assert_eq!(
+            SlashCommand::parse("/vim normal"),
+            Some(SlashCommand::Vim(vec!["normal".to_string()]))
+        );
         assert_eq!(SlashCommand::parse("/doctor"), Some(SlashCommand::Doctor));
     }
 
@@ -1698,5 +2253,38 @@ mod tests {
             bindings.cycle_permission_mode,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
         );
+    }
+
+    #[test]
+    fn parses_vim_slash_commands() {
+        assert!(matches!(
+            parse_vim_slash_command("/vim"),
+            Some(Ok(VimSlashCommand::Toggle))
+        ));
+        assert!(matches!(
+            parse_vim_slash_command("/vim on"),
+            Some(Ok(VimSlashCommand::On))
+        ));
+        assert!(matches!(
+            parse_vim_slash_command("/vim off"),
+            Some(Ok(VimSlashCommand::Off))
+        ));
+        assert!(matches!(
+            parse_vim_slash_command("/vim normal"),
+            Some(Ok(VimSlashCommand::SetMode(VimMode::Normal)))
+        ));
+        assert!(matches!(parse_vim_slash_command("/vim nope"), Some(Err(_))));
+        assert!(parse_vim_slash_command("/help").is_none());
+    }
+
+    #[test]
+    fn vim_word_motions_move_cursor() {
+        let text = "alpha beta gamma";
+        assert_eq!(move_to_next_word_start(text, 0), 6);
+        assert_eq!(move_to_next_word_start(text, 6), 11);
+        assert_eq!(move_to_prev_word_start(text, 11), 6);
+        assert_eq!(move_to_prev_word_start(text, 6), 0);
+        assert_eq!(move_to_word_end(text, 0), 4);
+        assert_eq!(move_to_word_end(text, 6), 9);
     }
 }

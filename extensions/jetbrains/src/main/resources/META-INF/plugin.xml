@@ -1,0 +1,24 @@
+<idea-plugin>
+    <id>com.deepseek.ide</id>
+    <name>DeepSeek CLI</name>
+    <vendor email="support@deepseek.com">DeepSeek</vendor>
+
+    <description><![CDATA[
+        Minimal IntelliJ integration for DeepSeek CLI JSON-RPC over stdio.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <notificationGroup id="DeepSeek" displayType="BALLOON" isLogByDefault="true"/>
+    </extensions>
+
+    <actions>
+        <action id="DeepSeek.Status"
+                class="com.deepseek.ide.DeepSeekStatusAction"
+                text="DeepSeek Status"
+                description="Check DeepSeek RPC status">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

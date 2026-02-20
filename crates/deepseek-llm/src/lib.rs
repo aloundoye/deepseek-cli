@@ -36,11 +36,12 @@ impl DeepSeekClient {
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: &str) -> Result<LlmResponse> {
-        let payload = self.build_payload(req);
+        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
+        let mut payload = self.build_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
-
-        for attempt in 0..=self.cfg.max_retries {
+        let mut attempt: u8 = 0;
+        while attempt <= self.cfg.max_retries {
             let response = self
                 .client
                 .post(&self.cfg.endpoint)
@@ -62,9 +63,19 @@ impl DeepSeekClient {
                         return Ok(parsed);
                     }
 
+                    if status == StatusCode::BAD_REQUEST
+                        && server_cache_enabled
+                        && payload_rejects_cache_control(&body)
+                    {
+                        server_cache_enabled = false;
+                        payload = self.build_payload_with_server_cache(req, server_cache_enabled);
+                        continue;
+                    }
+
                     last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     break;
@@ -73,6 +84,7 @@ impl DeepSeekClient {
                     last_err = Some(anyhow!("deepseek request failed: {e}"));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     break;
@@ -84,6 +96,14 @@ impl DeepSeekClient {
     }
 
     fn build_payload(&self, req: &LlmRequest) -> Value {
+        self.build_payload_with_server_cache(req, self.cfg.prompt_cache_enabled)
+    }
+
+    fn build_payload_with_server_cache(
+        &self,
+        req: &LlmRequest,
+        enable_server_cache: bool,
+    ) -> Value {
         let fast_mode = self.cfg.fast_mode;
         let max_tokens = if fast_mode {
             req.max_tokens.min(2048)
@@ -116,6 +136,16 @@ impl DeepSeekClient {
                 }));
             }
             messages.push(json!({"role": "user", "content": parts}));
+        }
+        if enable_server_cache {
+            if let Some(first) = messages.first_mut() {
+                annotate_cache_control(first);
+            }
+            if messages.len() > 1
+                && let Some(last) = messages.last_mut()
+            {
+                annotate_cache_control(last);
+            }
         }
 
         let model = normalize_deepseek_model(&req.model).unwrap_or(req.model.as_str());
@@ -167,13 +197,14 @@ impl DeepSeekClient {
         api_key: &str,
         mut cb: StreamCallback,
     ) -> Result<LlmResponse> {
+        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_payload(req);
         // Force streaming on for the HTTP request
         payload["stream"] = json!(true);
 
         let mut last_err: Option<anyhow::Error> = None;
-
-        for attempt in 0..=self.cfg.max_retries {
+        let mut attempt: u8 = 0;
+        while attempt <= self.cfg.max_retries {
             let response = self
                 .client
                 .post(&self.cfg.endpoint)
@@ -303,9 +334,19 @@ impl DeepSeekClient {
                     }
 
                     let body = resp.text().unwrap_or_default();
+                    if status == StatusCode::BAD_REQUEST
+                        && server_cache_enabled
+                        && payload_rejects_cache_control(&body)
+                    {
+                        server_cache_enabled = false;
+                        payload = self.build_payload_with_server_cache(req, server_cache_enabled);
+                        payload["stream"] = json!(true);
+                        continue;
+                    }
                     last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     break;
@@ -314,6 +355,7 @@ impl DeepSeekClient {
                     last_err = Some(anyhow!("deepseek request failed: {e}"));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     break;
@@ -324,6 +366,24 @@ impl DeepSeekClient {
         Err(last_err
             .unwrap_or_else(|| anyhow!("deepseek streaming request failed without detailed error")))
     }
+}
+
+fn annotate_cache_control(message: &mut Value) {
+    if let Some(obj) = message.as_object_mut() {
+        obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+}
+
+fn payload_rejects_cache_control(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("cache_control")
+        || (lower.contains("unknown")
+            && (lower.contains("field") || lower.contains("property"))
+            && lower.contains("cache"))
+        || (lower.contains("extra")
+            && lower.contains("field")
+            && lower.contains("cache")
+            && lower.contains("permitted"))
 }
 
 impl LlmClient for DeepSeekClient {
@@ -901,6 +961,78 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Respond in es")
         );
+        assert!(messages[0].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn prompt_cache_annotations_can_be_disabled_for_server_payload() {
+        let cfg = LlmConfig {
+            prompt_cache_enabled: false,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let payload = client.build_payload(&LlmRequest {
+            unit: deepseek_core::LlmUnit::Planner,
+            prompt: "hello".to_string(),
+            model: "deepseek-chat".to_string(),
+            max_tokens: 128,
+            non_urgent: false,
+            images: vec![],
+        });
+        let messages = payload["messages"].as_array().expect("messages");
+        assert!(
+            messages
+                .iter()
+                .all(|msg| msg.get("cache_control").is_none())
+        );
+    }
+
+    #[test]
+    fn bad_request_cache_control_fallback_disables_server_cache_annotations() {
+        let server = start_mock_retry_server(vec![
+            MockHttpResponse {
+                status: 400,
+                body: r#"{"error":"unknown field cache_control"}"#.to_string(),
+                retry_after: None,
+            },
+            MockHttpResponse {
+                status: 200,
+                body: r#"{"choices":[{"message":{"content":"ok-after-cache-fallback"}}]}"#
+                    .to_string(),
+                retry_after: None,
+            },
+        ]);
+
+        let cfg = LlmConfig {
+            endpoint: server.endpoint.clone(),
+            stream: false,
+            api_key_env: "DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST".to_string(),
+            max_retries: 0,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST", "test-key");
+        }
+
+        let out = client
+            .complete(&LlmRequest {
+                unit: deepseek_core::LlmUnit::Planner,
+                prompt: "fallback".to_string(),
+                model: "deepseek-chat".to_string(),
+                max_tokens: 64,
+                non_urgent: false,
+                images: vec![],
+            })
+            .expect("response should succeed after fallback");
+        assert_eq!(out.text, "ok-after-cache-fallback");
+        assert_eq!(server.request_count(), 2);
+
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST");
+        }
     }
 
     #[test]

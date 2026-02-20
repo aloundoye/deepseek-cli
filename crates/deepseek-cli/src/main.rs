@@ -2037,6 +2037,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                             "/permissions",
                             "/background",
                             "/visual",
+                            "/vim",
                         ],
                     });
                     if json_mode {
@@ -2340,6 +2341,21 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
                         )?;
                     }
                 }
+                SlashCommand::Vim(args) => {
+                    let mode = if args.is_empty() {
+                        "toggle"
+                    } else {
+                        args.first().map(String::as_str).unwrap_or("toggle")
+                    };
+                    if json_mode {
+                        print_json(&json!({
+                            "vim": "tui_only",
+                            "mode": mode
+                        }))?;
+                    } else {
+                        println!("vim mode is handled in TUI only; requested mode={mode}");
+                    }
+                }
                 SlashCommand::TerminalSetup => {
                     if json_mode {
                         print_json(&json!({"terminal_setup": "configured"}))?;
@@ -2432,14 +2448,62 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
 
 fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     let engine = AgentEngine::new(cwd)?;
-    let mut force_max_think = false;
-    let status = current_ui_status(cwd, cfg, force_max_think)?;
+
+    // Set a crossterm-compatible approval handler for raw-mode TUI.
+    engine.set_approval_handler(Box::new(|call| {
+        use crossterm::event::{self as ct_event, Event as CtEvent, KeyCode as CtKeyCode};
+        use std::io::Write;
+
+        let compact_args = serde_json::to_string(&call.args)
+            .unwrap_or_else(|_| "<unserializable args>".to_string());
+
+        // Write prompt directly to stdout (already in raw mode).
+        let mut stdout = std::io::stdout();
+        write!(
+            stdout,
+            "\r\napproval required for `{}` {}\r\napprove? [y/N] ",
+            call.name, compact_args
+        )?;
+        stdout.flush()?;
+
+        // Read a single keypress via crossterm (raw-mode safe).
+        loop {
+            if ct_event::poll(std::time::Duration::from_secs(120))? {
+                if let CtEvent::Key(key) = ct_event::read()? {
+                    return match key.code {
+                        CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
+                            write!(stdout, "y\r\n")?;
+                            stdout.flush()?;
+                            Ok(true)
+                        }
+                        _ => {
+                            write!(stdout, "n\r\n")?;
+                            stdout.flush()?;
+                            Ok(false)
+                        }
+                    };
+                }
+            } else {
+                // Timeout — deny by default.
+                write!(stdout, "n (timeout)\r\n")?;
+                stdout.flush()?;
+                return Ok(false);
+            }
+        }
+    }));
+
+    let force_max_think = std::cell::Cell::new(false);
+    let status = current_ui_status(cwd, cfg, force_max_think.get())?;
     let bindings = load_tui_keybindings(cwd, cfg);
     let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
-    run_tui_shell_with_bindings(status, bindings, theme, |prompt| {
-        if let Some(cmd) = SlashCommand::parse(prompt) {
-            let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual".to_string(),
+    run_tui_shell_with_bindings(
+        status,
+        bindings,
+        theme,
+        |prompt| {
+            if let Some(cmd) = SlashCommand::parse(prompt) {
+                let out = match cmd {
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual /vim".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -2515,12 +2579,12 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                 SlashCommand::Model(model) => {
                     if let Some(model) = model {
                         let lower = model.to_ascii_lowercase();
-                        force_max_think =
-                            lower.contains("reasoner") || lower.contains("max") || lower.contains("high");
+                        force_max_think.set(
+                            lower.contains("reasoner") || lower.contains("max") || lower.contains("high"));
                     }
                     format!(
                         "model mode: {}",
-                        if force_max_think { &cfg.llm.max_think_model } else { &cfg.llm.base_model }
+                        if force_max_think.get() { &cfg.llm.max_think_model } else { &cfg.llm.base_model }
                     )
                 }
                 SlashCommand::Cost => {
@@ -2592,14 +2656,14 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::Status => {
-                    let status = current_ui_status(cwd, cfg, force_max_think)?;
+                    let status = current_ui_status(cwd, cfg, force_max_think.get())?;
                     render_statusline(&status)
                 }
                 SlashCommand::Effort(level) => {
                     let level = level.unwrap_or_else(|| "medium".to_string());
                     let normalized = level.to_ascii_lowercase();
-                    force_max_think = matches!(normalized.as_str(), "high" | "max");
-                    format!("effort={} force_max_think={}", normalized, force_max_think)
+                    force_max_think.set(matches!(normalized.as_str(), "high" | "max"));
+                    format!("effort={} force_max_think={}", normalized, force_max_think.get())
                 }
                 SlashCommand::Skills(args) => {
                     let manager = SkillManager::new(cwd)?;
@@ -2660,6 +2724,13 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                         format!("Search '{}': use 'deepseek search' subcommand.", query)
                     }
                 }
+                SlashCommand::Vim(args) => {
+                    if args.is_empty() {
+                        "vim mode toggled in the TUI input layer".to_string()
+                    } else {
+                        format!("vim mode command received: {}", args.join(" "))
+                    }
+                }
                 SlashCommand::TerminalSetup => "Use /terminal-setup in interactive mode.".to_string(),
                 SlashCommand::Keybindings => {
                     let path = AppConfig::keybindings_path().unwrap_or_default();
@@ -2668,10 +2739,12 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                 SlashCommand::Doctor => "Use 'deepseek doctor' for diagnostics.".to_string(),
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
             };
-            return Ok(out);
-        }
-        engine.run_once_with_mode(prompt, allow_tools, force_max_think)
-    })
+                return Ok(out);
+            }
+            engine.run_once_with_mode(prompt, allow_tools, force_max_think.get())
+        },
+        || current_ui_status(cwd, cfg, force_max_think.get()).ok(),
+    )
 }
 
 fn load_tui_keybindings(cwd: &Path, cfg: &AppConfig) -> KeyBindings {

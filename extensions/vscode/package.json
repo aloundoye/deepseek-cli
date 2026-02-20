@@ -1,0 +1,50 @@
+{
+  "name": "deepseek-vscode",
+  "displayName": "DeepSeek CLI",
+  "description": "VS Code bridge for DeepSeek CLI JSON-RPC.",
+  "version": "0.0.1",
+  "publisher": "deepseek",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:deepseek.startServer",
+    "onCommand:deepseek.status"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "DeepSeek",
+      "properties": {
+        "deepseek.ide.binaryPath": {
+          "type": "string",
+          "default": "deepseek",
+          "description": "Path to the deepseek CLI binary."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "deepseek.startServer",
+        "title": "DeepSeek: Start RPC Server"
+      },
+      {
+        "command": "deepseek.status",
+        "title": "DeepSeek: Status"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}

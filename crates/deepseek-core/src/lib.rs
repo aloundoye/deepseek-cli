@@ -555,6 +555,10 @@ pub enum EventKind {
     ExitPlanModeV1 {
         session_id: Uuid,
     },
+    ProviderSelectedV1 {
+        provider: String,
+        model: String,
+    },
 }
 
 pub trait Planner {

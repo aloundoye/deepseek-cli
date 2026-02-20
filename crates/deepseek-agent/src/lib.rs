@@ -4,9 +4,10 @@ use deepseek_core::{
     AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ExecContext, Executor, Failure,
     LlmRequest, LlmUnit, ModelRouter, Plan, PlanContext, PlanStep, Planner, RouterSignals, Session,
     SessionBudgets, SessionState, StepOutcome, ToolCall, ToolHost,
+    is_valid_session_state_transition,
 };
 use deepseek_llm::{DeepSeekClient, LlmClient};
-use deepseek_memory::MemoryManager;
+use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
@@ -197,6 +198,8 @@ impl Executor for SimpleExecutor {
     }
 }
 
+type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
+
 pub struct AgentEngine {
     workspace: PathBuf,
     store: Store,
@@ -214,6 +217,8 @@ pub struct AgentEngine {
     max_turns: Option<u64>,
     /// Maximum cost in USD before stopping (CLI override).
     max_budget_usd: Option<f64>,
+    /// Optional external approval handler (e.g. crossterm-based for TUI mode).
+    approval_handler: Mutex<Option<ApprovalHandler>>,
 }
 
 impl AgentEngine {
@@ -242,6 +247,7 @@ impl AgentEngine {
             stream_callback: Mutex::new(None),
             max_turns,
             max_budget_usd,
+            approval_handler: Mutex::new(None),
         })
     }
 
@@ -253,6 +259,13 @@ impl AgentEngine {
     /// Override max budget USD limit (from CLI flag).
     pub fn set_max_budget_usd(&mut self, max: Option<f64>) {
         self.max_budget_usd = max;
+    }
+
+    /// Set an external approval handler (e.g. for TUI/raw-mode compatible input).
+    pub fn set_approval_handler(&self, handler: ApprovalHandler) {
+        if let Ok(mut guard) = self.approval_handler.lock() {
+            *guard = Some(handler);
+        }
     }
 
     /// Set a streaming callback that will be invoked for each token chunk
@@ -910,7 +923,7 @@ impl AgentEngine {
         self.tool_host.fire_stop_hooks();
 
         let projection = self.store.rebuild_from_events(session.session_id)?;
-        Ok(format!(
+        let summary = format!(
             "session={} steps={} failures={} subagents={} router_models={:?} base_model={} max_model={}",
             session.session_id,
             projection.step_status.len(),
@@ -919,7 +932,27 @@ impl AgentEngine {
             projection.router_models,
             self.cfg.llm.base_model,
             self.cfg.llm.max_think_model
-        ))
+        );
+        if let Ok(manager) = MemoryManager::new(&self.workspace) {
+            let mut patterns = Vec::new();
+            patterns.push(format!(
+                "steps={} verification_failures={} execution_failed={}",
+                plan.steps.len(),
+                verification_failures,
+                execution_failed
+            ));
+            if verification_failures > 0 {
+                patterns.push("verification failures require focused plan revision".to_string());
+            }
+            let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                objective: prompt.to_string(),
+                summary: summary.clone(),
+                success: run_succeeded,
+                patterns,
+                recorded_at: None,
+            });
+        }
+        Ok(summary)
     }
 
     pub fn resume(&self) -> Result<String> {
@@ -1959,7 +1992,7 @@ impl AgentEngine {
 
     fn transition(&self, session: &mut Session, to: SessionState) -> Result<()> {
         let from = session.status.clone();
-        if !is_valid_transition(&from, &to) {
+        if !is_valid_session_state_transition(&from, &to) {
             return Err(anyhow!(
                 "invalid session state transition: {:?} -> {:?}",
                 from,
@@ -2177,6 +2210,14 @@ impl AgentEngine {
     }
 
     fn request_tool_approval(&self, call: &ToolCall) -> Result<bool> {
+        // Try external approval handler first (TUI / raw-mode compatible).
+        if let Ok(mut guard) = self.approval_handler.lock()
+            && let Some(handler) = guard.as_mut()
+        {
+            return handler(call);
+        }
+
+        // Fallback: blocking stdin for non-TUI mode.
         let mut stdout = std::io::stdout();
         let stdin = std::io::stdin();
         if !stdin.is_terminal() || !stdout.is_terminal() {
@@ -4188,35 +4229,6 @@ fn augment_goal_with_subagent_notes(goal: &str, notes: &[String]) -> String {
     } else {
         format!("{goal} [subagent_findings: {joined}]")
     }
-}
-
-fn is_valid_transition(from: &SessionState, to: &SessionState) -> bool {
-    use SessionState::*;
-    if from == to {
-        return true;
-    }
-    matches!(
-        (from, to),
-        (Idle, Planning)
-            | (Completed, Planning)
-            | (Failed, Planning)
-            | (Planning, ExecutingStep)
-            | (Planning, Failed)
-            | (ExecutingStep, AwaitingApproval)
-            | (ExecutingStep, Planning)
-            | (ExecutingStep, Verifying)
-            | (ExecutingStep, Failed)
-            | (AwaitingApproval, ExecutingStep)
-            | (AwaitingApproval, Failed)
-            | (Verifying, ExecutingStep)
-            | (Verifying, Completed)
-            | (Verifying, Failed)
-            | (_, Paused)
-            | (Paused, Planning)
-            | (Paused, ExecutingStep)
-            | (Paused, Completed)
-            | (Paused, Failed)
-    )
 }
 
 #[cfg(test)]

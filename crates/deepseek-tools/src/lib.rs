@@ -4,6 +4,7 @@ mod shell;
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
+use deepseek_chrome::{ChromeSession, ScreenshotFormat};
 use deepseek_core::{
     AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ToolCall, ToolHost, ToolProposal,
     ToolResult,
@@ -105,6 +106,22 @@ impl LocalToolHost {
 
     pub fn is_review_mode(&self) -> bool {
         self.review_mode
+    }
+
+    fn chrome_port_from_call(call: &ToolCall) -> Result<u16> {
+        let port = call
+            .args
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(9222);
+        u16::try_from(port).map_err(|_| anyhow!("invalid chrome debug port: {port}"))
+    }
+
+    fn chrome_session_from_call(call: &ToolCall) -> Result<ChromeSession> {
+        let port = Self::chrome_port_from_call(call)?;
+        let mut session = ChromeSession::new(port)?;
+        session.check_connection()?;
+        Ok(session)
     }
 
     fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
@@ -677,6 +694,102 @@ impl LocalToolHost {
                         "source": "duckduckgo",
                         "searched_at": chrono::Utc::now().to_rfc3339(),
                     }
+                }))
+            }
+            "chrome.navigate" => {
+                let url = call
+                    .args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("url missing"))?;
+                if !url.starts_with("http://")
+                    && !url.starts_with("https://")
+                    && !url.starts_with("about:")
+                {
+                    return Err(anyhow!("url must start with http://, https://, or about:"));
+                }
+                let session = Self::chrome_session_from_call(call)?;
+                let result = session.navigate(url)?;
+                Ok(json!({
+                    "url": url,
+                    "cdp": result,
+                    "ok": result.error.is_none()
+                }))
+            }
+            "chrome.click" => {
+                let selector = call
+                    .args
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("selector missing"))?;
+                let session = Self::chrome_session_from_call(call)?;
+                let result = session.click(selector)?;
+                Ok(json!({
+                    "selector": selector,
+                    "cdp": result,
+                    "ok": result.error.is_none()
+                }))
+            }
+            "chrome.type_text" => {
+                let selector = call
+                    .args
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("selector missing"))?;
+                let text = call
+                    .args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("text missing"))?;
+                let session = Self::chrome_session_from_call(call)?;
+                let result = session.type_text(selector, text)?;
+                Ok(json!({
+                    "selector": selector,
+                    "text": text,
+                    "cdp": result,
+                    "ok": result.error.is_none()
+                }))
+            }
+            "chrome.screenshot" => {
+                let format = match call
+                    .args
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("png")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "png" => ScreenshotFormat::Png,
+                    "jpeg" | "jpg" => ScreenshotFormat::Jpeg,
+                    "webp" => ScreenshotFormat::Webp,
+                    other => return Err(anyhow!("unsupported screenshot format: {other}")),
+                };
+                let session = Self::chrome_session_from_call(call)?;
+                let image_base64 = session.screenshot(format)?;
+                Ok(json!({
+                    "format": call.args.get("format").and_then(|v| v.as_str()).unwrap_or("png"),
+                    "base64": image_base64
+                }))
+            }
+            "chrome.read_console" => {
+                let session = Self::chrome_session_from_call(call)?;
+                let entries = session.read_console()?;
+                Ok(json!({
+                    "entries": entries,
+                    "count": entries.len()
+                }))
+            }
+            "chrome.evaluate" => {
+                let expression = call
+                    .args
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("expression missing"))?;
+                let session = Self::chrome_session_from_call(call)?;
+                let value = session.evaluate(expression)?;
+                Ok(json!({
+                    "expression": expression,
+                    "value": value
                 }))
             }
             "notebook.read" => {
@@ -2854,5 +2967,47 @@ mod tests {
         let result = super::build_bwrap_command(workspace, "ls", &config);
         assert!(result.contains("--proc"));
         assert!(result.contains("--dev"));
+    }
+
+    #[test]
+    fn chrome_tool_calls_return_structured_payloads() {
+        let (_workspace, host) = temp_host();
+        let navigate = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.navigate".to_string(),
+                args: json!({"url":"https://example.com"}),
+                requires_approval: false,
+            },
+        });
+        assert!(navigate.success);
+        assert_eq!(navigate.output["ok"], true);
+        assert_eq!(navigate.output["url"], "https://example.com");
+
+        let evaluate = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.evaluate".to_string(),
+                args: json!({"expression":"1 + 1"}),
+                requires_approval: false,
+            },
+        });
+        assert!(evaluate.success);
+        assert!(evaluate.output["value"].is_object() || evaluate.output["value"].is_number());
+
+        let screenshot = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.screenshot".to_string(),
+                args: json!({"format":"png"}),
+                requires_approval: false,
+            },
+        });
+        assert!(screenshot.success);
+        assert!(
+            screenshot.output["base64"]
+                .as_str()
+                .is_some_and(|data| !data.is_empty())
+        );
     }
 }
