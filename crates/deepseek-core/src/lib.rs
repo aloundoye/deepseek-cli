@@ -634,6 +634,18 @@ pub enum StreamChunk {
 /// Uses `Arc<dyn Fn>` so it can be cloned across multiple turns in a chat loop.
 pub type StreamCallback = std::sync::Arc<dyn Fn(StreamChunk) + Send + Sync>;
 
+/// A question posed by the agent to the user via the `user_question` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+/// Handler invoked when the agent asks the user a question.
+/// Returns `Some(answer)` if the user provides an answer, or `None` on cancellation.
+pub type UserQuestionHandler = std::sync::Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
+
 // ── Chat-with-tools types (DeepSeek function calling) ──────────────────
 
 /// A message in a multi-turn conversation.

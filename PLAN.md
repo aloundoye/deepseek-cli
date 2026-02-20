@@ -103,51 +103,39 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 
 ---
 
-## Phase 2: Tool System Completeness
+## Phase 2: Tool System Completeness ✅ COMPLETED
 
-### 2.1 Add missing tools to tool_definitions()
-- File: `crates/deepseek-tools/src/lib.rs` — `tool_definitions()`
-- Implemented but not exposed to LLM:
-  - `diagnostics.check` — runs `cargo check`, `tsc`, `ruff` (auto-detected)
-  - `index.query` — Tantivy full-text code search
-  - `fs.search_rg` — ripgrep integration
-  - `git.show` — git show for specific commits/files
-  - `patch.stage` / `patch.apply` — patch management
-  - `chrome.*` (6 tools) — browser automation
-- Also add to `map_tool_name()` for each new definition
+### 2.1 Add missing tools to tool_definitions() ✅
+- Added 6 chrome tools (navigate, click, type_text, screenshot, read_console, evaluate) to `tool_definitions()` and `map_tool_name()`
+- Added 4 agent-level tools (user_question, task_create, task_update, spawn_task)
+- All tools now have definitions, mappings, and `AGENT_LEVEL_TOOLS` constant
 
-### 2.2 Fix fs_edit tool definition to match all edit modes
-- File: `crates/deepseek-tools/src/lib.rs`
-- Implementation supports 3 modes: string search/replace, line-range replacement, global replace
-- Definition only describes old_string/new_string
-- **Fix**: Either document all modes in the definition, or simplify to just search/replace (Claude Code style)
+### 2.2 Fix fs_edit tool definition to match all edit modes ✅
+- Already uses Claude Code style (search/replace/all) — no changes needed
 
-### 2.3 Implement AskUserQuestion tool
-- Claude Code has this tool for the LLM to ask users questions mid-task
-- **Implement**: Add `user_question` tool that:
-  - Sends question text via stream callback to TUI
-  - TUI shows question and input field
-  - Blocks agent thread for user response via channel
-  - Returns user's answer as tool result
+### 2.3 Implement AskUserQuestion tool ✅
+- Added `UserQuestion` type and `UserQuestionHandler` callback in deepseek-core
+- Agent intercepts `user_question` tool calls before LocalToolHost
+- External handler (TUI mode) or fallback stdin prompt
+- Returns JSON `{"answer": "..."}` or `{"cancelled": true}`
 
-### 2.4 Implement task tracking tool (TodoWrite equivalent)
-- Claude Code's `TodoWrite` lets LLM create/update task lists
-- DeepSeek has `task_queue` table in store already
-- **Implement**: Add `task_create` and `task_update` tools
-  - LLM can create tasks with subject, description, status
-  - TUI shows task list in transcript as formatted list
+### 2.4 Implement task tracking tools (TodoWrite equivalent) ✅
+- Added `task_create` tool: creates tasks in store with subject, description, priority
+- Added `task_update` tool: updates task status (pending/in_progress/completed/failed)
+- Emits `TaskCreatedV1` events, uses store's `insert_task()` and `update_task_status()`
 
-### 2.5 Implement subagent/Task tool
-- Claude Code's `Task` tool spawns parallel subagents
-- DeepSeek has `SubagentManager` but only used by legacy path
-- **Implement**: Add `spawn_task` tool that creates a subagent via `SubagentManager`, runs in background thread, returns results to conversation
+### 2.5 Implement subagent/Task tool ✅
+- Added `spawn_task` tool: spawns subagents via `SubagentManager`
+- Supports explore/plan/task roles
+- External worker function or fallback echo worker
+- `set_subagent_worker()` setter for full agent capabilities
 
-### 2.6 Improve tool output truncation
-- File: `crates/deepseek-agent/src/lib.rs` — chat() tool result handling
-- Current: hard cut at 30KB
-- **Improve**: Keep first 100 + last 100 lines, show `... (N lines omitted) ...`
-- For bash_run: always keep stderr + last 200 lines of stdout
-- For fs_read: show line count + head/tail
+### 2.6 Improve tool output truncation ✅
+- `truncate_tool_output()` now accepts tool name for tool-specific strategies
+- `bash.run`: parses JSON output, keeps full stderr, truncates stdout to last 200 lines
+- `fs.read`: uses 80 head + 80 tail lines with total line count
+- Generic: keeps 100 head + 100 tail lines with omission count
+- 4 new tests verify all truncation strategies
 
 ---
 

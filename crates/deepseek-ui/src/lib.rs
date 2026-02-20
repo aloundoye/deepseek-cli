@@ -9,7 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 /// Events sent from the background agent thread to the TUI event loop.
 pub enum TuiStreamEvent {
@@ -200,7 +201,14 @@ pub fn render_statusline(status: &UiStatus) -> String {
     )
 }
 
-fn render_statusline_spans(status: &UiStatus) -> Vec<Span<'static>> {
+fn render_statusline_spans(
+    status: &UiStatus,
+    active_tool: Option<&str>,
+    spinner_frame: &str,
+    scroll_pct: Option<usize>,
+    vim_mode_label: Option<&str>,
+    has_new_content_below: bool,
+) -> Vec<Span<'static>> {
     let mode_color = match status.permission_mode.as_str() {
         "auto" => Color::Green,
         "locked" => Color::Red,
@@ -212,22 +220,30 @@ fn render_statusline_spans(status: &UiStatus) -> Vec<Span<'static>> {
         _ => " ASK ",
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", status.model),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            mode_label.to_string(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(mode_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let mut spans = Vec::new();
+
+    // Active tool with spinner (left side)
+    if let Some(tool) = active_tool {
+        spans.push(Span::styled(
+            format!(" {} {} ", spinner_frame, tool),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    spans.push(Span::styled(
+        format!(" {} ", status.model),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        mode_label.to_string(),
+        Style::default()
+            .fg(Color::Black)
+            .bg(mode_color)
+            .add_modifier(Modifier::BOLD),
+    ));
 
     if status.pending_approvals > 0 {
         spans.push(Span::raw(" "));
@@ -292,6 +308,35 @@ fn render_statusline_spans(status: &UiStatus) -> Vec<Span<'static>> {
         format!(" ${:.4} ", status.estimated_cost_usd),
         Style::default().fg(Color::DarkGray),
     ));
+
+    // Vim mode badge
+    if let Some(mode) = vim_mode_label {
+        spans.push(Span::styled(
+            format!(" {} ", mode),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Scroll position
+    if let Some(pct) = scroll_pct {
+        spans.push(Span::styled(
+            format!(" {}% ", pct),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    // New content below indicator
+    if has_new_content_below {
+        spans.push(Span::styled(
+            " \u{2193} new ".to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     spans
 }
@@ -460,6 +505,136 @@ fn highlight_code_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Parse inline markdown (`**bold**`, `` `code` ``) and return styled spans.
+fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i: usize = 0;
+    let mut seg_start: usize = 0;
+
+    while i < len {
+        // Only inspect ASCII marker bytes; multi-byte chars are never `*` or `` ` ``.
+        if bytes[i] == b'`' {
+            // Inline code: `...`
+            if let Some(end) = text[i + 1..].find('`') {
+                if i > seg_start {
+                    spans.push(Span::styled(text[seg_start..i].to_string(), base_style));
+                }
+                spans.push(Span::styled(
+                    text[i + 1..i + 1 + end].to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                i = i + 1 + end + 1;
+                seg_start = i;
+                continue;
+            }
+        } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'*' {
+            // Bold: **...**
+            if let Some(end) = text[i + 2..].find("**") {
+                if i > seg_start {
+                    spans.push(Span::styled(text[seg_start..i].to_string(), base_style));
+                }
+                // Recursively parse nested inline code within bold.
+                spans.extend(parse_inline_markdown(
+                    &text[i + 2..i + 2 + end],
+                    base_style.add_modifier(Modifier::BOLD),
+                ));
+                i = i + 2 + end + 2;
+                seg_start = i;
+                continue;
+            }
+        }
+        // Advance by one character (handle multi-byte safely).
+        i += text[i..].chars().next().map_or(1, |c| c.len_utf8());
+    }
+
+    if seg_start < len {
+        spans.push(Span::styled(text[seg_start..].to_string(), base_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_string(), base_style));
+    }
+    spans
+}
+
+/// Render a single line of assistant markdown (headings, lists, blockquotes,
+/// horizontal rules, inline formatting). Used by both first-line and
+/// continuation-line renderers.
+fn render_assistant_markdown(text: &str) -> Line<'static> {
+    let body_style = Style::default().fg(Color::White);
+
+    // Code fence
+    if text.starts_with("```") {
+        return Line::from(vec![Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )]);
+    }
+
+    // Horizontal rule
+    if text == "---" || text == "***" || text == "___" {
+        return Line::from(vec![Span::styled(
+            "  ─────────────────────────────────────────".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )]);
+    }
+
+    // Headings — strip `#` prefix and render inline markdown
+    if let Some(heading) = text
+        .strip_prefix("### ")
+        .or_else(|| text.strip_prefix("## "))
+        .or_else(|| text.strip_prefix("# "))
+    {
+        let heading_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
+        spans.extend(parse_inline_markdown(heading, heading_style));
+        return Line::from(spans);
+    }
+
+    // Blockquote
+    if let Some(quote) = text.strip_prefix("> ") {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::styled("  │ ".to_string(), dim)];
+        spans.extend(parse_inline_markdown(quote, dim));
+        return Line::from(spans);
+    }
+
+    // Unordered list
+    if let Some(item) = text.strip_prefix("- ").or_else(|| text.strip_prefix("* ")) {
+        let mut spans = vec![Span::styled(
+            "  • ".to_string(),
+            Style::default().fg(Color::Cyan),
+        )];
+        spans.extend(parse_inline_markdown(item, body_style));
+        return Line::from(spans);
+    }
+
+    // Numbered list (e.g. "1. ", "12. ")
+    if let Some(dot_pos) = text.find(". ")
+        && text[..dot_pos].chars().all(|c| c.is_ascii_digit())
+        && dot_pos <= 4
+    {
+        let num = &text[..dot_pos + 2]; // "1. "
+        let item = &text[dot_pos + 2..];
+        let mut spans = vec![Span::styled(
+            format!("  {num}"),
+            Style::default().fg(Color::Cyan),
+        )];
+        spans.extend(parse_inline_markdown(item, body_style));
+        return Line::from(spans);
+    }
+
+    // Default: indented body with inline markdown
+    let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
+    spans.extend(parse_inline_markdown(text, body_style));
+    Line::from(spans)
+}
+
 fn style_transcript_line(entry: &TranscriptEntry, in_code_block: bool) -> Line<'static> {
     let (prefix, prefix_style, body_style) = match entry.kind {
         MessageKind::User => (
@@ -499,36 +674,75 @@ fn style_transcript_line(entry: &TranscriptEntry, in_code_block: bool) -> Line<'
         return highlight_code_line(text);
     }
 
-    // Simple markdown-like styling for assistant messages
+    // Full markdown rendering for assistant messages
     if entry.kind == MessageKind::Assistant {
-        if text.starts_with("```") {
-            return Line::from(vec![Span::styled(
-                text.clone(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            )]);
-        }
-        if text.starts_with("# ") || text.starts_with("## ") || text.starts_with("### ") {
-            return Line::from(vec![Span::styled(
-                text.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]);
-        }
-        if text.starts_with("- ") || text.starts_with("* ") {
-            return Line::from(vec![
-                Span::styled("  • ".to_string(), Style::default().fg(Color::Cyan)),
-                Span::styled(text[2..].to_string(), body_style),
-            ]);
-        }
+        return render_assistant_markdown(text);
     }
 
     Line::from(vec![
         Span::styled(prefix.to_string(), prefix_style),
         Span::styled(text.clone(), body_style),
     ])
+}
+
+/// Style a continuation line (2nd+ line of a multi-line entry). Same body
+/// styling as the entry kind but no prefix character, just indentation.
+fn style_continuation_line(entry: &TranscriptEntry, in_code_block: bool) -> Line<'static> {
+    let body_style = match entry.kind {
+        MessageKind::User => Style::default().fg(Color::White),
+        MessageKind::Assistant => Style::default().fg(Color::White),
+        MessageKind::System => Style::default().fg(Color::DarkGray),
+        MessageKind::ToolCall => Style::default().fg(Color::Yellow),
+        MessageKind::ToolResult => Style::default().fg(Color::DarkGray),
+        MessageKind::Error => Style::default().fg(Color::Red),
+    };
+    let text = &entry.text;
+    if in_code_block && entry.kind == MessageKind::Assistant && !text.starts_with("```") {
+        return highlight_code_line(text);
+    }
+    // Full markdown rendering for assistant continuation lines too
+    if entry.kind == MessageKind::Assistant {
+        return render_assistant_markdown(text);
+    }
+    // Indent continuation to align with body text after the prefix
+    Line::from(vec![Span::styled(format!("  {text}"), body_style)])
+}
+
+/// Estimate the number of visual rows a `Line` occupies after word wrapping
+/// within the given `max_width`. This mirrors ratatui's `Wrap { trim: false }`
+/// behaviour so the scroll offset calculation stays in sync with rendering.
+fn word_wrapped_line_count(line: &Line<'_>, max_width: usize) -> usize {
+    if max_width == 0 {
+        return 1;
+    }
+    // Fast path: line fits in a single row.
+    let total = line.width();
+    if total <= max_width {
+        return 1;
+    }
+    // Concatenate span contents to get the full visible text.
+    let text: String = line.iter().map(|span| span.content.as_ref()).collect();
+    let mut rows: usize = 1;
+    let mut col: usize = 0;
+    // Walk word-by-word (preserving trailing whitespace with split_inclusive).
+    for word in text.split_inclusive(char::is_whitespace) {
+        let w = UnicodeWidthStr::width(word);
+        if w == 0 {
+            continue;
+        }
+        // If the word doesn't fit on the current row, start a new row.
+        if col > 0 && col + w > max_width {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+        // Handle words wider than max_width (forced mid-word wrapping).
+        while col > max_width {
+            rows += 1;
+            col -= max_width;
+        }
+    }
+    rows
 }
 
 fn render_context_gauge(status: &UiStatus, area: Rect, frame: &mut ratatui::Frame<'_>) {
@@ -964,7 +1178,7 @@ where
 pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
-    theme: TuiTheme,
+    _theme: TuiTheme,
     stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
     mut refresh_status: S,
@@ -994,9 +1208,18 @@ where
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     let mut stdout = io::stdout();
+    // Enter alternate screen and aggressively clear everything so no
+    // previous terminal content is visible (mimics Claude Code takeover).
     execute!(stdout, EnterAlternateScreen)?;
+    {
+        use std::io::Write;
+        // Clear screen + scrollback + move home + hide cursor
+        stdout.write_all(b"\x1b[2J\x1b[3J\x1b[H\x1b[?25l")?;
+        stdout.flush()?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut shell = ChatShell::default();
     let mut input = String::new();
@@ -1004,7 +1227,7 @@ where
     let mut history_cursor: Option<usize> = None;
     let mut saved_input = String::new();
     let mut info_line = String::from(
-        "Ctrl+C exit | Tab autocomplete | Ctrl+O toggle pane | Ctrl+B background | Shift+Enter newline | /vim",
+        " Ctrl+C exit | PageUp/Down scroll | Home/End jump | Tab autocomplete | Shift+Enter newline | /vim",
     );
     let mut right_pane = RightPane::Plan;
     let mut right_pane_collapsed = false;
@@ -1022,7 +1245,9 @@ where
     let mut pending_approval: Option<(String, String, mpsc::Sender<bool>)> = None;
     let mut cancelled = false;
     let mut transcript_auto_scroll = true;
-    let mut transcript_scroll_pos: u16 = 0;
+    let mut transcript_scroll_pos: usize = 0;
+    let mut last_max_scroll: usize = 0;
+    let mut has_new_content_below = false;
 
     loop {
         tick_count = tick_count.wrapping_add(1);
@@ -1034,17 +1259,20 @@ where
 
             // Main vertical layout:
             //  [context gauge]  (1 line)
-            //  [body area]      (fills)
-            //  [tool output]    (20%)
-            //  [input]          (3 lines)
+            //  [transcript]     (fills — borderless)
+            //  [separator]      (1 line — thin ───)
+            //  [input]          (1 line — borderless > prompt)
+            //  [separator]      (1 line — thin ───)
             //  [status bar]     (1 line)
             //  [info/help]      (1 line)
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1), // context gauge
-                    Constraint::Min(8),    // transcript (full width)
-                    Constraint::Length(3), // input
+                    Constraint::Min(6),    // transcript (borderless)
+                    Constraint::Length(1), // separator above input
+                    Constraint::Length(1), // input
+                    Constraint::Length(1), // separator below input
                     Constraint::Length(1), // status bar
                     Constraint::Length(1), // info/help line
                 ])
@@ -1053,7 +1281,10 @@ where
             // Context usage gauge
             render_context_gauge(&status, vertical[0], frame);
 
-            // Transcript with styled entries and syntax highlighting
+            // Transcript: borderless with turn separators and syntax highlighting
+            let transcript_area_height = vertical[1].height as usize;
+            let transcript_area_width = vertical[1].width as usize;
+
             let visible_entries: Vec<&TranscriptEntry> = shell
                 .transcript
                 .iter()
@@ -1063,93 +1294,161 @@ where
                 .into_iter()
                 .rev()
                 .collect();
+
             let mut in_code_block = false;
-            let transcript_lines: Vec<Line<'_>> = visible_entries
-                .iter()
-                .map(|entry| {
-                    if entry.kind == MessageKind::Assistant && entry.text.starts_with("```") {
+            let mut transcript_lines: Vec<Line<'_>> = Vec::new();
+            let mut prev_kind: Option<MessageKind> = None;
+            for entry in &visible_entries {
+                // Turn separator between user↔assistant (not assistant↔tool)
+                if let Some(pk) = prev_kind {
+                    let need_sep = matches!(
+                        (pk, entry.kind),
+                        (MessageKind::User, MessageKind::Assistant)
+                            | (
+                                MessageKind::Assistant
+                                    | MessageKind::ToolCall
+                                    | MessageKind::ToolResult,
+                                MessageKind::User
+                            )
+                    );
+                    if need_sep {
+                        transcript_lines.push(Line::from(Span::styled(
+                            "\u{2500}".repeat(transcript_area_width),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+                prev_kind = Some(entry.kind);
+
+                for (i, sub_text) in entry.text.split('\n').enumerate() {
+                    let sub_entry = TranscriptEntry {
+                        kind: entry.kind,
+                        text: sub_text.to_string(),
+                    };
+                    if sub_entry.kind == MessageKind::Assistant && sub_entry.text.starts_with("```")
+                    {
                         in_code_block = !in_code_block;
                     }
-                    style_transcript_line(entry, in_code_block)
-                })
-                .collect();
-
-            let transcript_title = if let Some(ref tool) = shell.active_tool {
-                format!(" {} {} ", shell.spinner_frame(), tool)
-            } else {
-                " Transcript ".to_string()
-            };
-
-            // Scroll: auto-scroll to bottom unless user has scrolled up
-            let transcript_area_height = vertical[1].height.saturating_sub(2) as usize; // subtract borders
-            let total_lines = transcript_lines.len();
-            let max_scroll = if total_lines > transcript_area_height {
-                (total_lines - transcript_area_height) as u16
-            } else {
-                0
-            };
+                    if i == 0 {
+                        transcript_lines.push(style_transcript_line(&sub_entry, in_code_block));
+                    } else {
+                        transcript_lines.push(style_continuation_line(&sub_entry, in_code_block));
+                    }
+                }
+            }
+            // Compute scroll offset for borderless transcript
+            let total_visual_lines: usize = transcript_lines
+                .iter()
+                .map(|line| word_wrapped_line_count(line, transcript_area_width))
+                .sum();
+            let max_scroll = total_visual_lines.saturating_sub(transcript_area_height);
+            last_max_scroll = max_scroll;
             let scroll_offset = if transcript_auto_scroll {
                 max_scroll
             } else {
                 transcript_scroll_pos.min(max_scroll)
             };
 
+            // Borderless transcript
             frame.render_widget(
                 Paragraph::new(transcript_lines)
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                transcript_title,
-                                Style::default()
-                                    .fg(theme.primary)
-                                    .add_modifier(Modifier::BOLD),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if shell.active_tool.is_some() {
-                                Color::Yellow
-                            } else {
-                                theme.primary
-                            })),
-                    )
                     .wrap(Wrap { trim: false })
-                    .scroll((scroll_offset, 0)),
+                    .scroll((scroll_offset.min(u16::MAX as usize) as u16, 0)),
                 vertical[1],
             );
 
-            // Input with blinking cursor at cursor_pos
-            let input_display = if vim_enabled && vim_mode == VimMode::Command {
-                let cursor_ch = if cursor_visible { "█" } else { " " };
+            // Thin separator line between transcript and input
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(vertical[2].width as usize),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                vertical[2],
+            );
+
+            // Borderless input with prompt character
+            let (prompt_str, prompt_style) = if vim_enabled {
+                match vim_mode {
+                    VimMode::Normal => (
+                        ": ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    VimMode::Visual => (
+                        ": ",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    VimMode::Command => (
+                        ": ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    VimMode::Insert => (
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                }
+            } else {
+                (
+                    "> ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            let input_text = if vim_enabled && vim_mode == VimMode::Command {
+                let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
                 format!(":{}{}", vim_command_buffer, cursor_ch)
             } else {
                 let before = &input[..cursor_pos.min(input.len())];
                 let after = &input[cursor_pos.min(input.len())..];
-                let cursor_ch = if cursor_visible { "█" } else { " " };
+                let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
                 format!("{}{}{}", before, cursor_ch, after)
             };
-            let input_title = if vim_enabled {
-                format!(" deepseek [{}] ", vim_mode.label())
-            } else {
-                " deepseek ".to_string()
-            };
             frame.render_widget(
-                Paragraph::new(input_display).block(
-                    Block::default()
-                        .title(Span::styled(
-                            input_title,
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme.primary)),
-                ),
-                vertical[2],
+                Paragraph::new(Line::from(vec![
+                    Span::styled(prompt_str.to_string(), prompt_style),
+                    Span::raw(input_text),
+                ])),
+                vertical[3],
             );
 
-            // Status bar with styled spans
+            // Thin separator line between input and status bar
             frame.render_widget(
-                Paragraph::new(Line::from(render_statusline_spans(&status))),
-                vertical[3],
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(vertical[4].width as usize),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                vertical[4],
+            );
+
+            // Enhanced status bar with spinner, scroll, vim mode, new content
+            let scroll_pct = if !transcript_auto_scroll && max_scroll > 0 {
+                Some((scroll_offset * 100) / max_scroll)
+            } else {
+                None
+            };
+            let vim_label = if vim_enabled {
+                Some(vim_mode.label())
+            } else {
+                None
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(render_statusline_spans(
+                    &status,
+                    shell.active_tool.as_deref(),
+                    shell.spinner_frame(),
+                    scroll_pct,
+                    vim_label,
+                    has_new_content_below,
+                ))),
+                vertical[5],
             );
 
             // Info/help line
@@ -1158,7 +1457,7 @@ where
                     info_line.clone(),
                     Style::default().fg(Color::DarkGray),
                 )),
-                vertical[4],
+                vertical[6],
             );
         })?;
 
@@ -1180,6 +1479,9 @@ where
             match ev {
                 TuiStreamEvent::ContentDelta(text) => {
                     shell.append_streaming(&text);
+                    if !transcript_auto_scroll {
+                        has_new_content_below = true;
+                    }
                 }
                 TuiStreamEvent::ReasoningDelta(text) => {
                     shell.push_tool(format!("[thinking] {text}"));
@@ -1701,9 +2003,21 @@ where
         }
         if key.code == KeyCode::PageDown {
             transcript_scroll_pos = transcript_scroll_pos.saturating_add(20);
-            // Re-enable auto-scroll if we've scrolled to or past the bottom
-            // (the render loop clamps to max_scroll, so going past is fine)
+            if transcript_scroll_pos >= last_max_scroll {
+                transcript_auto_scroll = true;
+                has_new_content_below = false;
+            }
+            continue;
+        }
+        // Home / End: jump to top / bottom of transcript
+        if key.code == KeyCode::Home {
+            transcript_auto_scroll = false;
+            transcript_scroll_pos = 0;
+            continue;
+        }
+        if key.code == KeyCode::End {
             transcript_auto_scroll = true;
+            has_new_content_below = false;
             continue;
         }
         // Shift+Up / Shift+Down: scroll transcript by one line
@@ -1714,7 +2028,10 @@ where
         }
         if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT) {
             transcript_scroll_pos = transcript_scroll_pos.saturating_add(1);
-            transcript_auto_scroll = true;
+            if transcript_scroll_pos >= last_max_scroll {
+                transcript_auto_scroll = true;
+                has_new_content_below = false;
+            }
             continue;
         }
         if key == bindings.history_prev {
@@ -1803,6 +2120,7 @@ where
             is_processing = true;
             cancelled = false;
             transcript_auto_scroll = true;
+            has_new_content_below = false;
             shell.active_tool = Some("processing...".to_string());
             on_submit(&prompt);
             if vim_quit_after_submit {
@@ -1845,7 +2163,7 @@ where
     }
 
     // TerminalGuard handles raw mode + alternate screen on drop.
-    // Just show cursor before the guard runs.
+    // Show cursor and clear inline viewport before the guard runs.
     terminal.show_cursor()?;
     drop(_guard);
     Ok(())
@@ -2278,7 +2596,7 @@ mod tests {
             context_max_tokens: 128_000,
             ..Default::default()
         };
-        let spans = render_statusline_spans(&status);
+        let spans = render_statusline_spans(&status, None, "", None, None, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("deepseek-chat"));
         assert!(text.contains("LOCKED"));
@@ -2286,6 +2604,25 @@ mod tests {
         assert!(text.contains("tasks"));
         assert!(text.contains("AUTOPILOT"));
         assert!(text.contains("100K/128K"));
+
+        // Test with extra context
+        let spans_with_ctx = render_statusline_spans(
+            &status,
+            Some("fs.read"),
+            "\u{280b}",
+            Some(42),
+            Some("INSERT"),
+            true,
+        );
+        let text2: String = spans_with_ctx
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text2.contains("fs.read"));
+        assert!(text2.contains("\u{280b}"));
+        assert!(text2.contains("INSERT"));
+        assert!(text2.contains("42%"));
+        assert!(text2.contains("\u{2193} new"));
     }
 
     #[test]
