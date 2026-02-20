@@ -9,13 +9,35 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+
+/// Events sent from the background agent thread to the TUI event loop.
+pub enum TuiStreamEvent {
+    /// Incremental content text from the LLM.
+    ContentDelta(String),
+    /// Incremental reasoning/thinking text from the LLM.
+    ReasoningDelta(String),
+    /// A tool is now actively executing.
+    ToolActive(String),
+    /// The agent needs user approval before proceeding.
+    ApprovalNeeded {
+        tool_name: String,
+        args_summary: String,
+        response_tx: mpsc::Sender<bool>,
+    },
+    /// An error occurred during agent execution.
+    Error(String),
+    /// Agent execution completed with the given output.
+    Done(String),
+}
 
 /// RAII guard that restores the terminal on drop (including panics).
 struct TerminalGuard;
@@ -654,6 +676,45 @@ impl ChatShell {
         self.artifact_lines.push(line.into());
     }
 
+    /// Append text to the current streaming assistant response.
+    /// Creates a new assistant entry if none is in progress.
+    pub fn append_streaming(&mut self, text: &str) {
+        if let Some(last) = self.transcript.last_mut()
+            && last.kind == MessageKind::Assistant
+        {
+            last.text.push_str(text);
+            return;
+        }
+        self.transcript.push(TranscriptEntry {
+            kind: MessageKind::Assistant,
+            text: text.to_string(),
+        });
+    }
+
+    /// Finalize the streaming response — ensure the complete output is in the transcript.
+    /// If streaming deltas were received, replaces the partial entry with the final output.
+    /// If no streaming happened, pushes the full output as new transcript entries.
+    pub fn finalize_streaming(&mut self, final_output: &str) {
+        if final_output.is_empty() {
+            return;
+        }
+        // Remove any partial streaming assistant entry built by append_streaming.
+        if self
+            .transcript
+            .last()
+            .is_some_and(|e| e.kind == MessageKind::Assistant)
+        {
+            self.transcript.pop();
+        }
+        // Push the complete output, one entry per line for proper rendering.
+        for line in final_output.lines() {
+            self.transcript.push(TranscriptEntry {
+                kind: MessageKind::Assistant,
+                text: line.to_string(),
+            });
+        }
+    }
+
     fn spinner_frame(&self) -> &'static str {
         const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         FRAMES[self.spinner_tick % FRAMES.len()]
@@ -879,11 +940,23 @@ pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
 {
+    let (tx, rx) = mpsc::channel();
     run_tui_shell_with_bindings(
         status,
         KeyBindings::default(),
         TuiTheme::default(),
-        move |prompt| on_submit(prompt),
+        rx,
+        move |prompt| {
+            let result = on_submit(prompt);
+            match result {
+                Ok(output) => {
+                    let _ = tx.send(TuiStreamEvent::Done(output));
+                }
+                Err(e) => {
+                    let _ = tx.send(TuiStreamEvent::Error(e.to_string()));
+                }
+            }
+        },
         || None,
     )
 }
@@ -892,13 +965,32 @@ pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
     theme: TuiTheme,
+    stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
     mut refresh_status: S,
 ) -> Result<()>
 where
-    F: FnMut(&str) -> Result<String>,
+    F: FnMut(&str),
     S: FnMut() -> Option<UiStatus>,
 {
+    // Install a SIGINT handler that sets a flag instead of killing the process.
+    // In raw mode, Ctrl+C is delivered as a key event, but external SIGINT
+    // (e.g. `kill -INT`) would otherwise terminate without terminal cleanup.
+    let sigint_flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let flag = Arc::clone(&sigint_flag);
+        signal_hook::flag::register(signal_hook::consts::SIGINT, flag)?;
+    }
+
+    // Set a panic hook that restores the terminal before printing the panic.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     let mut stdout = io::stdout();
@@ -926,6 +1018,11 @@ where
     let mut vim_visual_anchor: Option<usize> = None;
     let mut vim_yank_buffer = String::new();
     let mut vim_pending_operator: Option<char> = None;
+    let mut is_processing = false;
+    let mut pending_approval: Option<(String, String, mpsc::Sender<bool>)> = None;
+    let mut cancelled = false;
+    let mut transcript_auto_scroll = true;
+    let mut transcript_scroll_pos: u16 = 0;
 
     loop {
         tick_count = tick_count.wrapping_add(1);
@@ -945,27 +1042,16 @@ where
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),      // context gauge
-                    Constraint::Min(8),         // body (transcript + side pane)
-                    Constraint::Percentage(18), // tool output
-                    Constraint::Length(3),      // input
-                    Constraint::Length(1),      // status bar
-                    Constraint::Length(1),      // info/help line
+                    Constraint::Length(1), // context gauge
+                    Constraint::Min(8),    // transcript (full width)
+                    Constraint::Length(3), // input
+                    Constraint::Length(1), // status bar
+                    Constraint::Length(1), // info/help line
                 ])
                 .split(area);
 
             // Context usage gauge
             render_context_gauge(&status, vertical[0], frame);
-
-            // Body: Transcript (left) + Right pane (collapsible)
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(if right_pane_collapsed {
-                    [Constraint::Percentage(100), Constraint::Percentage(0)]
-                } else {
-                    [Constraint::Percentage(72), Constraint::Percentage(28)]
-                })
-                .split(vertical[1]);
 
             // Transcript with styled entries and syntax highlighting
             let visible_entries: Vec<&TranscriptEntry> = shell
@@ -994,6 +1080,20 @@ where
                 " Transcript ".to_string()
             };
 
+            // Scroll: auto-scroll to bottom unless user has scrolled up
+            let transcript_area_height = vertical[1].height.saturating_sub(2) as usize; // subtract borders
+            let total_lines = transcript_lines.len();
+            let max_scroll = if total_lines > transcript_area_height {
+                (total_lines - transcript_area_height) as u16
+            } else {
+                0
+            };
+            let scroll_offset = if transcript_auto_scroll {
+                max_scroll
+            } else {
+                transcript_scroll_pos.min(max_scroll)
+            };
+
             frame.render_widget(
                 Paragraph::new(transcript_lines)
                     .block(
@@ -1011,128 +1111,9 @@ where
                                 theme.primary
                             })),
                     )
-                    .wrap(Wrap { trim: false }),
-                body[0],
-            );
-
-            // Right pane (Plan / Tools / Mission Control / Artifacts)
-            let right_lines: Vec<Line<'_>> = match right_pane {
-                RightPane::Plan => shell
-                    .plan_lines
-                    .iter()
-                    .map(|l| {
-                        if l.starts_with("##") {
-                            Line::from(Span::styled(
-                                l.clone(),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ))
-                        } else if l.starts_with("- [x]") {
-                            Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
-                        } else if l.starts_with("- [ ]") {
-                            Line::from(Span::styled(
-                                l.clone(),
-                                Style::default().fg(Color::DarkGray),
-                            ))
-                        } else {
-                            Line::from(l.as_str())
-                        }
-                    })
-                    .collect(),
-                RightPane::Tools => shell
-                    .tool_lines
-                    .iter()
-                    .map(|l| {
-                        Line::from(Span::styled(l.clone(), Style::default().fg(Color::Yellow)))
-                    })
-                    .collect(),
-                RightPane::MissionControl => shell
-                    .mission_control_lines
-                    .iter()
-                    .map(|l| Line::from(l.as_str()))
-                    .collect(),
-                RightPane::Artifacts => shell
-                    .artifact_lines
-                    .iter()
-                    .map(|l| Line::from(l.as_str()))
-                    .collect(),
-            };
-
-            // Pane tabs
-            let pane_tabs = Tabs::new(vec![
-                Span::raw("Plan"),
-                Span::raw("Tools"),
-                Span::raw("Mission"),
-                Span::raw("Artifacts"),
-            ])
-            .select(match right_pane {
-                RightPane::Plan => 0,
-                RightPane::Tools => 1,
-                RightPane::MissionControl => 2,
-                RightPane::Artifacts => 3,
-            })
-            .style(Style::default().fg(Color::DarkGray))
-            .highlight_style(
-                Style::default()
-                    .fg(theme.secondary)
-                    .add_modifier(Modifier::BOLD),
-            );
-
-            let right_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .split(body[1]);
-
-            frame.render_widget(pane_tabs, right_layout[0]);
-            frame.render_widget(
-                Paragraph::new(right_lines)
-                    .block(
-                        Block::default()
-                            .title(right_pane.title())
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray)),
-                    )
-                    .wrap(Wrap { trim: false }),
-                right_layout[1],
-            );
-
-            // Tool output area
-            let tool_output_lines: Vec<Line<'_>> = shell
-                .tool_lines
-                .iter()
-                .rev()
-                .take(50)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|l| {
-                    if l.starts_with("error") || l.starts_with("Error") {
-                        Line::from(Span::styled(l.clone(), Style::default().fg(Color::Red)))
-                    } else if l.starts_with("ok") || l.starts_with("success") {
-                        Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
-                    } else {
-                        Line::from(Span::styled(
-                            l.clone(),
-                            Style::default().fg(Color::DarkGray),
-                        ))
-                    }
-                })
-                .collect();
-
-            frame.render_widget(
-                Paragraph::new(tool_output_lines)
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                " Tool Output ",
-                                Style::default().fg(Color::Yellow),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray)),
-                    )
-                    .wrap(Wrap { trim: false }),
-                vertical[2],
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_offset, 0)),
+                vertical[1],
             );
 
             // Input with blinking cursor at cursor_pos
@@ -1162,13 +1143,13 @@ where
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(theme.primary)),
                 ),
-                vertical[3],
+                vertical[2],
             );
 
             // Status bar with styled spans
             frame.render_widget(
                 Paragraph::new(Line::from(render_statusline_spans(&status))),
-                vertical[4],
+                vertical[3],
             );
 
             // Info/help line
@@ -1177,9 +1158,79 @@ where
                     info_line.clone(),
                     Style::default().fg(Color::DarkGray),
                 )),
-                vertical[5],
+                vertical[4],
             );
         })?;
+
+        // Drain streaming events from background agent thread.
+        // When cancelled, discard remaining events until Done/Error arrives.
+        while let Ok(ev) = stream_rx.try_recv() {
+            if cancelled {
+                match ev {
+                    TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_) => {
+                        cancelled = false;
+                    }
+                    TuiStreamEvent::ApprovalNeeded { response_tx, .. } => {
+                        let _ = response_tx.send(false);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match ev {
+                TuiStreamEvent::ContentDelta(text) => {
+                    shell.append_streaming(&text);
+                }
+                TuiStreamEvent::ReasoningDelta(text) => {
+                    shell.push_tool(format!("[thinking] {text}"));
+                }
+                TuiStreamEvent::ToolActive(name) => {
+                    shell.active_tool = Some(name);
+                }
+                TuiStreamEvent::ApprovalNeeded {
+                    tool_name,
+                    args_summary,
+                    response_tx,
+                } => {
+                    pending_approval = Some((tool_name, args_summary, response_tx));
+                }
+                TuiStreamEvent::Error(msg) => {
+                    shell.push_error(&msg);
+                    info_line = format!("error: {msg}");
+                    is_processing = false;
+                    shell.active_tool = None;
+                }
+                TuiStreamEvent::Done(output) => {
+                    shell.finalize_streaming(&output);
+                    info_line = "ok".to_string();
+                    is_processing = false;
+                    shell.active_tool = None;
+                    if let Some(new_status) = refresh_status() {
+                        status = new_status;
+                    }
+                }
+            }
+        }
+
+        // Handle pending approval prompts via keyboard
+        if let Some((ref tool_name, ref args_summary, _)) = pending_approval {
+            info_line = format!("approve `{tool_name}` {args_summary}? [y/N]");
+        }
+
+        // Check for external SIGINT (e.g. `kill -INT`).
+        if sigint_flag.swap(false, Ordering::Relaxed) {
+            if is_processing {
+                is_processing = false;
+                cancelled = true;
+                shell.active_tool = None;
+                if let Some((_, _, response_tx)) = pending_approval.take() {
+                    let _ = response_tx.send(false);
+                }
+                info_line = "interrupted — press Ctrl+C again to exit".to_string();
+            } else {
+                break;
+            }
+        }
 
         if !event::poll(Duration::from_millis(33))? {
             continue;
@@ -1196,8 +1247,34 @@ where
         };
 
         if key == bindings.exit {
+            if is_processing {
+                // First Ctrl+C during processing: cancel the operation.
+                is_processing = false;
+                cancelled = true;
+                shell.active_tool = None;
+                if let Some((_, _, response_tx)) = pending_approval.take() {
+                    let _ = response_tx.send(false);
+                }
+                info_line = "interrupted — press Ctrl+C again to exit".to_string();
+                continue;
+            }
             break;
         }
+
+        // Handle pending approval y/N
+        if pending_approval.is_some() {
+            let approved = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            if let Some((tool_name, _, response_tx)) = pending_approval.take() {
+                let _ = response_tx.send(approved);
+                info_line = if approved {
+                    format!("approved `{tool_name}`")
+                } else {
+                    format!("denied `{tool_name}`")
+                };
+            }
+            continue;
+        }
+
         let mut vim_quit_after_submit = false;
         if vim_enabled {
             let mut vim_consumed = false;
@@ -1541,22 +1618,10 @@ where
             shell.push_user(&background_cmd);
             input.clear();
             cursor_pos = 0;
+            is_processing = true;
+            cancelled = false;
             shell.active_tool = Some("processing...".to_string());
-            match on_submit(&background_cmd) {
-                Ok(output) => {
-                    shell.push_transcript(output);
-                    info_line = "background job started".to_string();
-                }
-                Err(err) => {
-                    let text = format!("error: {err}");
-                    shell.push_tool(text.clone());
-                    info_line = text;
-                }
-            }
-            shell.active_tool = None;
-            if let Some(new_status) = refresh_status() {
-                status = new_status;
-            }
+            on_submit(&background_cmd);
             continue;
         }
         if key == bindings.paste_hint {
@@ -1628,6 +1693,30 @@ where
             }
             continue;
         }
+        // PageUp / PageDown: always scroll transcript
+        if key.code == KeyCode::PageUp {
+            transcript_auto_scroll = false;
+            transcript_scroll_pos = transcript_scroll_pos.saturating_sub(20);
+            continue;
+        }
+        if key.code == KeyCode::PageDown {
+            transcript_scroll_pos = transcript_scroll_pos.saturating_add(20);
+            // Re-enable auto-scroll if we've scrolled to or past the bottom
+            // (the render loop clamps to max_scroll, so going past is fine)
+            transcript_auto_scroll = true;
+            continue;
+        }
+        // Shift+Up / Shift+Down: scroll transcript by one line
+        if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT) {
+            transcript_auto_scroll = false;
+            transcript_scroll_pos = transcript_scroll_pos.saturating_sub(1);
+            continue;
+        }
+        if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT) {
+            transcript_scroll_pos = transcript_scroll_pos.saturating_add(1);
+            transcript_auto_scroll = true;
+            continue;
+        }
         if key == bindings.history_prev {
             if !history.is_empty() {
                 if history_cursor.is_none() {
@@ -1669,6 +1758,10 @@ where
             continue;
         }
         if key == bindings.submit {
+            if is_processing {
+                info_line = "already processing, please wait...".to_string();
+                continue;
+            }
             let prompt = input.trim().to_string();
             if prompt.is_empty() {
                 continue;
@@ -1707,22 +1800,11 @@ where
             input.clear();
             cursor_pos = 0;
             history_cursor = None;
+            is_processing = true;
+            cancelled = false;
+            transcript_auto_scroll = true;
             shell.active_tool = Some("processing...".to_string());
-            match on_submit(&prompt) {
-                Ok(output) => {
-                    shell.push_transcript(output);
-                    info_line = "ok".to_string();
-                }
-                Err(err) => {
-                    let text = format!("error: {err}");
-                    shell.push_tool(text.clone());
-                    info_line = text;
-                }
-            }
-            shell.active_tool = None;
-            if let Some(new_status) = refresh_status() {
-                status = new_status;
-            }
+            on_submit(&prompt);
             if vim_quit_after_submit {
                 break;
             }

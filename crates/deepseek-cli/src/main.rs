@@ -2,11 +2,11 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use deepseek_agent::AgentEngine;
+use deepseek_agent::{AgentEngine, ChatOptions};
 use deepseek_core::{
     AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventEnvelope,
-    EventKind, Session, SessionBudgets, SessionState, ToolHost, normalize_deepseek_model,
-    normalize_deepseek_profile, runtime_dir,
+    EventKind, Session, SessionBudgets, SessionState, StreamChunk, ToolHost,
+    normalize_deepseek_model, normalize_deepseek_profile, runtime_dir,
 };
 use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
@@ -17,8 +17,8 @@ use deepseek_skills::SkillManager;
 use deepseek_store::{AutopilotRunRecord, BackgroundJobRecord, ReplayCassetteRecord, Store};
 use deepseek_tools::PluginManager;
 use deepseek_ui::{
-    KeyBindings, SlashCommand, TuiTheme, UiStatus, load_keybindings, render_statusline,
-    run_tui_shell_with_bindings,
+    KeyBindings, SlashCommand, TuiStreamEvent, TuiTheme, UiStatus, load_keybindings,
+    render_statusline, run_tui_shell_with_bindings,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -931,7 +933,8 @@ fn main() -> Result<()> {
         Commands::Ask(args) => {
             ensure_llm_ready(&cwd, cli.json)?;
             let engine = AgentEngine::new(&cwd)?;
-            let output = engine.run_once(&args.prompt, args.tools)?;
+            let output =
+                engine.chat_with_options(&args.prompt, ChatOptions { tools: args.tools })?;
             if cli.json {
                 print_json(&json!({"output": output}))?;
             } else {
@@ -1478,11 +1481,9 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
             last_error.as_deref(),
         );
 
-        match engine.run_once_with_mode_and_priority(
+        match engine.chat_with_options(
             &iteration_prompt,
-            args.tools,
-            args.max_think,
-            true,
+            deepseek_agent::ChatOptions { tools: args.tools },
         ) {
             Ok(output) => {
                 completed_iterations += 1;
@@ -2417,7 +2418,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
 
         // Set up streaming callback for real-time token output
         if !json_mode {
-            engine.set_stream_callback(Box::new(|chunk: deepseek_core::StreamChunk| {
+            engine.set_stream_callback(std::sync::Arc::new(|chunk: deepseek_core::StreamChunk| {
                 use std::io::Write as _;
                 let out = std::io::stdout();
                 let mut handle = out.lock();
@@ -2435,7 +2436,7 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
             }));
         }
 
-        let output = engine.run_once_with_mode(prompt, allow_tools, force_max_think)?;
+        let output = engine.chat_with_options(prompt, ChatOptions { tools: allow_tools })?;
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
             print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
@@ -2446,63 +2447,46 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
     Ok(())
 }
 
-fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
-    let engine = AgentEngine::new(cwd)?;
+fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> Result<()> {
+    let engine = Arc::new(AgentEngine::new(cwd)?);
+    let force_max_think = Arc::new(AtomicBool::new(false));
 
-    // Set a crossterm-compatible approval handler for raw-mode TUI.
-    engine.set_approval_handler(Box::new(|call| {
-        use crossterm::event::{self as ct_event, Event as CtEvent, KeyCode as CtKeyCode};
-        use std::io::Write;
+    // Create the channel for TUI stream events.
+    let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
 
-        let compact_args = serde_json::to_string(&call.args)
-            .unwrap_or_else(|_| "<unserializable args>".to_string());
+    // Set approval handler that routes through the TUI channel.
+    {
+        let approval_tx = tx.clone();
+        engine.set_approval_handler(Box::new(move |call| {
+            let (resp_tx, resp_rx) = mpsc::channel();
+            let compact_args = serde_json::to_string(&call.args)
+                .unwrap_or_else(|_| "<unserializable>".to_string());
+            let _ = approval_tx.send(TuiStreamEvent::ApprovalNeeded {
+                tool_name: call.name.clone(),
+                args_summary: compact_args,
+                response_tx: resp_tx,
+            });
+            // Block agent thread waiting for TUI user response.
+            resp_rx
+                .recv()
+                .map_err(|e| anyhow!("approval channel closed: {e}"))
+        }));
+    }
 
-        // Write prompt directly to stdout (already in raw mode).
-        let mut stdout = std::io::stdout();
-        write!(
-            stdout,
-            "\r\napproval required for `{}` {}\r\napprove? [y/N] ",
-            call.name, compact_args
-        )?;
-        stdout.flush()?;
-
-        // Read a single keypress via crossterm (raw-mode safe).
-        loop {
-            if ct_event::poll(std::time::Duration::from_secs(120))? {
-                if let CtEvent::Key(key) = ct_event::read()? {
-                    return match key.code {
-                        CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
-                            write!(stdout, "y\r\n")?;
-                            stdout.flush()?;
-                            Ok(true)
-                        }
-                        _ => {
-                            write!(stdout, "n\r\n")?;
-                            stdout.flush()?;
-                            Ok(false)
-                        }
-                    };
-                }
-            } else {
-                // Timeout — deny by default.
-                write!(stdout, "n (timeout)\r\n")?;
-                stdout.flush()?;
-                return Ok(false);
-            }
-        }
-    }));
-
-    let force_max_think = std::cell::Cell::new(false);
-    let status = current_ui_status(cwd, cfg, force_max_think.get())?;
+    let status = current_ui_status(cwd, cfg, force_max_think.load(Ordering::Relaxed))?;
     let bindings = load_tui_keybindings(cwd, cfg);
     let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
+    let fmt_refresh = Arc::clone(&force_max_think);
     run_tui_shell_with_bindings(
         status,
         bindings,
         theme,
+        rx,
         |prompt| {
+            // Handle slash commands synchronously, sending result via channel.
             if let Some(cmd) = SlashCommand::parse(prompt) {
-                let out = match cmd {
+                let result: Result<String> = (|| {
+                    let out = match cmd {
                 SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual /vim".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
@@ -2579,12 +2563,14 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                 SlashCommand::Model(model) => {
                     if let Some(model) = model {
                         let lower = model.to_ascii_lowercase();
-                        force_max_think.set(
-                            lower.contains("reasoner") || lower.contains("max") || lower.contains("high"));
+                        force_max_think.store(
+                            lower.contains("reasoner") || lower.contains("max") || lower.contains("high"),
+                            Ordering::Relaxed,
+                        );
                     }
                     format!(
                         "model mode: {}",
-                        if force_max_think.get() { &cfg.llm.max_think_model } else { &cfg.llm.base_model }
+                        if force_max_think.load(Ordering::Relaxed) { &cfg.llm.max_think_model } else { &cfg.llm.base_model }
                     )
                 }
                 SlashCommand::Cost => {
@@ -2656,14 +2642,17 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     }
                 }
                 SlashCommand::Status => {
-                    let status = current_ui_status(cwd, cfg, force_max_think.get())?;
+                    let status = current_ui_status(cwd, cfg, force_max_think.load(Ordering::Relaxed))?;
                     render_statusline(&status)
                 }
                 SlashCommand::Effort(level) => {
                     let level = level.unwrap_or_else(|| "medium".to_string());
                     let normalized = level.to_ascii_lowercase();
-                    force_max_think.set(matches!(normalized.as_str(), "high" | "max"));
-                    format!("effort={} force_max_think={}", normalized, force_max_think.get())
+                    force_max_think.store(
+                        matches!(normalized.as_str(), "high" | "max"),
+                        Ordering::Relaxed,
+                    );
+                    format!("effort={} force_max_think={}", normalized, force_max_think.load(Ordering::Relaxed))
                 }
                 SlashCommand::Skills(args) => {
                     let manager = SkillManager::new(cwd)?;
@@ -2738,12 +2727,56 @@ fn run_chat_tui(cwd: &Path, allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                 }
                 SlashCommand::Doctor => "Use 'deepseek doctor' for diagnostics.".to_string(),
                 SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
-            };
-                return Ok(out);
+                    };
+                    Ok(out)
+                })();
+                match result {
+                    Ok(output) => {
+                        let _ = tx.send(TuiStreamEvent::Done(output));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(TuiStreamEvent::Error(e.to_string()));
+                    }
+                }
+                return;
             }
-            engine.run_once_with_mode(prompt, allow_tools, force_max_think.get())
+
+            // Agent prompt — set stream callback and spawn background thread.
+            let engine_clone = Arc::clone(&engine);
+            let prompt = prompt.to_string();
+            let _max_think = force_max_think.load(Ordering::Relaxed);
+            let tx_stream = tx.clone();
+            let tx_done = tx.clone();
+
+            engine.set_stream_callback(std::sync::Arc::new(move |chunk| match chunk {
+                StreamChunk::ContentDelta(s) => {
+                    let _ = tx_stream.send(TuiStreamEvent::ContentDelta(s));
+                }
+                StreamChunk::ReasoningDelta(s) => {
+                    let _ = tx_stream.send(TuiStreamEvent::ReasoningDelta(s));
+                }
+                StreamChunk::Done => {}
+            }));
+
+            thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    engine_clone.chat(&prompt)
+                }));
+                match result {
+                    Ok(Ok(output)) => {
+                        let _ = tx_done.send(TuiStreamEvent::Done(output));
+                    }
+                    Ok(Err(e)) => {
+                        let _ = tx_done.send(TuiStreamEvent::Error(e.to_string()));
+                    }
+                    Err(_) => {
+                        let _ = tx_done
+                            .send(TuiStreamEvent::Error("agent thread panicked".to_string()));
+                    }
+                }
+            });
         },
-        || current_ui_status(cwd, cfg, force_max_think.get()).ok(),
+        move || current_ui_status(cwd, cfg, fmt_refresh.load(Ordering::Relaxed)).ok(),
     )
 }
 
@@ -7053,7 +7086,8 @@ fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
                 args.input.as_deref(),
             )?;
             let engine = AgentEngine::new(cwd)?;
-            let output = engine.run_once_with_mode(&rendered.prompt, args.tools, args.max_think)?;
+            let output =
+                engine.chat_with_options(&rendered.prompt, ChatOptions { tools: args.tools })?;
             if json_mode {
                 print_json(&json!({
                     "plugin_id": rendered.plugin_id,
@@ -7467,7 +7501,8 @@ fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<()> {
             let run = manager.run(&args.skill_id, args.input.as_deref(), &paths)?;
             if args.execute {
                 ensure_llm_ready(cwd, json_mode)?;
-                let output = AgentEngine::new(cwd)?.run_once(&run.rendered_prompt, false)?;
+                let output = AgentEngine::new(cwd)?
+                    .chat_with_options(&run.rendered_prompt, ChatOptions { tools: false })?;
                 if json_mode {
                     print_json(&json!({"skill": run, "output": output}))?;
                 } else {
@@ -8933,7 +8968,7 @@ fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     // Set up streaming callback for real-time output
     if is_text || is_stream_json {
         let stream_json = is_stream_json;
-        engine.set_stream_callback(Box::new(move |chunk: StreamChunk| {
+        engine.set_stream_callback(std::sync::Arc::new(move |chunk: StreamChunk| {
             let out = stdout();
             let mut handle = out.lock();
             match chunk {
@@ -8976,7 +9011,7 @@ fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
         }));
     }
 
-    let output = engine.run_once(&prompt, true)?;
+    let output = engine.chat(&prompt)?;
 
     match cli.output_format.as_str() {
         "json" => {
@@ -9118,7 +9153,7 @@ fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Result<()> {
     );
 
     let engine = AgentEngine::new(cwd)?;
-    let output = engine.run_once(&review_prompt, false)?;
+    let output = engine.chat_with_options(&review_prompt, ChatOptions { tools: false })?;
 
     if json_mode {
         print_json(&json!({

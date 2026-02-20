@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest, LlmResponse, LlmToolCall, StreamCallback,
-    StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
+    ChatMessage, ChatRequest, DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest, LlmResponse,
+    LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -19,6 +19,14 @@ pub trait LlmClient {
     /// Streaming variant that invokes `cb` for each token chunk as it arrives.
     /// Returns the fully assembled `LlmResponse` once the stream ends.
     fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse>;
+
+    /// Chat completion with tool definitions (function calling).
+    /// Sends a multi-turn conversation with tool schemas and returns the response.
+    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse>;
+
+    /// Streaming chat completion with tool definitions.
+    fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback)
+    -> Result<LlmResponse>;
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +167,252 @@ impl DeepSeekClient {
         })
     }
 
+    fn build_chat_payload(&self, req: &ChatRequest) -> Value {
+        let messages: Vec<Value> = req
+            .messages
+            .iter()
+            .map(|m| match m {
+                ChatMessage::System { content } => json!({"role": "system", "content": content}),
+                ChatMessage::User { content } => json!({"role": "user", "content": content}),
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    let mut msg = json!({"role": "assistant"});
+                    if let Some(c) = content {
+                        msg["content"] = json!(c);
+                    }
+                    if !tool_calls.is_empty() {
+                        let tc: Vec<Value> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments
+                                    }
+                                })
+                            })
+                            .collect();
+                        msg["tool_calls"] = json!(tc);
+                    }
+                    msg
+                }
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => json!({"role": "tool", "tool_call_id": tool_call_id, "content": content}),
+            })
+            .collect();
+
+        let mut payload = json!({
+            "model": normalize_deepseek_model(&req.model).unwrap_or(&req.model),
+            "messages": messages,
+            "max_tokens": req.max_tokens,
+            "stream": false
+        });
+        if let Some(temp) = req.temperature {
+            payload["temperature"] = json!(temp);
+        }
+        if !req.tools.is_empty() {
+            payload["tools"] = serde_json::to_value(&req.tools).unwrap_or(json!([]));
+            payload["tool_choice"] =
+                serde_json::to_value(&req.tool_choice).unwrap_or(json!("auto"));
+        }
+        payload
+    }
+
+    fn complete_chat_inner(&self, req: &ChatRequest, api_key: &str) -> Result<LlmResponse> {
+        let payload = self.build_chat_payload(req);
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempt: u8 = 0;
+        while attempt <= self.cfg.max_retries {
+            let response = self
+                .client
+                .post(&self.cfg.endpoint)
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    let body = resp.text()?;
+                    if status.is_success() {
+                        return parse_non_streaming_payload(&body);
+                    }
+                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("chat request failed")))
+    }
+
+    fn complete_chat_streaming_inner(
+        &self,
+        req: &ChatRequest,
+        api_key: &str,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let mut payload = self.build_chat_payload(req);
+        payload["stream"] = json!(true);
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempt: u8 = 0;
+        while attempt <= self.cfg.max_retries {
+            let response = self
+                .client
+                .post(&self.cfg.endpoint)
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+
+                    if status.is_success() {
+                        let mut content_out = String::new();
+                        let mut reasoning_out = String::new();
+                        let mut finish_reason: Option<String> = None;
+                        let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
+                        let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
+
+                        let reader = std::io::BufReader::new(resp);
+                        for line_result in reader.lines() {
+                            let line = match line_result {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    last_err = Some(anyhow!("stream read error: {e}"));
+                                    break;
+                                }
+                            };
+                            let trimmed = line.trim();
+                            if !trimmed.starts_with("data:") {
+                                continue;
+                            }
+                            let chunk = trimmed.trim_start_matches("data:").trim();
+                            if chunk == "[DONE]" {
+                                cb(StreamChunk::Done);
+                                break;
+                            }
+                            let value: Value = match serde_json::from_str(chunk) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let choice = value
+                                .get("choices")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first());
+                            let Some(choice) = choice else {
+                                continue;
+                            };
+                            if let Some(reason) =
+                                choice.get("finish_reason").and_then(|v| v.as_str())
+                            {
+                                finish_reason = Some(reason.to_string());
+                            }
+                            if let Some(delta) = choice.get("delta") {
+                                if let Some(content) = delta.get("content").and_then(|v| v.as_str())
+                                {
+                                    content_out.push_str(content);
+                                    cb(StreamChunk::ContentDelta(content.to_string()));
+                                }
+                                if let Some(reasoning) =
+                                    delta.get("reasoning_content").and_then(|v| v.as_str())
+                                {
+                                    reasoning_out.push_str(reasoning);
+                                    cb(StreamChunk::ReasoningDelta(reasoning.to_string()));
+                                }
+                                if let Some(tool_calls) =
+                                    delta.get("tool_calls").and_then(|v| v.as_array())
+                                {
+                                    merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
+                                }
+                            }
+                        }
+
+                        if let Some(err) = last_err.take() {
+                            return Err(err);
+                        }
+
+                        let mut tool_calls: Vec<LlmToolCall> = tool_call_parts
+                            .into_iter()
+                            .filter_map(|(index, value)| {
+                                if value.name.trim().is_empty() {
+                                    return None;
+                                }
+                                Some(LlmToolCall {
+                                    id: value
+                                        .id
+                                        .unwrap_or_else(|| format!("tool_call_{}", index + 1)),
+                                    name: value.name,
+                                    arguments: value.arguments,
+                                })
+                            })
+                            .collect();
+                        if !completed_tool_calls.is_empty() {
+                            tool_calls.extend(completed_tool_calls);
+                        }
+
+                        let text = if !content_out.is_empty() {
+                            content_out
+                        } else if !reasoning_out.is_empty() {
+                            reasoning_out.clone()
+                        } else {
+                            String::new()
+                        };
+                        return Ok(LlmResponse {
+                            text,
+                            finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
+                            reasoning_content: reasoning_out,
+                            tool_calls,
+                        });
+                    }
+
+                    let body = resp.text().unwrap_or_default();
+                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("chat streaming request failed")))
+    }
+
     fn resolve_api_key(&self) -> Option<String> {
         std::env::var(&self.cfg.api_key_env)
             .ok()
@@ -195,7 +449,7 @@ impl DeepSeekClient {
         &self,
         req: &LlmRequest,
         api_key: &str,
-        mut cb: StreamCallback,
+        cb: StreamCallback,
     ) -> Result<LlmResponse> {
         let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_payload(req);
@@ -431,6 +685,38 @@ impl LlmClient for DeepSeekClient {
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model, profile)?;
         self.complete_streaming_inner(&normalized_req, &key, cb)
+    }
+
+    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" {
+            return Err(anyhow!(
+                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
+                self.cfg.provider
+            ));
+        }
+        let key = self
+            .resolve_api_key()
+            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
+        self.complete_chat_inner(req, &key)
+    }
+
+    fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" {
+            return Err(anyhow!(
+                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
+                self.cfg.provider
+            ));
+        }
+        let key = self
+            .resolve_api_key()
+            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
+        self.complete_chat_streaming_inner(req, &key, cb)
     }
 }
 
@@ -1340,7 +1626,7 @@ mod tests {
 
         let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let chunks_clone = Arc::clone(&chunks);
-        let cb: StreamCallback = Box::new(move |chunk| match chunk {
+        let cb: StreamCallback = Arc::new(move |chunk| match chunk {
             StreamChunk::ContentDelta(text) => {
                 chunks_clone.lock().unwrap().push(text);
             }
