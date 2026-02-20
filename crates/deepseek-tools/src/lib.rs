@@ -1633,6 +1633,234 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        // ── Chrome browser automation tools ─────────────────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "chrome_navigate".to_string(),
+                description: "Navigate a Chrome browser to a URL. Requires Chrome to be running with remote debugging enabled (--remote-debugging-port=9222).".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to navigate to (must start with http://, https://, or about:)"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "Chrome debug port. Defaults to 9222."
+                        }
+                    },
+                    "required": ["url"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "chrome_click".to_string(),
+                description: "Click an element on the page by CSS selector.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector of the element to click"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "Chrome debug port. Defaults to 9222."
+                        }
+                    },
+                    "required": ["selector"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "chrome_type_text".to_string(),
+                description: "Type text into an input element selected by CSS selector.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector of the input element"
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The text to type into the element"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "Chrome debug port. Defaults to 9222."
+                        }
+                    },
+                    "required": ["selector", "text"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "chrome_screenshot".to_string(),
+                description: "Capture a screenshot of the current page. Returns the image as base64.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "enum": ["png", "jpeg", "webp"],
+                            "description": "Image format. Defaults to 'png'."
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "Chrome debug port. Defaults to 9222."
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "chrome_read_console".to_string(),
+                description: "Read the browser's console log entries.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "port": {
+                            "type": "integer",
+                            "description": "Chrome debug port. Defaults to 9222."
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "chrome_evaluate".to_string(),
+                description: "Evaluate a JavaScript expression in the browser and return the result.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "JavaScript expression to evaluate"
+                        },
+                        "port": {
+                            "type": "integer",
+                            "description": "Chrome debug port. Defaults to 9222."
+                        }
+                    },
+                    "required": ["expression"]
+                }),
+            },
+        },
+        // ── Agent-level tools (handled by AgentEngine, not LocalToolHost) ───
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "user_question".to_string(),
+                description: "Ask the user a question and wait for their response. Use this when you need clarification, a decision, or user input to proceed.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask the user"
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional list of suggested answer choices"
+                        }
+                    },
+                    "required": ["question"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_create".to_string(),
+                description: "Create a task to track progress on the current work. Returns the task ID.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "subject": {
+                            "type": "string",
+                            "description": "Brief title for the task"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Detailed description of what needs to be done"
+                        },
+                        "priority": {
+                            "type": "integer",
+                            "description": "Priority level (0=low, 1=normal, 2=high). Defaults to 1."
+                        }
+                    },
+                    "required": ["subject"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_update".to_string(),
+                description: "Update a task's status. Use to mark tasks as in_progress, completed, or failed.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "UUID of the task to update"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed", "failed"],
+                            "description": "New status for the task"
+                        },
+                        "outcome": {
+                            "type": "string",
+                            "description": "Optional outcome description (typically set when completing or failing)"
+                        }
+                    },
+                    "required": ["task_id", "status"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "spawn_task".to_string(),
+                description: "Spawn an autonomous subagent to work on a subtask in parallel. The subagent runs independently with its own context and returns results when complete. Use for tasks that can be done independently (research, exploration, isolated code changes).".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Short name for the subagent (e.g. 'explore-auth', 'fix-tests')"
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "Detailed description of what the subagent should accomplish"
+                        },
+                        "role": {
+                            "type": "string",
+                            "enum": ["explore", "plan", "task"],
+                            "description": "Subagent role: 'explore' for research/information gathering, 'plan' for breaking down tasks, 'task' for executing specific work"
+                        }
+                    },
+                    "required": ["name", "goal", "role"]
+                }),
+            },
+        },
     ]
 }
 
@@ -1658,9 +1886,23 @@ pub fn map_tool_name(function_name: &str) -> &str {
         "patch_stage" => "patch.stage",
         "patch_apply" => "patch.apply",
         "diagnostics_check" => "diagnostics.check",
+        "chrome_navigate" => "chrome.navigate",
+        "chrome_click" => "chrome.click",
+        "chrome_type_text" => "chrome.type_text",
+        "chrome_screenshot" => "chrome.screenshot",
+        "chrome_read_console" => "chrome.read_console",
+        "chrome_evaluate" => "chrome.evaluate",
+        "user_question" => "user_question",
+        "task_create" => "task_create",
+        "task_update" => "task_update",
+        "spawn_task" => "spawn_task",
         other => other,
     }
 }
+
+/// Tools that are handled by AgentEngine directly, not by LocalToolHost.
+pub const AGENT_LEVEL_TOOLS: &[&str] =
+    &["user_question", "task_create", "task_update", "spawn_task"];
 
 fn should_skip_rel_path(path: &Path) -> bool {
     path.components().any(|c| {
@@ -3491,5 +3733,98 @@ mod tests {
                 .as_str()
                 .is_some_and(|data| !data.is_empty())
         );
+    }
+
+    #[test]
+    fn tool_definitions_include_all_tools() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+
+        // Core tools
+        for expected in [
+            "fs_read",
+            "fs_write",
+            "fs_edit",
+            "fs_list",
+            "fs_glob",
+            "fs_grep",
+            "bash_run",
+            "multi_edit",
+            "git_status",
+            "git_diff",
+            "git_show",
+            "web_fetch",
+            "web_search",
+            "notebook_read",
+            "notebook_edit",
+            "index_query",
+            "patch_stage",
+            "patch_apply",
+            "diagnostics_check",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing tool definition: {expected}"
+            );
+        }
+        // Chrome tools
+        for expected in [
+            "chrome_navigate",
+            "chrome_click",
+            "chrome_type_text",
+            "chrome_screenshot",
+            "chrome_read_console",
+            "chrome_evaluate",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing chrome tool definition: {expected}"
+            );
+        }
+        // Agent-level tools
+        for expected in ["user_question", "task_create", "task_update", "spawn_task"] {
+            assert!(
+                names.contains(&expected),
+                "missing agent tool definition: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_tool_name_covers_all_definitions() {
+        let defs = tool_definitions();
+        for def in &defs {
+            let fn_name = &def.function.name;
+            let mapped = map_tool_name(fn_name);
+            // Every underscored name should map to something
+            assert!(
+                !mapped.is_empty(),
+                "map_tool_name returned empty for {fn_name}"
+            );
+        }
+        // Verify chrome mappings specifically
+        assert_eq!(map_tool_name("chrome_navigate"), "chrome.navigate");
+        assert_eq!(map_tool_name("chrome_click"), "chrome.click");
+        assert_eq!(map_tool_name("chrome_type_text"), "chrome.type_text");
+        assert_eq!(map_tool_name("chrome_screenshot"), "chrome.screenshot");
+        assert_eq!(map_tool_name("chrome_read_console"), "chrome.read_console");
+        assert_eq!(map_tool_name("chrome_evaluate"), "chrome.evaluate");
+        // Agent-level tool mappings
+        assert_eq!(map_tool_name("user_question"), "user_question");
+        assert_eq!(map_tool_name("task_create"), "task_create");
+        assert_eq!(map_tool_name("task_update"), "task_update");
+        assert_eq!(map_tool_name("spawn_task"), "spawn_task");
+    }
+
+    #[test]
+    fn agent_level_tools_constant_matches_definitions() {
+        let defs = tool_definitions();
+        let def_names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for tool_name in AGENT_LEVEL_TOOLS {
+            assert!(
+                def_names.contains(tool_name),
+                "AGENT_LEVEL_TOOLS contains '{tool_name}' but no definition exists"
+            );
+        }
     }
 }

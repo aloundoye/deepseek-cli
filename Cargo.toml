@@ -45,6 +45,7 @@ toml = "1.0.2"
 thiserror = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 walkdir = "2"
+unicode-width = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
 signal-hook = "0.3"

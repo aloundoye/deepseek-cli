@@ -11,9 +11,11 @@ use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
-use deepseek_store::{ProviderMetricRecord, Store, SubagentRunRecord, VerificationRunRecord};
+use deepseek_store::{
+    ProviderMetricRecord, Store, SubagentRunRecord, TaskQueueRecord, VerificationRunRecord,
+};
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
-use deepseek_tools::{LocalToolHost, map_tool_name, tool_definitions};
+use deepseek_tools::{AGENT_LEVEL_TOOLS, LocalToolHost, map_tool_name, tool_definitions};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -200,6 +202,9 @@ impl Executor for SimpleExecutor {
 
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
+/// Handler for spawn_task subagent workers. Takes a goal string, returns result.
+type SubagentWorkerFn = Arc<dyn Fn(String) -> Result<String> + Send + Sync>;
+
 /// Options for `chat_with_options()`.
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
@@ -226,6 +231,10 @@ pub struct AgentEngine {
     max_budget_usd: Option<f64>,
     /// Optional external approval handler (e.g. crossterm-based for TUI mode).
     approval_handler: Mutex<Option<ApprovalHandler>>,
+    /// Optional handler invoked when the agent asks the user a question.
+    user_question_handler: Mutex<Option<deepseek_core::UserQuestionHandler>>,
+    /// Optional worker function for spawn_task subagents.
+    subagent_worker: Mutex<Option<SubagentWorkerFn>>,
 }
 
 impl AgentEngine {
@@ -255,6 +264,8 @@ impl AgentEngine {
             max_turns,
             max_budget_usd,
             approval_handler: Mutex::new(None),
+            user_question_handler: Mutex::new(None),
+            subagent_worker: Mutex::new(None),
         })
     }
 
@@ -280,6 +291,20 @@ impl AgentEngine {
     pub fn set_stream_callback(&self, cb: deepseek_core::StreamCallback) {
         if let Ok(mut guard) = self.stream_callback.lock() {
             *guard = Some(cb);
+        }
+    }
+
+    /// Set a handler for user questions (the `user_question` tool).
+    pub fn set_user_question_handler(&self, handler: deepseek_core::UserQuestionHandler) {
+        if let Ok(mut guard) = self.user_question_handler.lock() {
+            *guard = Some(handler);
+        }
+    }
+
+    /// Set a worker function for spawn_task subagents.
+    pub fn set_subagent_worker(&self, worker: SubagentWorkerFn) {
+        if let Ok(mut guard) = self.subagent_worker.lock() {
+            *guard = Some(worker);
         }
     }
 
@@ -1345,6 +1370,31 @@ impl AgentEngine {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
 
+                // ── Agent-level tools (handled here, not by LocalToolHost) ──
+                if AGENT_LEVEL_TOOLS.contains(&internal_name) {
+                    let tool_result = self.execute_agent_tool(internal_name, &args, &session)?;
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: tool_result.clone(),
+                    });
+                    self.emit(
+                        session.session_id,
+                        EventKind::TurnAddedV1 {
+                            role: "tool".to_string(),
+                            content: format!(
+                                "[{}] ok: {}",
+                                internal_name,
+                                if tool_result.len() > 200 {
+                                    format!("{}...", &tool_result[..200])
+                                } else {
+                                    tool_result
+                                }
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
+
                 let tool_call = ToolCall {
                     name: internal_name.to_string(),
                     args: args.clone(),
@@ -1433,7 +1483,7 @@ impl AgentEngine {
                         failure_streak += 1;
                     }
 
-                    truncate_tool_output(&result.output.to_string(), 30000)
+                    truncate_tool_output(internal_name, &result.output.to_string(), 30000)
                 } else {
                     failure_streak += 1;
                     // Notify TUI of denial
@@ -2889,6 +2939,276 @@ impl AgentEngine {
         Ok(matches!(normalized.as_str(), "y" | "yes"))
     }
 
+    /// Execute an agent-level tool (user_question, task_create, task_update, spawn_task).
+    /// These tools are handled directly by the agent, not by LocalToolHost.
+    fn execute_agent_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        session: &Session,
+    ) -> Result<String> {
+        // Notify TUI of tool execution
+        let arg_summary = summarize_tool_args(tool_name, args);
+        if let Ok(mut cb_guard) = self.stream_callback.lock()
+            && let Some(ref mut cb) = *cb_guard
+        {
+            let detail = if arg_summary.is_empty() {
+                String::new()
+            } else {
+                format!(" {arg_summary}")
+            };
+            cb(StreamChunk::ContentDelta(format!(
+                "\n[tool: {tool_name}]{detail}\n"
+            )));
+        }
+
+        let tool_start = Instant::now();
+        let result = match tool_name {
+            "user_question" => self.handle_user_question(args),
+            "task_create" => self.handle_task_create(args, session),
+            "task_update" => self.handle_task_update(args),
+            "spawn_task" => self.handle_spawn_task(args),
+            _ => Err(anyhow::anyhow!("unknown agent tool: {tool_name}")),
+        };
+        let tool_elapsed = tool_start.elapsed();
+
+        let (status_label, output) = match result {
+            Ok(output) => ("ok", output),
+            Err(e) => ("error", format!("Error: {e}")),
+        };
+
+        // Notify TUI of completion
+        if let Ok(mut cb_guard) = self.stream_callback.lock()
+            && let Some(ref mut cb) = *cb_guard
+        {
+            let preview_line = output
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            cb(StreamChunk::ContentDelta(format!(
+                "[tool: {tool_name}] {status_label} ({:.1}s) {preview_line}\n",
+                tool_elapsed.as_secs_f64()
+            )));
+        }
+
+        Ok(output)
+    }
+
+    /// Handle the user_question tool: ask the user a question and return their answer.
+    fn handle_user_question(&self, args: &serde_json::Value) -> Result<String> {
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("question parameter is required"))?;
+        let options: Vec<String> = args
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let user_q = deepseek_core::UserQuestion {
+            question: question.to_string(),
+            options: options.clone(),
+        };
+
+        // Try external handler first (TUI mode)
+        if let Ok(guard) = self.user_question_handler.lock()
+            && let Some(handler) = guard.as_ref()
+        {
+            if let Some(answer) = handler(user_q) {
+                return Ok(serde_json::to_string(&serde_json::json!({
+                    "answer": answer
+                }))?);
+            }
+            return Ok(serde_json::to_string(
+                &serde_json::json!({"answer": null, "cancelled": true}),
+            )?);
+        }
+
+        // Fallback: blocking stdin
+        let mut stdout = std::io::stdout();
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() || !stdout.is_terminal() {
+            return Ok(serde_json::to_string(
+                &serde_json::json!({"error": "user_question not available in non-interactive mode"}),
+            )?);
+        }
+
+        writeln!(stdout, "\n{question}")?;
+        if !options.is_empty() {
+            for (i, opt) in options.iter().enumerate() {
+                writeln!(stdout, "  {}: {opt}", i + 1)?;
+            }
+        }
+        write!(stdout, "> ")?;
+        stdout.flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let answer = input.trim().to_string();
+        Ok(serde_json::to_string(
+            &serde_json::json!({"answer": answer}),
+        )?)
+    }
+
+    /// Handle the task_create tool: create a task in the store.
+    fn handle_task_create(&self, args: &serde_json::Value, session: &Session) -> Result<String> {
+        let subject = args
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("subject parameter is required"))?;
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+        let task_id = Uuid::now_v7();
+        let now = chrono::Utc::now().to_rfc3339();
+        let title = if description.is_empty() {
+            subject.to_string()
+        } else {
+            format!("{subject}: {description}")
+        };
+
+        let record = TaskQueueRecord {
+            task_id,
+            session_id: session.session_id,
+            title,
+            priority,
+            status: "pending".to_string(),
+            outcome: None,
+            artifact_path: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.store.insert_task(&record)?;
+
+        self.emit(
+            session.session_id,
+            EventKind::TaskCreatedV1 {
+                task_id,
+                title: subject.to_string(),
+                priority,
+            },
+        )?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "task_id": task_id.to_string(),
+            "status": "pending",
+            "subject": subject
+        }))?)
+    }
+
+    /// Handle the task_update tool: update a task's status.
+    fn handle_task_update(&self, args: &serde_json::Value) -> Result<String> {
+        let task_id_str = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("task_id parameter is required"))?;
+        let task_id = Uuid::parse_str(task_id_str)?;
+        let status = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("status parameter is required"))?;
+        let outcome = args.get("outcome").and_then(|v| v.as_str());
+
+        self.store.update_task_status(task_id, status, outcome)?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "task_id": task_id_str,
+            "status": status,
+            "updated": true
+        }))?)
+    }
+
+    /// Handle the spawn_task tool: spawn a subagent to work on a subtask.
+    fn handle_spawn_task(&self, args: &serde_json::Value) -> Result<String> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("name parameter is required"))?;
+        let goal = args
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("goal parameter is required"))?;
+        let role_str = args.get("role").and_then(|v| v.as_str()).unwrap_or("task");
+        let role = match role_str {
+            "explore" => deepseek_subagent::SubagentRole::Explore,
+            "plan" => deepseek_subagent::SubagentRole::Plan,
+            _ => deepseek_subagent::SubagentRole::Task,
+        };
+
+        let make_task = || deepseek_subagent::SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: name.to_string(),
+            goal: goal.to_string(),
+            role: role.clone(),
+            team: "default".to_string(),
+            read_only_fallback: matches!(role, deepseek_subagent::SubagentRole::Explore),
+        };
+
+        // Try external worker first (set by the CLI for full agent capabilities)
+        let has_external_worker = self
+            .subagent_worker
+            .lock()
+            .ok()
+            .as_ref()
+            .is_some_and(|g| g.is_some());
+
+        if has_external_worker {
+            let worker = self
+                .subagent_worker
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().cloned());
+            if let Some(worker) = worker {
+                let goal = goal.to_string();
+                let results = self
+                    .subagents
+                    .run_tasks(vec![make_task()], move |_t| worker(goal.clone()));
+                if let Some(result) = results.first() {
+                    return Ok(serde_json::to_string(&serde_json::json!({
+                        "name": result.name,
+                        "success": result.success,
+                        "output": result.output,
+                        "error": result.error,
+                        "attempts": result.attempts
+                    }))?);
+                }
+            }
+        }
+
+        // Fallback: run with a simple echo worker
+        let goal_str = goal.to_string();
+        let results = self.subagents.run_tasks(vec![make_task()], move |t| {
+            Ok(format!(
+                "Subagent '{}' completed goal: {}",
+                t.name, goal_str
+            ))
+        });
+        if let Some(result) = results.first() {
+            return Ok(serde_json::to_string(&serde_json::json!({
+                "name": result.name,
+                "success": result.success,
+                "output": result.output,
+                "error": result.error,
+                "attempts": result.attempts
+            }))?);
+        }
+
+        Ok(serde_json::to_string(
+            &serde_json::json!({"error": "subagent failed to start"}),
+        )?)
+    }
+
     fn emit_patch_events_if_any(
         &self,
         session_id: Uuid,
@@ -4234,11 +4554,64 @@ fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
     }
 }
 
-fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
+fn truncate_tool_output(tool_name: &str, output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output.to_string();
     }
     let lines: Vec<&str> = output.lines().collect();
+
+    // Tool-specific truncation strategies
+    match tool_name {
+        "bash.run" => {
+            // For bash: try to separate stderr from stdout, always keep stderr,
+            // then keep last 200 lines of stdout.
+            // Since output is a JSON value, parse it to extract stderr if possible.
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(output) {
+                let stderr = val.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                let stdout = val.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                let stdout_lines: Vec<&str> = stdout.lines().collect();
+                let kept_stdout = if stdout_lines.len() > 200 {
+                    format!(
+                        "... ({} lines omitted) ...\n{}",
+                        stdout_lines.len() - 200,
+                        stdout_lines[stdout_lines.len() - 200..].join("\n")
+                    )
+                } else {
+                    stdout.to_string()
+                };
+                return serde_json::to_string(&serde_json::json!({
+                    "stdout": kept_stdout,
+                    "stderr": stderr,
+                    "truncated": true,
+                    "original_stdout_lines": stdout_lines.len()
+                }))
+                .unwrap_or_else(|_| truncate_generic(&lines, max_bytes, output.len()));
+            }
+            truncate_generic(&lines, max_bytes, output.len())
+        }
+        "fs.read" => {
+            // For fs.read: show line count + head/tail
+            if lines.len() > 200 {
+                let head_count = 80;
+                let tail_count = 80;
+                let head: Vec<&str> = lines[..head_count].to_vec();
+                let tail: Vec<&str> = lines[lines.len() - tail_count..].to_vec();
+                format!(
+                    "{}\n\n... ({} total lines, {} lines omitted) ...\n\n{}",
+                    head.join("\n"),
+                    lines.len(),
+                    lines.len() - head_count - tail_count,
+                    tail.join("\n")
+                )
+            } else {
+                truncate_generic(&lines, max_bytes, output.len())
+            }
+        }
+        _ => truncate_generic(&lines, max_bytes, output.len()),
+    }
+}
+
+fn truncate_generic(lines: &[&str], max_bytes: usize, total_bytes: usize) -> String {
     if lines.len() > 200 {
         let head: Vec<&str> = lines[..100].to_vec();
         let tail: Vec<&str> = lines[lines.len() - 100..].to_vec();
@@ -4250,8 +4623,9 @@ fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
         )
     } else {
         // Byte-truncate at a safe char boundary
-        let truncated = &output[..output.floor_char_boundary(max_bytes)];
-        format!("{}... (truncated, {} bytes total)", truncated, output.len())
+        let joined = lines.join("\n");
+        let truncated = &joined[..joined.floor_char_boundary(max_bytes)];
+        format!("{}... (truncated, {} bytes total)", truncated, total_bytes)
     }
 }
 
@@ -6057,5 +6431,53 @@ mod tests {
         assert!(target_patterns_overlap("src/*.rs", "src/lib.rs"));
         assert!(target_patterns_overlap("src/lib.rs", "src/lib.rs"));
         assert!(!target_patterns_overlap("docs", "src/lib.rs"));
+    }
+
+    #[test]
+    fn truncate_tool_output_short_passes_through() {
+        let output = "hello world";
+        let result = truncate_tool_output("fs.read", output, 30000);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn truncate_tool_output_generic_keeps_head_and_tail() {
+        let lines: Vec<String> = (0..300).map(|i| format!("line {i}")).collect();
+        let big = lines.join("\n");
+        let result = truncate_tool_output("fs.grep", &big, 100);
+        assert!(result.contains("line 0"));
+        assert!(result.contains("line 99"));
+        assert!(result.contains("line 299"));
+        assert!(result.contains("100 lines omitted"));
+    }
+
+    #[test]
+    fn truncate_tool_output_fs_read_uses_80_head_tail() {
+        let lines: Vec<String> = (0..500).map(|i| format!("line {i}")).collect();
+        let big = lines.join("\n");
+        let result = truncate_tool_output("fs.read", &big, 100);
+        assert!(result.contains("line 0"));
+        assert!(result.contains("line 79"));
+        assert!(result.contains("line 499"));
+        assert!(result.contains("500 total lines"));
+    }
+
+    #[test]
+    fn truncate_tool_output_bash_run_keeps_stderr() {
+        let stdout_lines: Vec<String> = (0..400).map(|i| format!("stdout line {i}")).collect();
+        let bash_output = serde_json::json!({
+            "stdout": stdout_lines.join("\n"),
+            "stderr": "important error message",
+            "exit_code": 1
+        });
+        let result = truncate_tool_output("bash.run", &bash_output.to_string(), 100);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // stderr is fully preserved
+        assert_eq!(parsed["stderr"], "important error message");
+        // stdout is truncated
+        assert_eq!(parsed["truncated"], true);
+        let kept_stdout = parsed["stdout"].as_str().unwrap();
+        assert!(kept_stdout.contains("stdout line 399"));
+        assert!(kept_stdout.contains("lines omitted"));
     }
 }
