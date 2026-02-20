@@ -80,7 +80,7 @@ impl DeepSeekClient {
                         continue;
                     }
 
-                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
                         attempt = attempt.saturating_add(1);
@@ -89,7 +89,7 @@ impl DeepSeekClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -245,7 +245,7 @@ impl DeepSeekClient {
                     if status.is_success() {
                         return parse_non_streaming_payload(&body);
                     }
-                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
                         attempt = attempt.saturating_add(1);
@@ -254,7 +254,7 @@ impl DeepSeekClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -391,7 +391,7 @@ impl DeepSeekClient {
                     }
 
                     let body = resp.text().unwrap_or_default();
-                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
                         attempt = attempt.saturating_add(1);
@@ -400,7 +400,7 @@ impl DeepSeekClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -597,7 +597,7 @@ impl DeepSeekClient {
                         payload["stream"] = json!(true);
                         continue;
                     }
-                    last_err = Some(anyhow!("deepseek API error {}: {}", status, body));
+                    last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
                         attempt = attempt.saturating_add(1);
@@ -606,7 +606,7 @@ impl DeepSeekClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(anyhow!("deepseek request failed: {e}"));
+                    last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -717,6 +717,51 @@ impl LlmClient for DeepSeekClient {
             .resolve_api_key()
             .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
         self.complete_chat_streaming_inner(req, &key, cb)
+    }
+}
+
+/// Produce a user-friendly error from a DeepSeek API HTTP response.
+fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8) -> anyhow::Error {
+    // Try to extract the error message from JSON body
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message").or(Some(e)))
+                .and_then(|m| m.as_str().map(ToString::to_string))
+        })
+        .unwrap_or_else(|| body.chars().take(200).collect());
+
+    match status {
+        StatusCode::UNAUTHORIZED => anyhow!(
+            "Authentication failed (HTTP 401). Check your API key: ensure DEEPSEEK_API_KEY is set correctly, or run `deepseek config edit`."
+        ),
+        StatusCode::TOO_MANY_REQUESTS => anyhow!(
+            "Rate limited (HTTP 429). Exhausted {}/{} retries. Try again shortly or reduce request frequency. Detail: {}",
+            attempt + 1, max_retries + 1, detail
+        ),
+        StatusCode::PAYMENT_REQUIRED => anyhow!(
+            "Insufficient balance (HTTP 402). Top up your DeepSeek account at https://platform.deepseek.com"
+        ),
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => anyhow!(
+            "DeepSeek server error (HTTP {}). Exhausted {}/{} retries. The service may be temporarily unavailable. Detail: {}",
+            status.as_u16(), attempt + 1, max_retries + 1, detail
+        ),
+        _ => anyhow!(
+            "DeepSeek API error (HTTP {}): {}",
+            status.as_u16(), detail
+        ),
+    }
+}
+
+/// Produce a user-friendly error from a transport/network failure.
+fn format_transport_error(err: &reqwest::Error) -> anyhow::Error {
+    if err.is_timeout() {
+        anyhow!("Request timed out. The DeepSeek API did not respond in time. Try increasing llm.timeout_seconds in your config.")
+    } else if err.is_connect() {
+        anyhow!("Connection failed. Could not reach the DeepSeek API. Check your network connection and llm.endpoint setting.")
+    } else {
+        anyhow!("Network error: {err}")
     }
 }
 
@@ -1438,7 +1483,7 @@ mod tests {
                 images: vec![],
             })
             .expect_err("request should fail after retries are exhausted");
-        assert!(err.to_string().contains("deepseek API error 429"));
+        assert!(err.to_string().contains("Rate limited (HTTP 429)"));
         assert_eq!(server.request_count(), 3);
 
         // SAFETY: test-only process-level env mutation.

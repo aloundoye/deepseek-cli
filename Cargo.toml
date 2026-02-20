@@ -46,7 +46,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 walkdir = "2"
 unicode-width = "0.2"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 signal-hook = "0.3"
 notify = "8"

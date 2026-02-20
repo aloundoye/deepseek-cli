@@ -1864,6 +1864,34 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Filter tool definitions by allowed/disallowed lists.
+///
+/// - If `allowed` is `Some`, only tools whose `function.name` is in the list are kept.
+/// - If `disallowed` is `Some`, tools whose `function.name` is in the list are removed.
+/// - `allowed` and `disallowed` should not both be `Some` (caller must validate).
+pub fn filter_tool_definitions(
+    tools: Vec<ToolDefinition>,
+    allowed: Option<&[String]>,
+    disallowed: Option<&[String]>,
+) -> Vec<ToolDefinition> {
+    let tools = if let Some(allow_list) = allowed {
+        tools
+            .into_iter()
+            .filter(|t| allow_list.iter().any(|a| a == &t.function.name))
+            .collect()
+    } else {
+        tools
+    };
+    if let Some(deny_list) = disallowed {
+        tools
+            .into_iter()
+            .filter(|t| !deny_list.iter().any(|d| d == &t.function.name))
+            .collect()
+    } else {
+        tools
+    }
+}
+
 /// Map tool definition function names (underscored) to internal tool names (dotted).
 pub fn map_tool_name(function_name: &str) -> &str {
     match function_name {
@@ -1897,6 +1925,48 @@ pub fn map_tool_name(function_name: &str) -> &str {
         "task_update" => "task_update",
         "spawn_task" => "spawn_task",
         other => other,
+    }
+}
+
+/// Return a user-friendly hint for a tool error, or `None` if no specific hint applies.
+pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
+    let lower = error_msg.to_ascii_lowercase();
+    match tool_name {
+        "fs.edit" | "multi_edit" => {
+            if lower.contains("search pattern not found") {
+                Some("Hint: the old_string was not found in the file. Try reading the file first with fs.read to verify the exact content.".to_string())
+            } else if lower.contains("line range out of bounds") {
+                Some("Hint: the line range exceeds the file length. Read the file first to check how many lines it has.".to_string())
+            } else {
+                None
+            }
+        }
+        "fs.read" => {
+            if lower.contains("no such file") || lower.contains("not found") {
+                Some("Hint: file does not exist. Use fs.glob to search for the correct path.".to_string())
+            } else if lower.contains("permission denied") {
+                Some("Hint: permission denied. The file may be outside the allowed workspace.".to_string())
+            } else {
+                None
+            }
+        }
+        "fs.write" => {
+            if lower.contains("permission denied") {
+                Some("Hint: permission denied. Check that the directory exists and is writable.".to_string())
+            } else {
+                None
+            }
+        }
+        "bash.run" => {
+            if lower.contains("timed out") || lower.contains("timeout") {
+                Some("Hint: command timed out. Try a shorter operation or increase the timeout.".to_string())
+            } else if lower.contains("not found") || lower.contains("command not found") {
+                Some("Hint: command not found. Check that the program is installed and in PATH.".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -3826,5 +3896,33 @@ mod tests {
                 "AGENT_LEVEL_TOOLS contains '{tool_name}' but no definition exists"
             );
         }
+    }
+
+    #[test]
+    fn filter_tool_definitions_allowed() {
+        let defs = tool_definitions();
+        let allowed = vec!["fs_read".to_string(), "fs_write".to_string()];
+        let filtered = filter_tool_definitions(defs, Some(&allowed), None);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|t| t.function.name == "fs_read"));
+        assert!(filtered.iter().any(|t| t.function.name == "fs_write"));
+    }
+
+    #[test]
+    fn filter_tool_definitions_disallowed() {
+        let defs = tool_definitions();
+        let original_count = defs.len();
+        let disallowed = vec!["bash_run".to_string()];
+        let filtered = filter_tool_definitions(defs, None, Some(&disallowed));
+        assert_eq!(filtered.len(), original_count - 1);
+        assert!(!filtered.iter().any(|t| t.function.name == "bash_run"));
+    }
+
+    #[test]
+    fn filter_tool_definitions_no_filters() {
+        let defs = tool_definitions();
+        let original_count = defs.len();
+        let filtered = filter_tool_definitions(defs, None, None);
+        assert_eq!(filtered.len(), original_count);
     }
 }

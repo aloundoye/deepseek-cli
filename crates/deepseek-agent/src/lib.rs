@@ -15,7 +15,10 @@ use deepseek_store::{
     ProviderMetricRecord, Store, SubagentRunRecord, TaskQueueRecord, VerificationRunRecord,
 };
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
-use deepseek_tools::{AGENT_LEVEL_TOOLS, LocalToolHost, map_tool_name, tool_definitions};
+use deepseek_tools::{
+    AGENT_LEVEL_TOOLS, LocalToolHost, filter_tool_definitions, map_tool_name, tool_definitions,
+    tool_error_hint,
+};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -210,6 +213,16 @@ type SubagentWorkerFn = Arc<dyn Fn(String) -> Result<String> + Send + Sync>;
 pub struct ChatOptions {
     /// Whether to include tool definitions and allow tool execution.
     pub tools: bool,
+    /// If set, only these tool function names are sent to the LLM.
+    pub allowed_tools: Option<Vec<String>>,
+    /// If set, these tool function names are removed before sending to the LLM.
+    pub disallowed_tools: Option<Vec<String>>,
+    /// Replace the default system prompt entirely.
+    pub system_prompt_override: Option<String>,
+    /// Append text to the default system prompt.
+    pub system_prompt_append: Option<String>,
+    /// Additional directories to include in workspace context.
+    pub additional_dirs: Vec<PathBuf>,
 }
 
 pub struct AgentEngine {
@@ -277,6 +290,16 @@ impl AgentEngine {
     /// Override max budget USD limit (from CLI flag).
     pub fn set_max_budget_usd(&mut self, max: Option<f64>) {
         self.max_budget_usd = max;
+    }
+
+    /// Override the permission mode at runtime (from CLI flag).
+    pub fn set_permission_mode(&mut self, mode: &str) {
+        self.policy = PolicyEngine::from_mode(mode);
+    }
+
+    /// Enable verbose logging on the observer.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.observer.set_verbose(verbose);
     }
 
     /// Set an external approval handler (e.g. for TUI/raw-mode compatible input).
@@ -995,7 +1018,13 @@ impl AgentEngine {
 
     /// Chat-with-tools loop (convenience wrapper with tools enabled).
     pub fn chat(&self, prompt: &str) -> Result<String> {
-        self.chat_with_options(prompt, ChatOptions { tools: true })
+        self.chat_with_options(
+            prompt,
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// Chat loop with configurable options. When `options.tools` is false, no tool
@@ -1013,14 +1042,39 @@ impl AgentEngine {
                 content: prompt.to_string(),
             },
         )?;
+        self.emit(
+            session.session_id,
+            EventKind::ChatTurnV1 {
+                message: ChatMessage::User {
+                    content: prompt.to_string(),
+                },
+            },
+        )?;
 
         // Build system prompt with workspace context
-        let system_prompt = self.build_chat_system_prompt(prompt)?;
+        let system_prompt = if let Some(ref override_prompt) = options.system_prompt_override {
+            override_prompt.clone()
+        } else {
+            let base = self.build_chat_system_prompt(prompt)?;
+            if let Some(ref append) = options.system_prompt_append {
+                format!("{base}\n\n{append}")
+            } else {
+                base
+            }
+        };
         let tools = if options.tools {
-            tool_definitions()
+            let all = tool_definitions();
+            filter_tool_definitions(
+                all,
+                options.allowed_tools.as_deref(),
+                options.disallowed_tools.as_deref(),
+            )
         } else {
             vec![]
         };
+
+        self.observer
+            .verbose_log(&format!("chat: {} tool definitions loaded", tools.len()));
 
         // Initialize conversation with system + user message
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
@@ -1029,14 +1083,14 @@ impl AgentEngine {
 
         // Load prior conversation turns if resuming an existing session
         let projection = self.store.rebuild_from_events(session.session_id)?;
-        if projection.transcript.len() > 1 {
-            // Session has prior turns — restore them as messages.
-            // Tool results are included as user context summaries since we
-            // cannot reconstruct exact tool_call IDs for the API format.
+        if !projection.chat_messages.is_empty() {
+            // Prefer structured ChatTurnV1 messages (preserves tool_call IDs)
+            messages.extend(projection.chat_messages.iter().cloned());
+        } else if projection.transcript.len() > 1 {
+            // Fallback: legacy string-based transcript (older sessions)
             let mut pending_tool_summaries: Vec<String> = Vec::new();
             for entry in &projection.transcript {
                 if let Some(content) = entry.strip_prefix("user: ") {
-                    // Flush any pending tool summaries before the next user message
                     if !pending_tool_summaries.is_empty() {
                         messages.push(ChatMessage::User {
                             content: format!(
@@ -1050,7 +1104,6 @@ impl AgentEngine {
                         content: content.to_string(),
                     });
                 } else if let Some(content) = entry.strip_prefix("assistant: ") {
-                    // Flush any pending tool summaries before the next assistant message
                     if !pending_tool_summaries.is_empty() {
                         messages.push(ChatMessage::User {
                             content: format!(
@@ -1068,7 +1121,6 @@ impl AgentEngine {
                     pending_tool_summaries.push(content.to_string());
                 }
             }
-            // Flush remaining tool summaries
             if !pending_tool_summaries.is_empty() {
                 messages.push(ChatMessage::User {
                     content: format!(
@@ -1088,6 +1140,7 @@ impl AgentEngine {
         let mut turn_count: u64 = 0;
         let mut failure_streak: u32 = 0;
         let mut empty_response_count: u32 = 0;
+        let mut budget_warned = false;
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
         loop {
@@ -1111,8 +1164,7 @@ impl AgentEngine {
                     });
                 }
                 return Err(anyhow!(
-                    "Reached maximum turn limit ({}). The task may be too complex for a single session.",
-                    max_turns
+                    "Reached maximum turn limit ({max_turns}). Use --max-turns to increase the limit, or break the task into smaller pieces."
                 ));
             }
 
@@ -1139,9 +1191,26 @@ impl AgentEngine {
                         });
                     }
                     return Err(anyhow!(
-                        "Budget limit reached (${:.2} / ${:.2})",
+                        "Budget limit reached (${:.2}/${:.2}). Use --max-budget-usd to increase the limit.",
                         cost,
                         max_usd
+                    ));
+                }
+                // Warn at 80% budget usage (once per session)
+                if !budget_warned && cost >= max_usd * 0.8 {
+                    budget_warned = true;
+                    let remaining = max_usd - cost;
+                    if let Ok(cb_guard) = self.stream_callback.lock()
+                        && let Some(ref cb) = *cb_guard
+                    {
+                        cb(StreamChunk::ContentDelta(format!(
+                            "\n⚠ Budget warning: ${:.2}/${:.2} used ({:.0}%). ${:.2} remaining.\n",
+                            cost, max_usd, cost / max_usd * 100.0, remaining
+                        )));
+                    }
+                    self.observer.verbose_log(&format!(
+                        "budget warning: ${:.2}/{:.2} ({:.0}%)",
+                        cost, max_usd, cost / max_usd * 100.0
                     ));
                 }
             }
@@ -1228,6 +1297,13 @@ impl AgentEngine {
                 temperature: Some(0.0),
             };
 
+            self.observer.verbose_log(&format!(
+                "turn {turn_count}: calling LLM model={} messages={} tools={}",
+                request.model,
+                request.messages.len(),
+                request.tools.len()
+            ));
+
             // Call the LLM with streaming (clone the Arc so it persists across turns)
             let response = {
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
@@ -1311,6 +1387,15 @@ impl AgentEngine {
                         content: answer.clone(),
                     },
                 )?;
+                self.emit(
+                    session.session_id,
+                    EventKind::ChatTurnV1 {
+                        message: ChatMessage::Assistant {
+                            content: Some(answer.clone()),
+                            tool_calls: vec![],
+                        },
+                    },
+                )?;
 
                 self.tool_host.fire_stop_hooks();
                 let _ = self.transition(&mut session, SessionState::Completed);
@@ -1363,12 +1448,42 @@ impl AgentEngine {
                     },
                 )?;
             }
+            // Persist full assistant message with tool_calls for resume
+            self.emit(
+                session.session_id,
+                EventKind::ChatTurnV1 {
+                    message: ChatMessage::Assistant {
+                        content: if response.text.is_empty() {
+                            None
+                        } else {
+                            Some(response.text.clone())
+                        },
+                        tool_calls: response.tool_calls.clone(),
+                    },
+                },
+            )?;
 
             // Execute each tool call and collect results
             for tc in &response.tool_calls {
                 let internal_name = map_tool_name(&tc.name);
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+
+                // Safety net: block disallowed tools at execution time
+                if let Some(ref deny_list) = options.disallowed_tools
+                    && deny_list.iter().any(|d| d == &tc.name)
+                {
+                    self.observer
+                        .verbose_log(&format!("blocked disallowed tool: {}", tc.name));
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: format!(
+                            "Error: tool '{}' is not allowed in this session",
+                            tc.name
+                        ),
+                    });
+                    continue;
+                }
 
                 // ── Agent-level tools (handled here, not by LocalToolHost) ──
                 if AGENT_LEVEL_TOOLS.contains(&internal_name) {
@@ -1483,7 +1598,16 @@ impl AgentEngine {
                         failure_streak += 1;
                     }
 
-                    truncate_tool_output(internal_name, &result.output.to_string(), 30000)
+                    let mut output =
+                        truncate_tool_output(internal_name, &result.output.to_string(), 30000);
+                    // Append actionable hint for failed tools
+                    if !result.success
+                        && let Some(hint) = tool_error_hint(internal_name, &output)
+                    {
+                        output.push_str("\n\n");
+                        output.push_str(&hint);
+                    }
+                    output
                 } else {
                     failure_streak += 1;
                     // Notify TUI of denial
@@ -1502,10 +1626,11 @@ impl AgentEngine {
                 };
 
                 // Add tool result message to conversation
-                messages.push(ChatMessage::Tool {
+                let tool_msg = ChatMessage::Tool {
                     tool_call_id: tc.id.clone(),
                     content: tool_result.clone(),
-                });
+                };
+                messages.push(tool_msg.clone());
 
                 // Emit tool interaction as transcript entry for session resume
                 let status = if approved { "ok" } else { "denied" };
@@ -1519,6 +1644,12 @@ impl AgentEngine {
                     EventKind::TurnAddedV1 {
                         role: "tool".to_string(),
                         content: format!("[{}] {}: {}", internal_name, status, result_preview),
+                    },
+                )?;
+                self.emit(
+                    session.session_id,
+                    EventKind::ChatTurnV1 {
+                        message: tool_msg,
                     },
                 )?;
             }
@@ -4442,30 +4573,56 @@ fn seconds_until_off_peak_start(current_hour: u8, start_hour: u8) -> u64 {
     minutes_until * 60
 }
 
+/// Estimate BPE token count using word/character hybrid heuristic.
+///
+/// More accurate than simple `chars/4`: counts whitespace-delimited words
+/// and applies a per-word multiplier based on word length. For BPE tokenizers
+/// (including DeepSeek's), short words (~1 token each), medium words (~1-2
+/// tokens), long words / identifiers (~2-4 tokens). Also adds overhead for
+/// message framing (~4 tokens per message).
 fn estimate_tokens(text: &str) -> u64 {
-    // Rough token estimate for local accounting and status reporting.
-    (text.chars().count() as u64).div_ceil(4)
+    if text.is_empty() {
+        return 0;
+    }
+    let mut tokens: u64 = 0;
+    for word in text.split_whitespace() {
+        let len = word.len();
+        tokens += match len {
+            0 => 0,
+            1..=3 => 1,   // short words/symbols: 1 token
+            4..=7 => 2,   // common words: ~1.5 tokens
+            8..=15 => 3,  // longer words/identifiers: ~2-3 tokens
+            _ => (len as u64).div_ceil(4), // very long tokens: ~4 chars/token
+        };
+    }
+    // Account for whitespace tokens and message framing overhead
+    tokens.max(1)
 }
 
 fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
+    // Each message has ~4 tokens of framing overhead (role, delimiters).
+    const MSG_OVERHEAD: u64 = 4;
     messages
         .iter()
-        .map(|m| match m {
-            ChatMessage::System { content } | ChatMessage::User { content } => {
-                estimate_tokens(content)
-            }
-            ChatMessage::Assistant {
-                content,
-                tool_calls,
-            } => {
-                let c = content.as_deref().map(estimate_tokens).unwrap_or(0);
-                let t: u64 = tool_calls
-                    .iter()
-                    .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments))
-                    .sum();
-                c + t
-            }
-            ChatMessage::Tool { content, .. } => estimate_tokens(content),
+        .map(|m| {
+            MSG_OVERHEAD
+                + match m {
+                    ChatMessage::System { content } | ChatMessage::User { content } => {
+                        estimate_tokens(content)
+                    }
+                    ChatMessage::Assistant {
+                        content,
+                        tool_calls,
+                    } => {
+                        let c = content.as_deref().map(estimate_tokens).unwrap_or(0);
+                        let t: u64 = tool_calls
+                            .iter()
+                            .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments))
+                            .sum();
+                        c + t
+                    }
+                    ChatMessage::Tool { content, .. } => estimate_tokens(content),
+                }
         })
         .sum()
 }

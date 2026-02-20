@@ -262,6 +262,10 @@ pub enum EventKind {
         role: String,
         content: String,
     },
+    /// Structured chat turn with full tool_call data for accurate session resume.
+    ChatTurnV1 {
+        message: ChatMessage,
+    },
     SessionStateChangedV1 {
         from: SessionState,
         to: SessionState,
