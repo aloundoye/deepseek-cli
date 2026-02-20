@@ -555,6 +555,10 @@ pub enum EventKind {
     ExitPlanModeV1 {
         session_id: Uuid,
     },
+    ProviderSelectedV1 {
+        provider: String,
+        model: String,
+    },
 }
 
 pub trait Planner {
@@ -627,7 +631,87 @@ pub enum StreamChunk {
 }
 
 /// Callback type for receiving streaming chunks.
-pub type StreamCallback = Box<dyn FnMut(StreamChunk) + Send>;
+/// Uses `Arc<dyn Fn>` so it can be cloned across multiple turns in a chat loop.
+pub type StreamCallback = std::sync::Arc<dyn Fn(StreamChunk) + Send + Sync>;
+
+// ── Chat-with-tools types (DeepSeek function calling) ──────────────────
+
+/// A message in a multi-turn conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "role")]
+pub enum ChatMessage {
+    #[serde(rename = "system")]
+    System { content: String },
+    #[serde(rename = "user")]
+    User { content: String },
+    #[serde(rename = "assistant")]
+    Assistant {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        tool_calls: Vec<LlmToolCall>,
+    },
+    #[serde(rename = "tool")]
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+/// A tool (function) definition sent to the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDefinition,
+}
+
+/// The function schema within a tool definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Controls how the model picks tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// "none", "auto", or "required"
+    Mode(String),
+    /// Force a specific function.
+    Function {
+        #[serde(rename = "type")]
+        choice_type: String,
+        function: ToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
+impl ToolChoice {
+    pub fn auto() -> Self {
+        Self::Mode("auto".to_string())
+    }
+    pub fn none() -> Self {
+        Self::Mode("none".to_string())
+    }
+}
+
+/// Request for the chat-with-tools API.
+#[derive(Debug, Clone)]
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

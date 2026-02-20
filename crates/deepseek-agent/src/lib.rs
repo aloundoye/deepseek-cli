@@ -1,18 +1,19 @@
 use anyhow::{Result, anyhow};
 use chrono::{Timelike, Utc};
 use deepseek_core::{
-    AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ExecContext, Executor, Failure,
-    LlmRequest, LlmUnit, ModelRouter, Plan, PlanContext, PlanStep, Planner, RouterSignals, Session,
-    SessionBudgets, SessionState, StepOutcome, ToolCall, ToolHost,
+    AppConfig, ApprovedToolCall, ChatMessage, ChatRequest, EventEnvelope, EventKind, ExecContext,
+    Executor, Failure, LlmRequest, LlmUnit, ModelRouter, Plan, PlanContext, PlanStep, Planner,
+    RouterSignals, Session, SessionBudgets, SessionState, StepOutcome, StreamChunk, ToolCall,
+    ToolChoice, ToolHost, is_valid_session_state_transition,
 };
 use deepseek_llm::{DeepSeekClient, LlmClient};
-use deepseek_memory::MemoryManager;
+use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_router::WeightedRouter;
 use deepseek_store::{ProviderMetricRecord, Store, SubagentRunRecord, VerificationRunRecord};
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
-use deepseek_tools::LocalToolHost;
+use deepseek_tools::{LocalToolHost, map_tool_name, tool_definitions};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -197,6 +198,15 @@ impl Executor for SimpleExecutor {
     }
 }
 
+type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
+
+/// Options for `chat_with_options()`.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOptions {
+    /// Whether to include tool definitions and allow tool execution.
+    pub tools: bool,
+}
+
 pub struct AgentEngine {
     workspace: PathBuf,
     store: Store,
@@ -214,6 +224,8 @@ pub struct AgentEngine {
     max_turns: Option<u64>,
     /// Maximum cost in USD before stopping (CLI override).
     max_budget_usd: Option<f64>,
+    /// Optional external approval handler (e.g. crossterm-based for TUI mode).
+    approval_handler: Mutex<Option<ApprovalHandler>>,
 }
 
 impl AgentEngine {
@@ -242,6 +254,7 @@ impl AgentEngine {
             stream_callback: Mutex::new(None),
             max_turns,
             max_budget_usd,
+            approval_handler: Mutex::new(None),
         })
     }
 
@@ -253,6 +266,13 @@ impl AgentEngine {
     /// Override max budget USD limit (from CLI flag).
     pub fn set_max_budget_usd(&mut self, max: Option<f64>) {
         self.max_budget_usd = max;
+    }
+
+    /// Set an external approval handler (e.g. for TUI/raw-mode compatible input).
+    pub fn set_approval_handler(&self, handler: ApprovalHandler) {
+        if let Ok(mut guard) = self.approval_handler.lock() {
+            *guard = Some(handler);
+        }
     }
 
     /// Set a streaming callback that will be invoked for each token chunk
@@ -554,10 +574,14 @@ impl AgentEngine {
         Ok(plan)
     }
 
+    #[deprecated(note = "use chat() or chat_with_options() instead")]
+    #[allow(deprecated)]
     pub fn run_once(&self, prompt: &str, allow_tools: bool) -> Result<String> {
         self.run_once_with_mode_and_priority(prompt, allow_tools, false, false)
     }
 
+    #[deprecated(note = "use chat() or chat_with_options() instead")]
+    #[allow(deprecated)]
     pub fn run_once_with_mode(
         &self,
         prompt: &str,
@@ -567,6 +591,8 @@ impl AgentEngine {
         self.run_once_with_mode_and_priority(prompt, allow_tools, force_max_think, false)
     }
 
+    #[deprecated(note = "use chat() or chat_with_options() instead")]
+    #[allow(deprecated)]
     pub fn run_once_with_mode_and_priority(
         &self,
         prompt: &str,
@@ -910,7 +936,7 @@ impl AgentEngine {
         self.tool_host.fire_stop_hooks();
 
         let projection = self.store.rebuild_from_events(session.session_id)?;
-        Ok(format!(
+        let summary = format!(
             "session={} steps={} failures={} subagents={} router_models={:?} base_model={} max_model={}",
             session.session_id,
             projection.step_status.len(),
@@ -919,7 +945,674 @@ impl AgentEngine {
             projection.router_models,
             self.cfg.llm.base_model,
             self.cfg.llm.max_think_model
-        ))
+        );
+        if let Ok(manager) = MemoryManager::new(&self.workspace) {
+            let mut patterns = Vec::new();
+            patterns.push(format!(
+                "steps={} verification_failures={} execution_failed={}",
+                plan.steps.len(),
+                verification_failures,
+                execution_failed
+            ));
+            if verification_failures > 0 {
+                patterns.push("verification failures require focused plan revision".to_string());
+            }
+            let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                objective: prompt.to_string(),
+                summary: summary.clone(),
+                success: run_succeeded,
+                patterns,
+                recorded_at: None,
+            });
+        }
+        Ok(summary)
+    }
+
+    /// Chat-with-tools loop (convenience wrapper with tools enabled).
+    pub fn chat(&self, prompt: &str) -> Result<String> {
+        self.chat_with_options(prompt, ChatOptions { tools: true })
+    }
+
+    /// Chat loop with configurable options. When `options.tools` is false, no tool
+    /// definitions are sent and the model produces a single text response.
+    pub fn chat_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let mut session = self.ensure_session()?;
+
+        self.tool_host.fire_session_hooks("sessionstart");
+        self.transition(&mut session, SessionState::Planning)?;
+
+        self.emit(
+            session.session_id,
+            EventKind::TurnAddedV1 {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            },
+        )?;
+
+        // Build system prompt with workspace context
+        let system_prompt = self.build_chat_system_prompt(prompt)?;
+        let tools = if options.tools {
+            tool_definitions()
+        } else {
+            vec![]
+        };
+
+        // Initialize conversation with system + user message
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
+            content: system_prompt,
+        }];
+
+        // Load prior conversation turns if resuming an existing session
+        let projection = self.store.rebuild_from_events(session.session_id)?;
+        if projection.transcript.len() > 1 {
+            // Session has prior turns — restore them as messages.
+            // Tool results are included as user context summaries since we
+            // cannot reconstruct exact tool_call IDs for the API format.
+            let mut pending_tool_summaries: Vec<String> = Vec::new();
+            for entry in &projection.transcript {
+                if let Some(content) = entry.strip_prefix("user: ") {
+                    // Flush any pending tool summaries before the next user message
+                    if !pending_tool_summaries.is_empty() {
+                        messages.push(ChatMessage::User {
+                            content: format!(
+                                "[Prior tool results]\n{}",
+                                pending_tool_summaries.join("\n")
+                            ),
+                        });
+                        pending_tool_summaries.clear();
+                    }
+                    messages.push(ChatMessage::User {
+                        content: content.to_string(),
+                    });
+                } else if let Some(content) = entry.strip_prefix("assistant: ") {
+                    // Flush any pending tool summaries before the next assistant message
+                    if !pending_tool_summaries.is_empty() {
+                        messages.push(ChatMessage::User {
+                            content: format!(
+                                "[Prior tool results]\n{}",
+                                pending_tool_summaries.join("\n")
+                            ),
+                        });
+                        pending_tool_summaries.clear();
+                    }
+                    messages.push(ChatMessage::Assistant {
+                        content: Some(content.to_string()),
+                        tool_calls: vec![],
+                    });
+                } else if let Some(content) = entry.strip_prefix("tool: ") {
+                    pending_tool_summaries.push(content.to_string());
+                }
+            }
+            // Flush remaining tool summaries
+            if !pending_tool_summaries.is_empty() {
+                messages.push(ChatMessage::User {
+                    content: format!(
+                        "[Prior tool results]\n{}",
+                        pending_tool_summaries.join("\n")
+                    ),
+                });
+            }
+        }
+
+        // Add the current user message
+        messages.push(ChatMessage::User {
+            content: prompt.to_string(),
+        });
+
+        let max_turns = self.max_turns.unwrap_or(200);
+        let mut turn_count: u64 = 0;
+        let mut failure_streak: u32 = 0;
+        let mut empty_response_count: u32 = 0;
+        self.transition(&mut session, SessionState::ExecutingStep)?;
+
+        loop {
+            turn_count += 1;
+            if turn_count > max_turns {
+                let _ = self.transition(&mut session, SessionState::Failed);
+                if let Ok(manager) = MemoryManager::new(&self.workspace) {
+                    let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                        objective: prompt.to_string(),
+                        summary: format!(
+                            "chat failed: max turn limit ({}) reached, failure_streak={}",
+                            max_turns, failure_streak
+                        ),
+                        success: false,
+                        patterns: vec![
+                            format!("turns={max_turns} failure_streak={failure_streak}"),
+                            "max turn limit suggests task is too complex for single session"
+                                .to_string(),
+                        ],
+                        recorded_at: None,
+                    });
+                }
+                return Err(anyhow!(
+                    "Reached maximum turn limit ({}). The task may be too complex for a single session.",
+                    max_turns
+                ));
+            }
+
+            // Budget check
+            if let Some(max_usd) = self.max_budget_usd {
+                let cost = self
+                    .store
+                    .total_session_cost(session.session_id)
+                    .unwrap_or(0.0);
+                if cost >= max_usd {
+                    let _ = self.transition(&mut session, SessionState::Failed);
+                    if let Ok(manager) = MemoryManager::new(&self.workspace) {
+                        let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                            objective: prompt.to_string(),
+                            summary: format!(
+                                "chat failed: budget limit (${:.2}/${:.2}) at turn {}, failure_streak={}",
+                                cost, max_usd, turn_count, failure_streak
+                            ),
+                            success: false,
+                            patterns: vec![format!(
+                                "turns={turn_count} failure_streak={failure_streak} cost=${cost:.2}"
+                            )],
+                            recorded_at: None,
+                        });
+                    }
+                    return Err(anyhow!(
+                        "Budget limit reached (${:.2} / ${:.2})",
+                        cost,
+                        max_usd
+                    ));
+                }
+            }
+
+            // Context window compaction
+            let token_count = estimate_messages_tokens(&messages);
+            let threshold = (self.cfg.llm.context_window_tokens as f64
+                * self.cfg.context.auto_compact_threshold.clamp(0.1, 1.0) as f64)
+                as u64;
+            if token_count > threshold && messages.len() > 4 {
+                // Keep system prompt (index 0) + last 6 messages
+                let keep_tail = 6.min(messages.len() - 1);
+                let compacted_range = &messages[1..messages.len() - keep_tail];
+                let summary = summarize_chat_messages(compacted_range);
+                let from_turn = 1u64;
+                let to_turn = compacted_range.len() as u64;
+                let summary_id = Uuid::now_v7();
+
+                let mut new_messages = vec![messages[0].clone()];
+                new_messages.push(ChatMessage::User {
+                    content: format!("[Context compacted — prior conversation summary]\n{summary}"),
+                });
+                new_messages.extend_from_slice(&messages[messages.len() - keep_tail..]);
+                let new_token_count = estimate_messages_tokens(&new_messages);
+
+                self.emit(
+                    session.session_id,
+                    EventKind::ContextCompactedV1 {
+                        summary_id,
+                        from_turn,
+                        to_turn,
+                        token_delta_estimate: token_count as i64 - new_token_count as i64,
+                        replay_pointer: String::new(),
+                    },
+                )?;
+
+                messages = new_messages;
+            }
+
+            // Route model selection based on complexity signals
+            let verification_failure_count = self
+                .store
+                .list_recent_verification_runs(session.session_id, 10)
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| !r.success)
+                .count() as f32;
+            let conversation_depth = (messages.len() as f32 / 20.0).min(1.0);
+            let ambiguity = if prompt.contains('?')
+                || prompt.contains(" or ")
+                || prompt.contains("which ")
+                || prompt.contains("should ")
+            {
+                0.5
+            } else {
+                0.0
+            };
+            let signals = RouterSignals {
+                prompt_complexity: (prompt.len() as f32 / 500.0).min(1.0),
+                repo_breadth: conversation_depth,
+                failure_streak: (failure_streak as f32 / 3.0).min(1.0),
+                verification_failures: (verification_failure_count / 3.0).min(1.0),
+                low_confidence: if empty_response_count > 0 { 0.6 } else { 0.2 },
+                ambiguity_flags: ambiguity,
+            };
+            let decision = self.router.select(LlmUnit::Executor, signals);
+            self.emit(
+                session.session_id,
+                EventKind::RouterDecisionV1 {
+                    decision: decision.clone(),
+                },
+            )?;
+
+            let request = ChatRequest {
+                model: decision.selected_model.clone(),
+                messages: messages.clone(),
+                tools: tools.clone(),
+                tool_choice: if options.tools {
+                    ToolChoice::auto()
+                } else {
+                    ToolChoice::none()
+                },
+                max_tokens: session.budgets.max_think_tokens.max(4096),
+                temperature: Some(0.0),
+            };
+
+            // Call the LLM with streaming (clone the Arc so it persists across turns)
+            let response = {
+                let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                if let Some(cb) = cb {
+                    self.llm.complete_chat_streaming(&request, cb)?
+                } else {
+                    self.llm.complete_chat(&request)?
+                }
+            };
+
+            // Escalation retry: if base model returned empty response and we weren't
+            // already using the reasoner, retry with the max_think model once.
+            let response =
+                if response.text.is_empty() && response.tool_calls.is_empty() && turn_count <= 1 {
+                    let max_model = &self.cfg.llm.max_think_model;
+                    if decision.selected_model != *max_model {
+                        self.emit(
+                            session.session_id,
+                            EventKind::RouterEscalationV1 {
+                                reason_codes: vec!["empty_response_escalation".to_string()],
+                            },
+                        )?;
+                        let escalated_request = ChatRequest {
+                            model: max_model.clone(),
+                            ..request
+                        };
+                        let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                        if let Some(cb) = cb {
+                            self.llm.complete_chat_streaming(&escalated_request, cb)?
+                        } else {
+                            self.llm.complete_chat(&escalated_request)?
+                        }
+                    } else {
+                        response
+                    }
+                } else {
+                    response
+                };
+
+            // Record usage metrics
+            let input_tok = estimate_tokens(
+                &messages
+                    .iter()
+                    .map(|m| match m {
+                        ChatMessage::System { content } | ChatMessage::User { content } => {
+                            content.as_str()
+                        }
+                        ChatMessage::Assistant { content, .. } => content.as_deref().unwrap_or(""),
+                        ChatMessage::Tool { content, .. } => content.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            );
+            let output_tok =
+                estimate_tokens(&response.text) + estimate_tokens(&response.reasoning_content);
+            self.emit(
+                session.session_id,
+                EventKind::UsageUpdatedV1 {
+                    unit: LlmUnit::Executor,
+                    model: decision.selected_model.clone(),
+                    input_tokens: input_tok,
+                    output_tokens: output_tok,
+                },
+            )?;
+            self.emit_cost_event(session.session_id, input_tok, output_tok)?;
+
+            // If the model returned text content with no tool calls, we're done
+            if response.tool_calls.is_empty() {
+                let answer = if !response.text.is_empty() {
+                    response.text.clone()
+                } else if !response.reasoning_content.is_empty() {
+                    response.reasoning_content.clone()
+                } else {
+                    "(No response generated)".to_string()
+                };
+
+                self.emit(
+                    session.session_id,
+                    EventKind::TurnAddedV1 {
+                        role: "assistant".to_string(),
+                        content: answer.clone(),
+                    },
+                )?;
+
+                self.tool_host.fire_stop_hooks();
+                let _ = self.transition(&mut session, SessionState::Completed);
+
+                // Persist memory observation for future sessions
+                if let Ok(manager) = MemoryManager::new(&self.workspace) {
+                    let mut patterns = vec![format!(
+                        "turns={turn_count} failure_streak={failure_streak}"
+                    )];
+                    if failure_streak > 0 {
+                        patterns.push(
+                            "some tool failures occurred but task completed successfully"
+                                .to_string(),
+                        );
+                    }
+                    let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                        objective: prompt.to_string(),
+                        summary: format!(
+                            "chat completed in {} turns, failure_streak={}",
+                            turn_count, failure_streak
+                        ),
+                        success: true,
+                        patterns,
+                        recorded_at: None,
+                    });
+                }
+
+                return Ok(answer);
+            }
+
+            // The model wants to call tools — add the assistant message with tool_calls
+            if response.text.is_empty() {
+                empty_response_count += 1;
+            }
+            messages.push(ChatMessage::Assistant {
+                content: if response.text.is_empty() {
+                    None
+                } else {
+                    Some(response.text.clone())
+                },
+                tool_calls: response.tool_calls.clone(),
+            });
+
+            if !response.text.is_empty() {
+                self.emit(
+                    session.session_id,
+                    EventKind::TurnAddedV1 {
+                        role: "assistant".to_string(),
+                        content: response.text.clone(),
+                    },
+                )?;
+            }
+
+            // Execute each tool call and collect results
+            for tc in &response.tool_calls {
+                let internal_name = map_tool_name(&tc.name);
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+
+                let tool_call = ToolCall {
+                    name: internal_name.to_string(),
+                    args: args.clone(),
+                    requires_approval: false,
+                };
+
+                // Emit tool proposal event
+                let proposal = self.tool_host.propose(tool_call.clone());
+                self.emit(
+                    session.session_id,
+                    EventKind::ToolProposedV1 {
+                        proposal: proposal.clone(),
+                    },
+                )?;
+
+                // Check approval
+                let approved = proposal.approved
+                    || self.request_tool_approval(&proposal.call).unwrap_or(false);
+
+                let tool_arg_summary = summarize_tool_args(internal_name, &args);
+                let tool_result = if approved {
+                    self.emit(
+                        session.session_id,
+                        EventKind::ToolApprovedV1 {
+                            invocation_id: proposal.invocation_id,
+                        },
+                    )?;
+
+                    // Notify TUI that a tool is being executed
+                    if let Ok(mut cb_guard) = self.stream_callback.lock()
+                        && let Some(ref mut cb) = *cb_guard
+                    {
+                        let detail = if tool_arg_summary.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {tool_arg_summary}")
+                        };
+                        cb(StreamChunk::ContentDelta(format!(
+                            "\n[tool: {}]{detail}\n",
+                            internal_name
+                        )));
+                    }
+
+                    let tool_start = Instant::now();
+                    let result = self.tool_host.execute(ApprovedToolCall {
+                        invocation_id: proposal.invocation_id,
+                        call: proposal.call,
+                    });
+                    let tool_elapsed = tool_start.elapsed();
+
+                    self.emit(
+                        session.session_id,
+                        EventKind::ToolResultV1 {
+                            result: result.clone(),
+                        },
+                    )?;
+
+                    // Notify TUI of completion with result preview
+                    if let Ok(mut cb_guard) = self.stream_callback.lock()
+                        && let Some(ref mut cb) = *cb_guard
+                    {
+                        let status_label = if result.success { "ok" } else { "error" };
+                        let output_str = result.output.to_string();
+                        let preview = if output_str.len() > 200 {
+                            format!("{}...", &output_str[..output_str.floor_char_boundary(200)])
+                        } else {
+                            output_str
+                        };
+                        let preview_line = preview
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(120)
+                            .collect::<String>();
+                        cb(StreamChunk::ContentDelta(format!(
+                            "[tool: {}] {status_label} ({:.1}s) {preview_line}\n",
+                            internal_name,
+                            tool_elapsed.as_secs_f64()
+                        )));
+                    }
+
+                    if result.success {
+                        failure_streak = 0;
+                    } else {
+                        failure_streak += 1;
+                    }
+
+                    truncate_tool_output(&result.output.to_string(), 30000)
+                } else {
+                    failure_streak += 1;
+                    // Notify TUI of denial
+                    if let Ok(mut cb_guard) = self.stream_callback.lock()
+                        && let Some(ref mut cb) = *cb_guard
+                    {
+                        cb(StreamChunk::ContentDelta(format!(
+                            "\n[tool: {}] denied (requires approval)\n",
+                            internal_name
+                        )));
+                    }
+                    format!(
+                        "Tool '{}' requires approval. Please grant permission to proceed.",
+                        internal_name
+                    )
+                };
+
+                // Add tool result message to conversation
+                messages.push(ChatMessage::Tool {
+                    tool_call_id: tc.id.clone(),
+                    content: tool_result.clone(),
+                });
+
+                // Emit tool interaction as transcript entry for session resume
+                let status = if approved { "ok" } else { "denied" };
+                let result_preview = if tool_result.len() > 200 {
+                    format!("{}...", &tool_result[..200])
+                } else {
+                    tool_result
+                };
+                self.emit(
+                    session.session_id,
+                    EventKind::TurnAddedV1 {
+                        role: "tool".to_string(),
+                        content: format!("[{}] {}: {}", internal_name, status, result_preview),
+                    },
+                )?;
+            }
+        }
+    }
+
+    /// Build a system prompt for chat-with-tools mode.
+    fn build_chat_system_prompt(&self, _user_prompt: &str) -> Result<String> {
+        let workspace = self.workspace.to_string_lossy();
+        let now = Utc::now();
+
+        // Detect project type
+        let mut project_markers = Vec::new();
+        for (file, lang) in &[
+            ("Cargo.toml", "Rust"),
+            ("package.json", "JavaScript/TypeScript"),
+            ("pyproject.toml", "Python"),
+            ("go.mod", "Go"),
+            ("pom.xml", "Java/Maven"),
+            ("build.gradle", "Java/Gradle"),
+            ("Gemfile", "Ruby"),
+            ("composer.json", "PHP"),
+            ("CMakeLists.txt", "C/C++"),
+            ("Makefile", "Make"),
+        ] {
+            if self.workspace.join(file).exists() {
+                project_markers.push(*lang);
+            }
+        }
+        let project_info = if project_markers.is_empty() {
+            String::new()
+        } else {
+            format!("Project type: {}\n", project_markers.join(", "))
+        };
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
+        let permission_mode = self.policy.permission_mode();
+        let base_model = &self.cfg.llm.base_model;
+        let max_model = &self.cfg.llm.max_think_model;
+
+        // Try to get git branch and short status
+        let git_info = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&self.workspace)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .map(|branch| format!("Git branch: {branch}\n"))
+            .unwrap_or_default();
+
+        let mut parts = vec![format!(
+            "You are DeepSeek, an AI coding assistant powering the `deepseek` CLI. \
+             You help users with software engineering tasks including writing code, \
+             debugging, refactoring, testing, and explaining codebases.\n\n\
+             # Environment\n\
+             Working directory: {workspace}\n\
+             Platform: {} ({})\n\
+             Shell: {shell}\n\
+             Date: {}\n\
+             {project_info}\
+             {git_info}\
+             Models: {base_model} (fast) / {max_model} (reasoning)\n\
+             Permission mode: {permission_mode:?}\n\n\
+             # Permission Mode\n\
+             Current mode is **{permission_mode:?}**.\n\
+             - Ask: tool calls that modify files or run commands require user approval\n\
+             - Auto: tool calls matching the allowlist are auto-approved\n\
+             - Locked: all non-read operations are denied — read-only session\n\
+             Adjust your approach accordingly. In Locked mode, only use read tools.\n\n\
+             # Tool Usage Guidelines\n\
+             - **fs_read**: Always read a file before editing it. Use `start_line`/`end_line` for large files. Supports images and PDFs (use `pages` for PDFs).\n\
+             - **fs_edit**: Use exact `search` strings to make precise edits. The search string must appear verbatim in the file. Set `all: false` for first-occurrence-only.\n\
+             - **fs_write**: Only for creating new files. Prefer `fs_edit` to modify existing files.\n\
+             - **fs_glob**: Find files by pattern (e.g. `**/*.rs`). Use before grep to scope searches.\n\
+             - **fs_grep**: Search file contents with regex. Use `case_sensitive: false` for case-insensitive. Use `glob` to filter file types.\n\
+             - **bash_run**: Execute shell commands (git, build, test, etc.). Commands have a timeout (default 120s).\n\
+             - **multi_edit**: Batch edits across multiple files in one call. Each entry has a path and search/replace pairs.\n\
+             - **git_status / git_diff / git_show**: Inspect repository state, diffs, and specific commits.\n\
+             - **web_fetch**: Retrieve URL content as text. Use for documentation lookup.\n\
+             - **web_search**: Search the web and return structured results.\n\
+             - **index_query**: Full-text code search across the indexed codebase.\n\
+             - **diagnostics_check**: Run language-specific diagnostics (cargo check, tsc, ruff, etc.).\n\
+             - **patch_stage / patch_apply**: Stage and apply unified diffs with SHA verification.\n\
+             - **notebook_read / notebook_edit**: Read and modify Jupyter notebooks.\n\n\
+             # Safety Rules\n\
+             - Always read a file before editing it — understand existing code first\n\
+             - Never delete files, force-push, or run destructive commands without explicit user approval\n\
+             - Stay within the working directory unless told otherwise\n\
+             - Do not modify files outside the project without asking\n\
+             - Do not introduce security vulnerabilities (command injection, XSS, SQL injection)\n\
+             - Do not commit files containing secrets (.env, credentials, API keys)\n\n\
+             # Git Protocol\n\
+             - Create new commits — never amend unless explicitly asked\n\
+             - Never push without user confirmation\n\
+             - Use descriptive commit messages that explain the \"why\"\n\
+             - Stage specific files by name, not `git add -A` or `git add .`\n\
+             - Never use --force, --no-verify, or destructive git commands without asking\n\n\
+             # Error Recovery\n\
+             - If a tool call fails, read the error message carefully\n\
+             - Try a different approach rather than repeating the same call\n\
+             - Re-read the file after an edit failure to check current state\n\
+             - If blocked, explain the issue to the user rather than brute-forcing\n\n\
+             # Style\n\
+             - Be concise and focused — avoid over-engineering\n\
+             - Use markdown formatting in responses\n\
+             - Reference files with path:line_number format\n\
+             - When done, briefly explain what you changed and why",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            now.format("%Y-%m-%d"),
+        )];
+
+        // Add DEEPSEEK.md / memory if available
+        if let Ok(manager) = MemoryManager::new(&self.workspace)
+            && let Ok(memory) = manager.read_combined_memory()
+            && !memory.trim().is_empty()
+        {
+            parts.push(format!("\n\n[Project Memory]\n{memory}"));
+        }
+
+        // Add recent verification feedback
+        let session = self.ensure_session()?;
+        let verification_feedback = self
+            .store
+            .list_recent_verification_runs(session.session_id, 5)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|run| !run.success)
+            .take(3)
+            .collect::<Vec<_>>();
+        if !verification_feedback.is_empty() {
+            parts.push(format!(
+                "\n\n[Recent Verification Failures]\n{}",
+                format_verification_feedback(&verification_feedback)
+            ));
+        }
+
+        Ok(parts.join(""))
     }
 
     pub fn resume(&self) -> Result<String> {
@@ -1390,19 +2083,8 @@ impl AgentEngine {
 
         let started = Instant::now();
         let response = {
-            let has_cb = self
-                .stream_callback
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
-            if has_cb {
-                let cb = self
-                    .stream_callback
-                    .lock()
-                    .ok()
-                    .and_then(|mut g| g.take())
-                    .unwrap();
-                // Callback is consumed; for multi-call flows we don't re-stream
+            let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+            if let Some(cb) = cb {
                 self.llm.complete_streaming(req, cb)
             } else {
                 self.llm.complete(req)
@@ -1959,7 +2641,7 @@ impl AgentEngine {
 
     fn transition(&self, session: &mut Session, to: SessionState) -> Result<()> {
         let from = session.status.clone();
-        if !is_valid_transition(&from, &to) {
+        if !is_valid_session_state_transition(&from, &to) {
             return Err(anyhow!(
                 "invalid session state transition: {:?} -> {:?}",
                 from,
@@ -2177,6 +2859,14 @@ impl AgentEngine {
     }
 
     fn request_tool_approval(&self, call: &ToolCall) -> Result<bool> {
+        // Try external approval handler first (TUI / raw-mode compatible).
+        if let Ok(mut guard) = self.approval_handler.lock()
+            && let Some(handler) = guard.as_mut()
+        {
+            return handler(call);
+        }
+
+        // Fallback: blocking stdin for non-TUI mode.
         let mut stdout = std::io::stdout();
         let stdin = std::io::stdin();
         if !stdin.is_terminal() || !stdout.is_terminal() {
@@ -3437,6 +4127,191 @@ fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).div_ceil(4)
 }
 
+fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::System { content } | ChatMessage::User { content } => {
+                estimate_tokens(content)
+            }
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let c = content.as_deref().map(estimate_tokens).unwrap_or(0);
+                let t: u64 = tool_calls
+                    .iter()
+                    .map(|tc| estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments))
+                    .sum();
+                c + t
+            }
+            ChatMessage::Tool { content, .. } => estimate_tokens(content),
+        })
+        .sum()
+}
+
+fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "fs.read" | "fs.write" | "fs.edit" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("path={p}"))
+            .unwrap_or_default(),
+        "fs.glob" | "fs.grep" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("pattern={p}"))
+            .unwrap_or_default(),
+        "bash.run" => args
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .map(|c| {
+                if c.len() > 80 {
+                    format!("cmd={}...", &c[..80])
+                } else {
+                    format!("cmd={c}")
+                }
+            })
+            .unwrap_or_default(),
+        "multi_edit" => args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|a| format!("{} files", a.len()))
+            .unwrap_or_default(),
+        "web.fetch" => args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|u| {
+                if u.len() > 80 {
+                    format!("url={}...", &u[..80])
+                } else {
+                    format!("url={u}")
+                }
+            })
+            .unwrap_or_default(),
+        "web.search" => args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| format!("query={q}"))
+            .unwrap_or_default(),
+        "git.show" => args
+            .get("spec")
+            .and_then(|v| v.as_str())
+            .map(|s| format!("spec={s}"))
+            .unwrap_or_default(),
+        "index.query" => args
+            .get("q")
+            .and_then(|v| v.as_str())
+            .map(|q| format!("q={q}"))
+            .unwrap_or_default(),
+        "patch.stage" => args
+            .get("unified_diff")
+            .and_then(|v| v.as_str())
+            .map(|d| {
+                if d.len() > 100 {
+                    format!("diff={}...", &d[..100])
+                } else {
+                    format!("diff={d}")
+                }
+            })
+            .unwrap_or_default(),
+        "patch.apply" => args
+            .get("patch_id")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("patch_id={id}"))
+            .unwrap_or_default(),
+        "diagnostics.check" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("path={p}"))
+            .unwrap_or_else(|| "project".to_string()),
+        "notebook.read" | "notebook.edit" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("path={p}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() > 200 {
+        let head: Vec<&str> = lines[..100].to_vec();
+        let tail: Vec<&str> = lines[lines.len() - 100..].to_vec();
+        format!(
+            "{}\n... ({} lines omitted) ...\n{}",
+            head.join("\n"),
+            lines.len() - 200,
+            tail.join("\n")
+        )
+    } else {
+        // Byte-truncate at a safe char boundary
+        let truncated = &output[..output.floor_char_boundary(max_bytes)];
+        format!("{}... (truncated, {} bytes total)", truncated, output.len())
+    }
+}
+
+fn summarize_chat_messages(messages: &[ChatMessage]) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    for msg in messages {
+        match msg {
+            ChatMessage::System { .. } => {}
+            ChatMessage::User { content } => {
+                let truncated = if content.len() > 200 {
+                    format!("{}...", &content[..content.floor_char_boundary(200)])
+                } else {
+                    content.clone()
+                };
+                entries.push(format!("- User: {truncated}"));
+            }
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                if let Some(text) = content {
+                    let truncated = if text.len() > 200 {
+                        format!("{}...", &text[..text.floor_char_boundary(200)])
+                    } else {
+                        text.clone()
+                    };
+                    entries.push(format!("- Assistant: {truncated}"));
+                }
+                for tc in tool_calls {
+                    let summary = summarize_tool_args(
+                        map_tool_name(&tc.name),
+                        &serde_json::from_str(&tc.arguments).unwrap_or(json!({})),
+                    );
+                    entries.push(format!("- Tool call: {}({})", tc.name, summary));
+                }
+            }
+            ChatMessage::Tool { content, .. } => {
+                let truncated = if content.len() > 100 {
+                    format!("{}...", &content[..content.floor_char_boundary(100)])
+                } else {
+                    content.clone()
+                };
+                entries.push(format!("- Tool result: {truncated}"));
+            }
+        }
+    }
+    if entries.len() > 30 {
+        let head = &entries[..15];
+        let tail = &entries[entries.len() - 15..];
+        format!(
+            "{}\n... ({} entries omitted) ...\n{}",
+            head.join("\n"),
+            entries.len() - 30,
+            tail.join("\n")
+        )
+    } else {
+        entries.join("\n")
+    }
+}
+
 fn subagent_request_for_task(
     task: &SubagentTask,
     root_goal: &str,
@@ -4188,35 +5063,6 @@ fn augment_goal_with_subagent_notes(goal: &str, notes: &[String]) -> String {
     } else {
         format!("{goal} [subagent_findings: {joined}]")
     }
-}
-
-fn is_valid_transition(from: &SessionState, to: &SessionState) -> bool {
-    use SessionState::*;
-    if from == to {
-        return true;
-    }
-    matches!(
-        (from, to),
-        (Idle, Planning)
-            | (Completed, Planning)
-            | (Failed, Planning)
-            | (Planning, ExecutingStep)
-            | (Planning, Failed)
-            | (ExecutingStep, AwaitingApproval)
-            | (ExecutingStep, Planning)
-            | (ExecutingStep, Verifying)
-            | (ExecutingStep, Failed)
-            | (AwaitingApproval, ExecutingStep)
-            | (AwaitingApproval, Failed)
-            | (Verifying, ExecutingStep)
-            | (Verifying, Completed)
-            | (Verifying, Failed)
-            | (_, Paused)
-            | (Paused, Planning)
-            | (Paused, ExecutingStep)
-            | (Paused, Completed)
-            | (Paused, Failed)
-    )
 }
 
 #[cfg(test)]

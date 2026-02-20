@@ -55,17 +55,41 @@ deepseek-testkit    Test utilities, replay harness, fake LLM
 
 ## Core Abstractions
 
-**Session state machine** (`deepseek-core`): Idle → Planning → ExecutingStep → AwaitingApproval → Verifying → Completed/Failed/Paused. Transitions validated by `is_valid_session_state_transition()`.
+### Chat-with-Tools Architecture (Primary)
+
+The agent uses **DeepSeek API function calling** for a conversational chat-with-tools loop:
+
+1. User prompt + system prompt + tool definitions → DeepSeek API (`/chat/completions` with `tools` parameter)
+2. Model streams response (text content and/or `tool_calls`)
+3. If `tool_calls` present: execute each tool, send results back as `role: "tool"` messages, loop to step 1
+4. If no `tool_calls`: return text response to user — conversation turn complete
+
+**Key types** (`deepseek-core`):
+- `ChatMessage` — tagged enum: `System`, `User`, `Assistant` (with optional `tool_calls`), `Tool` (with `tool_call_id`)
+- `ChatRequest` — model, messages, tools, tool_choice, max_tokens, temperature
+- `ToolDefinition` / `FunctionDefinition` — OpenAI-compatible function schemas
+- `ToolChoice` — `auto`, `none`, or specific function
+- `LlmToolCall` — id, name, arguments (as returned by the API)
+
+**Agent entry point**: `AgentEngine::chat(prompt)` in `deepseek-agent` — the main chat-with-tools loop.
+
+**Tool definitions**: `deepseek_tools::tool_definitions()` returns `Vec<ToolDefinition>` for all tools. `deepseek_tools::map_tool_name()` maps API function names (underscored: `fs_read`) to internal tool names (dotted: `fs.read`).
+
+**LLM client**: `LlmClient::complete_chat_streaming()` / `complete_chat()` in `deepseek-llm` — sends `ChatRequest` with tools to the DeepSeek API and handles streaming tool call delta merging.
+
+### Legacy Plan-and-Execute Architecture
+
+The old `run_once_with_mode()` method still exists for backward compatibility. It uses `SchemaPlanner` to generate JSON plans and `SimpleExecutor` to run hardcoded tool calls. **New code should use `AgentEngine::chat()` instead.**
+
+### Supporting Abstractions
 
 **Event sourcing**: All state changes, tool proposals/approvals/results journaled to `.deepseek/events.jsonl` (append-only). SQLite projections in `.deepseek/store.sqlite` for queries.
 
-**Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `bash.run`, `git.*`, `patch.*`, MCP tools, and plugins.
+**Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `fs.glob`, `bash.run`, `git.*`, `web.*`, `notebook.*`, `multi_edit`, and plugins.
 
-**Patch staging**: Model edits go to `.deepseek/patches/<id>.json` as unified diffs with base SHA-256. Apply requires SHA match or 3-way merge.
+**Model router** (`deepseek-router`): Weighted complexity scoring selects between `deepseek-chat` and `deepseek-reasoner`. Hybrid strategy: `deepseek-reasoner` is the primary "brain" for complex agentic tasks (CoT, self-correction, multi-step reasoning); `deepseek-chat` is used for fast, low-complexity responses. Both support function calling and 128K context. Threshold default 0.72.
 
-**Model router** (`deepseek-router`): Weighted complexity scoring selects between `deepseek-chat` and `deepseek-reasoner`. Auto-escalation on invalid plans. Threshold default 0.72.
-
-**Traits** in `deepseek-core`: `Planner`, `Executor`, `ModelRouter`, `ToolHost`.
+**TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`.
 
 ## Conventions
 

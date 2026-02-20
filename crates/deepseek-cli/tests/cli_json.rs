@@ -738,6 +738,13 @@ fn rewind_uses_checkpoint_id_from_apply() {
         &["--json", "ask", "Create patch so apply can checkpoint"],
     );
 
+    // Stage a patch directly so `apply --yes` can create a checkpoint.
+    // The chat-with-tools path doesn't auto-stage patches like the legacy
+    // plan-and-execute path did.
+    let store = deepseek_diff::PatchStore::new(workspace.path()).expect("patch store");
+    let diff = "diff --git a/.deepseek/notes.txt b/.deepseek/notes.txt\nnew file mode 100644\nindex 0000000..2b9d865\n--- /dev/null\n+++ b/.deepseek/notes.txt\n@@ -0,0 +1 @@\n+rewind checkpoint test\n";
+    let _ = store.stage(diff, &[]).expect("stage patch");
+
     let applied = run_json(workspace.path(), &["--json", "apply", "--yes"]);
     let checkpoint_id = applied["checkpoint_id"]
         .as_str()

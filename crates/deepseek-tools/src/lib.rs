@@ -4,9 +4,10 @@ mod shell;
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
+use deepseek_chrome::{ChromeSession, ScreenshotFormat};
 use deepseek_core::{
-    AppConfig, ApprovedToolCall, EventEnvelope, EventKind, ToolCall, ToolHost, ToolProposal,
-    ToolResult,
+    AppConfig, ApprovedToolCall, EventEnvelope, EventKind, FunctionDefinition, ToolCall,
+    ToolDefinition, ToolHost, ToolProposal, ToolResult,
 };
 use deepseek_diff::PatchStore;
 use deepseek_hooks::{HookContext, HookRuntime};
@@ -107,6 +108,22 @@ impl LocalToolHost {
         self.review_mode
     }
 
+    fn chrome_port_from_call(call: &ToolCall) -> Result<u16> {
+        let port = call
+            .args
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(9222);
+        u16::try_from(port).map_err(|_| anyhow!("invalid chrome debug port: {port}"))
+    }
+
+    fn chrome_session_from_call(call: &ToolCall) -> Result<ChromeSession> {
+        let port = Self::chrome_port_from_call(call)?;
+        let mut session = ChromeSession::new(port)?;
+        session.check_connection()?;
+        Ok(session)
+    }
+
     fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
         // Enforce review mode: block all non-read tools
         if self.review_mode && REVIEW_BLOCKED_TOOLS.contains(&call.name.as_str()) {
@@ -204,7 +221,13 @@ impl LocalToolHost {
                 }
 
                 let truncated = if bytes.len() > max_bytes {
-                    bytes[..max_bytes].to_vec()
+                    // Find the last valid UTF-8 char boundary to avoid splitting
+                    // a multi-byte character, which would cause from_utf8 to fail.
+                    let mut end = max_bytes;
+                    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+                        end -= 1;
+                    }
+                    bytes[..end].to_vec()
                 } else {
                     bytes.clone()
                 };
@@ -469,6 +492,12 @@ impl LocalToolHost {
                     .get("spec")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("spec missing"))?;
+                // Reject specs containing shell metacharacters to prevent injection.
+                if spec.contains([
+                    ';', '|', '&', '$', '`', '(', ')', '{', '}', '<', '>', '\'', '"', '\\', '\n',
+                ]) {
+                    return Err(anyhow!("git.show: spec contains forbidden characters"));
+                }
                 self.run_cmd(&format!("git show {spec}"), DEFAULT_TIMEOUT_SECONDS)
             }
             "index.query" => {
@@ -583,7 +612,11 @@ impl LocalToolHost {
                     .to_string();
                 let body = resp.text()?;
                 let truncated = body.len() > max_bytes;
-                let text = if truncated { &body[..max_bytes] } else { &body };
+                let text = if truncated {
+                    &body[..body.floor_char_boundary(max_bytes)]
+                } else {
+                    &body
+                };
                 // Strip HTML tags for readable text extraction
                 let content = if content_type.contains("html") {
                     strip_html_tags(text)
@@ -677,6 +710,102 @@ impl LocalToolHost {
                         "source": "duckduckgo",
                         "searched_at": chrono::Utc::now().to_rfc3339(),
                     }
+                }))
+            }
+            "chrome.navigate" => {
+                let url = call
+                    .args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("url missing"))?;
+                if !url.starts_with("http://")
+                    && !url.starts_with("https://")
+                    && !url.starts_with("about:")
+                {
+                    return Err(anyhow!("url must start with http://, https://, or about:"));
+                }
+                let session = Self::chrome_session_from_call(call)?;
+                let result = session.navigate(url)?;
+                Ok(json!({
+                    "url": url,
+                    "cdp": result,
+                    "ok": result.error.is_none()
+                }))
+            }
+            "chrome.click" => {
+                let selector = call
+                    .args
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("selector missing"))?;
+                let session = Self::chrome_session_from_call(call)?;
+                let result = session.click(selector)?;
+                Ok(json!({
+                    "selector": selector,
+                    "cdp": result,
+                    "ok": result.error.is_none()
+                }))
+            }
+            "chrome.type_text" => {
+                let selector = call
+                    .args
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("selector missing"))?;
+                let text = call
+                    .args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("text missing"))?;
+                let session = Self::chrome_session_from_call(call)?;
+                let result = session.type_text(selector, text)?;
+                Ok(json!({
+                    "selector": selector,
+                    "text": text,
+                    "cdp": result,
+                    "ok": result.error.is_none()
+                }))
+            }
+            "chrome.screenshot" => {
+                let format = match call
+                    .args
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("png")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "png" => ScreenshotFormat::Png,
+                    "jpeg" | "jpg" => ScreenshotFormat::Jpeg,
+                    "webp" => ScreenshotFormat::Webp,
+                    other => return Err(anyhow!("unsupported screenshot format: {other}")),
+                };
+                let session = Self::chrome_session_from_call(call)?;
+                let image_base64 = session.screenshot(format)?;
+                Ok(json!({
+                    "format": call.args.get("format").and_then(|v| v.as_str()).unwrap_or("png"),
+                    "base64": image_base64
+                }))
+            }
+            "chrome.read_console" => {
+                let session = Self::chrome_session_from_call(call)?;
+                let entries = session.read_console()?;
+                Ok(json!({
+                    "entries": entries,
+                    "count": entries.len()
+                }))
+            }
+            "chrome.evaluate" => {
+                let expression = call
+                    .args
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("expression missing"))?;
+                let session = Self::chrome_session_from_call(call)?;
+                let value = session.evaluate(expression)?;
+                Ok(json!({
+                    "expression": expression,
+                    "value": value
                 }))
             }
             "notebook.read" => {
@@ -1064,6 +1193,472 @@ impl ToolHost for LocalToolHost {
             success,
             output,
         }
+    }
+}
+
+/// Returns tool definitions for the DeepSeek API function calling interface.
+/// Parameter names MUST match what `run_tool()` reads from `call.args`.
+pub fn tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "fs_read".to_string(),
+                description: "Read the contents of a file. Returns file content with line numbers. For images, returns base64. For PDFs, extracts text.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file to read"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "1-based line number to start reading from. Optional."
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "1-based line number to stop reading at. Optional."
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": "Maximum bytes to read. Defaults to 1MB."
+                        },
+                        "pages": {
+                            "type": "string",
+                            "description": "Page range for PDF files (e.g. '1-5', '3', '10-20'). Only applicable to PDF files."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "fs_write".to_string(),
+                description: "Write content to a file. Creates the file and parent directories if they don't exist. Prefer fs_edit for modifying existing files.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file to write"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The full content to write to the file"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "fs_edit".to_string(),
+                description: "Edit a file by replacing an exact string match. The 'search' string must appear in the file. By default replaces all occurrences; set 'all' to false for first-only.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file to edit"
+                        },
+                        "search": {
+                            "type": "string",
+                            "description": "The exact text to find in the file"
+                        },
+                        "replace": {
+                            "type": "string",
+                            "description": "The text to replace the search string with"
+                        },
+                        "all": {
+                            "type": "boolean",
+                            "description": "Replace all occurrences (true, default) or just first (false)"
+                        }
+                    },
+                    "required": ["path", "search", "replace"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "fs_list".to_string(),
+                description: "List files and directories in the given directory.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "dir": {
+                            "type": "string",
+                            "description": "Directory path to list. Defaults to '.' (workspace root)."
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "fs_glob".to_string(),
+                description: "Find files matching a glob pattern. Returns matching file paths.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern to match (e.g. '**/*.rs', 'src/**/*.ts')"
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "Base directory to search in. Defaults to '.'."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum results to return. Defaults to 200."
+                        },
+                        "respectGitignore": {
+                            "type": "boolean",
+                            "description": "Whether to respect .gitignore rules. Defaults to true."
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "fs_grep".to_string(),
+                description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search for"
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Glob pattern to filter which files to search (e.g. '**/*.rs'). Defaults to '**/*'."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum matches to return. Defaults to 200."
+                        },
+                        "respectGitignore": {
+                            "type": "boolean",
+                            "description": "Whether to respect .gitignore rules. Defaults to true."
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "description": "Whether the search is case-sensitive. Defaults to true."
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "bash_run".to_string(),
+                description: "Execute a shell command and return stdout/stderr. Use for git, build, test, and other terminal commands.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": {
+                            "type": "string",
+                            "description": "The shell command to execute"
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds. Defaults to 120."
+                        }
+                    },
+                    "required": ["cmd"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "multi_edit".to_string(),
+                description: "Apply edits across multiple files with checkpoint support. Each file entry contains a path and edits array with search/replace pairs.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": { "type": "string", "description": "Relative file path" },
+                                    "edits": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "search": { "type": "string", "description": "Text to find" },
+                                                "replace": { "type": "string", "description": "Replacement text" }
+                                            },
+                                            "required": ["search", "replace"]
+                                        }
+                                    }
+                                },
+                                "required": ["path", "edits"]
+                            },
+                            "description": "Array of files with their edit operations"
+                        }
+                    },
+                    "required": ["files"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "git_status".to_string(),
+                description: "Show the working tree status (git status --short).".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "git_diff".to_string(),
+                description: "Show changes in the working directory (git diff).".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "web_fetch".to_string(),
+                description: "Fetch content from a URL and return it as text. HTML is stripped to plain text.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch (must start with http:// or https://)"
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": "Maximum bytes to retrieve. Defaults to 500000 (500KB)."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Request timeout in seconds. Defaults to 30."
+                        }
+                    },
+                    "required": ["url"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "web_search".to_string(),
+                description: "Search the web and return results with titles, URLs, and snippets.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results to return. Defaults to 10."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "notebook_read".to_string(),
+                description: "Read a Jupyter notebook (.ipynb), returning cell summaries with type and source preview.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the notebook file"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "notebook_edit".to_string(),
+                description: "Edit a cell in a Jupyter notebook. Supports replace, insert, and delete operations.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the notebook file"
+                        },
+                        "cell_index": {
+                            "type": "integer",
+                            "description": "0-based cell index to edit"
+                        },
+                        "new_source": {
+                            "type": "string",
+                            "description": "New content for the cell"
+                        },
+                        "cell_type": {
+                            "type": "string",
+                            "enum": ["code", "markdown"],
+                            "description": "Cell type. Optional for replace, required for insert."
+                        },
+                        "operation": {
+                            "type": "string",
+                            "enum": ["replace", "insert", "delete"],
+                            "description": "Edit operation. Defaults to 'replace'."
+                        }
+                    },
+                    "required": ["path", "cell_index", "new_source"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "git_show".to_string(),
+                description: "Show a git object (commit, tag, tree, or blob). Use to inspect specific commits, files at a revision, or diff between commits.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "spec": {
+                            "type": "string",
+                            "description": "Git revision spec (e.g. 'HEAD', 'abc123', 'HEAD:src/main.rs', 'main..feature')"
+                        }
+                    },
+                    "required": ["spec"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "index_query".to_string(),
+                description: "Full-text search the code index. Returns matching file paths and snippets ranked by relevance.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "q": {
+                            "type": "string",
+                            "description": "Search query string"
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum results to return. Defaults to 10."
+                        }
+                    },
+                    "required": ["q"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "patch_stage".to_string(),
+                description: "Stage a unified diff as a patch for later application. Returns a patch_id for use with patch_apply.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "unified_diff": {
+                            "type": "string",
+                            "description": "The unified diff content to stage"
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "Base file content for SHA verification. Optional."
+                        }
+                    },
+                    "required": ["unified_diff"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "patch_apply".to_string(),
+                description: "Apply a previously staged patch by its ID. Returns whether the patch was applied successfully and any conflicts.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "patch_id": {
+                            "type": "string",
+                            "description": "UUID of the staged patch to apply"
+                        }
+                    },
+                    "required": ["patch_id"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "diagnostics_check".to_string(),
+                description: "Run language-specific diagnostics (cargo check, tsc, ruff, etc.) on the project or a specific path. Auto-detects the appropriate checker.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Optional path to check. If omitted, checks the entire project."
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+    ]
+}
+
+/// Map tool definition function names (underscored) to internal tool names (dotted).
+pub fn map_tool_name(function_name: &str) -> &str {
+    match function_name {
+        "fs_read" => "fs.read",
+        "fs_write" => "fs.write",
+        "fs_edit" => "fs.edit",
+        "fs_list" => "fs.list",
+        "fs_glob" => "fs.glob",
+        "fs_grep" => "fs.grep",
+        "bash_run" => "bash.run",
+        "multi_edit" => "multi_edit",
+        "git_status" => "git.status",
+        "git_diff" => "git.diff",
+        "git_show" => "git.show",
+        "web_fetch" => "web.fetch",
+        "web_search" => "web.search",
+        "notebook_read" => "notebook.read",
+        "notebook_edit" => "notebook.edit",
+        "index_query" => "index.query",
+        "patch_stage" => "patch.stage",
+        "patch_apply" => "patch.apply",
+        "diagnostics_check" => "diagnostics.check",
+        other => other,
     }
 }
 
@@ -2854,5 +3449,47 @@ mod tests {
         let result = super::build_bwrap_command(workspace, "ls", &config);
         assert!(result.contains("--proc"));
         assert!(result.contains("--dev"));
+    }
+
+    #[test]
+    fn chrome_tool_calls_return_structured_payloads() {
+        let (_workspace, host) = temp_host();
+        let navigate = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.navigate".to_string(),
+                args: json!({"url":"https://example.com"}),
+                requires_approval: false,
+            },
+        });
+        assert!(navigate.success);
+        assert_eq!(navigate.output["ok"], true);
+        assert_eq!(navigate.output["url"], "https://example.com");
+
+        let evaluate = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.evaluate".to_string(),
+                args: json!({"expression":"1 + 1"}),
+                requires_approval: false,
+            },
+        });
+        assert!(evaluate.success);
+        assert!(evaluate.output["value"].is_object() || evaluate.output["value"].is_number());
+
+        let screenshot = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.screenshot".to_string(),
+                args: json!({"format":"png"}),
+                requires_approval: false,
+            },
+        });
+        assert!(screenshot.success);
+        assert!(
+            screenshot.output["base64"]
+                .as_str()
+                .is_some_and(|data| !data.is_empty())
+        );
     }
 }

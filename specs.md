@@ -203,6 +203,14 @@ The CLI supports three runtime permission modes that govern how tool calls are a
 | **Performance monitoring** | `/profile` command showing time breakdown. |
 | **Integration marketplace** | Community repository of MCP plugins. |
 
+### 2.14 How to Build Your "Claude Code" Clone
+
+For the best results, use a Hybrid Approach:
+
+- **Orchestrator (Reasoner):** Use `deepseek-reasoner` to analyze the codebase and generate the step-by-step execution plan.
+- **Executor (Chat):** Use `deepseek-chat` for minor tasks like writing unit test boilerplate or documentation to save on "thinking" token costs.
+- **Integration:** Plug these models into existing open-source frameworks like Roo Code or Cline, which are already optimized for DeepSeek's API.
+
 ---
 
 ## 3. System Architecture
@@ -286,6 +294,36 @@ The router computes a complexity score based on:
 Thresholds and weights are configurable. The router logs each decision (including the feature vector snapshot) to the event log, enabling post-hoc analysis and tuning.
 
 **Escalation retry:** If the chat model produces an invalid plan or stalls, the router automatically retries with the reasoner once.
+
+### 4.4.1 DeepSeek Model Strategy: Hybrid Approach
+
+DeepSeek offers two primary model endpoints: `deepseek-chat` and `deepseek-reasoner`. Both are powered by DeepSeek-V3.2 but optimized for different workflows.
+
+| Feature | `deepseek-chat` | `deepseek-reasoner` |
+|---------|-----------------|---------------------|
+| Primary Mode | Non-thinking (Direct output) | Thinking (Chain-of-Thought) |
+| Best For | Conversational QA, simple coding, speed | Complex logic, math, deep analysis |
+| Output Limit | Up to 8K tokens | Up to 64K (including CoT) |
+| Function Calling | Supported | Supported |
+| Pricing | ~$0.28 per 1M input tokens | ~$0.28 per 1M input tokens |
+| Context Window | 128K | 128K |
+| FIM Completion | Supported | Not supported |
+
+**Key Differences:**
+- **Reasoning Process**: `deepseek-reasoner` generates Chain-of-Thought (CoT) before the final answer, making it more accurate for multi-step problems but slower.
+- **Token Efficiency**: Same price per token, but `deepseek-reasoner` consumes more tokens per request due to hidden reasoning steps.
+- **Self-Correction**: The reasoner can identify logic errors during thinking, critical for autonomous bug fixing.
+- **Instruction Following**: R1/Reasoner shows higher reliability for intricate, multi-part instructions.
+
+**Hybrid Strategy (implemented via WeightedRouter):**
+
+| Role | Model | Rationale |
+|------|-------|-----------|
+| **Primary Agent** (planning, complex tool chains) | `deepseek-reasoner` | Superior CoT for multi-step reasoning, self-correction, complex debugging |
+| **Fast Executor** (simple completions, boilerplate, docs) | `deepseek-chat` | Speed + lower token cost for routine tasks |
+| **Router Decision** | Automatic | Complexity scoring selects model per turn |
+
+The router defaults to `deepseek-reasoner` for the agentic loop (complex tool-calling chains, codebase analysis, debugging) and falls back to `deepseek-chat` for simple responses when complexity score is below threshold (default 0.72). This mirrors the architecture needed for a "Claude Code"-class coding agent: the reasoner provides the high-level cognitive "thinking" while the chat model handles throughput-sensitive tasks.
 
 ### 4.5 Tool System
 

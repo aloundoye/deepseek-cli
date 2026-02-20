@@ -2773,6 +2773,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::TaskUpdatedV1 { .. } => "TaskUpdated@v1",
         EventKind::TaskDeletedV1 { .. } => "TaskDeleted@v1",
         EventKind::ExitPlanModeV1 { .. } => "ExitPlanMode@v1",
+        EventKind::ProviderSelectedV1 { .. } => "ProviderSelected@v1",
     }
 }
 

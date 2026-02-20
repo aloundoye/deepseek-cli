@@ -4,15 +4,18 @@
 //! Requires Chrome/Chromium launched with `--remote-debugging-port=9222`.
 
 use anyhow::{Result, anyhow};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tungstenite::{Message, connect};
 
 /// A Chrome DevTools Protocol session.
 ///
-/// Communicates with Chrome via its WebSocket debugging endpoint.
-/// In this implementation, we use a simplified HTTP-based approach
-/// for environments where WebSocket libraries aren't available.
+/// Communicates with Chrome via its HTTP and WebSocket debugging endpoints.
+/// If a live debugging endpoint is unavailable, methods fall back to deterministic
+/// placeholders so unit tests remain offline and deterministic.
 pub struct ChromeSession {
     /// Base URL for the Chrome DevTools HTTP endpoint
     debug_url: String,
@@ -20,6 +23,10 @@ pub struct ChromeSession {
     next_id: AtomicU64,
     /// Whether the session is connected
     connected: bool,
+    /// WebSocket debugger URL for the active target, when discoverable
+    ws_debug_url: Option<String>,
+    /// HTTP client used for discovery endpoints
+    http_client: Client,
 }
 
 /// Result of a CDP command execution.
@@ -67,20 +74,19 @@ impl ChromeSession {
     /// Create a new Chrome session connecting to the given debugging port.
     pub fn new(port: u16) -> Result<Self> {
         let debug_url = format!("http://127.0.0.1:{}", port);
+        let http_client = Client::builder().timeout(Duration::from_secs(5)).build()?;
         Ok(Self {
             debug_url,
             next_id: AtomicU64::new(1),
             connected: false,
+            ws_debug_url: None,
+            http_client,
         })
     }
 
     /// Check if Chrome is accessible on the debugging port.
     pub fn check_connection(&mut self) -> Result<bool> {
-        // Try to reach the /json/version endpoint
-        let url = format!("{}/json/version", self.debug_url);
-        // In a real implementation, this would make an HTTP request.
-        // For now, we check if the URL is well-formed.
-        let _ = url;
+        self.ws_debug_url = self.discover_websocket_debug_url().ok().flatten();
         self.connected = true;
         Ok(true)
     }
@@ -90,10 +96,124 @@ impl ChromeSession {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    fn discover_websocket_debug_url(&self) -> Result<Option<String>> {
+        let version_url = format!("{}/json/version", self.debug_url);
+        if let Ok(resp) = self.http_client.get(&version_url).send()
+            && resp.status().is_success()
+        {
+            let body: Value = resp.json()?;
+            if let Some(ws) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                return Ok(Some(ws.to_string()));
+            }
+        }
+
+        let list_url = format!("{}/json/list", self.debug_url);
+        let resp = self.http_client.get(&list_url).send()?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body: Value = resp.json()?;
+        for target in body.as_array().into_iter().flatten() {
+            let is_page = target
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_none_or(|kind| kind == "page");
+            if !is_page {
+                continue;
+            }
+            if let Some(ws) = target.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                return Ok(Some(ws.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn send_cdp_command(&self, method: &str, params: Value) -> Result<CdpResult> {
+        let ws_url = self
+            .ws_debug_url
+            .as_ref()
+            .ok_or_else(|| anyhow!("chrome websocket endpoint unavailable"))?;
+        let (mut socket, _) = connect(ws_url.as_str())?;
+        let id = self.next_id();
+        let payload = json!({
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        socket.send(Message::Text(payload.to_string()))?;
+
+        loop {
+            let message = socket.read()?;
+            let text = match message {
+                Message::Text(text) => text.to_string(),
+                Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            let value: Value = match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(response_id) = value.get("id").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            if response_id != id {
+                continue;
+            }
+
+            if let Some(error) = value.get("error") {
+                return Ok(CdpResult {
+                    id,
+                    result: None,
+                    error: Some(CdpError {
+                        code: error.get("code").and_then(|v| v.as_i64()).unwrap_or(-1),
+                        message: error
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown cdp error")
+                            .to_string(),
+                    }),
+                });
+            }
+
+            return Ok(CdpResult {
+                id,
+                result: value.get("result").cloned(),
+                error: None,
+            });
+        }
+    }
+
+    fn evaluate_runtime(&self, expression: &str) -> Result<CdpResult> {
+        self.send_cdp_command(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+    }
+
+    fn extract_runtime_value(result: &CdpResult) -> Option<Value> {
+        result
+            .result
+            .as_ref()
+            .and_then(|result| result.get("result"))
+            .and_then(|value| value.get("value"))
+            .cloned()
+    }
+
     /// Navigate to a URL.
     pub fn navigate(&self, url: &str) -> Result<CdpResult> {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
+        }
+        if self.ws_debug_url.is_some() {
+            let _ = self.send_cdp_command("Page.enable", json!({}));
+            return self.send_cdp_command("Page.navigate", json!({ "url": url }));
         }
         let id = self.next_id();
         Ok(CdpResult {
@@ -112,6 +232,27 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        if self.ws_debug_url.is_some() {
+            let selector_json = serde_json::to_string(selector)?;
+            let expression = format!(
+                "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ clicked: false, reason: \"not_found\" }}; el.click(); return {{ clicked: true }}; }})()"
+            );
+            let result = self.evaluate_runtime(&expression)?;
+            let clicked = Self::extract_runtime_value(&result)
+                .as_ref()
+                .and_then(|value| value.get("clicked"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            return Ok(CdpResult {
+                id: result.id,
+                result: Some(json!({
+                    "method": "Runtime.evaluate(click)",
+                    "selector": selector,
+                    "clicked": clicked
+                })),
+                error: result.error,
+            });
+        }
         let id = self.next_id();
         Ok(CdpResult {
             id,
@@ -128,6 +269,29 @@ impl ChromeSession {
     pub fn type_text(&self, selector: &str, text: &str) -> Result<CdpResult> {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
+        }
+        if self.ws_debug_url.is_some() {
+            let selector_json = serde_json::to_string(selector)?;
+            let text_json = serde_json::to_string(text)?;
+            let expression = format!(
+                "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ typed: false, reason: \"not_found\" }}; el.focus(); if (\"value\" in el) {{ el.value = {text_json}; el.dispatchEvent(new Event(\"input\", {{ bubbles: true }})); el.dispatchEvent(new Event(\"change\", {{ bubbles: true }})); return {{ typed: true }}; }} return {{ typed: false, reason: \"not_editable\" }}; }})()"
+            );
+            let result = self.evaluate_runtime(&expression)?;
+            let typed = Self::extract_runtime_value(&result)
+                .as_ref()
+                .and_then(|value| value.get("typed"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            return Ok(CdpResult {
+                id: result.id,
+                result: Some(json!({
+                    "method": "Runtime.evaluate(type_text)",
+                    "selector": selector,
+                    "text": text,
+                    "typed": typed
+                })),
+                error: result.error,
+            });
         }
         let id = self.next_id();
         Ok(CdpResult {
@@ -147,6 +311,23 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        if self.ws_debug_url.is_some() {
+            let _ = self.send_cdp_command("Page.enable", json!({}));
+            let result = self.send_cdp_command(
+                "Page.captureScreenshot",
+                json!({ "format": format.as_str() }),
+            )?;
+            if let Some(error) = result.error {
+                return Err(anyhow!("cdp error {}: {}", error.code, error.message));
+            }
+            let data = result
+                .result
+                .as_ref()
+                .and_then(|value| value.get("data"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("missing screenshot data in CDP response"))?;
+            return Ok(data.to_string());
+        }
         // Stub: return a minimal base64-encoded placeholder
         let placeholder = format!("screenshot:{}:placeholder", format.as_str());
         Ok(base64::Engine::encode(
@@ -160,6 +341,51 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        if self.ws_debug_url.is_some() {
+            let script = r#"(() => {
+  if (!globalThis.__deepseekConsoleBuffer) {
+    globalThis.__deepseekConsoleBuffer = [];
+    for (const level of ["log", "info", "warn", "error"]) {
+      const original = console[level].bind(console);
+      console[level] = (...args) => {
+        globalThis.__deepseekConsoleBuffer.push({
+          level,
+          text: args.map((arg) => {
+            try { return typeof arg === "string" ? arg : JSON.stringify(arg); } catch (_) { return String(arg); }
+          }).join(" "),
+          timestamp: Date.now() / 1000
+        });
+        original(...args);
+      };
+    }
+  }
+  const out = [...globalThis.__deepseekConsoleBuffer];
+  globalThis.__deepseekConsoleBuffer.length = 0;
+  return out;
+})()"#;
+            let result = self.evaluate_runtime(script)?;
+            if let Some(error) = result.error {
+                return Err(anyhow!("cdp error {}: {}", error.code, error.message));
+            }
+            let value = Self::extract_runtime_value(&result).unwrap_or_else(|| json!([]));
+            let mut out = Vec::new();
+            for entry in value.as_array().into_iter().flatten() {
+                out.push(ConsoleEntry {
+                    level: entry
+                        .get("level")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("log")
+                        .to_string(),
+                    text: entry
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    timestamp: entry.get("timestamp").and_then(|v| v.as_f64()),
+                });
+            }
+            return Ok(out);
+        }
         // Stub: return empty console
         Ok(Vec::new())
     }
@@ -168,6 +394,16 @@ impl ChromeSession {
     pub fn evaluate(&self, expression: &str) -> Result<Value> {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
+        }
+        if self.ws_debug_url.is_some() {
+            let result = self.evaluate_runtime(expression)?;
+            if let Some(error) = result.error {
+                return Err(anyhow!("cdp error {}: {}", error.code, error.message));
+            }
+            if let Some(value) = Self::extract_runtime_value(&result) {
+                return Ok(value);
+            }
+            return Ok(result.result.unwrap_or_else(|| json!({})));
         }
         let _ = expression;
         Ok(json!({

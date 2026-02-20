@@ -613,6 +613,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+
+[[package]]
 name = "deepseek-agent"
 version = "0.1.0"
 dependencies = [
@@ -640,8 +646,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "reqwest",
  "serde",
  "serde_json",
+ "tungstenite",
  "uuid",
 ]
 
@@ -654,6 +662,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "crossterm",
  "deepseek-agent",
  "deepseek-core",
  "deepseek-diff",
@@ -776,6 +785,7 @@ dependencies = [
  "deepseek-store",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
  "walkdir",
 ]
@@ -869,6 +879,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "deepseek-chrome",
  "deepseek-core",
  "deepseek-diff",
  "deepseek-hooks",
@@ -898,6 +909,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]
@@ -3033,6 +3045,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3682,6 +3705,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.8.5",
+ "sha1",
+ "thiserror 1.0.69",
+ "utf-8",
+]
+
+[[package]]
 name = "type1-encoding-parser"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3769,6 +3810,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8-ranges"

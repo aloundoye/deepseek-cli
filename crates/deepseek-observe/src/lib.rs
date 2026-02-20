@@ -85,14 +85,21 @@ impl Observer {
             "payload": payload,
         });
 
-        if let Err(err) = sink.client.post(&sink.endpoint).json(&body).send() {
-            self.append_log_line(&format!(
-                "{} TELEMETRY_ERROR name={} error={}",
-                Utc::now().to_rfc3339(),
-                name,
-                err
-            ))?;
-        }
+        // Fire-and-forget: send telemetry in a background thread so it never
+        // blocks the agent/TUI thread (the HTTP call can take up to 3 seconds).
+        let client = sink.client.clone();
+        let endpoint = sink.endpoint.clone();
+        let log_path = self.log_path.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = client.post(&endpoint).json(&body).send() {
+                let line = format!("{} TELEMETRY_ERROR error={}", Utc::now().to_rfc3339(), err);
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .and_then(|mut f| writeln!(f, "{line}"));
+            }
+        });
         Ok(())
     }
 }

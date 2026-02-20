@@ -21,6 +21,7 @@ rpassword.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 glob.workspace = true
+crossterm.workspace = true
 deepseek-agent = { path = "../deepseek-agent" }
 deepseek-core = { path = "../deepseek-core" }
 deepseek-diff = { path = "../deepseek-diff" }
