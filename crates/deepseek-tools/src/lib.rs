@@ -1928,6 +1928,48 @@ pub fn map_tool_name(function_name: &str) -> &str {
     }
 }
 
+/// Return a user-friendly hint for a tool error, or `None` if no specific hint applies.
+pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
+    let lower = error_msg.to_ascii_lowercase();
+    match tool_name {
+        "fs.edit" | "multi_edit" => {
+            if lower.contains("search pattern not found") {
+                Some("Hint: the old_string was not found in the file. Try reading the file first with fs.read to verify the exact content.".to_string())
+            } else if lower.contains("line range out of bounds") {
+                Some("Hint: the line range exceeds the file length. Read the file first to check how many lines it has.".to_string())
+            } else {
+                None
+            }
+        }
+        "fs.read" => {
+            if lower.contains("no such file") || lower.contains("not found") {
+                Some("Hint: file does not exist. Use fs.glob to search for the correct path.".to_string())
+            } else if lower.contains("permission denied") {
+                Some("Hint: permission denied. The file may be outside the allowed workspace.".to_string())
+            } else {
+                None
+            }
+        }
+        "fs.write" => {
+            if lower.contains("permission denied") {
+                Some("Hint: permission denied. Check that the directory exists and is writable.".to_string())
+            } else {
+                None
+            }
+        }
+        "bash.run" => {
+            if lower.contains("timed out") || lower.contains("timeout") {
+                Some("Hint: command timed out. Try a shorter operation or increase the timeout.".to_string())
+            } else if lower.contains("not found") || lower.contains("command not found") {
+                Some("Hint: command not found. Check that the program is installed and in PATH.".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Tools that are handled by AgentEngine directly, not by LocalToolHost.
 pub const AGENT_LEVEL_TOOLS: &[&str] =
     &["user_question", "task_create", "task_update", "spawn_task"];

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
-use deepseek_core::{EventEnvelope, EventKind, Plan, Session, SessionState, runtime_dir};
+use deepseek_core::{
+    ChatMessage, EventEnvelope, EventKind, Plan, Session, SessionState, runtime_dir,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -2631,6 +2633,8 @@ impl Store {
 #[derive(Debug, Default, Clone)]
 pub struct RebuildProjection {
     pub transcript: Vec<String>,
+    /// Structured chat messages for accurate session resume (from ChatTurnV1 events).
+    pub chat_messages: Vec<ChatMessage>,
     pub latest_plan: Option<Plan>,
     pub step_status: Vec<(Uuid, bool, String)>,
     pub router_models: Vec<String>,
@@ -2653,6 +2657,9 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
     match &event.kind {
         EventKind::TurnAddedV1 { role, content } => {
             proj.transcript.push(format!("{role}: {content}"))
+        }
+        EventKind::ChatTurnV1 { message } => {
+            proj.chat_messages.push(message.clone());
         }
         EventKind::PlanCreatedV1 { plan } | EventKind::PlanRevisedV1 { plan } => {
             proj.latest_plan = Some(plan.clone())
@@ -2706,6 +2713,7 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
 fn event_kind_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::TurnAddedV1 { .. } => "TurnAdded@v1",
+        EventKind::ChatTurnV1 { .. } => "ChatTurn@v1",
         EventKind::SessionStateChangedV1 { .. } => "SessionStateChanged@v1",
         EventKind::PlanCreatedV1 { .. } => "PlanCreated@v1",
         EventKind::PlanRevisedV1 { .. } => "PlanRevised@v1",

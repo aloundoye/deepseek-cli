@@ -143,30 +143,29 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 
 ---
 
-## Phase 5: Conversation & Memory
+## Phase 5: Conversation & Memory ✅
 
-### 5.1 Multi-turn conversation persistence
-- Load prior session turns into ChatMessage array on --continue/--resume
-- Handle tool_calls and tool results from prior turns
-- Implement conversation branching (fork at any point)
+### 5.1 Multi-turn conversation persistence ✅
+- Added `ChatTurnV1` event kind: stores full structured `ChatMessage` (including `tool_calls` with IDs and `Tool` results with `tool_call_id`)
+- On resume, prefers structured `chat_messages` from `ChatTurnV1`; falls back to legacy string transcript for older sessions
+- `RebuildProjection.chat_messages: Vec<ChatMessage>` added to store
 
-### 5.2 Improve error messages
-- Replace all raw debug output with user-friendly messages
-- API errors: "API key not set. Run `deepseek config edit` to add your DEEPSEEK_API_KEY"
-- Tool failures: "fs_edit failed: old_string not found in file. Try reading the file first."
-- Rate limits: "Rate limited. Retrying in 5s... (attempt 2/3)"
-- Budget: "Budget limit reached ($0.50/$0.50). Use --max-budget-usd to increase."
+### 5.2 Improve error messages ✅
+- Added `format_api_error()` in deepseek-llm: user-friendly messages for 401, 402, 429, 5xx with actionable suggestions
+- Added `format_transport_error()`: timeout and connection errors with config hints
+- Added `tool_error_hint()` in deepseek-tools: context-specific hints for fs.edit, fs.read, fs.write, bash.run failures
+- Agent appends hints to failed tool results before sending back to LLM
+- Improved budget/turn limit messages with `--max-budget-usd` / `--max-turns` suggestions
 
-### 5.3 Implement proper token counting
-- Current `estimate_tokens()` uses chars/4 approximation
-- Options: tiktoken-rs crate, or DeepSeek tokenizer API
-- Critical for accurate context window management
+### 5.3 Implement proper token counting ✅
+- Replaced `chars/4` approximation with word-based BPE heuristic in `estimate_tokens()`
+- Short words (1-3 chars) → 1 token, medium (4-7) → 2, long (8-15) → 3, very long → chars/4
+- Added per-message overhead (4 tokens framing) in `estimate_messages_tokens()`
 
-### 5.4 Cost tracking per conversation
-- Track input/output/cached tokens per turn
-- Show cumulative cost in status bar
-- Warn at 80% of budget limit
-- Log to cost_ledger in store
+### 5.4 Cost tracking per conversation ✅
+- Cost ledger, per-session cost queries, and status bar display were already complete
+- Added 80% budget warning via stream callback (once per session)
+- Warning shows used/max cost, percentage, and remaining budget
 
 ---
 
@@ -345,27 +344,3 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 - Move temp workspace creation pattern (repeated in 5+ crates) to `testkit::temp_workspace()`
 - Move `temp_host()` pattern from deepseek-tools tests to shared helper
 - Add `testkit::fake_session()` for agent tests
-
-  Recommendations for UX Improvement                                                                                                                                                                                                            
-                                                                                                                                                                                                                                                
-  #### Immediate (1 week):                                                                                                                                                                                                                      
-  1. Add deepseek setup interactive wizard                                                                                                                                                                                                      
-  2. Colorize terminal output                                                                                                                                                                                                                   
-  3. Improve error messages with suggestions                                                                                                                                                                                                    
-  4. Add progress indicators for LLM calls                                                                                                                                                                                                      
-                                                                                                                                                                                                                                                
-  #### Short-term (1 month):                                                                                                                                                                                                                    
-  1. Create deepseek config interactive editor                                                                                                                                                                                                  
-  2. Add command aliases for common tasks                                                                                                                                                                                                       
-  3. Implement shell completions                                                                                                                                                                                                                
-  4. Add --help to all commands                                                                                                                                                                                                                 
-                                                                                                                                                                             
-  #### Medium-term (2 months):                                                                                                                                                                                                                  
-  1. Build TUI (terminal UI) for interactive mode                                                                                                                                                                                               
-  2. Add visual diff viewer for patches                                                                                                                                                                                                         
-  3. Create session browser                                                                                                                                                                                                                     
-  4. Implement command history and favorites                                                                                                                                                                                                    
-                                                                                                                                                                                                                                                
-  #### Long-term (3 months):                                                                                                                                                                                                                                                                     
-  3. AI-powered command suggestions                                                                                                                                                                                                             
-  4. Personalized workflows 
