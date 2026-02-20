@@ -153,6 +153,15 @@ impl PolicyEngine {
         }
     }
 
+    /// Create a PolicyEngine with default settings but a specific permission mode string.
+    pub fn from_mode(mode: &str) -> Self {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::from_str_lossy(mode),
+            ..PolicyConfig::default()
+        };
+        Self::new(cfg)
+    }
+
     pub fn from_app_config(cfg: &deepseek_core::PolicyConfig) -> Self {
         let defaults = PolicyConfig::default();
         let mut mapped = PolicyConfig {

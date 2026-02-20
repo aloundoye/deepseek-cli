@@ -4,7 +4,13 @@ use std::path::Path;
 
 pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     let engine = AgentEngine::new(workspace)?;
-    let _ = engine.chat_with_options("replay test", ChatOptions { tools: false })?;
+    let _ = engine.chat_with_options(
+        "replay test",
+        ChatOptions {
+            tools: false,
+            ..Default::default()
+        },
+    )?;
     engine.resume()
 }
 

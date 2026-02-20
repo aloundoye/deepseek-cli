@@ -79,6 +79,46 @@ struct Cli {
     #[arg(long)]
     from_pr: Option<u64>,
 
+    /// Permission mode: ask (default), auto, or plan.
+    #[arg(long = "permission-mode", global = true)]
+    permission_mode: Option<String>,
+
+    /// Skip all permission checks (dangerous — use only in trusted environments).
+    #[arg(long = "dangerously-skip-permissions", global = true)]
+    dangerously_skip_permissions: bool,
+
+    /// Only allow these tools (comma-separated function names, e.g. fs_read,fs_grep).
+    #[arg(long = "allowed-tools", global = true, value_delimiter = ',')]
+    allowed_tools: Vec<String>,
+
+    /// Disallow these tools (comma-separated function names, e.g. bash_run,fs_write).
+    #[arg(long = "disallowed-tools", global = true, value_delimiter = ',')]
+    disallowed_tools: Vec<String>,
+
+    /// Replace the default system prompt entirely.
+    #[arg(long = "system-prompt", global = true)]
+    system_prompt: Option<String>,
+
+    /// Append text to the default system prompt.
+    #[arg(long = "append-system-prompt", global = true)]
+    append_system_prompt: Option<String>,
+
+    /// Additional directories to include in workspace context (repeatable).
+    #[arg(long = "add-dir", global = true)]
+    add_dir: Vec<PathBuf>,
+
+    /// Enable verbose logging to stderr.
+    #[arg(short = 'v', long = "verbose", global = true)]
+    verbose: bool,
+
+    /// Initialize a new DEEPSEEK.md in the current directory and exit.
+    #[arg(long = "init")]
+    init: bool,
+
+    /// Non-interactive mode: auto-deny all approval prompts.
+    #[arg(long = "no-input")]
+    no_input: bool,
+
     /// Prompt for print mode (positional, used when -p is set).
     #[arg(trailing_var_arg = true)]
     prompt_args: Vec<String>,
@@ -906,9 +946,67 @@ struct PluginRunArgs {
     max_think: bool,
 }
 
+/// Validate mutually exclusive CLI flags.
+fn validate_cli_flags(cli: &Cli) -> Result<()> {
+    if !cli.allowed_tools.is_empty() && !cli.disallowed_tools.is_empty() {
+        return Err(anyhow!(
+            "--allowed-tools and --disallowed-tools are mutually exclusive"
+        ));
+    }
+    if cli.system_prompt.is_some() && cli.append_system_prompt.is_some() {
+        return Err(anyhow!(
+            "--system-prompt and --append-system-prompt are mutually exclusive"
+        ));
+    }
+    Ok(())
+}
+
+/// Apply CLI-level engine overrides (permission mode, verbose, budget limits).
+fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
+    if cli.dangerously_skip_permissions {
+        engine.set_permission_mode("auto");
+    } else if let Some(ref mode) = cli.permission_mode {
+        engine.set_permission_mode(mode);
+    }
+    if cli.verbose {
+        engine.set_verbose(true);
+    }
+    engine.set_max_turns(cli.max_turns);
+    engine.set_max_budget_usd(cli.max_budget_usd);
+}
+
+/// Build ChatOptions from CLI flags.
+fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
+    ChatOptions {
+        tools,
+        allowed_tools: if cli.allowed_tools.is_empty() {
+            None
+        } else {
+            Some(cli.allowed_tools.clone())
+        },
+        disallowed_tools: if cli.disallowed_tools.is_empty() {
+            None
+        } else {
+            Some(cli.disallowed_tools.clone())
+        },
+        system_prompt_override: cli.system_prompt.clone(),
+        system_prompt_append: cli.append_system_prompt.clone(),
+        additional_dirs: cli.add_dir.clone(),
+    }
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    validate_cli_flags(&cli)?;
     let cwd = std::env::current_dir()?;
+
+    // Handle --init: create DEEPSEEK.md and exit
+    if cli.init {
+        let manager = MemoryManager::new(&cwd)?;
+        let path = manager.ensure_initialized()?;
+        println!("Initialized {}", path.display());
+        return Ok(());
+    }
 
     // Handle -p/--print mode: non-interactive single-shot execution
     if cli.print_mode {
@@ -925,16 +1023,20 @@ fn main() -> Result<()> {
         return run_resume_specific(&cwd, session_id, cli.json, cli.model.as_deref());
     }
 
-    let command = cli.command.unwrap_or(Commands::Chat(ChatArgs::default()));
+    let command = cli
+        .command
+        .take()
+        .unwrap_or(Commands::Chat(ChatArgs::default()));
 
     match command {
-        Commands::Chat(args) => run_chat(&cwd, cli.json, args.tools, args.tui),
+        Commands::Chat(args) => run_chat(&cwd, cli.json, args.tools, args.tui, Some(&cli)),
         Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),
         Commands::Ask(args) => {
             ensure_llm_ready(&cwd, cli.json)?;
-            let engine = AgentEngine::new(&cwd)?;
-            let output =
-                engine.chat_with_options(&args.prompt, ChatOptions { tools: args.tools })?;
+            let mut engine = AgentEngine::new(&cwd)?;
+            apply_cli_flags(&mut engine, &cli);
+            let options = chat_options_from_cli(&cli, args.tools);
+            let output = engine.chat_with_options(&args.prompt, options)?;
             if cli.json {
                 print_json(&json!({"output": output}))?;
             } else {
@@ -1483,7 +1585,10 @@ fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: bool) -> Resul
 
         match engine.chat_with_options(
             &iteration_prompt,
-            deepseek_agent::ChatOptions { tools: args.tools },
+            deepseek_agent::ChatOptions {
+                tools: args.tools,
+                ..Default::default()
+            },
         ) {
             Ok(output) => {
                 completed_iterations += 1;
@@ -1969,12 +2074,21 @@ fn write_autopilot_heartbeat(path: &Path, payload: &serde_json::Value) -> Result
     Ok(())
 }
 
-fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> Result<()> {
+fn run_chat(
+    cwd: &Path,
+    json_mode: bool,
+    allow_tools: bool,
+    force_tui: bool,
+    cli: Option<&Cli>,
+) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
     let cfg = AppConfig::ensure(cwd)?;
     ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
-    let engine = AgentEngine::new(cwd)?;
+    let mut engine = AgentEngine::new(cwd)?;
+    if let Some(cli) = cli {
+        apply_cli_flags(&mut engine, cli);
+    }
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
         return run_chat_tui(cwd, allow_tools, &cfg);
@@ -2436,7 +2550,13 @@ fn run_chat(cwd: &Path, json_mode: bool, allow_tools: bool, force_tui: bool) -> 
             }));
         }
 
-        let output = engine.chat_with_options(prompt, ChatOptions { tools: allow_tools })?;
+        let output = engine.chat_with_options(
+            prompt,
+            ChatOptions {
+                tools: allow_tools,
+                ..Default::default()
+            },
+        )?;
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
             print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
@@ -3432,7 +3552,7 @@ fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Resu
     } else {
         Default::default()
     };
-    let usage = store.usage_summary(session.map(|s| s.session_id), None)?;
+    let usage = store.usage_summary(session.as_ref().map(|s| s.session_id), None)?;
     let autopilot_running = store
         .load_latest_autopilot_run()?
         .is_some_and(|run| run.status == "running");
@@ -3448,6 +3568,21 @@ fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Resu
     let estimated_cost_usd = (usage.input_tokens as f64 / 1_000_000.0)
         * cfg.usage.cost_per_million_input
         + (usage.output_tokens as f64 / 1_000_000.0) * cfg.usage.cost_per_million_output;
+
+    // Estimate current context window usage from transcript content size.
+    // Each token is ~4 chars on average. This approximates how much of the
+    // context window the next LLM call would consume (not cumulative API usage).
+    // If the session is already completed/failed, show 0 — a new session will start.
+    let is_terminal_session = session
+        .as_ref()
+        .is_some_and(|s| matches!(s.status, SessionState::Completed | SessionState::Failed));
+    let estimated_context_tokens = if is_terminal_session {
+        0
+    } else {
+        let transcript_chars: u64 = projection.transcript.iter().map(|t| t.len() as u64).sum();
+        transcript_chars / 4
+    };
+
     Ok(UiStatus {
         model: if force_max_think {
             cfg.llm.max_think_model.clone()
@@ -3463,7 +3598,7 @@ fn current_ui_status(cwd: &Path, cfg: &AppConfig, force_max_think: bool) -> Resu
             .clone()
             .unwrap_or_else(|| cfg.policy.permission_mode.clone()),
         active_tasks: projection.task_ids.len(),
-        context_used_tokens: usage.input_tokens + usage.output_tokens,
+        context_used_tokens: estimated_context_tokens,
         context_max_tokens: cfg.llm.context_window_tokens,
         session_turns: projection.transcript.len(),
         working_directory: cwd.display().to_string(),
@@ -7086,8 +7221,13 @@ fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result<()> {
                 args.input.as_deref(),
             )?;
             let engine = AgentEngine::new(cwd)?;
-            let output =
-                engine.chat_with_options(&rendered.prompt, ChatOptions { tools: args.tools })?;
+            let output = engine.chat_with_options(
+                &rendered.prompt,
+                ChatOptions {
+                    tools: args.tools,
+                    ..Default::default()
+                },
+            )?;
             if json_mode {
                 print_json(&json!({
                     "plugin_id": rendered.plugin_id,
@@ -7501,8 +7641,13 @@ fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<()> {
             let run = manager.run(&args.skill_id, args.input.as_deref(), &paths)?;
             if args.execute {
                 ensure_llm_ready(cwd, json_mode)?;
-                let output = AgentEngine::new(cwd)?
-                    .chat_with_options(&run.rendered_prompt, ChatOptions { tools: false })?;
+                let output = AgentEngine::new(cwd)?.chat_with_options(
+                    &run.rendered_prompt,
+                    ChatOptions {
+                        tools: false,
+                        ..Default::default()
+                    },
+                )?;
                 if json_mode {
                     print_json(&json!({"skill": run, "output": output}))?;
                 } else {
@@ -8951,8 +9096,12 @@ fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     let is_text = !json_mode;
     ensure_llm_ready(cwd, json_mode)?;
     let mut engine = AgentEngine::new(cwd)?;
-    engine.set_max_turns(cli.max_turns);
-    engine.set_max_budget_usd(cli.max_budget_usd);
+    apply_cli_flags(&mut engine, cli);
+
+    // Handle --no-input: auto-deny all approval prompts
+    if cli.no_input {
+        engine.set_approval_handler(Box::new(|_call| Ok(false)));
+    }
 
     // Handle --from-pr: fetch PR diff and prepend to prompt
     let prompt = if let Some(pr_number) = cli.from_pr {
@@ -9011,7 +9160,8 @@ fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
         }));
     }
 
-    let output = engine.chat(&prompt)?;
+    let options = chat_options_from_cli(cli, true);
+    let output = engine.chat_with_options(&prompt, options)?;
 
     match cli.output_format.as_str() {
         "json" => {
@@ -9068,7 +9218,7 @@ fn run_continue_session(cwd: &Path, json_mode: bool, _model: Option<&str>) -> Re
         );
     }
     // Enter chat mode with the continued session context
-    run_chat(cwd, json_mode, true, false)
+    run_chat(cwd, json_mode, true, false, None)
 }
 
 fn run_resume_specific(
@@ -9092,7 +9242,7 @@ fn run_resume_specific(
             session.status
         );
     }
-    run_chat(cwd, json_mode, true, false)
+    run_chat(cwd, json_mode, true, false, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -9153,7 +9303,13 @@ fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Result<()> {
     );
 
     let engine = AgentEngine::new(cwd)?;
-    let output = engine.chat_with_options(&review_prompt, ChatOptions { tools: false })?;
+    let output = engine.chat_with_options(
+        &review_prompt,
+        ChatOptions {
+            tools: false,
+            ..Default::default()
+        },
+    )?;
 
     if json_mode {
         print_json(&json!({

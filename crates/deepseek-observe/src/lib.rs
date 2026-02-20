@@ -11,6 +11,7 @@ use std::time::Duration;
 pub struct Observer {
     log_path: PathBuf,
     telemetry: Option<TelemetrySink>,
+    verbose: bool,
 }
 
 struct TelemetrySink {
@@ -26,6 +27,7 @@ impl Observer {
         Ok(Self {
             log_path: dir.join("observe.log"),
             telemetry,
+            verbose: false,
         })
     }
 
@@ -63,6 +65,23 @@ impl Observer {
                 "confidence": decision.confidence,
             }),
         )
+    }
+
+    /// Enable or disable verbose logging to stderr.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
+    }
+
+    /// Returns whether verbose mode is enabled.
+    pub fn is_verbose(&self) -> bool {
+        self.verbose
+    }
+
+    /// Log a message to stderr with `[deepseek]` prefix when verbose mode is on.
+    pub fn verbose_log(&self, msg: &str) {
+        if self.verbose {
+            eprintln!("[deepseek] {msg}");
+        }
     }
 
     fn append_log_line(&self, line: &str) -> Result<()> {

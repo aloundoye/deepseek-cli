@@ -1864,6 +1864,34 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Filter tool definitions by allowed/disallowed lists.
+///
+/// - If `allowed` is `Some`, only tools whose `function.name` is in the list are kept.
+/// - If `disallowed` is `Some`, tools whose `function.name` is in the list are removed.
+/// - `allowed` and `disallowed` should not both be `Some` (caller must validate).
+pub fn filter_tool_definitions(
+    tools: Vec<ToolDefinition>,
+    allowed: Option<&[String]>,
+    disallowed: Option<&[String]>,
+) -> Vec<ToolDefinition> {
+    let tools = if let Some(allow_list) = allowed {
+        tools
+            .into_iter()
+            .filter(|t| allow_list.iter().any(|a| a == &t.function.name))
+            .collect()
+    } else {
+        tools
+    };
+    if let Some(deny_list) = disallowed {
+        tools
+            .into_iter()
+            .filter(|t| !deny_list.iter().any(|d| d == &t.function.name))
+            .collect()
+    } else {
+        tools
+    }
+}
+
 /// Map tool definition function names (underscored) to internal tool names (dotted).
 pub fn map_tool_name(function_name: &str) -> &str {
     match function_name {
@@ -3826,5 +3854,33 @@ mod tests {
                 "AGENT_LEVEL_TOOLS contains '{tool_name}' but no definition exists"
             );
         }
+    }
+
+    #[test]
+    fn filter_tool_definitions_allowed() {
+        let defs = tool_definitions();
+        let allowed = vec!["fs_read".to_string(), "fs_write".to_string()];
+        let filtered = filter_tool_definitions(defs, Some(&allowed), None);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|t| t.function.name == "fs_read"));
+        assert!(filtered.iter().any(|t| t.function.name == "fs_write"));
+    }
+
+    #[test]
+    fn filter_tool_definitions_disallowed() {
+        let defs = tool_definitions();
+        let original_count = defs.len();
+        let disallowed = vec!["bash_run".to_string()];
+        let filtered = filter_tool_definitions(defs, None, Some(&disallowed));
+        assert_eq!(filtered.len(), original_count - 1);
+        assert!(!filtered.iter().any(|t| t.function.name == "bash_run"));
+    }
+
+    #[test]
+    fn filter_tool_definitions_no_filters() {
+        let defs = tool_definitions();
+        let original_count = defs.len();
+        let filtered = filter_tool_definitions(defs, None, None);
+        assert_eq!(filtered.len(), original_count);
     }
 }

@@ -139,41 +139,36 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 
 ---
 
-## Phase 3: TUI / User Experience
+## Phase 3: TUI / User Experience ✅
 
-### 3.1 Improve markdown rendering
-- File: `crates/deepseek-ui/src/lib.rs` — `style_transcript_line()`
-- Current: basic heading bold, code block coloring
-- **Add**: proper bullet/numbered lists, inline code backticks, bold/italic, tables
-- Consider pulling in a ratatui markdown widget or building a simple parser
+### 3.1 Improve markdown rendering ✅
+- Added `*italic*` support to `parse_inline_markdown()` with recursive nesting
+- Added table rendering: pipe-delimited rows with `│` separators, separator rows dimmed
+- Italic, bold, inline code, and combinations all work
 
-### 3.2 Add tool call display in transcript
-- When LLM calls tools, push transcript entries showing:
-  - Tool name and key arguments (dimmed/gray)
-  - Result status (green check or red X)
-  - Duration
-- Update `TranscriptEntry` kinds or add new `MessageKind::ToolCall` / `MessageKind::ToolResult`
+### 3.2 Add tool call display in transcript ✅
+- Added `ChatShell::push_tool_call(name, args_summary)` — creates `MessageKind::ToolCall` entry
+- Added `ChatShell::push_tool_result(name, duration_ms, summary)` — creates `MessageKind::ToolResult` with auto-formatted duration (ms/s)
+- Added `TuiStreamEvent::ToolCallStart` and `TuiStreamEvent::ToolCallEnd` events with full handling in event loop
 
-### 3.3 Add cost/token tracking in status bar
-- File: `crates/deepseek-ui/src/lib.rs` — `render_statusline_spans()`
-- Show: `tokens: 12.3k/128k | cost: $0.04 | turn 3`
-- Wire into store's cost_ledger and token tracking
+### 3.3 Add cost/token tracking in status bar ✅
+- Added session turn count display (`turn N`) to `render_statusline_spans()` — hidden when 0
+- Context usage (K/K with color coding) and cost ($) were already displayed
+- Added `ChatShell::push_cost_summary()` for `/cost` command output
 
-### 3.4 Fix spinner during tool execution
-- File: `crates/deepseek-ui/src/lib.rs`
-- `shell.active_tool` exists but may not update properly in chat() mode
-- **Fix**: Send `TuiStreamEvent::ToolStarted(name)` / `TuiStreamEvent::ToolFinished` from agent to TUI via channel
+### 3.4 Fix spinner during tool execution ✅
+- Added `ToolCallStart`/`ToolCallEnd` stream events that properly set/clear `shell.active_tool`
+- `ToolCallStart` both pushes transcript entry and activates spinner
+- `ToolCallEnd` pushes result entry and clears spinner
 
-### 3.5 Add optional right panel toggle
-- The right panel (Plan/Tools/Mission/Artifacts) was removed for clean chat
-- Add back as toggleable with Tab key (default: off)
-- Show: active tools, recent tool calls, task list, cost breakdown
+### 3.5 Right panel toggle — SKIPPED
+- Removed: right panel split disrupts the clean Claude-style full-width chat UI
+- The existing `RightPane` enum and `Ctrl+O` cycle remain for future use if needed
 
-### 3.6 Improve slash command output
-- `/cost` — show breakdown per session with input/output/cached tokens
-- `/compact` — show tokens freed and new usage percentage
-- `/status` — show model, permission mode, tools enabled, session info
-- `/model` — show current model and allow switching
+### 3.6 Improve slash command output ✅
+- Added `ChatShell::push_cost_summary(status)` — formats cost, tokens, context %, turns
+- Added `ChatShell::push_status_summary(status)` — formats model, mode, approvals, tasks, jobs, autopilot, cost
+- Added `ChatShell::push_model_info(model)` — displays current model
 
 ---
 
@@ -358,11 +353,86 @@ Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Co
 - Include subcommand and flag completions
 - Test with common shells
 
-│### **Potential Areas for Improvement**                                                                                    │
-│                                                                                                                           │
-│  1. **Documentation**: Architectural documentation could be more comprehensive                                            │
-│  2. **Configuration**: Complex config system might be overwhelming for new users                                          │
-│  3. **Testing**: More integration tests could improve reliability                                                         │
-│  4. **Error Handling**: Could benefit from more structured error types                                                    │
-│  5. **Performance**: Large workspaces might benefit from more aggressive caching                                          │
-│                                                                                   
+---
+
+## Phase 11: Architectural Debt & Hardening
+
+### 11.1 Split main.rs into modules
+- File: `crates/deepseek-cli/src/main.rs` — **9,563 lines, 149 functions**
+- Extract into submodules:
+  - `src/commands/mod.rs` — Clap structs, Commands enum, dispatch
+  - `src/commands/chat.rs` — `run_chat()`, `run_chat_tui()`, TUI setup
+  - `src/commands/autopilot.rs` — `run_autopilot()`, status, pause/resume
+  - `src/commands/profile.rs` — `run_profile()`, `run_benchmark()`
+  - `src/commands/patch.rs` — `run_diff()`, `run_apply()`
+  - `src/commands/admin.rs` — config, permissions, plugins, clean, doctor
+  - `src/output.rs` — `OutputFormatter` replacing 106 `if cli.json` blocks
+- Create `CliContext { cwd, json_mode, output }` to replace `json_mode: bool` threaded through 40+ signatures
+
+### 11.2 Add type-safe tool names
+- Create `ToolName` enum (~30 variants) in deepseek-core
+- Replace `ToolCall.name: String` → `ToolCall.name: ToolName`
+- Replace `map_tool_name()` with `ToolName::from_api_name()` / `ToolName::as_internal()`
+- Replace `REVIEW_BLOCKED_TOOLS: &[&str]` → `ToolName::is_read_only()`
+- Replace `AGENT_LEVEL_TOOLS: &[&str]` → `ToolName::is_agent_level()`
+- Update deepseek-tools, deepseek-agent, deepseek-policy
+
+### 11.3 Restructure EventKind into sub-enums
+- Current: 69-variant flat enum (260+ lines)
+- Refactor into:
+  - `SessionEventV1` — TurnAdded, StateChanged, Started, Resumed
+  - `ToolEventV1` — Proposed, Approved, Denied, Result
+  - `PlanEventV1` — Created, Revised, StepMarked
+  - `TaskEventV1` — Created, Completed, Updated, Deleted
+  - `JobEventV1` — Started, Resumed, Stopped
+  - `PluginEventV1` — Installed, Removed, Enabled, Disabled, etc.
+- Replace string fields with enums: `role: String` → `role: ChatRole`, `stop_reason: String` → `StopReason`, `status: String` → `TaskStatus`
+
+### 11.4 Add missing test coverage
+- **deepseek-store** (2870 LOC, 2 tests): event journal append/rebuild, SQLite projection consistency, concurrent access, event type migrations
+- **deepseek-router** (130 LOC, 1 test): boundary conditions (threshold=0.72 exactly), low scores → base model, weight combinations, all-zero signals
+- **deepseek-hooks** (129 LOC, 1 test): Windows PowerShell execution, hook failure modes, timeout handling
+- **deepseek-skills** (235 LOC, 1 test): glob pattern edge cases, directory traversal, hot reload
+- **deepseek-memory** (530 LOC, 3 tests): DEEPSEEK.md read/write roundtrip, auto-memory observation persistence, cross-project memory
+- **deepseek-diff** (296 LOC, 2 tests): SHA verification, conflict detection, 3-way merge
+
+### 11.5 Fix error handling hygiene
+- Replace 26+ `lock().unwrap()` calls with `.lock().expect("context")` or proper error propagation
+- Replace `.ok()` on config loading with logging: distinguish "file not found" from "parse error"
+- Replace silent regex compilation failures in deepseek-policy with startup validation
+- Add `#[must_use]` where `Result` return values are silently dropped
+
+### 11.6 Consolidate config type safety
+- Move `PolicyConfig.permission_mode: String` → `PermissionMode` enum (already exists in deepseek-policy)
+- Move `PolicyConfig.approve_edits: String` → `ApprovalMode { Ask, Allow, Deny }` enum
+- Move `PolicyConfig.sandbox_mode: String` → `SandboxMode` enum (already exists)
+- Validate config at load time instead of at use time
+
+### 11.7 Extract test helpers to deepseek-testkit
+- Move temp workspace creation pattern (repeated in 5+ crates) to `testkit::temp_workspace()`
+- Move `temp_host()` pattern from deepseek-tools tests to shared helper
+- Add `testkit::fake_session()` for agent tests
+
+  Recommendations for UX Improvement                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                
+  #### Immediate (1 week):                                                                                                                                                                                                                      
+  1. Add deepseek setup interactive wizard                                                                                                                                                                                                      
+  2. Colorize terminal output                                                                                                                                                                                                                   
+  3. Improve error messages with suggestions                                                                                                                                                                                                    
+  4. Add progress indicators for LLM calls                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                
+  #### Short-term (1 month):                                                                                                                                                                                                                    
+  1. Create deepseek config interactive editor                                                                                                                                                                                                  
+  2. Add command aliases for common tasks                                                                                                                                                                                                       
+  3. Implement shell completions                                                                                                                                                                                                                
+  4. Add --help to all commands                                                                                                                                                                                                                 
+                                                                                                                                                                             
+  #### Medium-term (2 months):                                                                                                                                                                                                                  
+  1. Build TUI (terminal UI) for interactive mode                                                                                                                                                                                               
+  2. Add visual diff viewer for patches                                                                                                                                                                                                         
+  3. Create session browser                                                                                                                                                                                                                     
+  4. Implement command history and favorites                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                
+  #### Long-term (3 months):                                                                                                                                                                                                                                                                     
+  3. AI-powered command suggestions                                                                                                                                                                                                             
+  4. Personalized workflows 

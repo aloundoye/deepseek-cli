@@ -15,7 +15,9 @@ use deepseek_store::{
     ProviderMetricRecord, Store, SubagentRunRecord, TaskQueueRecord, VerificationRunRecord,
 };
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
-use deepseek_tools::{AGENT_LEVEL_TOOLS, LocalToolHost, map_tool_name, tool_definitions};
+use deepseek_tools::{
+    AGENT_LEVEL_TOOLS, LocalToolHost, filter_tool_definitions, map_tool_name, tool_definitions,
+};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -210,6 +212,16 @@ type SubagentWorkerFn = Arc<dyn Fn(String) -> Result<String> + Send + Sync>;
 pub struct ChatOptions {
     /// Whether to include tool definitions and allow tool execution.
     pub tools: bool,
+    /// If set, only these tool function names are sent to the LLM.
+    pub allowed_tools: Option<Vec<String>>,
+    /// If set, these tool function names are removed before sending to the LLM.
+    pub disallowed_tools: Option<Vec<String>>,
+    /// Replace the default system prompt entirely.
+    pub system_prompt_override: Option<String>,
+    /// Append text to the default system prompt.
+    pub system_prompt_append: Option<String>,
+    /// Additional directories to include in workspace context.
+    pub additional_dirs: Vec<PathBuf>,
 }
 
 pub struct AgentEngine {
@@ -277,6 +289,16 @@ impl AgentEngine {
     /// Override max budget USD limit (from CLI flag).
     pub fn set_max_budget_usd(&mut self, max: Option<f64>) {
         self.max_budget_usd = max;
+    }
+
+    /// Override the permission mode at runtime (from CLI flag).
+    pub fn set_permission_mode(&mut self, mode: &str) {
+        self.policy = PolicyEngine::from_mode(mode);
+    }
+
+    /// Enable verbose logging on the observer.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.observer.set_verbose(verbose);
     }
 
     /// Set an external approval handler (e.g. for TUI/raw-mode compatible input).
@@ -995,7 +1017,13 @@ impl AgentEngine {
 
     /// Chat-with-tools loop (convenience wrapper with tools enabled).
     pub fn chat(&self, prompt: &str) -> Result<String> {
-        self.chat_with_options(prompt, ChatOptions { tools: true })
+        self.chat_with_options(
+            prompt,
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// Chat loop with configurable options. When `options.tools` is false, no tool
@@ -1015,12 +1043,29 @@ impl AgentEngine {
         )?;
 
         // Build system prompt with workspace context
-        let system_prompt = self.build_chat_system_prompt(prompt)?;
+        let system_prompt = if let Some(ref override_prompt) = options.system_prompt_override {
+            override_prompt.clone()
+        } else {
+            let base = self.build_chat_system_prompt(prompt)?;
+            if let Some(ref append) = options.system_prompt_append {
+                format!("{base}\n\n{append}")
+            } else {
+                base
+            }
+        };
         let tools = if options.tools {
-            tool_definitions()
+            let all = tool_definitions();
+            filter_tool_definitions(
+                all,
+                options.allowed_tools.as_deref(),
+                options.disallowed_tools.as_deref(),
+            )
         } else {
             vec![]
         };
+
+        self.observer
+            .verbose_log(&format!("chat: {} tool definitions loaded", tools.len()));
 
         // Initialize conversation with system + user message
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
@@ -1228,6 +1273,13 @@ impl AgentEngine {
                 temperature: Some(0.0),
             };
 
+            self.observer.verbose_log(&format!(
+                "turn {turn_count}: calling LLM model={} messages={} tools={}",
+                request.model,
+                request.messages.len(),
+                request.tools.len()
+            ));
+
             // Call the LLM with streaming (clone the Arc so it persists across turns)
             let response = {
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
@@ -1369,6 +1421,22 @@ impl AgentEngine {
                 let internal_name = map_tool_name(&tc.name);
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+
+                // Safety net: block disallowed tools at execution time
+                if let Some(ref deny_list) = options.disallowed_tools
+                    && deny_list.iter().any(|d| d == &tc.name)
+                {
+                    self.observer
+                        .verbose_log(&format!("blocked disallowed tool: {}", tc.name));
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: format!(
+                            "Error: tool '{}' is not allowed in this session",
+                            tc.name
+                        ),
+                    });
+                    continue;
+                }
 
                 // ── Agent-level tools (handled here, not by LocalToolHost) ──
                 if AGENT_LEVEL_TOOLS.contains(&internal_name) {
