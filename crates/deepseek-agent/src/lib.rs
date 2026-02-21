@@ -8250,7 +8250,7 @@ mod tests {
         let received = std::sync::Arc::new(std::sync::Mutex::new(false));
         let received_clone = received.clone();
         engine.set_stream_callback(std::sync::Arc::new(move |_chunk| {
-            *received_clone.lock().unwrap() = true;
+            *received_clone.lock().expect("test lock") = true;
         }));
         let result = engine.chat_with_options(
             "test stream",

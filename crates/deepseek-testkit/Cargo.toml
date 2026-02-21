@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 deepseek-agent = { path = "../deepseek-agent" }
 

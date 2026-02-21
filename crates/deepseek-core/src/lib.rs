@@ -193,11 +193,351 @@ pub struct RouterDecision {
     pub escalated: bool,
 }
 
+/// Type-safe tool name enum covering all built-in tools.
+///
+/// Maps between underscored API names (`fs_read`) and dotted internal names (`fs.read`).
+/// Plugin and MCP tools are not represented here — use `from_api_name` which returns `None`
+/// for unknown tool names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolName {
+    FsRead,
+    FsWrite,
+    FsEdit,
+    FsList,
+    FsGlob,
+    FsGrep,
+    BashRun,
+    MultiEdit,
+    GitStatus,
+    GitDiff,
+    GitShow,
+    WebFetch,
+    WebSearch,
+    NotebookRead,
+    NotebookEdit,
+    IndexQuery,
+    PatchStage,
+    PatchApply,
+    DiagnosticsCheck,
+    ChromeNavigate,
+    ChromeClick,
+    ChromeTypeText,
+    ChromeScreenshot,
+    ChromeReadConsole,
+    ChromeEvaluate,
+    UserQuestion,
+    TaskCreate,
+    TaskUpdate,
+    TaskGet,
+    TaskList,
+    SpawnTask,
+    TaskOutput,
+    TaskStop,
+    EnterPlanMode,
+    ExitPlanMode,
+    Skill,
+    KillShell,
+}
+
+impl ToolName {
+    /// Parse from underscored API name (e.g. `"fs_read"`). Returns `None` for
+    /// unknown names (plugins, MCP tools).
+    #[must_use]
+    pub fn from_api_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "fs_read" => Self::FsRead,
+            "fs_write" => Self::FsWrite,
+            "fs_edit" => Self::FsEdit,
+            "fs_list" => Self::FsList,
+            "fs_glob" => Self::FsGlob,
+            "fs_grep" => Self::FsGrep,
+            "bash_run" => Self::BashRun,
+            "multi_edit" => Self::MultiEdit,
+            "git_status" => Self::GitStatus,
+            "git_diff" => Self::GitDiff,
+            "git_show" => Self::GitShow,
+            "web_fetch" => Self::WebFetch,
+            "web_search" => Self::WebSearch,
+            "notebook_read" => Self::NotebookRead,
+            "notebook_edit" => Self::NotebookEdit,
+            "index_query" => Self::IndexQuery,
+            "patch_stage" => Self::PatchStage,
+            "patch_apply" => Self::PatchApply,
+            "diagnostics_check" => Self::DiagnosticsCheck,
+            "chrome_navigate" => Self::ChromeNavigate,
+            "chrome_click" => Self::ChromeClick,
+            "chrome_type_text" => Self::ChromeTypeText,
+            "chrome_screenshot" => Self::ChromeScreenshot,
+            "chrome_read_console" => Self::ChromeReadConsole,
+            "chrome_evaluate" => Self::ChromeEvaluate,
+            "user_question" => Self::UserQuestion,
+            "task_create" => Self::TaskCreate,
+            "task_update" => Self::TaskUpdate,
+            "task_get" => Self::TaskGet,
+            "task_list" => Self::TaskList,
+            "spawn_task" => Self::SpawnTask,
+            "task_output" => Self::TaskOutput,
+            "task_stop" => Self::TaskStop,
+            "enter_plan_mode" => Self::EnterPlanMode,
+            "exit_plan_mode" => Self::ExitPlanMode,
+            "skill" => Self::Skill,
+            "kill_shell" => Self::KillShell,
+            _ => return None,
+        })
+    }
+
+    /// Parse from dotted internal name (e.g. `"fs.read"`). Returns `None` for
+    /// unknown names.
+    #[must_use]
+    pub fn from_internal_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "fs.read" => Self::FsRead,
+            "fs.write" => Self::FsWrite,
+            "fs.edit" => Self::FsEdit,
+            "fs.list" => Self::FsList,
+            "fs.glob" => Self::FsGlob,
+            "fs.grep" => Self::FsGrep,
+            "bash.run" => Self::BashRun,
+            "multi_edit" => Self::MultiEdit,
+            "git.status" => Self::GitStatus,
+            "git.diff" => Self::GitDiff,
+            "git.show" => Self::GitShow,
+            "web.fetch" => Self::WebFetch,
+            "web.search" => Self::WebSearch,
+            "notebook.read" => Self::NotebookRead,
+            "notebook.edit" => Self::NotebookEdit,
+            "index.query" => Self::IndexQuery,
+            "patch.stage" => Self::PatchStage,
+            "patch.apply" => Self::PatchApply,
+            "diagnostics.check" => Self::DiagnosticsCheck,
+            "chrome.navigate" => Self::ChromeNavigate,
+            "chrome.click" => Self::ChromeClick,
+            "chrome.type_text" => Self::ChromeTypeText,
+            "chrome.screenshot" => Self::ChromeScreenshot,
+            "chrome.read_console" => Self::ChromeReadConsole,
+            "chrome.evaluate" => Self::ChromeEvaluate,
+            "user_question" => Self::UserQuestion,
+            "task_create" => Self::TaskCreate,
+            "task_update" => Self::TaskUpdate,
+            "task_get" => Self::TaskGet,
+            "task_list" => Self::TaskList,
+            "spawn_task" => Self::SpawnTask,
+            "task_output" => Self::TaskOutput,
+            "task_stop" => Self::TaskStop,
+            "enter_plan_mode" => Self::EnterPlanMode,
+            "exit_plan_mode" => Self::ExitPlanMode,
+            "skill" => Self::Skill,
+            "kill_shell" => Self::KillShell,
+            _ => return None,
+        })
+    }
+
+    /// Dotted internal name (e.g. `"fs.read"`, `"bash.run"`).
+    #[must_use]
+    pub fn as_internal(&self) -> &'static str {
+        match self {
+            Self::FsRead => "fs.read",
+            Self::FsWrite => "fs.write",
+            Self::FsEdit => "fs.edit",
+            Self::FsList => "fs.list",
+            Self::FsGlob => "fs.glob",
+            Self::FsGrep => "fs.grep",
+            Self::BashRun => "bash.run",
+            Self::MultiEdit => "multi_edit",
+            Self::GitStatus => "git.status",
+            Self::GitDiff => "git.diff",
+            Self::GitShow => "git.show",
+            Self::WebFetch => "web.fetch",
+            Self::WebSearch => "web.search",
+            Self::NotebookRead => "notebook.read",
+            Self::NotebookEdit => "notebook.edit",
+            Self::IndexQuery => "index.query",
+            Self::PatchStage => "patch.stage",
+            Self::PatchApply => "patch.apply",
+            Self::DiagnosticsCheck => "diagnostics.check",
+            Self::ChromeNavigate => "chrome.navigate",
+            Self::ChromeClick => "chrome.click",
+            Self::ChromeTypeText => "chrome.type_text",
+            Self::ChromeScreenshot => "chrome.screenshot",
+            Self::ChromeReadConsole => "chrome.read_console",
+            Self::ChromeEvaluate => "chrome.evaluate",
+            Self::UserQuestion => "user_question",
+            Self::TaskCreate => "task_create",
+            Self::TaskUpdate => "task_update",
+            Self::TaskGet => "task_get",
+            Self::TaskList => "task_list",
+            Self::SpawnTask => "spawn_task",
+            Self::TaskOutput => "task_output",
+            Self::TaskStop => "task_stop",
+            Self::EnterPlanMode => "enter_plan_mode",
+            Self::ExitPlanMode => "exit_plan_mode",
+            Self::Skill => "skill",
+            Self::KillShell => "kill_shell",
+        }
+    }
+
+    /// Underscored API name (e.g. `"fs_read"`, `"bash_run"`).
+    #[must_use]
+    pub fn as_api_name(&self) -> &'static str {
+        match self {
+            Self::FsRead => "fs_read",
+            Self::FsWrite => "fs_write",
+            Self::FsEdit => "fs_edit",
+            Self::FsList => "fs_list",
+            Self::FsGlob => "fs_glob",
+            Self::FsGrep => "fs_grep",
+            Self::BashRun => "bash_run",
+            Self::MultiEdit => "multi_edit",
+            Self::GitStatus => "git_status",
+            Self::GitDiff => "git_diff",
+            Self::GitShow => "git_show",
+            Self::WebFetch => "web_fetch",
+            Self::WebSearch => "web_search",
+            Self::NotebookRead => "notebook_read",
+            Self::NotebookEdit => "notebook_edit",
+            Self::IndexQuery => "index_query",
+            Self::PatchStage => "patch_stage",
+            Self::PatchApply => "patch_apply",
+            Self::DiagnosticsCheck => "diagnostics_check",
+            Self::ChromeNavigate => "chrome_navigate",
+            Self::ChromeClick => "chrome_click",
+            Self::ChromeTypeText => "chrome_type_text",
+            Self::ChromeScreenshot => "chrome_screenshot",
+            Self::ChromeReadConsole => "chrome_read_console",
+            Self::ChromeEvaluate => "chrome_evaluate",
+            Self::UserQuestion => "user_question",
+            Self::TaskCreate => "task_create",
+            Self::TaskUpdate => "task_update",
+            Self::TaskGet => "task_get",
+            Self::TaskList => "task_list",
+            Self::SpawnTask => "spawn_task",
+            Self::TaskOutput => "task_output",
+            Self::TaskStop => "task_stop",
+            Self::EnterPlanMode => "enter_plan_mode",
+            Self::ExitPlanMode => "exit_plan_mode",
+            Self::Skill => "skill",
+            Self::KillShell => "kill_shell",
+        }
+    }
+
+    /// Whether this tool is read-only (allowed in plan/explore mode).
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::FsRead
+                | Self::FsList
+                | Self::FsGlob
+                | Self::FsGrep
+                | Self::GitStatus
+                | Self::GitDiff
+                | Self::GitShow
+                | Self::WebFetch
+                | Self::WebSearch
+                | Self::IndexQuery
+                | Self::NotebookRead
+                | Self::DiagnosticsCheck
+                | Self::UserQuestion
+                | Self::TaskCreate
+                | Self::TaskUpdate
+                | Self::TaskGet
+                | Self::TaskList
+                | Self::SpawnTask
+                | Self::ExitPlanMode
+        )
+    }
+
+    /// Whether this tool is handled by AgentEngine, not LocalToolHost.
+    #[must_use]
+    pub fn is_agent_level(&self) -> bool {
+        matches!(
+            self,
+            Self::UserQuestion
+                | Self::TaskCreate
+                | Self::TaskUpdate
+                | Self::TaskGet
+                | Self::TaskList
+                | Self::SpawnTask
+                | Self::TaskOutput
+                | Self::TaskStop
+                | Self::EnterPlanMode
+                | Self::ExitPlanMode
+                | Self::Skill
+                | Self::KillShell
+        )
+    }
+
+    /// Whether this tool is blocked during review mode.
+    #[must_use]
+    pub fn is_review_blocked(&self) -> bool {
+        matches!(
+            self,
+            Self::FsWrite
+                | Self::FsEdit
+                | Self::MultiEdit
+                | Self::PatchStage
+                | Self::PatchApply
+                | Self::BashRun
+                | Self::NotebookEdit
+        )
+    }
+
+    /// All built-in tool name variants.
+    pub const ALL: &'static [ToolName] = &[
+        Self::FsRead,
+        Self::FsWrite,
+        Self::FsEdit,
+        Self::FsList,
+        Self::FsGlob,
+        Self::FsGrep,
+        Self::BashRun,
+        Self::MultiEdit,
+        Self::GitStatus,
+        Self::GitDiff,
+        Self::GitShow,
+        Self::WebFetch,
+        Self::WebSearch,
+        Self::NotebookRead,
+        Self::NotebookEdit,
+        Self::IndexQuery,
+        Self::PatchStage,
+        Self::PatchApply,
+        Self::DiagnosticsCheck,
+        Self::ChromeNavigate,
+        Self::ChromeClick,
+        Self::ChromeTypeText,
+        Self::ChromeScreenshot,
+        Self::ChromeReadConsole,
+        Self::ChromeEvaluate,
+        Self::UserQuestion,
+        Self::TaskCreate,
+        Self::TaskUpdate,
+        Self::TaskGet,
+        Self::TaskList,
+        Self::SpawnTask,
+        Self::TaskOutput,
+        Self::TaskStop,
+        Self::EnterPlanMode,
+        Self::ExitPlanMode,
+        Self::Skill,
+        Self::KillShell,
+    ];
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub args: serde_json::Value,
     pub requires_approval: bool,
+}
+
+impl ToolCall {
+    /// Parse the internal tool name into a typed `ToolName`.
+    /// Returns `None` for plugin/MCP tools or unknown names.
+    #[must_use]
+    pub fn tool_name(&self) -> Option<ToolName> {
+        ToolName::from_internal_name(&self.name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,6 +879,158 @@ pub enum EventKind {
         provider: String,
         model: String,
     },
+}
+
+impl EventKind {
+    /// Logical category for this event kind.
+    #[must_use]
+    pub fn category(&self) -> &'static str {
+        match self {
+            // Session lifecycle
+            Self::SessionStartedV1 { .. }
+            | Self::SessionResumedV1 { .. }
+            | Self::SessionStateChangedV1 { .. }
+            | Self::SessionForkedV1 { .. } => "session",
+
+            // Chat / transcript
+            Self::TurnAddedV1 { .. }
+            | Self::ChatTurnV1 { .. }
+            | Self::ContextCompactedV1 { .. }
+            | Self::EffortChangedV1 { .. }
+            | Self::PermissionModeChangedV1 { .. }
+            | Self::TurnLimitExceededV1 { .. }
+            | Self::BudgetExceededV1 { .. } => "chat",
+
+            // Tool invocations
+            Self::ToolProposedV1 { .. }
+            | Self::ToolApprovedV1 { .. }
+            | Self::ToolResultV1 { .. }
+            | Self::ToolDeniedV1 { .. } => "tool",
+
+            // Plans
+            Self::PlanCreatedV1 { .. }
+            | Self::PlanRevisedV1 { .. }
+            | Self::StepMarkedV1 { .. }
+            | Self::EnterPlanModeV1 { .. }
+            | Self::ExitPlanModeV1 { .. } => "plan",
+
+            // Tasks
+            Self::TaskCreatedV1 { .. }
+            | Self::TaskCompletedV1 { .. }
+            | Self::TaskUpdatedV1 { .. }
+            | Self::TaskDeletedV1 { .. } => "task",
+
+            // Routing / model selection
+            Self::RouterDecisionV1 { .. }
+            | Self::RouterEscalationV1 { .. }
+            | Self::ProviderSelectedV1 { .. } => "router",
+
+            // Patches (diff/apply)
+            Self::PatchStagedV1 { .. } | Self::PatchAppliedV1 { .. } => "patch",
+
+            // Plugins
+            Self::PluginInstalledV1 { .. }
+            | Self::PluginRemovedV1 { .. }
+            | Self::PluginEnabledV1 { .. }
+            | Self::PluginDisabledV1 { .. }
+            | Self::PluginCatalogSyncedV1 { .. }
+            | Self::PluginVerifiedV1 { .. } => "plugin",
+
+            // Usage / cost tracking
+            Self::UsageUpdatedV1 { .. }
+            | Self::CostUpdatedV1 { .. }
+            | Self::PromptCacheHitV1 { .. } => "usage",
+
+            // Autopilot
+            Self::AutopilotRunStartedV1 { .. }
+            | Self::AutopilotRunHeartbeatV1 { .. }
+            | Self::AutopilotRunStoppedV1 { .. } => "autopilot",
+
+            // Subagent orchestration
+            Self::SubagentSpawnedV1 { .. }
+            | Self::SubagentCompletedV1 { .. }
+            | Self::SubagentFailedV1 { .. } => "subagent",
+
+            // Background jobs
+            Self::BackgroundJobStartedV1 { .. }
+            | Self::BackgroundJobResumedV1 { .. }
+            | Self::BackgroundJobStoppedV1 { .. } => "background",
+
+            // MCP
+            Self::McpServerAddedV1 { .. }
+            | Self::McpServerRemovedV1 { .. }
+            | Self::McpToolDiscoveredV1 { .. } => "mcp",
+
+            // Skills
+            Self::SkillLoadedV1 { .. } => "skill",
+
+            // Hooks
+            Self::HookExecutedV1 { .. } => "hook",
+
+            // Memory
+            Self::MemorySyncedV1 { .. } => "memory",
+
+            // Profile / benchmark
+            Self::ProfileCapturedV1 { .. } => "profile",
+
+            // Verification
+            Self::VerificationRunV1 { .. } => "verification",
+
+            // Checkpoint / rewind
+            Self::CheckpointCreatedV1 { .. } | Self::CheckpointRewoundV1 { .. } => "checkpoint",
+
+            // Export
+            Self::TranscriptExportedV1 { .. } => "export",
+
+            // Web search
+            Self::WebSearchExecutedV1 { .. } => "web",
+
+            // Review
+            Self::ReviewStartedV1 { .. } | Self::ReviewCompletedV1 { .. } => "review",
+
+            // Artifact bundling
+            Self::ArtifactBundledV1 { .. } => "artifact",
+
+            // Telemetry
+            Self::TelemetryEventV1 { .. } => "telemetry",
+
+            // Replay
+            Self::ReplayExecutedV1 { .. } => "replay",
+
+            // Scheduling
+            Self::OffPeakScheduledV1 { .. } => "scheduling",
+
+            // Visual testing
+            Self::VisualArtifactCapturedV1 { .. } => "visual",
+
+            // Remote environments
+            Self::RemoteEnvConfiguredV1 { .. } => "remote_env",
+
+            // Teleport
+            Self::TeleportBundleCreatedV1 { .. } => "teleport",
+
+            // Notebook
+            Self::NotebookEditedV1 { .. } => "notebook",
+
+            // PDF
+            Self::PdfTextExtractedV1 { .. } => "pdf",
+
+            // IDE
+            Self::IdeSessionStartedV1 { .. } => "ide",
+        }
+    }
+
+    /// Whether this event is a tool-related event (proposal, approval, result, denial).
+    #[must_use]
+    pub fn is_tool_event(&self) -> bool {
+        self.category() == "tool"
+    }
+
+    /// Whether this event is a session lifecycle event.
+    #[must_use]
+    pub fn is_session_event(&self) -> bool {
+        self.category() == "session"
+    }
 }
 
 pub trait ModelRouter {
@@ -970,18 +1462,126 @@ pub struct SandboxNetworkConfig {
     pub allow_unix_sockets: bool,
 }
 
+/// Controls whether edits or bash commands require interactive approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    Ask,
+    Always,
+    Never,
+}
+
+impl std::fmt::Display for ApprovalMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ask => write!(f, "ask"),
+            Self::Always => write!(f, "always"),
+            Self::Never => write!(f, "never"),
+        }
+    }
+}
+
+impl std::str::FromStr for ApprovalMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "always" => Ok(Self::Always),
+            "never" | "false" | "off" => Ok(Self::Never),
+            other => Err(anyhow::anyhow!(
+                "invalid approval mode '{}' (expected ask|always|never)",
+                other
+            )),
+        }
+    }
+}
+
+/// Sandbox enforcement mode for tool execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    Allowlist,
+    Isolated,
+    Off,
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+impl std::fmt::Display for SandboxMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allowlist => write!(f, "allowlist"),
+            Self::Isolated => write!(f, "isolated"),
+            Self::Off => write!(f, "off"),
+            Self::ReadOnly => write!(f, "read-only"),
+            Self::WorkspaceWrite => write!(f, "workspace-write"),
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "allowlist" => Ok(Self::Allowlist),
+            "isolated" | "container" | "os-sandbox" | "os_sandbox" => Ok(Self::Isolated),
+            "off" => Ok(Self::Off),
+            "read-only" | "readonly" => Ok(Self::ReadOnly),
+            "workspace-write" | "workspace_write" => Ok(Self::WorkspaceWrite),
+            other => Err(anyhow::anyhow!(
+                "invalid sandbox mode '{}' (expected allowlist|isolated|off|read-only|workspace-write)",
+                other
+            )),
+        }
+    }
+}
+
+/// Permission mode for the overall policy engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    Ask,
+    Auto,
+    Locked,
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ask => write!(f, "ask"),
+            Self::Auto => write!(f, "auto"),
+            Self::Locked => write!(f, "locked"),
+        }
+    }
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "auto" => Ok(Self::Auto),
+            "locked" => Ok(Self::Locked),
+            other => Err(anyhow::anyhow!(
+                "invalid permission mode '{}' (expected ask|auto|locked)",
+                other
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicyConfig {
-    pub approve_edits: String,
-    pub approve_bash: String,
+    pub approve_edits: ApprovalMode,
+    pub approve_bash: ApprovalMode,
     pub allowlist: Vec<String>,
     pub block_paths: Vec<String>,
     pub redact_patterns: Vec<String>,
-    pub sandbox_mode: String,
+    pub sandbox_mode: SandboxMode,
     pub sandbox_wrapper: Option<String>,
     /// Permission mode: "ask" (default), "auto", or "locked".
-    pub permission_mode: String,
+    pub permission_mode: PermissionMode,
     /// Optional lint command to run automatically after fs.edit (e.g., "cargo fmt --check").
     pub lint_after_edit: Option<String>,
     /// OS-level sandbox configuration.
@@ -992,8 +1592,8 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            approve_edits: "ask".to_string(),
-            approve_bash: "ask".to_string(),
+            approve_edits: ApprovalMode::Ask,
+            approve_bash: ApprovalMode::Ask,
             allowlist: vec![
                 "rg".to_string(),
                 "git status".to_string(),
@@ -1016,9 +1616,9 @@ impl Default for PolicyConfig {
                 "\\b\\d{3}-\\d{2}-\\d{4}\\b".to_string(),
                 "(?i)\\b(mrn|medical_record_number|patient_id)\\s*[:=]\\s*[a-z0-9\\-]{4,}\\b".to_string(),
             ],
-            sandbox_mode: "allowlist".to_string(),
+            sandbox_mode: SandboxMode::Allowlist,
             sandbox_wrapper: None,
-            permission_mode: "ask".to_string(),
+            permission_mode: PermissionMode::Ask,
             lint_after_edit: None,
             sandbox: SandboxConfig::default(),
         }
@@ -1413,5 +2013,158 @@ mod tests {
             let re_serialized = serde_json::to_string(&deserialized).expect("re-serialize");
             assert_eq!(serialized, re_serialized);
         }
+    }
+
+    #[test]
+    fn approval_mode_serde_roundtrip() {
+        for (mode, expected) in [
+            (ApprovalMode::Ask, "\"ask\""),
+            (ApprovalMode::Always, "\"always\""),
+            (ApprovalMode::Never, "\"never\""),
+        ] {
+            let serialized = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(serialized, expected);
+            let deserialized: ApprovalMode =
+                serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(deserialized, mode);
+        }
+    }
+
+    #[test]
+    fn sandbox_mode_serde_roundtrip() {
+        for (mode, expected) in [
+            (SandboxMode::Allowlist, "\"allowlist\""),
+            (SandboxMode::Isolated, "\"isolated\""),
+            (SandboxMode::Off, "\"off\""),
+            (SandboxMode::ReadOnly, "\"read-only\""),
+            (SandboxMode::WorkspaceWrite, "\"workspace-write\""),
+        ] {
+            let serialized = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(serialized, expected);
+            let deserialized: SandboxMode = serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(deserialized, mode);
+        }
+    }
+
+    #[test]
+    fn permission_mode_serde_roundtrip() {
+        for (mode, expected) in [
+            (PermissionMode::Ask, "\"ask\""),
+            (PermissionMode::Auto, "\"auto\""),
+            (PermissionMode::Locked, "\"locked\""),
+        ] {
+            let serialized = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(serialized, expected);
+            let deserialized: PermissionMode =
+                serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(deserialized, mode);
+        }
+    }
+
+    #[test]
+    fn tool_name_roundtrip_all_variants() {
+        for &tool in ToolName::ALL {
+            let api = tool.as_api_name();
+            let internal = tool.as_internal();
+            assert_eq!(
+                ToolName::from_api_name(api),
+                Some(tool),
+                "from_api_name roundtrip failed for {api}"
+            );
+            assert_eq!(
+                ToolName::from_internal_name(internal),
+                Some(tool),
+                "from_internal_name roundtrip failed for {internal}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_name_is_read_only_matches_plan_mode() {
+        let read_only: Vec<&str> = ToolName::ALL
+            .iter()
+            .filter(|t| t.is_read_only())
+            .map(|t| t.as_api_name())
+            .collect();
+        // Plan mode tools must be a subset of read-only tools
+        for name in &[
+            "fs_read",
+            "fs_list",
+            "fs_glob",
+            "fs_grep",
+            "git_status",
+            "git_diff",
+            "git_show",
+            "web_fetch",
+            "web_search",
+            "index_query",
+            "notebook_read",
+            "diagnostics_check",
+        ] {
+            assert!(read_only.contains(name), "{name} should be read-only");
+        }
+        // Write tools must not be read-only
+        for name in &["fs_write", "fs_edit", "bash_run", "notebook_edit"] {
+            assert!(!read_only.contains(name), "{name} should not be read-only");
+        }
+    }
+
+    #[test]
+    fn tool_name_unknown_returns_none() {
+        assert_eq!(ToolName::from_api_name("nonexistent_tool"), None);
+        assert_eq!(ToolName::from_api_name("plugin__foo__bar"), None);
+        assert_eq!(ToolName::from_api_name("mcp__server_tool"), None);
+        assert_eq!(ToolName::from_internal_name("unknown.tool"), None);
+    }
+
+    #[test]
+    fn event_kind_all_variants_have_category() {
+        // Verify a representative from each category returns a non-empty string
+        let events = vec![
+            EventKind::SessionStartedV1 {
+                session_id: Uuid::nil(),
+                workspace: String::new(),
+            },
+            EventKind::ChatTurnV1 {
+                message: ChatMessage::User {
+                    content: String::new(),
+                },
+            },
+            EventKind::ToolProposedV1 {
+                proposal: ToolProposal {
+                    invocation_id: Uuid::nil(),
+                    call: ToolCall {
+                        name: "fs.read".to_string(),
+                        args: serde_json::json!({}),
+                        requires_approval: false,
+                    },
+                    approved: false,
+                },
+            },
+            EventKind::TaskCreatedV1 {
+                task_id: Uuid::nil(),
+                title: String::new(),
+                priority: 0,
+            },
+            EventKind::PluginEnabledV1 {
+                plugin_id: String::new(),
+            },
+            EventKind::HookExecutedV1 {
+                phase: String::new(),
+                hook_path: String::new(),
+                success: true,
+                timed_out: false,
+                exit_code: Some(0),
+            },
+        ];
+        for event in &events {
+            let cat = event.category();
+            assert!(!cat.is_empty(), "category should not be empty");
+        }
+        // Verify specific categories
+        assert!(events[0].is_session_event());
+        assert!(!events[0].is_tool_event());
+        assert!(events[2].is_tool_event());
+        assert!(!events[2].is_session_event());
     }
 }

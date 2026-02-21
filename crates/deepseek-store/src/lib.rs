@@ -2830,6 +2830,220 @@ mod tests {
     }
 
     #[test]
+    fn append_event_increments_seq_no() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+        let session_id = Uuid::now_v7();
+        let session = Session {
+            session_id,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        for i in 1..=3 {
+            let seq = store.next_seq_no(session_id).expect("next_seq_no");
+            assert_eq!(seq, i);
+            store
+                .append_event(&EventEnvelope {
+                    seq_no: seq,
+                    at: Utc::now(),
+                    session_id,
+                    kind: EventKind::TurnAddedV1 {
+                        role: "user".to_string(),
+                        content: format!("msg {i}"),
+                    },
+                })
+                .expect("append");
+        }
+        let final_seq = store.next_seq_no(session_id).expect("final");
+        assert_eq!(final_seq, 4);
+    }
+
+    #[test]
+    fn save_and_load_session_roundtrip() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: "/tmp/test".to_string(),
+            baseline_commit: Some("abc123".to_string()),
+            status: SessionState::Planning,
+            budgets: SessionBudgets {
+                per_turn_seconds: 60,
+                max_think_tokens: 2000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save");
+        let loaded = store
+            .load_session(session.session_id)
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(loaded.session_id, session.session_id);
+        assert_eq!(loaded.workspace_root, session.workspace_root);
+        assert_eq!(loaded.baseline_commit, session.baseline_commit);
+    }
+
+    #[test]
+    fn load_latest_session_returns_most_recent() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        let s1 = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: "/tmp/first".to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&s1).expect("save s1");
+        // Small delay to ensure distinct updated_at timestamps
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let s2 = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: "/tmp/second".to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&s2).expect("save s2");
+
+        let latest = store
+            .load_latest_session()
+            .expect("load latest")
+            .expect("should exist");
+        assert_eq!(latest.session_id, s2.session_id);
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_corrupt() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = std::sync::Arc::new(Store::new(&workspace).expect("store"));
+        let session_id = Uuid::now_v7();
+        let session = Session {
+            session_id,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save");
+
+        let mut handles = vec![];
+        for t in 0..2 {
+            let s = store.clone();
+            let sid = session_id;
+            handles.push(std::thread::spawn(move || {
+                for i in 0..5 {
+                    let seq = (t * 5 + i + 1) as u64;
+                    let _ = s.append_event(&EventEnvelope {
+                        seq_no: seq,
+                        at: Utc::now(),
+                        session_id: sid,
+                        kind: EventKind::TurnAddedV1 {
+                            role: "user".to_string(),
+                            content: format!("thread {t} msg {i}"),
+                        },
+                    });
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let rebuilt = store.rebuild_from_events(session_id).expect("rebuild");
+        assert_eq!(rebuilt.transcript.len(), 10);
+    }
+
+    #[test]
+    fn rebuild_from_events_empty_session() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+        let rebuilt = store
+            .rebuild_from_events(Uuid::now_v7())
+            .expect("rebuild empty");
+        assert!(rebuilt.transcript.is_empty());
+        assert!(rebuilt.chat_messages.is_empty());
+    }
+
+    #[test]
+    fn event_journal_survives_reopen() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let session_id = Uuid::now_v7();
+
+        // First open: append event
+        {
+            let store = Store::new(&workspace).expect("store");
+            let session = Session {
+                session_id,
+                workspace_root: workspace.to_string_lossy().to_string(),
+                baseline_commit: None,
+                status: SessionState::Idle,
+                budgets: SessionBudgets {
+                    per_turn_seconds: 30,
+                    max_think_tokens: 1000,
+                },
+                active_plan_id: None,
+            };
+            store.save_session(&session).expect("save");
+            store
+                .append_event(&EventEnvelope {
+                    seq_no: 1,
+                    at: Utc::now(),
+                    session_id,
+                    kind: EventKind::TurnAddedV1 {
+                        role: "user".to_string(),
+                        content: "persisted".to_string(),
+                    },
+                })
+                .expect("append");
+        }
+
+        // Second open: verify
+        {
+            let store2 = Store::new(&workspace).expect("reopen store");
+            let rebuilt = store2
+                .rebuild_from_events(session_id)
+                .expect("rebuild after reopen");
+            assert_eq!(rebuilt.transcript.len(), 1);
+            assert!(rebuilt.transcript[0].contains("persisted"));
+        }
+    }
+
+    #[test]
     fn rebuild_handles_mixed_old_and_new_event_types() {
         let workspace =
             std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));

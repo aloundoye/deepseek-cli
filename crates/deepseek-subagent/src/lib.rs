@@ -398,7 +398,10 @@ impl TeamCoordinator {
 
     /// Get the current team state.
     pub fn state(&self) -> TeamState {
-        self.shared_state.lock().unwrap().clone()
+        self.shared_state
+            .lock()
+            .expect("subagent shared_state lock")
+            .clone()
     }
 
     /// Send a message from one teammate to another.

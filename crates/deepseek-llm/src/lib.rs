@@ -1826,10 +1826,13 @@ mod tests {
         let chunks_clone = Arc::clone(&chunks);
         let cb: StreamCallback = Arc::new(move |chunk| match chunk {
             StreamChunk::ContentDelta(text) => {
-                chunks_clone.lock().unwrap().push(text);
+                chunks_clone.lock().expect("test lock").push(text);
             }
             StreamChunk::Done => {
-                chunks_clone.lock().unwrap().push("[DONE]".to_string());
+                chunks_clone
+                    .lock()
+                    .expect("test lock")
+                    .push("[DONE]".to_string());
             }
             _ => {}
         });
@@ -1849,7 +1852,7 @@ mod tests {
             .expect("streaming response");
 
         assert_eq!(resp.text, "hello");
-        let collected = chunks.lock().unwrap();
+        let collected = chunks.lock().expect("test lock");
         assert_eq!(collected.len(), 3); // "hel", "lo", "[DONE]"
         assert_eq!(collected[0], "hel");
         assert_eq!(collected[1], "lo");

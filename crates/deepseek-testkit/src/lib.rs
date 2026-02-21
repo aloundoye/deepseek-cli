@@ -141,7 +141,22 @@ pub fn temp_workspace_with_mock() -> (tempfile::TempDir, MockLlmServer) {
     (dir, mock)
 }
 
-// ── Public test helper ──────────────────────────────────────────────────
+// ── Public test helpers ─────────────────────────────────────────────────
+
+/// Return a minimal valid `Session` for test use across crates.
+pub fn fake_session() -> deepseek_core::Session {
+    deepseek_core::Session {
+        session_id: uuid::Uuid::now_v7(),
+        workspace_root: "/tmp/test-workspace".to_string(),
+        baseline_commit: None,
+        status: deepseek_core::SessionState::Idle,
+        budgets: deepseek_core::SessionBudgets {
+            per_turn_seconds: 30,
+            max_think_tokens: 1000,
+        },
+        active_plan_id: None,
+    }
+}
 
 pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     let engine = AgentEngine::new(workspace)?;
