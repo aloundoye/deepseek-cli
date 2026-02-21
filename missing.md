@@ -385,7 +385,7 @@ This section adds concrete, implementation-level parity gaps that were not expli
 - ✅ 10.2 slash command parity for `/desktop`, `/todos`, `/chrome`; `/add-dir` mutates active context; `/login` + `/logout` perform real local session/settings updates; `remote-env check` performs real HTTP health verification.
 - ✅ 10.3 TUI parity improvements: reverse history search (`Ctrl+R`), `Esc Esc` rewind behavior, ghost-text suggestion + Tab accept, wired mission/artifacts/plan-collapse toggles, PR review status footer badge.
 - ✅ 10.4 Vim depth parity: `iw/aw` and quote/bracket text objects, `ciw/diw/yiw`, `gg`/`G` motions, expanded Vim tests.
-- 🚧 10.5 Chrome parity increment: strict live `/chrome` mode (no silent stubs), reconnect recovery, tab lifecycle commands (`tabs`, `tab new`, `tab focus`), and structured browser failure taxonomy. Native messaging host and recording/export remain.
+- 🚧 10.5 Chrome parity increment: strict live `/chrome` mode (no silent stubs), reconnect recovery, tab lifecycle commands (`tabs`, `tab new`, `tab focus`), structured browser failure taxonomy, native messaging host architecture, and `/chrome record` demo export flow are in place. Browser-extension depth remains iterative.
 - ✅ 10.7 JSON-RPC parity: added `session/remote_resume`, `session/handoff_export`, `session/handoff_import`, `events/poll`, and optional `prompt/stream_next` partial chunk polling path.
 - 🚧 10.6 deeper IDE workflow parity remains multi-iteration work.
 - ✅ 10.8 parity regression checklist added via `scripts/parity_regression_check.sh` and CI integration.
@@ -454,14 +454,14 @@ This section adds concrete, implementation-level parity gaps that were not expli
 **Priority:** High 🔥
 
 #### Tasks:
-1. 🚧 Add browser extension + native messaging host architecture (not only direct CDP port mode).
+1. ✅ Add browser extension + native messaging host architecture (not only direct CDP port mode).
 2. ✅ Add `/chrome` control flow including reconnect command.
 3. ✅ Implement resilient browser session lifecycle:
    - tab creation/switch/recovery flows
    - stale/idle connection recovery
 4. ✅ Remove/replace stub fallback behaviors when live connection is unavailable (slash-command path now requires live endpoint).
 5. Add browser automation extras parity:
-   - 🚧 recording/export flow (GIF/demo)
+   - ✅ recording/export flow (GIF/demo) via `/chrome record` (GIF when `ffmpeg` is available, frame-sequence fallback otherwise)
    - ✅ clearer failure taxonomy for common browser errors.
 
 ### 10.6 IDE Extension Depth Parity

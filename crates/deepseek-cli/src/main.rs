@@ -38,7 +38,7 @@ use commands::remote_env::run_remote_env;
 use commands::replay::run_replay;
 use commands::review::run_review;
 use commands::search::run_search;
-use commands::serve::{run_completions, run_serve};
+use commands::serve::{run_completions, run_native_host, run_serve};
 use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
@@ -363,6 +363,8 @@ enum Commands {
     Completions(CompletionsArgs),
     /// Start JSON-RPC server for IDE integration.
     Serve(ServeArgs),
+    /// Start Chrome native messaging host bridge.
+    NativeHost(NativeHostArgs),
 }
 
 #[derive(Args)]
@@ -683,6 +685,13 @@ struct ServeArgs {
     /// Transport to use: stdio (default).
     #[arg(long, default_value = "stdio")]
     transport: String,
+}
+
+#[derive(Args)]
+struct NativeHostArgs {
+    /// Optional workspace root to serve instead of the current directory.
+    #[arg(long)]
+    workspace_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -1412,6 +1421,7 @@ fn run() -> Result<()> {
         Commands::Context(_) => run_context(&cwd, cli.json),
         Commands::Completions(args) => run_completions(args),
         Commands::Serve(args) => run_serve(args, cli.json),
+        Commands::NativeHost(args) => run_native_host(&cwd, args),
     }
 }
 
@@ -1461,6 +1471,16 @@ fn validate_json_schema(output: &str, schema_str: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn native_host_command_parses() {
+        let cli = Cli::try_parse_from(["deepseek", "native-host"]).expect("parse native-host");
+        assert!(matches!(cli.command, Some(Commands::NativeHost(_))));
+    }
+
     #[test]
     fn json_schema_validates_object() {
         let schema = r#"{"type":"object","required":["name","age"]}"#;

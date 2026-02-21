@@ -30,3 +30,25 @@ Path: `extensions/jetbrains`
 3. In the spawned IDE, use `Tools -> DeepSeek Status`.
 
 The plugin starts `deepseek serve --transport stdio` and sends JSON-RPC `initialize` and `status` requests.
+
+## Chrome
+
+Path: `extensions/chrome`
+
+This package provides a native messaging bridge architecture:
+
+1. Load `extensions/chrome` as an unpacked extension in Chrome.
+2. Install native host manifest:
+
+   ```bash
+   cd extensions/chrome/native-messaging
+   ./install_native_host.sh <extension-id> /absolute/path/to/deepseek
+   ```
+
+3. The host launches:
+
+   ```bash
+   deepseek native-host
+   ```
+
+See `extensions/chrome/README.md` for details.

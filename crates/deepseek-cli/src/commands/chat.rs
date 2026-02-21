@@ -1883,6 +1883,97 @@ fn chrome_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
                 Err(err) => Ok(chrome_error_payload("evaluate", port, &debug_url, &err)),
             }
         }
+        "record" => {
+            let duration_seconds = args
+                .get(idx)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3)
+                .clamp(1, 60);
+            let output_path = args
+                .get(idx + 1)
+                .cloned()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    runtime_dir(cwd)
+                        .join("chrome")
+                        .join("recordings")
+                        .join(format!("recording-{}.gif", Utc::now().timestamp()))
+                });
+            if let Err(err) = session.ensure_live_connection() {
+                return Ok(chrome_error_payload("record", port, &debug_url, &err));
+            }
+            let frames_dir = runtime_dir(cwd)
+                .join("chrome")
+                .join("recordings")
+                .join(format!("frames-{}", Utc::now().timestamp_millis()));
+            std::fs::create_dir_all(&frames_dir)?;
+            let start = std::time::Instant::now();
+            let mut frame_count = 0usize;
+            while start.elapsed().as_secs() < duration_seconds {
+                let base64_png = session.screenshot(ScreenshotFormat::Png)?;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(base64_png)?;
+                let frame_path = frames_dir.join(format!("frame-{:04}.png", frame_count));
+                std::fs::write(&frame_path, bytes)?;
+                frame_count += 1;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            if frame_count == 0 {
+                return Err(anyhow!("recording produced no frames"));
+            }
+
+            if let Some(parent) = output_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let ffmpeg_result = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-framerate",
+                    "4",
+                    "-i",
+                    "frame-%04d.png",
+                    output_path.to_string_lossy().as_ref(),
+                ])
+                .current_dir(&frames_dir)
+                .output();
+
+            let mut export_mode = "frames_only".to_string();
+            let mut export_error = None;
+            if let Ok(output) = ffmpeg_result {
+                if output.status.success() {
+                    export_mode = "gif".to_string();
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if !stderr.is_empty() {
+                        export_error = Some(stderr);
+                    }
+                }
+            } else {
+                export_error = Some("ffmpeg unavailable; kept PNG frame sequence".to_string());
+            }
+
+            Ok(json!({
+                "schema": "deepseek.chrome.v1",
+                "action": "record",
+                "port": port,
+                "ok": true,
+                "duration_seconds": duration_seconds,
+                "frame_count": frame_count,
+                "frames_dir": frames_dir.to_string_lossy().to_string(),
+                "output_path": if export_mode == "gif" {
+                    output_path.to_string_lossy().to_string()
+                } else {
+                    String::new()
+                },
+                "export_mode": export_mode,
+                "export_error": export_error,
+            }))
+        }
         "screenshot" => {
             let format = match args.get(idx).map(|v| v.to_ascii_lowercase()) {
                 Some(value) if value == "jpeg" || value == "jpg" => ScreenshotFormat::Jpeg,
@@ -1942,7 +2033,7 @@ fn chrome_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
             Err(err) => Ok(chrome_error_payload("console", port, &debug_url, &err)),
         },
         _ => Err(anyhow!(
-            "usage: /chrome [status|reconnect|tabs|tab new <url>|tab focus <target_id>|navigate <url>|click <selector>|type <selector> <text>|evaluate <js>|screenshot [png|jpeg|webp] [output]|console]"
+            "usage: /chrome [status|reconnect|tabs|tab new <url>|tab focus <target_id>|navigate <url>|click <selector>|type <selector> <text>|evaluate <js>|record [seconds] [output.gif]|screenshot [png|jpeg|webp] [output]|console]"
         )),
     }
 }

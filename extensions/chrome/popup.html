@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>DeepSeek Bridge</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+        margin: 0;
+        padding: 12px;
+        width: 320px;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 6px;
+        border: 1px solid #334155;
+        padding: 7px 8px;
+        background: #111827;
+        color: #e2e8f0;
+      }
+      button {
+        border: 0;
+        border-radius: 6px;
+        padding: 7px 10px;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      pre {
+        margin: 0;
+        border: 1px solid #334155;
+        border-radius: 6px;
+        padding: 8px;
+        background: #020617;
+        color: #cbd5e1;
+        font-size: 11px;
+        line-height: 1.4;
+        max-height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>DeepSeek Native Bridge</h1>
+    <div class="row">
+      <input id="workspace" placeholder="workspace root (optional)" />
+      <button id="openSession">Open</button>
+    </div>
+    <div class="row">
+      <button id="status">Status</button>
+      <button id="list">Sessions</button>
+    </div>
+    <pre id="output">Click Status to test native messaging host.</pre>
+    <script src="popup.js"></script>
+  </body>
+</html>
