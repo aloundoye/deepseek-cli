@@ -34,7 +34,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | **Background execution** | Long-running tasks can be backgrounded (Ctrl+B) and resumed. |
 | **Print mode (`-p`)** | Non-interactive headless mode for CI/CD and scripting. Reads prompt from arg or stdin pipe. Supports `--output-format` (text/json/stream-json). |
 | **Session continue** | `--continue` resumes last session; `--resume <ID>` resumes a specific session. Full conversation context is restored. |
-| **Model override** | `--model` flag for per-invocation model override (e.g., `deepseek-chat` or `deepseek-reasoner`). |
+| **Model override** | `--model` flag for per-invocation model override. Use `--model max` or `--model high` to force thinking mode on `deepseek-chat`. |
 
 ### 2.2 File System Operations
 
@@ -68,7 +68,7 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | `/compact` | Summarize conversation to save context. |
 | `/memory` | Edit `DEEPSEEK.md` memory files. |
 | `/config` | Open configuration interface. |
-| `/model` | Switch between models (chat/reasoner) manually. |
+| `/model` | Toggle thinking mode on `deepseek-chat`. |
 | `/cost` | Show token usage and estimated cost. |
 | `/mcp` | Manage MCP server connections. |
 | `/rewind` | Rewind to previous checkpoint. |
@@ -196,20 +196,20 @@ The CLI supports three runtime permission modes that govern how tool calls are a
 | Enhancement | Description |
 |--------------|-------------|
 | **Cost efficiency** | ~16–20x cheaper than Claude; highlight in `/cost` command. |
-| **Automatic “max thinking”** | Seamlessly escalate to `deepseek-reasoner` when complexity requires it. |
+| **Automatic “max thinking”** | Seamlessly enable thinking mode on `deepseek-chat` when complexity requires it. |
 | **Prompt caching** | 90% discount on repeated input tokens; implement aggressive caching. |
 | **Off-peak scheduling** | Option to defer non-urgent tasks to cheaper rate periods. |
-| **DeepSeek-only provider** | Single-provider design: all API calls go to DeepSeek (`deepseek-chat` / `deepseek-reasoner`). No multi-LLM abstraction layer. Configuration knob `llm.provider` is reserved for future extensibility but currently only accepts `"deepseek"`. |
+| **DeepSeek-only provider** | Single-provider design: all API calls go to DeepSeek (`deepseek-chat` with optional thinking mode). No multi-LLM abstraction layer. Configuration knob `llm.provider` is reserved for future extensibility but currently only accepts `"deepseek"`. |
 | **Performance monitoring** | `/profile` command showing time breakdown. |
 | **Integration marketplace** | Community repository of MCP plugins. |
 
 ### 2.14 How to Build Your "Claude Code" Clone
 
-For the best results, use a Hybrid Approach:
+For the best results, use a Hybrid Approach with thinking mode on `deepseek-chat`:
 
-- **Orchestrator (Reasoner):** Use `deepseek-reasoner` to analyze the codebase and generate the step-by-step execution plan.
-- **Executor (Chat):** Use `deepseek-chat` for minor tasks like writing unit test boilerplate or documentation to save on "thinking" token costs.
-- **Integration:** Plug these models into existing open-source frameworks like Roo Code or Cline, which are already optimized for DeepSeek's API.
+- **Complex tasks (thinking enabled):** Use `deepseek-chat` with `thinking: {"type": "enabled", "budget_tokens": N}` for codebase analysis, multi-step planning, and debugging. This gives chain-of-thought reasoning + function calling simultaneously.
+- **Simple tasks (thinking off):** Use `deepseek-chat` without thinking mode for routine completions, boilerplate, and docs to save token costs.
+- **Note:** `deepseek-reasoner` does NOT support function calling (tools). Always use `deepseek-chat` for the agentic tool-calling loop.
 
 ---
 
@@ -224,7 +224,7 @@ crates/
   core/         # Shared config types, session loop, scheduling
   agent/        # Planner, Executor, Subagent orchestration, session hooks
   llm/          # DeepSeek API client, streaming, retries, caching
-  router/       # Model routing + auto max-think policy
+  router/       # Model routing + auto thinking-mode policy
   tools/        # Tool registry, sandboxed execution, web.fetch, auto-lint
   mcp/          # MCP server management and protocol handling
   subagent/     # Parallel subagent lifecycle and communication
@@ -247,7 +247,7 @@ crates/
 | **Planner** | Creates/revises plans using LLM; may spawn subagents for exploration. |
 | **Executor** | Executes plan steps via tools; requests plan refinement when needed. |
 | **Subagent Manager** | Spawns, monitors, and communicates with parallel subagents. |
-| **Model Router** | Decides which model (chat vs reasoner) to use per call; logs decisions. |
+| **Model Router** | Decides whether to enable thinking mode per call; logs decisions. |
 | **Tool Host** | Executes tools with policy enforcement, journaling, and sandboxing. |
 | **MCP Client** | Discovers and invokes tools from MCP servers. |
 | **Index Service** | Provides deterministic code search and repo snapshots. |
@@ -264,7 +264,7 @@ The session state machine (as defined in the revised RFC) governs the overall fl
 
 ### 4.2 Planner and Executor
 
-- **Planner** generates a JSON plan (see Section 3.2 of revised RFC). It may use the reasoner for complex planning tasks.
+- **Planner** generates a JSON plan (see Section 3.2 of revised RFC). It may use thinking mode for complex planning tasks.
 - **Executor** follows the plan, but can request **refinement** mid-step if ambiguity arises (e.g., search returns multiple candidates). Refinement requests go back to the planner with current context.
 
 ### 4.3 Subagent System
@@ -293,37 +293,31 @@ The router computes a complexity score based on:
 
 Thresholds and weights are configurable. The router logs each decision (including the feature vector snapshot) to the event log, enabling post-hoc analysis and tuning.
 
-**Escalation retry:** If the chat model produces an invalid plan or stalls, the router automatically retries with the reasoner once.
+**Escalation retry:** If the chat model produces an invalid plan or stalls, the router automatically retries with thinking mode enabled once.
 
-### 4.4.1 DeepSeek Model Strategy: Hybrid Approach
+### 4.4.1 DeepSeek Model Strategy: Thinking Mode on `deepseek-chat`
 
-DeepSeek offers two primary model endpoints: `deepseek-chat` and `deepseek-reasoner`. Both are powered by DeepSeek-V3.2 but optimized for different workflows.
+DeepSeek offers two model endpoints, but only `deepseek-chat` supports function calling (tools):
 
 | Feature | `deepseek-chat` | `deepseek-reasoner` |
 |---------|-----------------|---------------------|
-| Primary Mode | Non-thinking (Direct output) | Thinking (Chain-of-Thought) |
-| Best For | Conversational QA, simple coding, speed | Complex logic, math, deep analysis |
-| Output Limit | Up to 8K tokens | Up to 64K (including CoT) |
-| Function Calling | Supported | Supported |
-| Pricing | ~$0.28 per 1M input tokens | ~$0.28 per 1M input tokens |
+| Primary Mode | Non-thinking (Direct output) | Thinking (Chain-of-Thought, always-on) |
+| Thinking Mode | Yes (via `thinking` param) | Always-on |
+| Function Calling | **Yes** | **No** |
+| Best For | All agentic tasks (with thinking toggle) | Legacy planner paths without tools |
 | Context Window | 128K | 128K |
-| FIM Completion | Supported | Not supported |
 
-**Key Differences:**
-- **Reasoning Process**: `deepseek-reasoner` generates Chain-of-Thought (CoT) before the final answer, making it more accurate for multi-step problems but slower.
-- **Token Efficiency**: Same price per token, but `deepseek-reasoner` consumes more tokens per request due to hidden reasoning steps.
-- **Self-Correction**: The reasoner can identify logic errors during thinking, critical for autonomous bug fixing.
-- **Instruction Following**: R1/Reasoner shows higher reliability for intricate, multi-part instructions.
+**Key insight:** `deepseek-reasoner` does NOT support function calling. When tools are needed (the common case for an agentic coding assistant), we MUST use `deepseek-chat`. The DeepSeek API supports thinking mode on `deepseek-chat` via `thinking: {"type": "enabled", "budget_tokens": N}`, which gives us reasoning + function calling simultaneously.
 
 **Hybrid Strategy (implemented via WeightedRouter):**
 
-| Role | Model | Rationale |
-|------|-------|-----------|
-| **Primary Agent** (planning, complex tool chains) | `deepseek-reasoner` | Superior CoT for multi-step reasoning, self-correction, complex debugging |
-| **Fast Executor** (simple completions, boilerplate, docs) | `deepseek-chat` | Speed + lower token cost for routine tasks |
-| **Router Decision** | Automatic | Complexity scoring selects model per turn |
+| Role | Model | Thinking | Rationale |
+|------|-------|----------|-----------|
+| **Complex Agent** (planning, debugging, multi-step) | `deepseek-chat` | Enabled | CoT reasoning + tool calling |
+| **Fast Executor** (simple completions, boilerplate) | `deepseek-chat` | Disabled | Speed + lower token cost |
+| **Router Decision** | Automatic | Auto | Complexity scoring toggles thinking per turn |
 
-The router defaults to `deepseek-reasoner` for the agentic loop (complex tool-calling chains, codebase analysis, debugging) and falls back to `deepseek-chat` for simple responses when complexity score is below threshold (default 0.72). This mirrors the architecture needed for a "Claude Code"-class coding agent: the reasoner provides the high-level cognitive "thinking" while the chat model handles throughput-sensitive tasks.
+The router always uses `deepseek-chat` and toggles `thinking_enabled` when the complexity score crosses the threshold (default 0.72). This gives us the best of both worlds: chain-of-thought reasoning for complex tasks, with full function calling support at all times.
 
 ### 4.5 Tool System
 
@@ -442,7 +436,7 @@ In addition to the REPL, the CLI supports one-shot commands:
 
 ### M1: Core REPL + Basic Tools (Weeks 1–4)
 - Project setup, workspace structure.
-- Basic REPL with chat (no tools) using `deepseek-chat`.
+- Basic REPL with chat (no tools) using `deepseek-chat` (with thinking mode support).
 - Session persistence (event log, SQLite).
 - Read-only tools: `fs.list`, `fs.read`, `git.status`.
 - Manual model switching via `/model`.
@@ -495,7 +489,7 @@ In addition to the REPL, the CLI supports one-shot commands:
 ```toml
 [llm]
 base_model = "deepseek-chat"
-max_think_model = "deepseek-reasoner"
+max_think_model = "deepseek-reasoner"  # Legacy; thinking mode on deepseek-chat is used instead
 provider = "deepseek"              # Only "deepseek" is supported
 profile = "v3_2"
 context_window_tokens = 128000
@@ -511,7 +505,7 @@ retry_base_ms = 400
 stream = true
 
 [router]
-auto_max_think = true
+auto_max_think = true              # Enables automatic thinking mode escalation
 threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1

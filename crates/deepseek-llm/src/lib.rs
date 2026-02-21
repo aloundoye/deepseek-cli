@@ -177,6 +177,11 @@ impl DeepSeekClient {
     }
 
     fn build_chat_payload(&self, req: &ChatRequest) -> Value {
+        let thinking_enabled = req
+            .thinking
+            .as_ref()
+            .is_some_and(|t| t.thinking_type == "enabled");
+
         let messages: Vec<Value> = req
             .messages
             .iter()
@@ -185,11 +190,15 @@ impl DeepSeekClient {
                 ChatMessage::User { content } => json!({"role": "user", "content": content}),
                 ChatMessage::Assistant {
                     content,
+                    reasoning_content,
                     tool_calls,
                 } => {
                     let mut msg = json!({"role": "assistant"});
                     if let Some(c) = content {
                         msg["content"] = json!(c);
+                    }
+                    if let Some(rc) = reasoning_content {
+                        msg["reasoning_content"] = json!(rc);
                     }
                     if !tool_calls.is_empty() {
                         let tc: Vec<Value> = tool_calls
@@ -222,8 +231,14 @@ impl DeepSeekClient {
             "max_tokens": req.max_tokens,
             "stream": false
         });
-        if let Some(temp) = req.temperature {
-            payload["temperature"] = json!(temp);
+        // DeepSeek API requires temperature to be omitted when thinking is enabled.
+        if !thinking_enabled {
+            if let Some(temp) = req.temperature {
+                payload["temperature"] = json!(temp);
+            }
+        }
+        if let Some(ref thinking) = req.thinking {
+            payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
         }
         if !req.tools.is_empty() {
             payload["tools"] = serde_json::to_value(&req.tools).unwrap_or(json!([]));

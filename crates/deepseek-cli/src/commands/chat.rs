@@ -85,9 +85,8 @@ pub(crate) fn run_chat(
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
-            "models: base={} max_think={} approvals: bash={} edits={} tools={}",
+            "model: {} thinking=auto approvals: bash={} edits={} tools={}",
             cfg.llm.base_model,
-            cfg.llm.max_think_model,
             cfg.policy.approve_bash,
             cfg.policy.approve_edits,
             if allow_tools {
@@ -237,15 +236,18 @@ pub(crate) fn run_chat(
                     if json_mode {
                         print_json(&json!({
                             "force_max_think": force_max_think,
-                            "base_model": cfg.llm.base_model,
-                            "max_think_model": cfg.llm.max_think_model,
+                            "model": cfg.llm.base_model,
+                            "thinking_enabled": force_max_think,
                         }))?;
                     } else if force_max_think {
-                        println!("model mode: max-think ({})", cfg.llm.max_think_model);
+                        println!(
+                            "model mode: thinking-enabled ({})",
+                            cfg.llm.base_model
+                        );
                     } else {
                         println!(
-                            "model mode: hybrid auto (base={} max_think={})",
-                            cfg.llm.base_model, cfg.llm.max_think_model
+                            "model mode: auto ({} thinking=on-demand)",
+                            cfg.llm.base_model
                         );
                     }
                 }
@@ -308,10 +310,10 @@ pub(crate) fn run_chat(
                 SlashCommand::Plan => {
                     force_max_think = true;
                     if json_mode {
-                        print_json(&json!({"plan_mode": true, "force_max_think": true}))?;
+                        print_json(&json!({"plan_mode": true, "thinking_enabled": true}))?;
                     } else {
                         println!(
-                            "plan mode active; prompts will prefer structured planning and max-think routing."
+                            "plan mode active; prompts will prefer structured planning with thinking enabled."
                         );
                     }
                 }
@@ -349,16 +351,16 @@ pub(crate) fn run_chat(
                     if json_mode {
                         print_json(&json!({
                             "effort": normalized,
-                            "force_max_think": force_max_think
+                            "thinking_enabled": force_max_think
                         }))?;
                     } else {
                         println!(
-                            "effort={} model_mode={}",
+                            "effort={} thinking={}",
                             normalized,
                             if force_max_think {
-                                "max-think"
+                                "enabled"
                             } else {
-                                "hybrid-auto"
+                                "auto"
                             }
                         );
                     }
@@ -1012,11 +1014,14 @@ pub(crate) fn run_chat_tui(
                         force_max_think.store(is_max_think_selection(&model), Ordering::Relaxed);
                     }
                     if force_max_think.load(Ordering::Relaxed) {
-                        format!("model mode: max-think ({})", cfg.llm.max_think_model)
+                        format!(
+                            "model mode: thinking-enabled ({})",
+                            cfg.llm.base_model
+                        )
                     } else {
                         format!(
-                            "model mode: hybrid auto (base={} max_think={})",
-                            cfg.llm.base_model, cfg.llm.max_think_model
+                            "model mode: auto ({} thinking=on-demand)",
+                            cfg.llm.base_model
                         )
                     }
                 }
@@ -1063,7 +1068,7 @@ pub(crate) fn run_chat_tui(
                 }
                 SlashCommand::Plan => {
                     force_max_think.store(true, Ordering::Relaxed);
-                    "plan mode enabled (max-think routing preferred)".to_string()
+                    "plan mode enabled (thinking enabled)".to_string()
                 }
                 SlashCommand::Teleport(args) => {
                     match parse_teleport_args(args) {
@@ -1103,12 +1108,12 @@ pub(crate) fn run_chat_tui(
                         Ordering::Relaxed,
                     );
                     format!(
-                        "effort={} model_mode={}",
+                        "effort={} thinking={}",
                         normalized,
                         if force_max_think.load(Ordering::Relaxed) {
-                            "max-think"
+                            "enabled"
                         } else {
-                            "hybrid-auto"
+                            "auto"
                         }
                     )
                 }

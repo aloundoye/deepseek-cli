@@ -191,6 +191,11 @@ pub struct RouterDecision {
     pub confidence: f32,
     pub score: f32,
     pub escalated: bool,
+    /// When true, thinking mode should be enabled on the chat model.
+    /// This replaces routing to `deepseek-reasoner` — instead we use
+    /// `deepseek-chat` with `thinking: {type: "enabled", budget_tokens: N}`.
+    #[serde(default)]
+    pub thinking_enabled: bool,
 }
 
 /// Type-safe tool name enum covering all built-in tools.
@@ -1111,6 +1116,39 @@ pub type UserQuestionHandler = std::sync::Arc<dyn Fn(UserQuestion) -> Option<Str
 
 // ── Chat-with-tools types (DeepSeek function calling) ──────────────────
 
+/// Configuration for thinking mode on `deepseek-chat`.
+///
+/// When enabled, the model produces chain-of-thought reasoning before responding.
+/// This replaces the old `deepseek-reasoner` model selection — `deepseek-chat`
+/// with thinking enabled gives us reasoning + function calling simultaneously.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
+impl ThinkingConfig {
+    /// Enable thinking mode with a token budget for chain-of-thought.
+    #[must_use]
+    pub fn enabled(budget: u32) -> Self {
+        Self {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: Some(budget),
+        }
+    }
+
+    /// Disable thinking mode.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: None,
+        }
+    }
+}
+
 /// A message in a multi-turn conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role")]
@@ -1123,6 +1161,12 @@ pub enum ChatMessage {
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Chain-of-thought reasoning from thinking mode. Present when the model
+        /// uses thinking and returns reasoning alongside tool calls or content.
+        /// Must be stripped from prior turns before sending new API requests
+        /// (DeepSeek API requirement for multi-turn thinking + tools).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         tool_calls: Vec<LlmToolCall>,
     },
@@ -1186,6 +1230,9 @@ pub struct ChatRequest {
     pub tool_choice: ToolChoice,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// When set, enables thinking mode on `deepseek-chat`.
+    /// The API requires `temperature` to be omitted when thinking is enabled.
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

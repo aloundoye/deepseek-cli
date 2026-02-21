@@ -62,7 +62,7 @@ pub(crate) fn current_ui_status(
 
     Ok(UiStatus {
         model: if force_max_think {
-            cfg.llm.max_think_model.clone()
+            format!("{} (thinking)", cfg.llm.base_model)
         } else {
             cfg.llm.base_model.clone()
         },
@@ -157,7 +157,8 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "model": {
                 "profile": cfg.llm.profile,
                 "base": cfg.llm.base_model,
-                "max_think": cfg.llm.max_think_model,
+                "max_think": cfg.llm.base_model,
+                "thinking_mode": "auto",
             },
             "context_usage_percent": context_usage_pct,
             "pending_approvals": pending_approvals,
@@ -186,7 +187,8 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
             "model": {
                 "profile": cfg.llm.profile,
                 "base": cfg.llm.base_model,
-                "max_think": cfg.llm.max_think_model,
+                "max_think": cfg.llm.base_model,
+                "thinking_mode": "auto",
             },
             "context_usage_percent": 0.0,
             "pending_approvals": 0,

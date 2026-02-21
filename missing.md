@@ -1,9 +1,12 @@
 # Missing Features & Implementation Tasks
 ## DeepSeek CLI vs Claude Code Feature Gap Analysis
 
-**Status:** Active  
-**Date:** 2026-02-21  
+**Status:** Active
+**Date:** 2026-02-21
 **Goal:** Identify missing features compared to Claude Code and create actionable implementation tasks to achieve feature parity and competitive advantage.
+
+### Architecture Fix: Thinking Mode on `deepseek-chat` (DONE)
+The hybrid architecture was broken: `deepseek-reasoner` does NOT support function calling (tools). When the router escalated to the reasoner with tools active, the model would output raw markup instead of structured `tool_calls`. Fixed by using `deepseek-chat` with thinking mode (`thinking: {"type": "enabled", "budget_tokens": N}`) which gives reasoning + tools simultaneously. The router now always returns `deepseek-chat` and toggles `thinking_enabled` flag instead of switching models.
 
 ---
 
