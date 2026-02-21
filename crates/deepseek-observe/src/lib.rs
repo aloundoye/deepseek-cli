@@ -49,9 +49,10 @@ impl Observer {
 
     pub fn record_router_decision(&self, decision: &RouterDecision) -> Result<()> {
         self.append_log_line(&format!(
-            "{} ROUTER model={} score={} reasons={}",
+            "{} ROUTER model={} thinking={} score={} reasons={}",
             Utc::now().to_rfc3339(),
             decision.selected_model,
+            decision.thinking_enabled,
             decision.score,
             decision.reason_codes.join(",")
         ))?;
@@ -60,6 +61,7 @@ impl Observer {
             json!({
                 "decision_id": decision.decision_id,
                 "model": decision.selected_model,
+                "thinking_enabled": decision.thinking_enabled,
                 "score": decision.score,
                 "reason_codes": decision.reason_codes,
                 "confidence": decision.confidence,

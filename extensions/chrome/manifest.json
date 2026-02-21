@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek Browser Bridge",
+  "version": "0.1.0",
+  "description": "Bridge Chrome to DeepSeek CLI via native messaging.",
+  "permissions": ["nativeMessaging", "storage", "tabs", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "DeepSeek Bridge",
+    "default_popup": "popup.html"
+  }
+}

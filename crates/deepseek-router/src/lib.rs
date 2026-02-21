@@ -102,17 +102,17 @@ impl ModelRouter for WeightedRouter {
             reason_codes.push("failure_streak".to_string());
         }
 
+        // Always use the base model (`deepseek-chat`); when the score is high,
+        // enable thinking mode instead of switching to `deepseek-reasoner`.
+        // This gives us reasoning + function calling simultaneously.
         RouterDecision {
             decision_id: Uuid::now_v7(),
             reason_codes,
-            selected_model: if high {
-                self.cfg.max_think_model.clone()
-            } else {
-                self.cfg.base_model.clone()
-            },
+            selected_model: self.cfg.base_model.clone(),
             confidence: (1.0 - (score - self.cfg.threshold_high).abs()).clamp(0.1, 1.0),
             score,
             escalated: high,
+            thinking_enabled: high,
         }
     }
 }
@@ -135,7 +135,9 @@ mod tests {
                 ambiguity_flags: 1.0,
             },
         );
-        assert_eq!(decision.selected_model, "deepseek-reasoner");
+        assert_eq!(decision.selected_model, "deepseek-chat");
+        assert!(decision.thinking_enabled);
+        assert!(decision.escalated);
     }
 
     #[test]
@@ -154,6 +156,7 @@ mod tests {
         );
         assert_eq!(decision.selected_model, "deepseek-chat");
         assert!(!decision.escalated);
+        assert!(!decision.thinking_enabled);
     }
 
     #[test]
@@ -183,7 +186,8 @@ mod tests {
             decision.escalated,
             "score exactly at threshold should escalate"
         );
-        assert_eq!(decision.selected_model, "deepseek-reasoner");
+        assert_eq!(decision.selected_model, "deepseek-chat");
+        assert!(decision.thinking_enabled);
     }
 
     #[test]
@@ -233,7 +237,8 @@ mod tests {
             decision.escalated,
             "planner bias should escalate even with low score"
         );
-        assert_eq!(decision.selected_model, "deepseek-reasoner");
+        assert_eq!(decision.selected_model, "deepseek-chat");
+        assert!(decision.thinking_enabled);
         assert!(
             decision
                 .reason_codes

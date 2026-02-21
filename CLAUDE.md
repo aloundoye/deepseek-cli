@@ -87,7 +87,7 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `fs.glob`, `bash.run`, `git.*`, `web.*`, `notebook.*`, `multi_edit`, and plugins.
 
-**Model router** (`deepseek-router`): Weighted complexity scoring selects between `deepseek-chat` and `deepseek-reasoner`. Hybrid strategy: `deepseek-reasoner` is the primary "brain" for complex agentic tasks (CoT, self-correction, multi-step reasoning); `deepseek-chat` is used for fast, low-complexity responses. Both support function calling and 128K context. Threshold default 0.72.
+**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` instead of switching models. This uses `deepseek-chat` with `thinking: {"type": "enabled", "budget_tokens": N}` — giving us reasoning + function calling simultaneously. `deepseek-reasoner` does NOT support function calling and is only used for legacy planner paths without tools.
 
 **TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`.
 

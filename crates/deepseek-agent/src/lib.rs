@@ -3,7 +3,8 @@ use chrono::{Timelike, Utc};
 use deepseek_core::{
     AppConfig, ApprovedToolCall, ChatMessage, ChatRequest, EventEnvelope, EventKind, LlmRequest,
     LlmUnit, ModelRouter, Plan, PlanStep, RouterSignals, Session, SessionBudgets, SessionState,
-    StreamChunk, ToolCall, ToolChoice, ToolHost, is_valid_session_state_transition,
+    StreamChunk, ThinkingConfig, ToolCall, ToolChoice, ToolHost,
+    is_valid_session_state_transition,
 };
 use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
 use deepseek_llm::{DeepSeekClient, LlmClient};
@@ -1285,6 +1286,7 @@ impl AgentEngine {
                     }
                     messages.push(ChatMessage::Assistant {
                         content: Some(content.to_string()),
+                        reasoning_content: None,
                         tool_calls: vec![],
                     });
                 } else if let Some(content) = entry.strip_prefix("tool: ") {
@@ -1480,11 +1482,7 @@ impl AgentEngine {
                 ambiguity_flags: ambiguity,
             };
             let mut decision = self.router.select(LlmUnit::Executor, signals);
-            if options.force_max_think
-                && !decision
-                    .selected_model
-                    .eq_ignore_ascii_case(&self.cfg.llm.max_think_model)
-            {
+            if options.force_max_think && !decision.thinking_enabled {
                 if !decision
                     .reason_codes
                     .iter()
@@ -1494,7 +1492,7 @@ impl AgentEngine {
                         .reason_codes
                         .push("user_force_max_think".to_string());
                 }
-                decision.selected_model = self.cfg.llm.max_think_model.clone();
+                decision.thinking_enabled = true;
                 decision.escalated = true;
                 decision.confidence = decision.confidence.max(0.95);
                 decision.score = decision.score.max(self.cfg.router.threshold_high);
@@ -1506,8 +1504,30 @@ impl AgentEngine {
                 },
             )?;
 
+            let request_model = decision.selected_model.clone();
+
+            // Build thinking config when the router (or user) requests thinking mode.
+            let thinking = if decision.thinking_enabled {
+                Some(ThinkingConfig::enabled(
+                    session.budgets.max_think_tokens.max(4096),
+                ))
+            } else {
+                None
+            };
+
+            // Strip reasoning_content from prior assistant messages before sending
+            // a new request — DeepSeek API requirement for multi-turn thinking + tools.
+            for msg in &mut messages {
+                if let ChatMessage::Assistant {
+                    reasoning_content, ..
+                } = msg
+                {
+                    *reasoning_content = None;
+                }
+            }
+
             let request = ChatRequest {
-                model: decision.selected_model.clone(),
+                model: request_model.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
                 tool_choice: if options.tools {
@@ -1516,7 +1536,13 @@ impl AgentEngine {
                     ToolChoice::none()
                 },
                 max_tokens: session.budgets.max_think_tokens.max(4096),
-                temperature: Some(0.0),
+                // DeepSeek API requires temperature to be omitted when thinking is enabled.
+                temperature: if decision.thinking_enabled {
+                    None
+                } else {
+                    Some(0.0)
+                },
+                thinking: thinking.clone(),
             };
 
             self.observer.verbose_log(&format!(
@@ -1527,7 +1553,7 @@ impl AgentEngine {
             ));
 
             // Call the LLM with streaming (clone the Arc so it persists across turns)
-            let mut response_model = decision.selected_model.clone();
+            let response_model = request_model;
             let response = {
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
                 if let Some(cb) = cb {
@@ -1537,34 +1563,32 @@ impl AgentEngine {
                 }
             };
 
-            // Escalation retry: if base model returned empty response and we weren't
-            // already using the reasoner, retry with the max_think model once.
+            // Escalation retry: if base model returned empty response and thinking
+            // wasn't already enabled, retry with thinking mode on.
             let response = if response.text.is_empty()
                 && response.tool_calls.is_empty()
                 && turn_count <= 1
                 && self.cfg.router.auto_max_think
+                && !decision.thinking_enabled
             {
-                let max_model = &self.cfg.llm.max_think_model;
-                if decision.selected_model != *max_model {
-                    self.emit(
-                        session.session_id,
-                        EventKind::RouterEscalationV1 {
-                            reason_codes: vec!["empty_response_escalation".to_string()],
-                        },
-                    )?;
-                    response_model = max_model.clone();
-                    let escalated_request = ChatRequest {
-                        model: max_model.clone(),
-                        ..request
-                    };
-                    let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
-                    if let Some(cb) = cb {
-                        self.llm.complete_chat_streaming(&escalated_request, cb)?
-                    } else {
-                        self.llm.complete_chat(&escalated_request)?
-                    }
+                self.emit(
+                    session.session_id,
+                    EventKind::RouterEscalationV1 {
+                        reason_codes: vec!["empty_response_escalation".to_string()],
+                    },
+                )?;
+                let escalated_request = ChatRequest {
+                    thinking: Some(ThinkingConfig::enabled(
+                        session.budgets.max_think_tokens.max(4096),
+                    )),
+                    temperature: None,
+                    ..request
+                };
+                let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                if let Some(cb) = cb {
+                    self.llm.complete_chat_streaming(&escalated_request, cb)?
                 } else {
-                    response
+                    self.llm.complete_chat(&escalated_request)?
                 }
             } else {
                 response
@@ -1633,6 +1657,7 @@ impl AgentEngine {
                     EventKind::ChatTurnV1 {
                         message: ChatMessage::Assistant {
                             content: history_content,
+                            reasoning_content: None,
                             tool_calls: vec![],
                         },
                     },
@@ -1695,12 +1720,20 @@ impl AgentEngine {
             if response.text.is_empty() {
                 empty_response_count += 1;
             }
+            // Include reasoning_content in the in-memory history for the current
+            // turn (will be stripped before the next API call above).
+            let rc = if response.reasoning_content.is_empty() {
+                None
+            } else {
+                Some(response.reasoning_content.clone())
+            };
             messages.push(ChatMessage::Assistant {
                 content: if response.text.is_empty() {
                     None
                 } else {
                     Some(response.text.clone())
                 },
+                reasoning_content: rc,
                 tool_calls: response.tool_calls.clone(),
             });
 
@@ -1713,7 +1746,8 @@ impl AgentEngine {
                     },
                 )?;
             }
-            // Persist full assistant message with tool_calls for resume
+            // Persist full assistant message with tool_calls for resume.
+            // Strip reasoning_content from persisted events — no need to store it.
             self.emit(
                 session.session_id,
                 EventKind::ChatTurnV1 {
@@ -1723,6 +1757,7 @@ impl AgentEngine {
                         } else {
                             Some(response.text.clone())
                         },
+                        reasoning_content: None,
                         tool_calls: response.tool_calls.clone(),
                     },
                 },
@@ -5743,6 +5778,7 @@ fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
                     ChatMessage::Assistant {
                         content,
                         tool_calls,
+                        ..
                     } => {
                         let c = content.as_deref().map(estimate_tokens).unwrap_or(0);
                         let t: u64 = tool_calls
@@ -5956,6 +5992,7 @@ fn sanitize_chat_history_for_tool_calls(messages: &mut Vec<ChatMessage>) -> Chat
         match msg {
             ChatMessage::Assistant {
                 content,
+                reasoning_content,
                 tool_calls,
             } => {
                 if !pending_tool_ids.is_empty() {
@@ -5971,6 +6008,7 @@ fn sanitize_chat_history_for_tool_calls(messages: &mut Vec<ChatMessage>) -> Chat
                 if tool_calls.is_empty() {
                     normalized.push(ChatMessage::Assistant {
                         content,
+                        reasoning_content,
                         tool_calls,
                     });
                 } else {
@@ -5978,6 +6016,7 @@ fn sanitize_chat_history_for_tool_calls(messages: &mut Vec<ChatMessage>) -> Chat
                     pending_assistant_index = Some(normalized.len());
                     normalized.push(ChatMessage::Assistant {
                         content,
+                        reasoning_content,
                         tool_calls,
                     });
                 }
@@ -6160,6 +6199,7 @@ fn summarize_chat_messages(messages: &[ChatMessage]) -> String {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 if let Some(text) = content {
                     let truncated = if text.len() > 200 {
@@ -7310,6 +7350,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("done".to_string()),
+                reasoning_content: None,
                 tool_calls: vec![],
             },
         ];
@@ -7331,6 +7372,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![
                     tool_call("call_1", "fs.read"),
                     tool_call("call_2", "fs.read"),
@@ -7371,6 +7413,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![tool_call("call_1", "fs.read")],
             },
             ChatMessage::Tool {
@@ -7382,6 +7425,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![tool_call("call_2", "bash.run")],
             },
             ChatMessage::Tool {
@@ -7390,6 +7434,7 @@ mod tests {
             },
             ChatMessage::Assistant {
                 content: Some("done".to_string()),
+                reasoning_content: None,
                 tool_calls: vec![],
             },
             ChatMessage::User {
@@ -8468,7 +8513,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_force_max_think_uses_reasoner_model() {
+    fn chat_force_max_think_uses_thinking_mode() {
         let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
         mock.push(deepseek_testkit::Scenario::TextResponse(
             "Forced max-think response".into(),
@@ -8484,6 +8529,8 @@ mod tests {
         );
         assert!(result.is_ok(), "chat failed: {:?}", result.err());
 
+        // force_max_think now enables thinking mode on deepseek-chat
+        // (not switching to deepseek-reasoner which doesn't support tools)
         let store = Store::new(dir.path()).expect("store");
         let session = store
             .load_latest_session()
@@ -8496,8 +8543,8 @@ mod tests {
             projection
                 .router_models
                 .iter()
-                .any(|model| model.eq_ignore_ascii_case("deepseek-reasoner")),
-            "expected reasoner routing decision, got {:?}",
+                .all(|model| model.eq_ignore_ascii_case("deepseek-chat")),
+            "expected deepseek-chat (with thinking mode), got {:?}",
             projection.router_models
         );
     }
