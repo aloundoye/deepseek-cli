@@ -6,6 +6,7 @@ use deepseek_core::{
     RouterSignals, Session, SessionBudgets, SessionState, StepOutcome, StreamChunk, ToolCall,
     ToolChoice, ToolHost, is_valid_session_state_transition,
 };
+use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
 use deepseek_llm::{DeepSeekClient, LlmClient};
 use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
@@ -273,6 +274,8 @@ pub struct AgentEngine {
     background_tasks: Mutex<VecDeque<BackgroundTask>>,
     /// Background bash shells (bash_run with run_in_background: true).
     background_shells: Mutex<VecDeque<BackgroundShell>>,
+    /// Config-based hook runtime (14 events, JSON stdin/stdout).
+    hooks: HookRuntime,
 }
 
 impl AgentEngine {
@@ -287,6 +290,12 @@ impl AgentEngine {
 
         let max_turns = cfg.budgets.max_turns;
         let max_budget_usd = cfg.budgets.max_budget_usd;
+
+        // Parse hooks config from AppConfig's hooks JSON value.
+        let hooks_config: HooksConfig =
+            serde_json::from_value(cfg.hooks.clone()).unwrap_or_default();
+        let hooks = HookRuntime::new(workspace, hooks_config);
+
         Ok(Self {
             workspace: workspace.to_path_buf(),
             store,
@@ -306,6 +315,7 @@ impl AgentEngine {
             subagent_worker: Mutex::new(None),
             background_tasks: Mutex::new(VecDeque::new()),
             background_shells: Mutex::new(VecDeque::new()),
+            hooks,
         })
     }
 
@@ -355,6 +365,47 @@ impl AgentEngine {
     pub fn set_subagent_worker(&self, worker: SubagentWorkerFn) {
         if let Ok(mut guard) = self.subagent_worker.lock() {
             *guard = Some(worker);
+        }
+    }
+
+    // ── Hook helpers ──────────────────────────────────────────────────────
+
+    /// Build a base `HookInput` for the given event.
+    fn hook_input(&self, event: HookEvent) -> HookInput {
+        HookInput {
+            event: event.as_str().to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: self.workspace.to_string_lossy().to_string(),
+        }
+    }
+
+    /// Fire a hook event and return the result.
+    /// Logs hook runs via the observer.
+    fn fire_hook(&self, event: HookEvent, input: &HookInput) -> HookResult {
+        let result = self.hooks.fire(event, input);
+        if !result.runs.is_empty() {
+            self.observer.verbose_log(&format!(
+                "hook {}: {} handler(s) fired, blocked={}",
+                event.as_str(),
+                result.runs.len(),
+                result.blocked
+            ));
+        }
+        result
+    }
+
+    /// Inject any additional context from hooks into the message list.
+    fn inject_hook_context(messages: &mut Vec<ChatMessage>, hook_result: &HookResult) {
+        for ctx in &hook_result.additional_context {
+            if !ctx.is_empty() {
+                messages.push(ChatMessage::User {
+                    content: format!("<hook-context>\n{ctx}\n</hook-context>"),
+                });
+            }
         }
     }
 
@@ -1059,8 +1110,27 @@ impl AgentEngine {
     pub fn chat_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
         let mut session = self.ensure_session()?;
 
+        // Fire SessionStart hook (legacy + config-based).
         self.tool_host.fire_session_hooks("sessionstart");
+        {
+            let mut input = self.hook_input(HookEvent::SessionStart);
+            input.session_type = Some("startup".to_string());
+            self.fire_hook(HookEvent::SessionStart, &input);
+        }
         self.transition(&mut session, SessionState::Planning)?;
+
+        // Fire UserPromptSubmit hook (can block the prompt).
+        {
+            let mut input = self.hook_input(HookEvent::UserPromptSubmit);
+            input.prompt = Some(prompt.to_string());
+            let hr = self.fire_hook(HookEvent::UserPromptSubmit, &input);
+            if hr.blocked {
+                let reason = hr
+                    .block_reason
+                    .unwrap_or_else(|| "Blocked by hook".to_string());
+                return Ok(format!("[hook blocked prompt] {reason}"));
+            }
+        }
 
         self.emit(
             session.session_id,
@@ -1260,6 +1330,11 @@ impl AgentEngine {
                 * self.cfg.context.auto_compact_threshold.clamp(0.1, 1.0) as f64)
                 as u64;
             if token_count > threshold && messages.len() > 4 {
+                // Fire PreCompact hook — hooks can inject additional context.
+                let pre_compact_input = self.hook_input(HookEvent::PreCompact);
+                let hr = self.fire_hook(HookEvent::PreCompact, &pre_compact_input);
+                Self::inject_hook_context(&mut messages, &hr);
+
                 // Keep system prompt (index 0) + last 6 messages
                 let keep_tail = 6.min(messages.len() - 1);
                 let compacted_range = &messages[1..messages.len() - keep_tail];
@@ -1436,7 +1511,24 @@ impl AgentEngine {
                     },
                 )?;
 
+                // Fire Stop hook (can block — prompts agent to continue).
                 self.tool_host.fire_stop_hooks();
+                {
+                    let stop_input = self.hook_input(HookEvent::Stop);
+                    let hr = self.fire_hook(HookEvent::Stop, &stop_input);
+                    if hr.blocked {
+                        // Stop hook blocked — inject reason into conversation and continue loop.
+                        let reason = hr
+                            .block_reason
+                            .unwrap_or_else(|| "Hook requested continuation".to_string());
+                        messages.push(ChatMessage::User {
+                            content: format!(
+                                "<stop-hook-feedback>\n{reason}\nPlease continue.\n</stop-hook-feedback>"
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 let _ = self.transition(&mut session, SessionState::Completed);
 
                 // Persist memory observation for future sessions
@@ -1460,6 +1552,13 @@ impl AgentEngine {
                         patterns,
                         recorded_at: None,
                     });
+                }
+
+                // Fire SessionEnd hook.
+                {
+                    let mut input = self.hook_input(HookEvent::SessionEnd);
+                    input.session_type = Some("exit".to_string());
+                    self.fire_hook(HookEvent::SessionEnd, &input);
                 }
 
                 return Ok(answer);
@@ -1601,6 +1700,32 @@ impl AgentEngine {
                     continue;
                 }
 
+                // ── PreToolUse hook (can block/modify tool input) ──
+                let mut args = args;
+                {
+                    let mut input = self.hook_input(HookEvent::PreToolUse);
+                    input.tool_name = Some(tc.name.clone());
+                    input.tool_input = Some(args.clone());
+                    let hr = self.fire_hook(HookEvent::PreToolUse, &input);
+                    if hr.blocked {
+                        let reason = hr
+                            .block_reason
+                            .as_deref()
+                            .unwrap_or("Blocked by hook");
+                        messages.push(ChatMessage::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: format!("Error: tool blocked by hook — {reason}"),
+                        });
+                        Self::inject_hook_context(&mut messages, &hr);
+                        continue;
+                    }
+                    // Apply updated input if the hook modified tool parameters.
+                    if let Some(ref updated) = hr.updated_input {
+                        args = updated.clone();
+                    }
+                    Self::inject_hook_context(&mut messages, &hr);
+                }
+
                 let tool_call = ToolCall {
                     name: internal_name.to_string(),
                     args: args.clone(),
@@ -1737,6 +1862,22 @@ impl AgentEngine {
                         failure_streak = 0;
                     } else {
                         failure_streak += 1;
+                    }
+
+                    // ── PostToolUse / PostToolUseFailure hook ──
+                    {
+                        let hook_event = if result.success {
+                            HookEvent::PostToolUse
+                        } else {
+                            HookEvent::PostToolUseFailure
+                        };
+                        let mut post_input = self.hook_input(hook_event);
+                        post_input.tool_name = Some(tc.name.clone());
+                        post_input.tool_input = Some(args.clone());
+                        post_input.tool_result =
+                            Some(serde_json::Value::String(result.output.to_string()));
+                        let hr = self.fire_hook(hook_event, &post_input);
+                        Self::inject_hook_context(&mut messages, &hr);
                     }
 
                     let mut output =
@@ -3465,6 +3606,13 @@ impl AgentEngine {
     /// - `run_in_background`: if true, returns immediately with a task_id
     /// - `resume`: optional previous agent ID to continue from
     fn handle_spawn_task(&self, args: &serde_json::Value) -> Result<String> {
+        // Fire SubagentStart hook.
+        {
+            let mut input = self.hook_input(HookEvent::SubagentStart);
+            input.tool_input = Some(args.clone());
+            self.fire_hook(HookEvent::SubagentStart, &input);
+        }
+
         // Accept both new (`prompt`) and legacy (`goal`) parameter names.
         let prompt = args
             .get("prompt")
@@ -3559,18 +3707,20 @@ impl AgentEngine {
         }
 
         // Foreground (blocking) execution.
-        if let Some(worker) = worker {
+        let output = if let Some(worker) = worker {
             let results = self
                 .subagents
                 .run_tasks(vec![task], move |t| worker(&t));
             if let Some(result) = results.first() {
-                return Ok(serde_json::to_string(&json!({
+                serde_json::to_string(&json!({
                     "name": result.name,
                     "success": result.success,
                     "output": result.output,
                     "error": result.error,
                     "attempts": result.attempts
-                }))?);
+                }))?
+            } else {
+                serde_json::to_string(&json!({"error": "subagent failed to start"}))?
             }
         } else {
             // Fallback: run with a simple echo worker.
@@ -3584,19 +3734,26 @@ impl AgentEngine {
                     ))
                 });
             if let Some(result) = results.first() {
-                return Ok(serde_json::to_string(&json!({
+                serde_json::to_string(&json!({
                     "name": result.name,
                     "success": result.success,
                     "output": result.output,
                     "error": result.error,
                     "attempts": result.attempts
-                }))?);
+                }))?
+            } else {
+                serde_json::to_string(&json!({"error": "subagent failed to start"}))?
             }
+        };
+
+        // Fire SubagentStop hook.
+        {
+            let mut input = self.hook_input(HookEvent::SubagentStop);
+            input.tool_result = Some(serde_json::Value::String(output.clone()));
+            self.fire_hook(HookEvent::SubagentStop, &input);
         }
 
-        Ok(serde_json::to_string(
-            &json!({"error": "subagent failed to start"}),
-        )?)
+        Ok(output)
     }
 
     /// Handle the task_output tool: retrieve output from a background subagent.

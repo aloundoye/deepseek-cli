@@ -162,11 +162,11 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 8: Full Hooks System
+## Phase 8: Full Hooks System ✅
 
 > Claude Code has 14 hook events with 3 handler types. We have basic pre/post tool hooks with command handler only.
 
-### 8.1 Expand hook events to match Claude Code
+### 8.1 Expand hook events to match Claude Code ✅
 - **SessionStart** — fires on session begin/resume/clear/compact (matcher: startup, resume, clear, compact)
 - **UserPromptSubmit** — fires when user submits prompt (can block)
 - **PreToolUse** — before tool execution (can allow/deny/ask) — we have this partially
@@ -182,24 +182,24 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 - **SessionEnd** — session terminates (clear, logout, exit)
 - **TaskCompleted** — task marked complete
 
-### 8.2 Hook handler types
-- **command** (existing): shell command, JSON on stdin, exit codes (0=allow, 2=block)
-- **prompt**: single-turn LLM evaluation, returns `{ok: true/false, reason}`, defaults to fast model
-- **agent**: multi-turn subagent with read-only tools (Read, Grep, Glob), up to 50 turns
+### 8.2 Hook handler types ✅ (command handler implemented; prompt/agent handlers deferred to Phase 16)
+- **command** (implemented): shell command, JSON on stdin, exit codes (0=allow, 2=block)
+- **prompt**: single-turn LLM evaluation — deferred
+- **agent**: multi-turn subagent with read-only tools — deferred
 
-### 8.3 Hook input modification & decision control
+### 8.3 Hook input modification & decision control ✅
 - `updatedInput`: PreToolUse hooks can modify tool parameters before execution
 - `permissionDecision`: allow/deny/ask for PreToolUse and PermissionRequest
 - `additionalContext`: inject context into many hook events
 - `decision: "block"` at top level to block any hookable event
 
-### 8.4 Async hooks
+### 8.4 Async hooks (deferred)
 - `async: true` flag for non-blocking background hook execution
 - `once` flag: run only once per session (for skills)
 - Environment persistence: SessionStart hooks can write to env file
 
-### 8.5 Hook configuration locations
-- `~/.deepseek/settings.json` (all projects)
+### 8.5 Hook configuration locations ✅
+- `~/.deepseek/settings.json` (all projects) — via `AppConfig.hooks` JSON field
 - `.deepseek/settings.json` (project, shareable)
 - `.deepseek/settings.local.json` (project, gitignored)
 - Plugin `hooks/hooks.json`
@@ -652,7 +652,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | 5 | ✅ Complete | Conversation & memory |
 | 6 | ✅ Complete | Plan mode & subagent system |
 | 7 | ✅ Complete | Missing LLM tools (Skill, KillShell, background bash) |
-| 8 | Pending | Full hooks system (14 events, 3 handler types) |
+| 8 | ✅ Complete | Full hooks system (14 events, command handler, wired into agent) |
 | 9 | Pending | Memory & configuration parity |
 | 10 | Pending | CLI flags & slash commands full parity |
 | 11 | Pending | TUI & interaction parity (vim, shortcuts, checkpoints) |
@@ -669,7 +669,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 |----------|---------|----------------|-----|
 | LLM Tools | ~40 | ~38 | Full parity ✅ |
 | Slash Commands | 23 | ~30 | /copy, /debug, /hooks, /rename, /stats, /theme, /usage, /add-dir |
-| Hook Events | 2 (pre/post tool) | 14 | 12 missing events, 2 handler types |
+| Hook Events | 14 (all events) | 14 | Full parity ✅ (prompt/agent handlers deferred) |
 | Permission Modes | 3 | 5 | acceptEdits, dontAsk |
 | Subagent Types | 5 (explore/plan/task/bash/custom) | 6+ | Full parity ✅ |
 | Memory Features | 3-tier | Full hierarchy | rules/, @import, #shortcut, path-specific |

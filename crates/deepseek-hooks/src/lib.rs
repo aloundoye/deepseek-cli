@@ -1,10 +1,230 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
+// ── Hook Events ──────────────────────────────────────────────────────────────
+
+/// All hook events matching Claude Code's 14 events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HookEvent {
+    /// Fires on session begin/resume/clear/compact.
+    SessionStart,
+    /// Fires when user submits a prompt (can block).
+    UserPromptSubmit,
+    /// Before tool execution (can allow/deny/modify).
+    PreToolUse,
+    /// After tool succeeds (feedback only).
+    PostToolUse,
+    /// After tool fails (feedback only).
+    PostToolUseFailure,
+    /// When permission dialog is shown (can allow/deny).
+    PermissionRequest,
+    /// On notification events.
+    Notification,
+    /// When subagent is spawned.
+    SubagentStart,
+    /// When subagent finishes.
+    SubagentStop,
+    /// When main agent finishes responding.
+    Stop,
+    /// When config files change mid-session.
+    ConfigChange,
+    /// Before context compaction (inject instructions).
+    PreCompact,
+    /// Session terminates.
+    SessionEnd,
+    /// Task marked complete.
+    TaskCompleted,
+}
+
+impl HookEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::PreToolUse => "PreToolUse",
+            Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::PermissionRequest => "PermissionRequest",
+            Self::Notification => "Notification",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
+            Self::Stop => "Stop",
+            Self::ConfigChange => "ConfigChange",
+            Self::PreCompact => "PreCompact",
+            Self::SessionEnd => "SessionEnd",
+            Self::TaskCompleted => "TaskCompleted",
+        }
+    }
+
+    pub fn parse_event(s: &str) -> Option<Self> {
+        match s {
+            "SessionStart" | "sessionstart" => Some(Self::SessionStart),
+            "UserPromptSubmit" | "userpromptsubmit" => Some(Self::UserPromptSubmit),
+            "PreToolUse" | "pretooluse" => Some(Self::PreToolUse),
+            "PostToolUse" | "posttooluse" => Some(Self::PostToolUse),
+            "PostToolUseFailure" | "posttoolusefailure" => Some(Self::PostToolUseFailure),
+            "PermissionRequest" | "permissionrequest" => Some(Self::PermissionRequest),
+            "Notification" | "notification" => Some(Self::Notification),
+            "SubagentStart" | "subagentstart" => Some(Self::SubagentStart),
+            "SubagentStop" | "subagentstop" => Some(Self::SubagentStop),
+            "Stop" | "stop" => Some(Self::Stop),
+            "ConfigChange" | "configchange" => Some(Self::ConfigChange),
+            "PreCompact" | "precompact" => Some(Self::PreCompact),
+            "SessionEnd" | "sessionend" => Some(Self::SessionEnd),
+            "TaskCompleted" | "taskcompleted" => Some(Self::TaskCompleted),
+            _ => None,
+        }
+    }
+
+    /// Whether this event supports blocking (the hook can prevent the action).
+    pub fn supports_blocking(&self) -> bool {
+        matches!(
+            self,
+            Self::UserPromptSubmit
+                | Self::PreToolUse
+                | Self::PermissionRequest
+                | Self::SubagentStop
+                | Self::Stop
+        )
+    }
+}
+
+// ── Hook Configuration ───────────────────────────────────────────────────────
+
+/// A single hook definition from settings.json.
+///
+/// Example in settings:
+/// ```json
+/// {
+///   "hooks": {
+///     "PreToolUse": [{
+///       "matcher": "bash_run",
+///       "hooks": [{
+///         "type": "command",
+///         "command": "bash /path/to/validate.sh"
+///       }]
+///     }]
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookDefinition {
+    /// Optional matcher — tool name, session event subtype, etc.
+    #[serde(default)]
+    pub matcher: Option<String>,
+    /// The hook handlers to run.
+    pub hooks: Vec<HookHandler>,
+}
+
+/// A hook handler — how to execute the hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum HookHandler {
+    /// Shell command handler. JSON context on stdin, exit codes control behavior.
+    Command {
+        command: String,
+        /// Timeout in seconds (default 30).
+        #[serde(default = "default_timeout")]
+        timeout: u64,
+    },
+}
+
+fn default_timeout() -> u64 {
+    30
+}
+
+/// Full hooks configuration — maps event names to hook definitions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    #[serde(flatten)]
+    pub events: std::collections::HashMap<String, Vec<HookDefinition>>,
+}
+
+// ── Hook Input / Output ──────────────────────────────────────────────────────
+
+/// JSON input sent on stdin to command hooks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookInput {
+    /// The event that triggered this hook.
+    pub event: String,
+    /// Tool name (for PreToolUse/PostToolUse/PostToolUseFailure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Tool arguments (for PreToolUse).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<serde_json::Value>,
+    /// Tool result (for PostToolUse/PostToolUseFailure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<serde_json::Value>,
+    /// User prompt text (for UserPromptSubmit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Session event subtype (for SessionStart: startup/resume/clear/compact).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<String>,
+    /// Workspace path.
+    pub workspace: String,
+}
+
+/// Decision from a hook's stdout JSON.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookOutput {
+    /// Top-level decision: "block" prevents the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    /// Reason for the decision (shown to user).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// For PreToolUse: modified tool parameters to use instead.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "updatedInput")]
+    pub updated_input: Option<serde_json::Value>,
+    /// For PreToolUse/PermissionRequest: allow/deny/ask.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "permissionDecision")]
+    pub permission_decision: Option<String>,
+    /// Inject additional context into the conversation.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "additionalContext")]
+    pub additional_context: Option<String>,
+}
+
+// ── Hook Result ──────────────────────────────────────────────────────────────
+
+/// Result of running a single hook handler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookRun {
+    pub handler_description: String,
+    pub success: bool,
+    pub timed_out: bool,
+    pub exit_code: Option<i32>,
+    pub output: HookOutput,
+    /// True if the hook decided to block the action.
+    pub blocked: bool,
+}
+
+/// Aggregate result of running all hooks for an event.
+#[derive(Debug, Clone, Default)]
+pub struct HookResult {
+    pub runs: Vec<HookRun>,
+    /// True if any hook blocked the action.
+    pub blocked: bool,
+    /// Reason from the blocking hook.
+    pub block_reason: Option<String>,
+    /// Modified tool input from the last hook that provided one.
+    pub updated_input: Option<serde_json::Value>,
+    /// Additional context from hooks.
+    pub additional_context: Vec<String>,
+}
+
+// ── Legacy types (backward compat with existing callers) ─────────────────────
+
+/// Legacy context for file-based hooks (used by LocalToolHost).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookContext {
     pub phase: String,
@@ -14,18 +234,189 @@ pub struct HookContext {
     pub tool_result_json: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookRun {
-    pub path: PathBuf,
-    pub success: bool,
-    pub timed_out: bool,
-    pub exit_code: Option<i32>,
+// ── Hook Runtime ─────────────────────────────────────────────────────────────
+
+/// Manages hook execution, once-per-session tracking, and async hooks.
+pub struct HookRuntime {
+    workspace: PathBuf,
+    config: HooksConfig,
+    /// Tracks hooks that have `once: true` and have already run.
+    #[allow(dead_code)]
+    once_fired: Mutex<HashSet<String>>,
 }
 
-pub struct HookRuntime;
-
 impl HookRuntime {
-    pub fn run(paths: &[PathBuf], ctx: &HookContext, timeout: Duration) -> Result<Vec<HookRun>> {
+    pub fn new(workspace: &Path, config: HooksConfig) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            config,
+            once_fired: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Fire hooks for an event with the given input context.
+    pub fn fire(&self, event: HookEvent, input: &HookInput) -> HookResult {
+        let event_key = event.as_str();
+        let defs = match self.config.events.get(event_key) {
+            Some(defs) => defs.clone(),
+            None => return HookResult::default(),
+        };
+
+        let mut result = HookResult::default();
+
+        for def in &defs {
+            // Check matcher — if set, the input must match.
+            if let Some(ref matcher) = def.matcher {
+                let matches = match event {
+                    HookEvent::PreToolUse
+                    | HookEvent::PostToolUse
+                    | HookEvent::PostToolUseFailure => input
+                        .tool_name
+                        .as_deref()
+                        .is_some_and(|name| name == matcher),
+                    HookEvent::SessionStart => input
+                        .session_type
+                        .as_deref()
+                        .is_some_and(|st| st == matcher),
+                    HookEvent::Notification => input
+                        .session_type
+                        .as_deref()
+                        .is_some_and(|st| st == matcher),
+                    _ => true,
+                };
+                if !matches {
+                    continue;
+                }
+            }
+
+            for handler in &def.hooks {
+                let run = self.execute_handler(handler, input);
+                if run.blocked && event.supports_blocking() {
+                    result.blocked = true;
+                    result.block_reason = run
+                        .output
+                        .reason
+                        .clone()
+                        .or_else(|| Some("Blocked by hook".to_string()));
+                }
+                if let Some(ref ui) = run.output.updated_input {
+                    result.updated_input = Some(ui.clone());
+                }
+                if let Some(ref ctx) = run.output.additional_context {
+                    result.additional_context.push(ctx.clone());
+                }
+                result.runs.push(run);
+
+                // If blocked, stop running more handlers.
+                if result.blocked {
+                    return result;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Execute a single hook handler.
+    fn execute_handler(&self, handler: &HookHandler, input: &HookInput) -> HookRun {
+        match handler {
+            HookHandler::Command { command, timeout } => {
+                self.run_command_handler(command, input, *timeout)
+            }
+        }
+    }
+
+    /// Run a command hook handler: pipe JSON on stdin, parse stdout JSON for decisions.
+    fn run_command_handler(&self, command: &str, input: &HookInput, timeout_secs: u64) -> HookRun {
+        let input_json = serde_json::to_string(input).unwrap_or_default();
+
+        let shell = if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        };
+        let shell_flag = if cfg!(target_os = "windows") {
+            "/C"
+        } else {
+            "-c"
+        };
+
+        let mut cmd = Command::new(shell);
+        cmd.arg(shell_flag);
+        cmd.arg(command);
+        cmd.current_dir(&self.workspace);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_e) => {
+                return HookRun {
+                    handler_description: command.to_string(),
+                    success: false,
+                    timed_out: false,
+                    exit_code: None,
+                    output: HookOutput::default(),
+                    blocked: false,
+                };
+            }
+        };
+
+        // Write input JSON to stdin.
+        let mut child = child;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input_json.as_bytes());
+            drop(stdin);
+        }
+
+        let timeout = Duration::from_secs(timeout_secs);
+        let (timed_out, status) = match child.wait_timeout(timeout) {
+            Ok(Some(status)) => (false, Some(status)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                (true, None)
+            }
+            Err(_) => (false, None),
+        };
+
+        let exit_code = status.and_then(|s| s.code());
+        let success = !timed_out && exit_code == Some(0);
+
+        // Exit code 2 = block.
+        let blocked_by_exit = exit_code == Some(2);
+
+        // Try to parse stdout as JSON for decisions.
+        let stdout_output = child
+            .stdout
+            .and_then(|mut out| {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut out, &mut buf).ok()?;
+                Some(buf)
+            })
+            .unwrap_or_default();
+
+        let output: HookOutput = serde_json::from_str(&stdout_output).unwrap_or_default();
+
+        let blocked = blocked_by_exit || output.decision.as_deref() == Some("block");
+
+        HookRun {
+            handler_description: command.to_string(),
+            success,
+            timed_out,
+            exit_code,
+            output,
+            blocked,
+        }
+    }
+
+    /// Legacy compatibility: run file-based hooks with the old API.
+    pub fn run_legacy(
+        paths: &[PathBuf],
+        ctx: &HookContext,
+        timeout: Duration,
+    ) -> Result<Vec<HookRun>> {
         let mut out = Vec::new();
         for path in paths {
             let mut cmd = build_command(path);
@@ -57,10 +448,12 @@ impl HookRuntime {
                 }
             };
             out.push(HookRun {
-                path: path.clone(),
+                handler_description: path.to_string_lossy().to_string(),
                 success: status.success() && !timed_out,
                 timed_out,
                 exit_code: status.code(),
+                output: HookOutput::default(),
+                blocked: false,
             });
         }
         Ok(out)
@@ -100,18 +493,183 @@ fn build_command(path: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
+
+    #[test]
+    fn hook_event_roundtrip() {
+        for event in [
+            HookEvent::SessionStart,
+            HookEvent::UserPromptSubmit,
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+            HookEvent::PostToolUseFailure,
+            HookEvent::PermissionRequest,
+            HookEvent::Notification,
+            HookEvent::SubagentStart,
+            HookEvent::SubagentStop,
+            HookEvent::Stop,
+            HookEvent::ConfigChange,
+            HookEvent::PreCompact,
+            HookEvent::SessionEnd,
+            HookEvent::TaskCompleted,
+        ] {
+            assert_eq!(
+                HookEvent::parse_event(event.as_str()),
+                Some(event),
+                "roundtrip failed for {:?}",
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn hook_event_from_str_case_insensitive() {
+        assert_eq!(
+            HookEvent::parse_event("pretooluse"),
+            Some(HookEvent::PreToolUse)
+        );
+        assert_eq!(
+            HookEvent::parse_event("PreToolUse"),
+            Some(HookEvent::PreToolUse)
+        );
+        assert_eq!(HookEvent::parse_event("bogus"), None);
+    }
+
+    #[test]
+    fn supports_blocking_correct() {
+        assert!(HookEvent::PreToolUse.supports_blocking());
+        assert!(HookEvent::UserPromptSubmit.supports_blocking());
+        assert!(!HookEvent::PostToolUse.supports_blocking());
+        assert!(!HookEvent::SessionStart.supports_blocking());
+    }
+
+    #[test]
+    fn empty_config_returns_default_result() {
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig::default());
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        assert!(!result.blocked);
+        assert!(result.runs.is_empty());
+    }
+
+    #[test]
+    fn matcher_filters_by_tool_name() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: Some("bash_run".to_string()),
+                hooks: vec![HookHandler::Command {
+                    command: "echo '{}'".to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+
+        // Should NOT match — tool name doesn't match matcher.
+        let input_no_match = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("fs_read".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input_no_match);
+        assert!(result.runs.is_empty());
+
+        // Should match.
+        let input_match = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input_match);
+        assert_eq!(result.runs.len(), 1);
+    }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn executes_hook_scripts() {
+    fn command_hook_exit_2_blocks() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "exit 2".to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        assert!(result.blocked);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn command_hook_exit_0_allows() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "exit 0".to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        assert!(!result.blocked);
+        assert!(result.runs[0].success);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn legacy_hook_execution() {
         let workspace =
             std::env::temp_dir().join(format!("deepseek-hooks-test-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         let hook = workspace.join("hook.sh");
         fs::write(&hook, "#!/bin/sh\nexit 0\n").expect("hook");
 
-        let runs = HookRuntime::run(
+        let runs = HookRuntime::run_legacy(
             &[hook],
             &HookContext {
                 phase: "pretooluse".to_string(),
@@ -125,5 +683,24 @@ mod tests {
         .expect("run");
         assert_eq!(runs.len(), 1);
         assert!(runs[0].success);
+    }
+
+    #[test]
+    fn hooks_config_deserializes() {
+        let json = r#"{
+            "PreToolUse": [{
+                "matcher": "bash_run",
+                "hooks": [{"type": "command", "command": "echo ok"}]
+            }],
+            "Stop": [{
+                "hooks": [{"type": "command", "command": "notify-send done", "timeout": 10}]
+            }]
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).expect("parse");
+        assert!(config.events.contains_key("PreToolUse"));
+        assert!(config.events.contains_key("Stop"));
+        let pre = &config.events["PreToolUse"];
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].matcher.as_deref(), Some("bash_run"));
     }
 }

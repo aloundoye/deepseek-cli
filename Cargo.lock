@@ -625,6 +625,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "deepseek-core",
+ "deepseek-hooks",
  "deepseek-llm",
  "deepseek-memory",
  "deepseek-observe",

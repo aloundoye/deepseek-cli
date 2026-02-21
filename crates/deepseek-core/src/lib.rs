@@ -751,6 +751,10 @@ pub struct AppConfig {
     pub index: IndexConfig,
     pub budgets: BudgetsConfig,
     pub theme: ThemeConfig,
+    /// Hooks configuration (maps event names to hook definitions).
+    /// Stored as raw JSON, parsed by deepseek-hooks at runtime.
+    #[serde(default)]
+    pub hooks: serde_json::Value,
 }
 
 impl AppConfig {
