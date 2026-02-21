@@ -87,15 +87,12 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `fs.glob`, `bash.run`, `git.*`, `web.*`, `notebook.*`, `multi_edit`, and plugins.
 
-**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` and `reasoner_directed=true` (for executor units).
+**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true`.
 
 **Unified thinking + tools** (primary, DeepSeek V3.2): When `router.unified_thinking_tools = true` (default), `deepseek-chat` is called with both `thinking: {type: "enabled"}` and `tools: [...]` in a single API call. The model reasons via chain-of-thought and emits tool calls in one pass. Per V3.2 docs: `reasoning_content` is **kept** within the current tool loop (same user question) so the model retains its logical thread, and **stripped** from prior conversation turns (previous user questions) to save bandwidth. Temperature, top_p, and penalty params are omitted when thinking is enabled.
 
-**Reasoner-directed execution** (fallback, `deepseek-agent`): When `router.unified_thinking_tools = false`, falls back to a two-model loop where `deepseek-reasoner` analyzes the situation and directs strategy on every tool-enabled turn, then `deepseek-chat` executes tool calls guided by that reasoning. Activated when `router.reasoner_directed = true` and the router signals high complexity. The reasoner call produces a directive that is injected into the conversation history as an assistant message. If the reasoner outputs `TASK_COMPLETE`, the loop terminates and returns the final answer. Falls back gracefully if the reasoner call errors. Capped by `router.reasoner_directed_max_turns` (default 20) to limit token cost. Note: `deepseek-reasoner` does NOT support function calling — only `deepseek-chat` can call tools.
-
-**Mode router** (`deepseek-agent::mode_router`): Selects among three execution modes per turn:
+**Mode router** (`deepseek-agent::mode_router`): Selects between two execution modes per turn:
 - **V3Autopilot** (default): `deepseek-chat` with unified thinking + tools in a single API call. Fast, handles most tasks.
-- **R1Supervise**: Existing `reasoner_directed` loop — R1 analyzes, V3 executes. Legacy fallback.
 - **R1DriveTools**: R1 (`deepseek-reasoner`) drives tools step-by-step via structured JSON intents (`tool_intent`, `delegate_patch`, `done`, `abort`). Orchestrator validates + executes via `ToolHost`. R1 receives `ObservationPack` context between steps. Escalation triggers: repeated step failures (≥2), ambiguous errors, blast radius (≥5 files changed), cross-module failures. V3 gets one mechanical recovery attempt for compile/lint errors before escalation. R1 budget capped at `r1_max_steps` (default 30).
 
 Key modules in `deepseek-agent`:
@@ -143,17 +140,12 @@ DeepSeek V3.2 (`deepseek-chat`) officially supports **thinking mode with functio
 **Implementation** (`deepseek-agent/src/lib.rs` — `chat_with_options()`):
 - Thinking is enabled when `decision.thinking_enabled && (!options.tools || unified_thinking_tools)`.
 - `reasoning_content` is stripped only from assistant messages *before* the last User message (prior turns), kept from current tool loop messages.
-- When `unified_thinking_tools = true`, both the two-phase thinking and reasoner-directed blocks are skipped.
 
-### DSML markup leak (legacy fallback)
+### DSML markup leak (safety net)
 
 Older DeepSeek API versions could intermittently output **raw DSML markup** when thinking was combined with tools. The DSML rescue parser in `deepseek-llm/src/lib.rs` (`rescue_raw_tool_calls()`) remains as a safety net, parsing Format A (`<｜DSML｜invoke>`) and Format B (`<｜tool▁call▁begin｜>`) markup into proper `Vec<LlmToolCall>`.
 
-**Fallback modes** (when `unified_thinking_tools = false`):
-- **Reasoner-directed execution**: `deepseek-reasoner` analyzes each turn, `deepseek-chat` executes tools guided by that reasoning. Set `router.reasoner_directed = true`.
-- **Two-phase thinking**: A single thinking-only call on the first turn, then tools-only execution. Set `router.two_phase_thinking = true` with `reasoner_directed = false`.
-
-**To disable unified mode and use the old architecture**: Set `router.unified_thinking_tools = false` in settings.
+**Workaround for complex failures**: The mode router automatically escalates from V3Autopilot to R1DriveTools when repeated failures, ambiguous errors, or high blast radius are detected. R1 drives tools via JSON intents with a step budget (`r1_max_steps`, default 30).
 
 ## Supply-Chain Security
 

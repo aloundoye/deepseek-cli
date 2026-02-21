@@ -24,17 +24,9 @@ threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1
 # Unified thinking + tools (DeepSeek V3.2): use deepseek-chat with thinking
-# mode enabled alongside tools in a single API call. Simpler and lower-latency
-# than the two-model reasoner-directed loop. Set to false to fall back to
-# reasoner_directed mode.
+# mode enabled alongside tools in a single API call.
 unified_thinking_tools = true
-# Reasoner-directed execution (fallback): deepseek-reasoner analyzes on every
-# tool-enabled turn, deepseek-chat executes tool calls guided by that reasoning.
-# Only active when unified_thinking_tools = false.
-reasoner_directed = true
-# Maximum reasoner calls per session to limit token cost.
-reasoner_directed_max_turns = 20
-# Mode router: selects among V3_AUTOPILOT, R1_SUPERVISE, R1_DRIVE_TOOLS.
+# Mode router: selects between V3_AUTOPILOT and R1_DRIVE_TOOLS.
 # V3_AUTOPILOT is the default (deepseek-chat with unified thinking + tools).
 # R1_DRIVE_TOOLS escalates to deepseek-reasoner driving tools via JSON intents.
 mode_router_enabled = true

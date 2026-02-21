@@ -114,11 +114,6 @@ impl ModelRouter for WeightedRouter {
             self.cfg.base_model.clone()
         };
 
-        // Reasoner-directed: when complexity is high and this is an executor
-        // call, signal that the agent should use the two-model loop
-        // (deepseek-reasoner analyzes, deepseek-chat executes tools).
-        let reasoner_directed = high && matches!(unit, LlmUnit::Executor);
-
         RouterDecision {
             decision_id: Uuid::now_v7(),
             reason_codes,
@@ -126,7 +121,6 @@ impl ModelRouter for WeightedRouter {
             score,
             escalated: high,
             thinking_enabled: high && selected_model == self.cfg.base_model,
-            reasoner_directed,
             selected_model,
         }
     }
@@ -153,8 +147,6 @@ mod tests {
         assert_eq!(decision.selected_model, "deepseek-reasoner");
         assert!(!decision.thinking_enabled);
         assert!(decision.escalated);
-        // Planner units don't get reasoner_directed (only Executor does)
-        assert!(!decision.reasoner_directed);
     }
 
     #[test]
@@ -174,7 +166,6 @@ mod tests {
         assert_eq!(decision.selected_model, "deepseek-chat");
         assert!(!decision.escalated);
         assert!(!decision.thinking_enabled);
-        assert!(!decision.reasoner_directed);
     }
 
     #[test]
@@ -206,8 +197,6 @@ mod tests {
         );
         assert_eq!(decision.selected_model, "deepseek-chat");
         assert!(decision.thinking_enabled);
-        // Executor with high score should signal reasoner_directed
-        assert!(decision.reasoner_directed);
     }
 
     #[test]

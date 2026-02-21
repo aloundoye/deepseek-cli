@@ -196,11 +196,6 @@ pub struct RouterDecision {
     /// `deepseek-chat` with `thinking: {type: "enabled", budget_tokens: N}`.
     #[serde(default)]
     pub thinking_enabled: bool,
-    /// When true, the agent should use reasoner-directed execution: call
-    /// `deepseek-reasoner` to analyze and direct strategy, then `deepseek-chat`
-    /// executes tool calls guided by the reasoning.
-    #[serde(default)]
-    pub reasoner_directed: bool,
 }
 
 /// Type-safe tool name enum covering all built-in tools.
@@ -1099,6 +1094,12 @@ pub enum StreamChunk {
     ContentDelta(String),
     /// A reasoning/thinking text delta.
     ReasoningDelta(String),
+    /// Agent mode transition (e.g., V3Autopilot → R1DriveTools).
+    ModeTransition {
+        from: String,
+        to: String,
+        reason: String,
+    },
     /// Streaming is done; the final assembled response follows.
     Done,
 }
@@ -1488,21 +1489,10 @@ pub struct RouterConfig {
     pub threshold_high: f32,
     pub escalate_on_invalid_plan: bool,
     pub max_escalations_per_unit: u8,
-    /// When true and the router requests thinking mode but tools are active,
-    /// use a two-phase approach: first a thinking-only call (no tools) to reason
-    /// about strategy, then a tools call (no thinking) with the reasoning as context.
-    pub two_phase_thinking: bool,
-    /// When true, use `deepseek-reasoner` to analyze and direct strategy on every
-    /// tool-enabled turn, then `deepseek-chat` executes tool calls guided by that
-    /// reasoning. Fallback for when `unified_thinking_tools` is disabled.
-    pub reasoner_directed: bool,
     /// When true (default), use `deepseek-chat` with thinking mode enabled
     /// alongside tools in a single API call (DeepSeek V3.2 unified mode).
-    /// When false, fall back to the two-model `reasoner_directed` loop.
     pub unified_thinking_tools: bool,
-    /// Maximum number of reasoner calls per session to limit token cost.
-    pub reasoner_directed_max_turns: u32,
-    /// Enable the mode router (V3Autopilot / R1Supervise / R1DriveTools).
+    /// Enable the mode router (V3Autopilot / R1DriveTools).
     /// When false, always uses V3Autopilot.
     #[serde(default = "default_true_bool")]
     pub mode_router_enabled: bool,
@@ -1539,9 +1529,6 @@ impl Default for RouterConfig {
             threshold_high: 0.72,
             escalate_on_invalid_plan: true,
             max_escalations_per_unit: 1,
-            two_phase_thinking: true,
-            reasoner_directed: true,
-            reasoner_directed_max_turns: 20,
             unified_thinking_tools: true,
             mode_router_enabled: true,
             v3_max_step_failures: 2,

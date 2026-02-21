@@ -41,6 +41,12 @@ pub enum TuiStreamEvent {
         args_summary: String,
         response_tx: mpsc::Sender<bool>,
     },
+    /// The agent switched execution modes (e.g. V3Autopilot → R1DriveTools).
+    ModeTransition {
+        from: String,
+        to: String,
+        reason: String,
+    },
     /// An error occurred during agent execution.
     Error(String),
     /// Agent execution completed with the given output.
@@ -200,6 +206,9 @@ pub struct UiStatus {
     pub working_directory: String,
     #[serde(default)]
     pub pr_review_status: Option<String>,
+    /// Current agent execution mode (e.g. "V3Autopilot", "R1DriveTools").
+    #[serde(default)]
+    pub agent_mode: String,
 }
 
 fn default_context_max() -> u64 {
@@ -238,8 +247,13 @@ pub fn render_statusline(status: &UiStatus) -> String {
         .as_deref()
         .map(|value| format!(" review={value}"))
         .unwrap_or_default();
+    let agent_part = if !status.agent_mode.is_empty() && status.agent_mode != "V3Autopilot" {
+        format!(" agent={}", status.agent_mode)
+    } else {
+        String::new()
+    };
     format!(
-        "model={} {} approvals={} jobs={}{} autopilot={}{}{} cost=${:.4}",
+        "model={} {} approvals={} jobs={}{} autopilot={}{}{}{} cost=${:.4}",
         status.model,
         mode_indicator,
         status.pending_approvals,
@@ -252,6 +266,7 @@ pub fn render_statusline(status: &UiStatus) -> String {
         },
         ctx_part,
         review_part,
+        agent_part,
         status.estimated_cost_usd,
     )
 }
@@ -274,6 +289,7 @@ fn render_statusline_spans(
     scroll_pct: Option<usize>,
     vim_mode_label: Option<&str>,
     has_new_content_below: bool,
+    is_thinking: bool,
 ) -> Vec<Span<'static>> {
     let mode_color = match status.permission_mode.as_str() {
         "auto" => Color::Green,
@@ -290,8 +306,16 @@ fn render_statusline_spans(
 
     let mut spans = Vec::new();
 
-    // Active tool with spinner (left side)
-    if let Some(tool) = active_tool {
+    // Thinking indicator with spinner (takes priority over active tool)
+    if is_thinking {
+        spans.push(Span::styled(
+            format!(" {} Thinking ", spinner_frame),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(tool) = active_tool {
+        // Active tool with spinner (left side)
         spans.push(Span::styled(
             format!(" {} {} ", spinner_frame, tool),
             Style::default().fg(Color::Yellow),
@@ -347,6 +371,18 @@ fn render_statusline_spans(
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Agent mode badge — only shown when not in default V3Autopilot mode
+    if status.agent_mode == "R1DriveTools" {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            " R1 ".to_string(),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1035,6 +1071,15 @@ fn style_transcript_line(
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Red),
         ),
+        MessageKind::Thinking => (
+            "  ◐ ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
     };
 
     let text = &entry.text;
@@ -1093,6 +1138,9 @@ fn style_continuation_line(
         MessageKind::ToolCall => Style::default().fg(Color::Yellow),
         MessageKind::ToolResult => Style::default().fg(Color::Green),
         MessageKind::Error => Style::default().fg(Color::Red),
+        MessageKind::Thinking => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     };
     let text = &entry.text;
     if entry.kind == MessageKind::ToolResult {
@@ -1384,6 +1432,7 @@ pub enum MessageKind {
     ToolCall,
     ToolResult,
     Error,
+    Thinking,
 }
 
 #[derive(Debug, Clone)]
@@ -1420,6 +1469,12 @@ pub struct ChatShell {
     pub artifact_lines: Vec<String>,
     pub active_tool: Option<String>,
     pub spinner_tick: usize,
+    /// Whether the model is currently in a thinking/reasoning phase.
+    pub is_thinking: bool,
+    /// Accumulated thinking text for the current reasoning block.
+    pub thinking_buffer: String,
+    /// Current agent execution mode (e.g. "V3Autopilot", "R1DriveTools").
+    pub agent_mode: String,
 }
 
 impl ChatShell {
@@ -1472,6 +1527,13 @@ impl ChatShell {
 
     pub fn push_plan(&mut self, line: impl Into<String>) {
         self.plan_lines.push(line.into());
+    }
+
+    pub fn push_thinking(&mut self, line: impl Into<String>) {
+        self.transcript.push(TranscriptEntry {
+            kind: MessageKind::Thinking,
+            text: line.into(),
+        });
     }
 
     pub fn push_tool(&mut self, line: impl Into<String>) {
@@ -1929,7 +1991,10 @@ where
         },
     )?;
 
-    let mut shell = ChatShell::default();
+    let mut shell = ChatShell {
+        agent_mode: "V3Autopilot".to_string(),
+        ..Default::default()
+    };
     let mut input = String::new();
     let mut cursor_pos: usize = 0;
     let mut history_cursor: Option<usize> = None;
@@ -2031,6 +2096,33 @@ where
                     }
                 };
                 frame.render_widget(Paragraph::new(styled), stream_area);
+            } else if shell.is_thinking && !shell.thinking_buffer.is_empty() {
+                // Show the tail of the thinking buffer in the streaming area,
+                // styled as dimmed italic to distinguish from normal output.
+                let last_line = shell
+                    .thinking_buffer
+                    .lines()
+                    .next_back()
+                    .unwrap_or(&shell.thinking_buffer);
+                let display =
+                    truncate_inline(last_line, width.saturating_sub(6) as usize);
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            "  \u{25cb} ",
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                        Span::styled(
+                            display,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ])),
+                    stream_area,
+                );
             } else {
                 frame.render_widget(Paragraph::new(Span::raw("")), stream_area);
             }
@@ -2189,7 +2281,15 @@ where
             // Row 4: status bar (compact inline — model, active tool spinner, info)
             let status_area = Rect::new(area.x, area.y + 4, width, 1);
             let mut status_spans: Vec<Span<'static>> = Vec::new();
-            if let Some(ref tool) = shell.active_tool {
+            if shell.is_thinking {
+                status_spans.push(Span::styled(
+                    format!(" {} Thinking ", shell.spinner_frame()),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                status_spans.push(Span::raw(" "));
+            } else if let Some(ref tool) = shell.active_tool {
                 status_spans.push(Span::styled(
                     format!(" {} {} ", shell.spinner_frame(), tool),
                     Style::default().fg(Color::Yellow),
@@ -2315,6 +2415,11 @@ where
             }
             match ev {
                 TuiStreamEvent::ContentDelta(text) => {
+                    // Transition out of thinking state when content arrives.
+                    if shell.is_thinking {
+                        shell.is_thinking = false;
+                        shell.thinking_buffer.clear();
+                    }
                     // Buffer streaming text — complete lines will be flushed
                     // to scrollback on next loop iteration, partial line shown
                     // in the viewport.
@@ -2322,15 +2427,21 @@ where
                     shell.append_streaming(&text);
                 }
                 TuiStreamEvent::ReasoningDelta(text) => {
-                    shell.push_tool(format!("[thinking] {text}"));
+                    if !shell.is_thinking {
+                        shell.is_thinking = true;
+                        shell.thinking_buffer.clear();
+                    }
+                    shell.thinking_buffer.push_str(&text);
                 }
                 TuiStreamEvent::ToolActive(name) => {
+                    shell.is_thinking = false;
                     shell.active_tool = Some(name);
                 }
                 TuiStreamEvent::ToolCallStart {
                     tool_name,
                     args_summary,
                 } => {
+                    shell.is_thinking = false;
                     shell.push_tool_call(&tool_name, &args_summary);
                     shell.active_tool = Some(tool_name);
                 }
@@ -2341,6 +2452,16 @@ where
                 } => {
                     shell.push_tool_result(&tool_name, duration_ms, &summary);
                     shell.active_tool = None;
+                }
+                TuiStreamEvent::ModeTransition { from, to, reason } => {
+                    shell.agent_mode = to.clone();
+                    let label = if to == "R1DriveTools" {
+                        format!("Escalating to R1 ({})", reason)
+                    } else {
+                        format!("Returning to V3 ({})", reason)
+                    };
+                    shell.push_system(label);
+                    info_line = format!("mode: {from} -> {to}");
                 }
                 TuiStreamEvent::ApprovalNeeded {
                     tool_name,
@@ -2364,12 +2485,22 @@ where
                     streaming_buffer.clear();
                     streaming_in_code_block = false;
                     streaming_in_diff_block = false;
+                    shell.is_thinking = false;
+                    shell.thinking_buffer.clear();
                     shell.push_error(&msg);
                     info_line = format!("error: {msg}");
                     is_processing = false;
                     shell.active_tool = None;
                 }
                 TuiStreamEvent::Done(output) => {
+                    // Flush thinking buffer to transcript as a collapsed summary.
+                    if !shell.thinking_buffer.is_empty() {
+                        let thought = std::mem::take(&mut shell.thinking_buffer);
+                        // Show a single-line summary of the thinking in the transcript.
+                        let summary = truncate_inline(&thought.replace('\n', " "), 120);
+                        shell.push_thinking(summary);
+                    }
+                    shell.is_thinking = false;
                     // Flush any remaining partial streaming line to scrollback.
                     if !streaming_buffer.is_empty() {
                         let remaining = std::mem::take(&mut streaming_buffer);
@@ -2413,6 +2544,8 @@ where
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
+                shell.is_thinking = false;
+                shell.thinking_buffer.clear();
                 if let Some((_, _, response_tx)) = pending_approval.take() {
                     let _ = response_tx.send(false);
                 }
@@ -2446,6 +2579,8 @@ where
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
+                shell.is_thinking = false;
+                shell.thinking_buffer.clear();
                 if let Some((_, _, response_tx)) = pending_approval.take() {
                     let _ = response_tx.send(false);
                 }
@@ -3884,6 +4019,7 @@ mod tests {
             session_turns: 5,
             working_directory: "/tmp".to_string(),
             pr_review_status: None,
+            ..Default::default()
         });
         assert!(line.contains("model=deepseek-chat"));
         assert!(line.contains("autopilot=running"));
@@ -4031,6 +4167,7 @@ mod tests {
             session_turns: 10,
             working_directory: "/workspace".to_string(),
             pr_review_status: None,
+            ..Default::default()
         });
         assert!(line.contains("[AUTO]"));
         assert!(line.contains("ctx=96K/128K(75%)"));
@@ -4061,7 +4198,7 @@ mod tests {
             context_max_tokens: 128_000,
             ..Default::default()
         };
-        let spans = render_statusline_spans(&status, None, "", None, None, false);
+        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("deepseek-chat"));
         assert!(text.contains("LOCKED"));
@@ -4078,6 +4215,7 @@ mod tests {
             Some(42),
             Some("INSERT"),
             true,
+            false,
         );
         let text2: String = spans_with_ctx
             .iter()
@@ -4394,7 +4532,7 @@ mod tests {
             session_turns: 7,
             ..Default::default()
         };
-        let spans = render_statusline_spans(&status, None, "", None, None, false);
+        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("turn 7"));
     }
@@ -4406,9 +4544,80 @@ mod tests {
             session_turns: 0,
             ..Default::default()
         };
-        let spans = render_statusline_spans(&status, None, "", None, None, false);
+        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(!text.contains("turn"));
+    }
+
+    #[test]
+    fn statusline_shows_thinking_indicator() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            ..Default::default()
+        };
+        // When thinking, the spinner should show "Thinking" instead of the active tool.
+        let spans = render_statusline_spans(
+            &status,
+            Some("fs.read"),
+            "\u{280b}",
+            None,
+            None,
+            false,
+            true,
+        );
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Thinking"), "should show Thinking indicator");
+        assert!(
+            !text.contains("fs.read"),
+            "active tool should be hidden during thinking"
+        );
+    }
+
+    #[test]
+    fn statusline_hides_thinking_when_not_active() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            ..Default::default()
+        };
+        let spans = render_statusline_spans(
+            &status,
+            Some("fs.read"),
+            "\u{280b}",
+            None,
+            None,
+            false,
+            false,
+        );
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(!text.contains("Thinking"));
+        assert!(text.contains("fs.read"));
+    }
+
+    #[test]
+    fn chat_shell_push_thinking() {
+        let mut shell = ChatShell::default();
+        shell.push_thinking("analyzing the problem");
+        assert_eq!(shell.transcript.len(), 1);
+        assert_eq!(shell.transcript[0].kind, MessageKind::Thinking);
+        assert_eq!(shell.transcript[0].text, "analyzing the problem");
+    }
+
+    #[test]
+    fn thinking_state_transitions() {
+        let mut shell = ChatShell {
+            is_thinking: true,
+            ..Default::default()
+        };
+
+        // Start thinking
+        shell.thinking_buffer.push_str("step 1\nstep 2");
+        assert!(shell.is_thinking);
+
+        // Content delta clears thinking
+        shell.is_thinking = false;
+        shell.thinking_buffer.clear();
+        assert!(!shell.is_thinking);
+        assert!(shell.thinking_buffer.is_empty());
     }
 
     #[test]
@@ -4445,6 +4654,7 @@ mod tests {
             session_turns: 5,
             working_directory: "/tmp".to_string(),
             pr_review_status: None,
+            ..Default::default()
         };
         shell.push_status_summary(&status);
         let all_text: String = shell
@@ -4629,5 +4839,74 @@ mod tests {
                 crossterm::event::KeyModifiers::CONTROL
             )
         );
+    }
+
+    #[test]
+    fn mode_transition_updates_shell_and_transcript() {
+        let mut shell = ChatShell {
+            agent_mode: "V3Autopilot".to_string(),
+            ..Default::default()
+        };
+        // Simulate escalation to R1
+        shell.agent_mode = "R1DriveTools".to_string();
+        shell.push_system("Escalating to R1 (repeated step failures)");
+
+        assert_eq!(shell.agent_mode, "R1DriveTools");
+        assert_eq!(shell.transcript.len(), 1);
+        assert_eq!(shell.transcript[0].kind, MessageKind::System);
+        assert!(shell.transcript[0].text.contains("Escalating to R1"));
+
+        // Simulate return to V3
+        shell.agent_mode = "V3Autopilot".to_string();
+        shell.push_system("Returning to V3 (R1 completed)");
+        assert_eq!(shell.agent_mode, "V3Autopilot");
+        assert_eq!(shell.transcript.len(), 2);
+        assert!(shell.transcript[1].text.contains("Returning to V3"));
+    }
+
+    #[test]
+    fn statusline_shows_r1_badge_when_active() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            agent_mode: "R1DriveTools".to_string(),
+            ..Default::default()
+        };
+        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains(" R1 "), "status bar should show R1 badge");
+    }
+
+    #[test]
+    fn statusline_hides_r1_badge_in_v3_mode() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            agent_mode: "V3Autopilot".to_string(),
+            ..Default::default()
+        };
+        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(!text.contains(" R1 "), "status bar should not show R1 badge in V3 mode");
+    }
+
+    #[test]
+    fn plain_statusline_shows_agent_mode_when_r1() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            agent_mode: "R1DriveTools".to_string(),
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(line.contains("agent=R1DriveTools"));
+    }
+
+    #[test]
+    fn plain_statusline_hides_agent_mode_when_v3() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            agent_mode: "V3Autopilot".to_string(),
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(!line.contains("agent="), "V3 mode should not show agent= in statusline");
     }
 }

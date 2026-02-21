@@ -282,7 +282,7 @@ Subagents are lightweight agent instances running in parallel. Each has its own 
 
 ### 4.4 Model Router with Auto Max-Think
 
-The router computes a complexity score based on:
+The **WeightedRouter** (`deepseek-router`) computes a complexity score based on:
 
 - Prompt complexity (length, keywords).
 - Repo complexity (touched files, index breadth).
@@ -304,20 +304,56 @@ DeepSeek offers two model endpoints, but only `deepseek-chat` supports function 
 | Primary Mode | Non-thinking (Direct output) | Thinking (Chain-of-Thought, always-on) |
 | Thinking Mode | Yes (via `thinking` param) | Always-on |
 | Function Calling | **Yes** | **No** |
-| Best For | All agentic tasks (with thinking toggle) | Legacy planner paths without tools |
+| Best For | All agentic tasks (with thinking toggle) | Architect role: analysis via JSON intents |
 | Context Window | 128K | 128K |
 
-**Key insight:** `deepseek-reasoner` does NOT support function calling. When tools are needed (the common case for an agentic coding assistant), we MUST use `deepseek-chat`. The DeepSeek API supports thinking mode on `deepseek-chat` via `thinking: {"type": "enabled", "budget_tokens": N}`, which gives us reasoning + function calling simultaneously.
+**Key insight:** `deepseek-reasoner` does NOT support function calling. When tools are needed (the common case for an agentic coding assistant), we MUST use `deepseek-chat`. The DeepSeek API (V3.2) supports thinking mode on `deepseek-chat` via `thinking: {"type": "enabled", "budget_tokens": N}`, which gives us reasoning + function calling simultaneously.
 
-**Hybrid Strategy (implemented via WeightedRouter):**
+### 4.4.2 Two-Mode Execution Architecture (Mode Router)
 
-| Role | Model | Thinking | Rationale |
-|------|-------|----------|-----------|
-| **Complex Agent** (planning, debugging, multi-step) | `deepseek-chat` | Enabled | CoT reasoning + tool calling |
-| **Fast Executor** (simple completions, boilerplate) | `deepseek-chat` | Disabled | Speed + lower token cost |
-| **Router Decision** | Automatic | Auto | Complexity scoring toggles thinking per turn |
+The **Mode Router** (`deepseek-agent::mode_router`) selects between two execution modes per turn, implementing an Architect-Developer pattern:
 
-The router always uses `deepseek-chat` and toggles `thinking_enabled` when the complexity score crosses the threshold (default 0.72). This gives us the best of both worlds: chain-of-thought reasoning for complex tasks, with full function calling support at all times.
+| Mode | Model | How Tools Are Called | When Used |
+|------|-------|---------------------|-----------|
+| **V3Autopilot** (default) | `deepseek-chat` | API function calling (thinking + tools unified) | Most tasks; fast, single-call |
+| **R1DriveTools** (escalation) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Complex failures, ambiguous errors, high blast radius |
+
+**Escalation triggers** (V3Autopilot → R1DriveTools):
+1. **Repeated step failures** — same step fails ≥ `v3_max_step_failures` (default 2) times
+2. **Ambiguous errors** — error cannot be classified (not compile/test/lint/runtime)
+3. **Blast radius exceeded** — ≥ `blast_radius_threshold` (default 5) files changed without verification
+4. **Cross-module failures** — errors span 2+ distinct modules
+5. **Architectural task** — prompt keywords suggest refactor/migrate/restructure
+
+**Mechanical recovery**: V3 gets one bounded recovery attempt for compile errors, lint errors, or missing dependencies before escalation. This avoids unnecessary R1 calls for simple fix-and-retry scenarios.
+
+**R1 drive-tools loop** (`deepseek-agent::r1_drive`):
+1. R1 receives an `ObservationPack` (actions, errors, diffs, test results, repo facts)
+2. R1 responds with one JSON envelope: `tool_intent`, `delegate_patch`, `done`, or `abort`
+3. Orchestrator validates JSON via `protocol::parse_r1_response()`, executes via `ToolHost`
+4. Orchestrator builds new `ObservationPack`, sends back to R1
+5. Loop until R1 returns `delegate_patch` (hand off to V3 patch writer), `done`, or `abort`
+6. R1 budget capped at `r1_max_steps` (default 30) to limit token cost
+
+**V3 patch writer** (`deepseek-agent::v3_patch`): When R1 issues `delegate_patch`, V3 is called with a focused prompt to produce a unified diff. Handles `need_more_context` requests by reading additional files. Max context requests configurable via `v3_patch_max_context_requests`.
+
+**Key modules:**
+- `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `decide_mode()`, escalation logic
+- `protocol.rs` — `R1Response` JSON envelope types, parsing + validation, V3 patch response parsing
+- `observation.rs` — `ObservationPack`, `ErrorClass`, error classification, compact R1 context serialization
+- `r1_drive.rs` — R1 drive-tools loop implementation
+- `v3_patch.rs` — V3 as focused patch-only code writer
+
+**Configuration** (all in `[router]` section):
+```toml
+mode_router_enabled = true          # Enable three-mode routing (false = always V3Autopilot)
+v3_max_step_failures = 2            # Consecutive failures before escalation
+blast_radius_threshold = 5          # Files changed without verify before escalation
+v3_mechanical_recovery = true       # Allow V3 one recovery attempt for compile/lint errors
+r1_max_steps = 30                   # Max R1 drive-tools steps per task
+r1_max_parse_retries = 2            # Max retries when R1 JSON fails validation
+v3_patch_max_context_requests = 3   # Max context requests from V3 patch writer
+```
 
 ### 4.5 Tool System
 
@@ -624,10 +660,3 @@ error = "Red"
 This RFC presents a complete blueprint for building a DeepSeek-powered coding agent that not only replicates every feature of Claude Code but also introduces DeepSeek-specific innovations. The modular architecture, emphasis on safety, deterministic replay, and incremental milestones ensure a path to a production-quality tool that can become the go-to open-source alternative.
 
 With the Rust ecosystem’s maturity and the DeepSeek API’s cost advantage, we are well-positioned to deliver a tool that developers will love. Let’s build it.
-
-│                                                                                                                           │
-│### **Long-term Vision:**                                                                                                  │
-│  1. **Cloud Sync**: Optional cloud backup for sessions and preferences                                                    │
-│  2. **Team Features**: Multi-user collaboration capabilities                                                              │
-│  3. **Advanced Analytics**: Usage insights and productivity metrics                                                       │
-│  4. **Model Fine-tuning**: Custom model training for specific workflows  

@@ -1,12 +1,15 @@
 //! Mode router: selects the execution mode for each agent turn.
 //!
-//! Three modes:
+//! Two modes:
 //! - **V3Autopilot**: `deepseek-chat` with thinking + tools (fast, default).
-//! - **R1Supervise**: Existing `reasoner_directed` loop (R1 directives + V3 executor).
 //! - **R1DriveTools**: R1 emits tool-intent JSON, orchestrator executes, R1 iterates.
+//!
+//! Escalation policy: V3 → R1 on doom-loops, ambiguous errors, blast radius, cross-module.
+//! Hysteresis: once in R1, stay until verify green, R1 `done`/`abort`, or budget exhausted.
 
 use crate::observation::{ErrorClass, ObservationPack};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The active execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,8 +17,6 @@ use serde::{Deserialize, Serialize};
 pub enum AgentMode {
     /// V3 with thinking + tools in a single call. Fast default.
     V3Autopilot,
-    /// R1 produces directives, V3 executes tool calls (existing reasoner_directed).
-    R1Supervise,
     /// R1 drives tools step-by-step via JSON intents. Orchestrator executes.
     R1DriveTools,
 }
@@ -24,7 +25,6 @@ impl std::fmt::Display for AgentMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::V3Autopilot => write!(f, "v3_autopilot"),
-            Self::R1Supervise => write!(f, "r1_supervise"),
             Self::R1DriveTools => write!(f, "r1_drive_tools"),
         }
     }
@@ -48,6 +48,8 @@ pub struct ModeRouterConfig {
     pub r1_max_parse_retries: u32,
     /// Max context requests from V3 patch writer before giving up.
     pub v3_patch_max_context_requests: u32,
+    /// Doom-loop threshold: if the same tool signature fails this many times, escalate.
+    pub doom_loop_threshold: u32,
 }
 
 impl Default for ModeRouterConfig {
@@ -60,6 +62,7 @@ impl Default for ModeRouterConfig {
             r1_max_steps: 30,
             r1_max_parse_retries: 2,
             v3_patch_max_context_requests: 3,
+            doom_loop_threshold: 2,
         }
     }
 }
@@ -75,6 +78,52 @@ impl ModeRouterConfig {
             r1_max_steps: rc.r1_max_steps,
             r1_max_parse_retries: rc.r1_max_parse_retries,
             v3_patch_max_context_requests: rc.v3_patch_max_context_requests,
+            doom_loop_threshold: 2,
+        }
+    }
+}
+
+/// Compact signature for doom-loop detection.
+///
+/// Tracks (tool_name, normalized_arg_key, exit_code_bucket) to detect
+/// repeated identical failures — the hallmark of a doom-loop.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolSignature {
+    pub tool: String,
+    pub arg_key: String,
+    pub exit_bucket: i32,
+}
+
+impl ToolSignature {
+    /// Build a signature from a tool call result.
+    pub fn new(tool: &str, args: &serde_json::Value, exit_code: Option<i32>) -> Self {
+        // Normalize args to a stable key: for file tools use file_path,
+        // for bash use the command, for grep use pattern, otherwise hash.
+        let arg_key = if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+            fp.to_string()
+        } else if let Some(cmd) = args.get("cmd").and_then(|v| v.as_str()) {
+            // Normalize whitespace for command comparison
+            cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+        } else if let Some(pat) = args.get("pattern").and_then(|v| v.as_str()) {
+            pat.to_string()
+        } else {
+            // Stable hash of full args
+            let mut s = args.to_string();
+            s.truncate(200);
+            s
+        };
+        // Bucket exit codes: 0=success, 1=general error, 2+=other
+        let exit_bucket = match exit_code {
+            Some(0) => 0,
+            Some(1) => 1,
+            Some(c) if c > 1 => 2,
+            Some(c) => c, // negative signals
+            None => -1,
+        };
+        Self {
+            tool: tool.to_string(),
+            arg_key,
+            exit_bucket,
         }
     }
 }
@@ -92,6 +141,11 @@ pub struct FailureTracker {
     pub error_modules: Vec<String>,
     /// Total R1 drive-tools steps used.
     pub r1_steps_used: u32,
+    /// Doom-loop tracker: maps tool signatures to failure count.
+    pub doom_loop_sigs: HashMap<ToolSignature, u32>,
+    /// Whether verification has passed since last R1 escalation.
+    /// Used for hysteresis: R1 stays active until this is true.
+    pub verify_passed_since_r1: bool,
 }
 
 impl FailureTracker {
@@ -105,12 +159,34 @@ impl FailureTracker {
         self.consecutive_step_failures += 1;
     }
 
+    /// Record a tool call result for doom-loop detection.
+    /// Returns true if a doom-loop is detected (same signature failed >= threshold).
+    pub fn record_tool_signature(&mut self, sig: ToolSignature, success: bool) -> bool {
+        if success {
+            // Remove from doom-loop tracking on success
+            self.doom_loop_sigs.remove(&sig);
+            false
+        } else {
+            let count = self.doom_loop_sigs.entry(sig).or_insert(0);
+            *count += 1;
+            // The caller checks against threshold
+            false // just records; decide_mode checks
+        }
+    }
+
+    /// Check if any tool signature has hit the doom-loop threshold.
+    pub fn has_doom_loop(&self, threshold: u32) -> bool {
+        self.doom_loop_sigs.values().any(|&count| count >= threshold)
+    }
+
     /// Record a successful verification (resets blast radius tracking).
     pub fn record_verify_pass(&mut self) {
         self.files_changed_since_verify.clear();
         self.error_modules.clear();
         self.consecutive_step_failures = 0;
         self.v3_recovery_used = false;
+        self.doom_loop_sigs.clear();
+        self.verify_passed_since_r1 = true;
     }
 
     /// Record a file being changed.
@@ -125,6 +201,11 @@ impl FailureTracker {
         if !self.error_modules.contains(&module.to_string()) {
             self.error_modules.push(module.to_string());
         }
+    }
+
+    /// Mark that we entered R1 mode (reset hysteresis flag).
+    pub fn entered_r1(&mut self) {
+        self.verify_passed_since_r1 = false;
     }
 }
 
@@ -143,6 +224,10 @@ pub enum EscalationReason {
     ArchitecturalTask,
     /// R1 drive-tools budget exhausted, fall back to V3.
     R1BudgetExhausted,
+    /// Same tool+args+exit repeated N times — doom-loop detected.
+    DoomLoop,
+    /// R1 completed or verification green — handoff back to V3.
+    R1Completed,
 }
 
 impl std::fmt::Display for EscalationReason {
@@ -154,6 +239,8 @@ impl std::fmt::Display for EscalationReason {
             Self::CrossModuleFailure => write!(f, "cross_module_failure"),
             Self::ArchitecturalTask => write!(f, "architectural_task"),
             Self::R1BudgetExhausted => write!(f, "r1_budget_exhausted"),
+            Self::DoomLoop => write!(f, "doom_loop"),
+            Self::R1Completed => write!(f, "r1_completed"),
         }
     }
 }
@@ -167,11 +254,17 @@ pub struct ModeDecision {
 
 /// Decide the execution mode based on current state.
 ///
-/// Returns V3Autopilot by default, escalates to R1DriveTools when:
+/// Escalation policy (V3 → R1):
+/// - Doom-loop: same tool signature fails N times
 /// - Same step fails >= v3_max_step_failures times
 /// - Error is ambiguous
 /// - Blast radius exceeds threshold
 /// - Errors span multiple modules
+///
+/// Hysteresis: once in R1, stay until:
+/// - Budget exhausted → fall back to V3
+/// - R1 returns done/abort (handled by caller)
+/// - Verification passes (verify_passed_since_r1)
 pub fn decide_mode(
     config: &ModeRouterConfig,
     current_mode: AgentMode,
@@ -185,22 +278,38 @@ pub fn decide_mode(
         };
     }
 
-    // If already in R1DriveTools, check budget
+    // If already in R1DriveTools, apply hysteresis
     if current_mode == AgentMode::R1DriveTools {
+        // Budget exhausted → forced return to V3
         if tracker.r1_steps_used >= config.r1_max_steps {
             return ModeDecision {
                 mode: AgentMode::V3Autopilot,
                 reason: Some(EscalationReason::R1BudgetExhausted),
             };
         }
-        // Stay in R1 mode until done/abort
+        // Verification passed → R1 can hand back to V3
+        if tracker.verify_passed_since_r1 {
+            return ModeDecision {
+                mode: AgentMode::V3Autopilot,
+                reason: Some(EscalationReason::R1Completed),
+            };
+        }
+        // Stay in R1 (hysteresis: don't ping-pong back to V3)
         return ModeDecision {
             mode: AgentMode::R1DriveTools,
             reason: None,
         };
     }
 
-    // Check escalation triggers from V3Autopilot or R1Supervise
+    // Check escalation triggers from V3Autopilot
+
+    // 0. Doom-loop detection (highest priority)
+    if tracker.has_doom_loop(config.doom_loop_threshold) {
+        return ModeDecision {
+            mode: AgentMode::R1DriveTools,
+            reason: Some(EscalationReason::DoomLoop),
+        };
+    }
 
     // 1. Repeated step failures
     if tracker.consecutive_step_failures >= config.v3_max_step_failures {
@@ -454,5 +563,126 @@ mod tests {
         tracker.record_file_change("a.rs");
         tracker.record_file_change("a.rs");
         assert_eq!(tracker.files_changed_since_verify.len(), 1);
+    }
+
+    #[test]
+    fn doom_loop_triggers_escalation() {
+        let config = ModeRouterConfig {
+            doom_loop_threshold: 2,
+            ..default_config()
+        };
+        let mut tracker = FailureTracker::default();
+        let sig = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo test"}),
+            Some(1),
+        );
+        tracker.record_tool_signature(sig.clone(), false);
+        // First failure — not yet a doom-loop
+        let d1 = decide_mode(&config, AgentMode::V3Autopilot, &tracker, None);
+        assert_eq!(d1.mode, AgentMode::V3Autopilot);
+
+        // Second failure with same signature — doom-loop!
+        tracker.record_tool_signature(sig, false);
+        let d2 = decide_mode(&config, AgentMode::V3Autopilot, &tracker, None);
+        assert_eq!(d2.mode, AgentMode::R1DriveTools);
+        assert_eq!(d2.reason, Some(EscalationReason::DoomLoop));
+    }
+
+    #[test]
+    fn doom_loop_cleared_on_success() {
+        let mut tracker = FailureTracker::default();
+        let sig = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo test"}),
+            Some(1),
+        );
+        tracker.record_tool_signature(sig.clone(), false);
+        assert_eq!(tracker.doom_loop_sigs.len(), 1);
+        // Success clears doom-loop tracking for that signature
+        tracker.record_tool_signature(sig, true);
+        assert!(tracker.doom_loop_sigs.is_empty());
+    }
+
+    #[test]
+    fn doom_loop_cleared_on_verify_pass() {
+        let mut tracker = FailureTracker::default();
+        let sig = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo test"}),
+            Some(1),
+        );
+        tracker.record_tool_signature(sig, false);
+        assert!(!tracker.doom_loop_sigs.is_empty());
+        tracker.record_verify_pass();
+        assert!(tracker.doom_loop_sigs.is_empty());
+    }
+
+    #[test]
+    fn different_signatures_tracked_independently() {
+        let mut tracker = FailureTracker::default();
+        let sig1 = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo test"}),
+            Some(1),
+        );
+        let sig2 = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo check"}),
+            Some(1),
+        );
+        tracker.record_tool_signature(sig1, false);
+        tracker.record_tool_signature(sig2, false);
+        assert!(!tracker.has_doom_loop(2));
+        assert_eq!(tracker.doom_loop_sigs.len(), 2);
+    }
+
+    #[test]
+    fn hysteresis_stays_in_r1_until_verify() {
+        let config = default_config();
+        let mut tracker = FailureTracker::default();
+        tracker.entered_r1();
+        tracker.r1_steps_used = 3;
+
+        // In R1 mode, no verify yet — should stay
+        let d1 = decide_mode(&config, AgentMode::R1DriveTools, &tracker, None);
+        assert_eq!(d1.mode, AgentMode::R1DriveTools);
+        assert!(d1.reason.is_none());
+
+        // Verify passes — should allow return to V3
+        tracker.record_verify_pass();
+        let d2 = decide_mode(&config, AgentMode::R1DriveTools, &tracker, None);
+        assert_eq!(d2.mode, AgentMode::V3Autopilot);
+        assert_eq!(d2.reason, Some(EscalationReason::R1Completed));
+    }
+
+    #[test]
+    fn hysteresis_r1_budget_overrides() {
+        let config = ModeRouterConfig {
+            r1_max_steps: 5,
+            ..default_config()
+        };
+        let mut tracker = FailureTracker::default();
+        tracker.entered_r1();
+        tracker.r1_steps_used = 5;
+        // Budget exhausted, even though verify hasn't passed
+        let d = decide_mode(&config, AgentMode::R1DriveTools, &tracker, None);
+        assert_eq!(d.mode, AgentMode::V3Autopilot);
+        assert_eq!(d.reason, Some(EscalationReason::R1BudgetExhausted));
+    }
+
+    #[test]
+    fn tool_signature_normalizes_commands() {
+        let sig1 = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo  test  --lib"}),
+            Some(1),
+        );
+        let sig2 = ToolSignature::new(
+            "bash.run",
+            &serde_json::json!({"cmd": "cargo test --lib"}),
+            Some(1),
+        );
+        assert_eq!(sig1, sig2, "whitespace normalization should match");
     }
 }
