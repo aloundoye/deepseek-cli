@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { ChildProcessWithoutNullStreams, spawn } from "child_process";
+import * as path from "path";
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -61,6 +62,14 @@ class DeepSeekRpcClient {
 
   async sessionOpen(workspaceRoot: string): Promise<JsonRpcResponse> {
     return this.request("session/open", { workspace_root: workspaceRoot });
+  }
+
+  async getFileSuggestions(query: string, limit: number = 10): Promise<JsonRpcResponse> {
+    return this.request("context/suggest", { query, limit });
+  }
+
+  async analyzeImports(filePath: string): Promise<JsonRpcResponse> {
+    return this.request("context/analyze", { file_path: filePath });
   }
 
   async sessionResume(sessionId: string): Promise<JsonRpcResponse> {
@@ -262,7 +271,68 @@ class DeepSeekChatPanel {
         this.autoAccept = !this.autoAccept;
         break;
       case "atMention": {
-        // Open file picker and insert @path into input.
+        // Get smart file suggestions based on current context
+        const editor = vscode.window.activeTextEditor;
+        let query = "";
+        
+        if (editor) {
+          // Use current word or selection as query
+          const selection = editor.document.getText(editor.selection);
+          if (selection.trim().length > 0) {
+            query = selection.trim();
+          } else {
+            // Get word at cursor
+            const wordRange = editor.document.getWordRangeAtPosition(editor.selection.active);
+            if (wordRange) {
+              query = editor.document.getText(wordRange);
+            }
+          }
+        }
+        
+        // Get file suggestions from DeepSeek
+        try {
+          const resp = await this.client.getFileSuggestions(query, 10);
+          if (!resp.error && resp.result) {
+            const suggestions = (resp.result as { suggestions: Array<{ path: string, score: number, reasons: string[] }> }).suggestions;
+            
+            if (suggestions.length > 0) {
+              // Show quick pick with suggestions
+              const items = suggestions.map(s => ({
+                label: path.basename(s.path),
+                description: s.path,
+                detail: `Score: ${s.score.toFixed(2)} - ${s.reasons.join(", ")}`,
+                path: s.path,
+              }));
+              
+              const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: "Select a file to reference",
+                matchOnDescription: true,
+                matchOnDetail: true,
+              });
+              
+              if (selected) {
+                const relativePath = vscode.workspace.asRelativePath(selected.path);
+                let mention = `@${relativePath}`;
+                
+                // Add line range if editor is open on this file
+                const editor = vscode.window.activeTextEditor;
+                if (editor && editor.document.uri.fsPath === selected.path && !editor.selection.isEmpty) {
+                  const startLine = editor.selection.start.line + 1;
+                  const endLine = editor.selection.end.line + 1;
+                  mention = `@${relativePath}:${startLine}-${endLine}`;
+                }
+                
+                this.panel.webview.postMessage({ type: "insertMention", text: mention });
+              }
+              break;
+            }
+          }
+        } catch (error) {
+          // Fall back to file picker if suggestions fail
+          console.warn("Failed to get file suggestions:", error);
+        }
+        
+        // Fallback: Open file picker
         const uris = await vscode.window.showOpenDialog({ canSelectMany: false });
         if (uris && uris.length > 0) {
           const relativePath = vscode.workspace.asRelativePath(uris[0]);
@@ -300,25 +370,153 @@ class DeepSeekChatPanel {
 <html>
 <head>
   <style>
-    body { font-family: var(--vscode-font-family); margin: 0; padding: 8px; display: flex; flex-direction: column; height: 100vh; }
-    #chat { flex: 1; overflow-y: auto; padding-bottom: 8px; }
-    .entry { margin: 4px 0; padding: 6px 10px; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; }
-    .user { background: var(--vscode-input-background); border-left: 3px solid var(--vscode-inputOption-activeBorder); }
-    .assistant { background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-editorInfo-foreground); }
-    .tool { background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-editorWarning-foreground); font-size: 0.9em; }
-    .role-label { font-size: 0.8em; font-weight: bold; opacity: 0.7; margin-bottom: 2px; }
-    #input-area { display: flex; gap: 4px; }
-    #prompt { flex: 1; padding: 6px; font-size: 14px; border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
-    button { padding: 6px 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 3px; }
+    :root {
+      --ds-radius: 8px;
+      --ds-border: color-mix(in srgb, var(--vscode-editor-foreground) 14%, transparent);
+      --ds-soft-border: color-mix(in srgb, var(--vscode-editor-foreground) 10%, transparent);
+      --ds-muted: color-mix(in srgb, var(--vscode-editor-foreground) 62%, transparent);
+      --ds-surface: color-mix(in srgb, var(--vscode-editor-background) 86%, var(--vscode-sideBar-background) 14%);
+      --ds-shadow: 0 1px 0 color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent);
+    }
+    body {
+      font-family: var(--vscode-font-family);
+      margin: 0;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      gap: 6px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-sideBar-background) 6%);
+    }
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 2px 2px 8px 2px;
+      scroll-behavior: smooth;
+    }
+    .entry {
+      margin: 6px 0;
+      padding: 8px 10px;
+      border-radius: var(--ds-radius);
+      border: 1px solid var(--ds-soft-border);
+      box-shadow: var(--ds-shadow);
+      animation: fadeIn 120ms ease-out;
+    }
+    .entry-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .role-label {
+      font-size: 0.73rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--ds-muted);
+      border: 1px solid var(--ds-soft-border);
+      border-radius: 999px;
+      padding: 1px 8px;
+      line-height: 1.5;
+    }
+    .entry-time {
+      font-size: 0.72rem;
+      color: var(--ds-muted);
+      opacity: 0.9;
+    }
+    .entry-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.46;
+      font-size: 0.85rem;
+      color: var(--vscode-editor-foreground);
+    }
+    .user {
+      background: color-mix(in srgb, var(--vscode-input-background) 82%, var(--ds-surface) 18%);
+      border-left: 3px solid color-mix(in srgb, var(--vscode-inputOption-activeBorder) 75%, transparent);
+    }
+    .assistant {
+      background: var(--ds-surface);
+      border-left: 3px solid color-mix(in srgb, var(--vscode-editorInfo-foreground) 70%, transparent);
+    }
+    .assistant .entry-content {
+      font-size: 0.89rem;
+      line-height: 1.52;
+    }
+    .tool {
+      background: color-mix(in srgb, var(--vscode-editor-background) 86%, var(--vscode-editorWidget-background) 14%);
+      border-left: 3px solid color-mix(in srgb, var(--vscode-editorWarning-foreground) 75%, transparent);
+    }
+    .tool .entry-content {
+      font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
+      font-size: 0.8rem;
+      line-height: 1.4;
+      opacity: 0.96;
+    }
+    .inline-tool {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--vscode-editorInfo-background) 48%, transparent);
+      border: 1px solid color-mix(in srgb, var(--vscode-editorInfo-foreground) 22%, transparent);
+      color: color-mix(in srgb, var(--vscode-editorInfo-foreground) 88%, var(--vscode-editor-foreground) 12%);
+    }
+    .inline-error {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--vscode-inputValidation-errorBackground) 42%, transparent);
+      border: 1px solid color-mix(in srgb, var(--vscode-inputValidation-errorBorder) 58%, transparent);
+      color: color-mix(in srgb, var(--vscode-inputValidation-errorForeground) 88%, var(--vscode-editor-foreground) 12%);
+    }
+    #input-area {
+      display: flex;
+      gap: 6px;
+    }
+    #prompt {
+      flex: 1;
+      padding: 7px 9px;
+      font-size: 14px;
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 6px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+    }
+    #prompt:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 0;
+    }
+    button {
+      padding: 6px 12px;
+      cursor: pointer;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      border-radius: 6px;
+      transition: filter 90ms ease-out;
+    }
     button:hover { background: var(--vscode-button-hoverBackground); }
-    .toolbar { display: flex; gap: 4px; margin-bottom: 4px; }
-    .toolbar button { font-size: 0.85em; padding: 3px 8px; }
+    button:active { filter: brightness(0.96); }
+    .toolbar {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+    .toolbar button {
+      font-size: 0.82rem;
+      padding: 4px 9px;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(2px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
   </style>
 </head>
 <body>
   <div class="toolbar">
     <button onclick="atMention()">@ File</button>
-    <button onclick="toggleAutoAccept()">Auto-Accept: <span id="autoAcceptState">OFF</span></button>
+    <button onclick="toggleAutoAccept()">Auto-Accept: <span id="autoAcceptState">${this.autoAccept ? "ON" : "OFF"}</span></button>
   </div>
   <div id="chat"></div>
   <div id="input-area">
@@ -329,6 +527,7 @@ class DeepSeekChatPanel {
     const vscode = acquireVsCodeApi();
     const chat = document.getElementById("chat");
     const prompt = document.getElementById("prompt");
+    const autoAcceptState = document.getElementById("autoAcceptState");
 
     function send() {
       const text = prompt.value.trim();
@@ -341,21 +540,55 @@ class DeepSeekChatPanel {
     function atMention() { vscode.postMessage({ type: "atMention" }); }
     function toggleAutoAccept() { vscode.postMessage({ type: "toggleAutoAccept" }); }
 
+    function roleName(role) {
+      if (role === "assistant") return "Generated";
+      if (role === "user") return "You";
+      if (role === "tool") return "Tool";
+      return role;
+    }
+
+    function renderInlineHighlights(role, text) {
+      const escaped = escapeHtml(text);
+      return escaped
+        .split(/\\r?\\n/)
+        .map((line) => {
+          const trimmed = line.trimStart();
+          if (trimmed.startsWith("[tool:")) {
+            return '<span class="inline-tool">' + line + '</span>';
+          }
+          if (/^(error|failed|exception|patch error):/i.test(trimmed)) {
+            return '<span class="inline-error">' + line + '</span>';
+          }
+          return line;
+        })
+        .join("\\n");
+    }
+
+    function addEntry(entry) {
+      const div = document.createElement("div");
+      div.className = "entry " + entry.role;
+      const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      div.innerHTML =
+        '<div class="entry-header">' +
+          '<div class="role-label">' + roleName(entry.role) + '</div>' +
+          '<div class="entry-time">' + stamp + '</div>' +
+        '</div>' +
+        '<div class="entry-content">' + renderInlineHighlights(entry.role, entry.content) + '</div>';
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
     window.addEventListener("message", (event) => {
       const msg = event.data;
       if (msg.type === "addEntry") {
-        const div = document.createElement("div");
-        div.className = "entry " + msg.entry.role;
-        div.innerHTML = '<div class="role-label">' + msg.entry.role + '</div>' + escapeHtml(msg.entry.content);
-        chat.appendChild(div);
-        chat.scrollTop = chat.scrollHeight;
+        addEntry(msg.entry);
       }
       if (msg.type === "insertMention") {
         prompt.value += msg.text + " ";
         prompt.focus();
       }
       if (msg.type === "autoAcceptState") {
-        document.getElementById("autoAcceptState").textContent = msg.enabled ? "ON" : "OFF";
+        autoAcceptState.textContent = msg.enabled ? "ON" : "OFF";
       }
     });
 

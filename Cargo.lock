@@ -670,8 +670,10 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "deepseek-agent",
+ "deepseek-context",
  "deepseek-core",
  "deepseek-diff",
+ "deepseek-errors",
  "deepseek-index",
  "deepseek-jsonrpc",
  "deepseek-mcp",
@@ -691,6 +693,22 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "deepseek-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ignore",
+ "indexmap",
+ "petgraph",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]
@@ -718,6 +736,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "deepseek-errors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -753,7 +781,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "deepseek-context",
  "deepseek-core",
+ "deepseek-errors",
  "deepseek-store",
  "serde",
  "serde_json",
@@ -2237,6 +2267,18 @@ checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
 dependencies = [
  "pest",
  "sha2",
+]
+
+[[package]]
+name = "petgraph"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
+dependencies = [
+ "fixedbitset",
+ "indexmap",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
