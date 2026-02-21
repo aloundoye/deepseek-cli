@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use chrono::{Timelike, Utc};
 use deepseek_core::{
     AppConfig, ApprovedToolCall, ChatMessage, ChatRequest, EventEnvelope, EventKind, ExecContext,
@@ -8,6 +8,7 @@ use deepseek_core::{
 };
 use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
 use deepseek_llm::{DeepSeekClient, LlmClient};
+use deepseek_mcp::{McpManager, McpTool};
 use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
@@ -276,6 +277,10 @@ pub struct AgentEngine {
     background_shells: Mutex<VecDeque<BackgroundShell>>,
     /// Config-based hook runtime (14 events, JSON stdin/stdout).
     hooks: HookRuntime,
+    /// MCP server manager for dynamic tool integration.
+    mcp: Option<McpManager>,
+    /// Cached MCP tools (discovered at chat startup).
+    mcp_tools: Mutex<Vec<McpTool>>,
 }
 
 impl AgentEngine {
@@ -295,6 +300,8 @@ impl AgentEngine {
         let hooks_config: HooksConfig =
             serde_json::from_value(cfg.hooks.clone()).unwrap_or_default();
         let hooks = HookRuntime::new(workspace, hooks_config);
+
+        let mcp = McpManager::new(workspace).ok();
 
         Ok(Self {
             workspace: workspace.to_path_buf(),
@@ -316,6 +323,8 @@ impl AgentEngine {
             background_tasks: Mutex::new(VecDeque::new()),
             background_shells: Mutex::new(VecDeque::new()),
             hooks,
+            mcp,
+            mcp_tools: Mutex::new(Vec::new()),
         })
     }
 
@@ -1245,6 +1254,10 @@ impl AgentEngine {
         }
         self.transition(&mut session, SessionState::Planning)?;
 
+        // Resolve @server:uri MCP resource references in the prompt
+        let prompt = self.resolve_mcp_resources(prompt);
+        let prompt = prompt.as_str();
+
         // Fire UserPromptSubmit hook (can block the prompt).
         {
             let mut input = self.hook_input(HookEvent::UserPromptSubmit);
@@ -1288,7 +1301,35 @@ impl AgentEngine {
             }
         };
         let all_tools = if options.tools {
-            let all = tool_definitions();
+            let mut all = tool_definitions();
+            // Merge plugin tool definitions
+            let plugin_defs = deepseek_tools::plugin_tool_definitions(&self.workspace);
+            if !plugin_defs.is_empty() {
+                self.observer
+                    .verbose_log(&format!("Plugins: {} tools merged", plugin_defs.len()));
+                all.extend(plugin_defs);
+            }
+            // Discover and merge MCP tools
+            let mcp_defs = self.discover_mcp_tool_definitions();
+            let mcp_tool_count = mcp_defs.len();
+            if mcp_tool_count > 0 {
+                // If MCP tools exceed threshold, use lazy loading via mcp_search
+                let mcp_token_estimate = mcp_tool_count as u64 * 50; // ~50 tokens per def
+                let context_threshold =
+                    self.cfg.llm.context_window_tokens / 10; // 10% of context
+                if mcp_token_estimate > context_threshold {
+                    // Too many MCP tools — add mcp_search instead for on-demand discovery
+                    all.push(mcp_search_tool_definition());
+                    self.observer.verbose_log(&format!(
+                        "MCP: {} tools exceed context threshold, using mcp_search lazy loading",
+                        mcp_tool_count
+                    ));
+                } else {
+                    all.extend(mcp_defs);
+                    self.observer
+                        .verbose_log(&format!("MCP: {} tools merged", mcp_tool_count));
+                }
+            }
             filter_tool_definitions(
                 all,
                 options.allowed_tools.as_deref(),
@@ -1745,6 +1786,70 @@ impl AgentEngine {
                             "Error: tool '{}' is not allowed in this session",
                             tc.name
                         ),
+                    });
+                    continue;
+                }
+
+                // ── MCP tool calls (routed to MCP servers) ──
+                if Self::is_mcp_tool(&tc.name) {
+                    if let Ok(cb) = self.stream_callback.lock()
+                        && let Some(ref cb) = *cb
+                    {
+                        cb(StreamChunk::ContentDelta(format!(
+                            "\n[mcp: {}]\n",
+                            tc.name
+                        )));
+                    }
+                    let tool_start = Instant::now();
+                    let result_text = match self.execute_mcp_tool(&tc.name, &args) {
+                        Ok(output) => output,
+                        Err(e) => format!("MCP tool error: {e}"),
+                    };
+                    let elapsed = tool_start.elapsed();
+                    if let Ok(cb) = self.stream_callback.lock()
+                        && let Some(ref cb) = *cb
+                    {
+                        cb(StreamChunk::ContentDelta(format!(
+                            "[mcp: {}] done ({:.1}s)\n",
+                            tc.name,
+                            elapsed.as_secs_f64()
+                        )));
+                    }
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: result_text,
+                    });
+                    continue;
+                }
+
+                // ── mcp_search meta-tool (lazy loading) ──
+                if internal_name == "mcp_search" {
+                    let query = args
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let matches = self.search_mcp_tools(query);
+                    let result = if matches.is_empty() {
+                        format!("No MCP tools found matching '{query}'")
+                    } else {
+                        let tool_list: Vec<String> = matches
+                            .iter()
+                            .map(|t| {
+                                format!(
+                                    "- mcp__{}_{}: {}",
+                                    t.server_id, t.name, t.description
+                                )
+                            })
+                            .collect();
+                        format!(
+                            "Found {} MCP tools matching '{query}':\n{}",
+                            matches.len(),
+                            tool_list.join("\n")
+                        )
+                    };
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: result,
                     });
                     continue;
                 }
@@ -3505,6 +3610,133 @@ impl AgentEngine {
         std::io::stdin().read_line(&mut input)?;
         let normalized = input.trim().to_ascii_lowercase();
         Ok(matches!(normalized.as_str(), "y" | "yes"))
+    }
+
+    // ── MCP tool integration ─────────────────────────────────────────────
+
+    /// Discover MCP tools from all enabled servers and return ToolDefinitions.
+    /// Results are cached in `self.mcp_tools` for routing tool calls later.
+    fn discover_mcp_tool_definitions(&self) -> Vec<deepseek_core::ToolDefinition> {
+        let Some(ref mcp) = self.mcp else {
+            return vec![];
+        };
+        let tools = match mcp.discover_tools() {
+            Ok(t) => t,
+            Err(e) => {
+                self.observer
+                    .verbose_log(&format!("MCP tool discovery failed: {e}"));
+                return vec![];
+            }
+        };
+        if let Ok(mut cache) = self.mcp_tools.lock() {
+            *cache = tools.clone();
+        }
+        tools
+            .into_iter()
+            .map(|t| mcp_tool_to_definition(&t))
+            .collect()
+    }
+
+    /// Check if a tool name is an MCP tool (starts with `mcp__`).
+    fn is_mcp_tool(name: &str) -> bool {
+        name.starts_with("mcp__")
+    }
+
+    /// Execute an MCP tool call by routing to the appropriate server via JSON-RPC.
+    fn execute_mcp_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<String> {
+        let (server_id, mcp_tool_name) = parse_mcp_tool_name(tool_name)
+            .ok_or_else(|| anyhow!("invalid MCP tool name: {tool_name}"))?;
+
+        let Some(ref mcp) = self.mcp else {
+            return Err(anyhow!("MCP manager not available"));
+        };
+
+        let server = mcp
+            .get_server(&server_id)?
+            .ok_or_else(|| anyhow!("MCP server not found: {server_id}"))?;
+
+        match server.transport {
+            deepseek_mcp::McpTransport::Http => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("HTTP MCP server has no URL"))?;
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?;
+
+                // Add OAuth token if available
+                let mut request = client.post(url).json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": mcp_tool_name,
+                        "arguments": args,
+                    }
+                }));
+                if let Ok(Some(token)) = deepseek_mcp::load_mcp_token(&server_id) {
+                    request = request.bearer_auth(token.access_token);
+                }
+
+                let response: serde_json::Value = request.send()?.error_for_status()?.json()?;
+                extract_mcp_call_result(&response)
+            }
+            deepseek_mcp::McpTransport::Stdio => {
+                execute_mcp_stdio_tool(&server, &mcp_tool_name, args)
+            }
+        }
+    }
+
+    /// Resolve `@server:uri` references in a prompt string into inline content.
+    fn resolve_mcp_resources(&self, prompt: &str) -> String {
+        let Some(ref mcp) = self.mcp else {
+            return prompt.to_string();
+        };
+        let mut result = String::with_capacity(prompt.len());
+        for token in prompt.split_whitespace() {
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            // Match @server:protocol://path pattern
+            if token.starts_with('@')
+                && token.len() > 2
+                && token[1..].contains(':')
+                && !token[1..].starts_with('/')
+                && let Ok(content) = mcp.resolve_resource(token)
+            {
+                result.push_str(&format!(
+                    "[resource: {}]\n{}\n[/resource]",
+                    &token[1..],
+                    content.trim()
+                ));
+                continue;
+            }
+            result.push_str(token);
+        }
+        result
+    }
+
+    /// Search MCP tools by description/name query — used by the `mcp_search` tool.
+    fn search_mcp_tools(&self, query: &str) -> Vec<McpTool> {
+        let cache = self.mcp_tools.lock().ok();
+        let tools = match cache {
+            Some(ref guard) => guard.as_slice(),
+            None => return vec![],
+        };
+        let query_lower = query.to_ascii_lowercase();
+        tools
+            .iter()
+            .filter(|t| {
+                t.name.to_ascii_lowercase().contains(&query_lower)
+                    || t.description.to_ascii_lowercase().contains(&query_lower)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Execute an agent-level tool (user_question, task_create, task_update, spawn_task).
@@ -6514,6 +6746,260 @@ fn augment_goal_with_subagent_notes(goal: &str, notes: &[String]) -> String {
     }
 }
 
+// ── MCP tool helpers ─────────────────────────────────────────────────────
+
+/// Convert an MCP tool to an OpenAI-compatible ToolDefinition.
+/// Uses `mcp__<server_id>__<tool_name>` naming convention.
+fn mcp_tool_to_definition(tool: &McpTool) -> deepseek_core::ToolDefinition {
+    let api_name = format!("mcp__{}_{}", tool.server_id, tool.name)
+        .replace('-', "_")
+        .replace('.', "_");
+    deepseek_core::ToolDefinition {
+        tool_type: "function".to_string(),
+        function: deepseek_core::FunctionDefinition {
+            name: api_name,
+            description: format!(
+                "[MCP: {}] {}",
+                tool.server_id,
+                if tool.description.is_empty() {
+                    &tool.name
+                } else {
+                    &tool.description
+                }
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments to pass to the MCP tool"
+                    }
+                },
+                "required": []
+            }),
+        },
+    }
+}
+
+/// Parse an MCP tool name (`mcp__server__tool`) into `(server_id, tool_name)`.
+fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
+    let stripped = name.strip_prefix("mcp__")?;
+    let underscore_pos = stripped.find('_')?;
+    let server_id = stripped[..underscore_pos].replace('_', "-");
+    let tool_name = stripped[underscore_pos + 1..].replace('_', ".");
+    Some((server_id, tool_name))
+}
+
+/// Extract the text result from an MCP JSON-RPC `tools/call` response.
+fn extract_mcp_call_result(response: &serde_json::Value) -> Result<String> {
+    // Check for JSON-RPC error
+    if let Some(error) = response.get("error") {
+        let msg = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(anyhow!("MCP error: {msg}"));
+    }
+
+    // Extract result content
+    let result = response.get("result").unwrap_or(response);
+
+    // MCP tools/call returns {content: [{type: "text", text: "..."}]}
+    if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
+        let texts: Vec<&str> = content
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    item.get("text").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !texts.is_empty() {
+            return Ok(texts.join("\n"));
+        }
+    }
+
+    // Fallback: stringify the result
+    Ok(serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// Execute a tool call on an MCP stdio server.
+fn execute_mcp_stdio_tool(
+    server: &deepseek_mcp::McpServer,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Result<String> {
+    let command = server
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow!("stdio MCP server has no command"))?;
+    let mut child = std::process::Command::new(command)
+        .args(&server.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start MCP server: {command}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open MCP stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open MCP stdout"))?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    let reader_handle = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
+            if tx.send(value).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Initialize
+    let init_params = json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": { "name": "deepseek-cli", "version": "0.1.0" }
+    });
+    write_mcp_request(&mut stdin, 1, "initialize", init_params)?;
+
+    // Call the tool
+    let call_params = json!({
+        "name": tool_name,
+        "arguments": args.get("arguments").unwrap_or(args),
+    });
+    write_mcp_request(&mut stdin, 2, "tools/call", call_params)?;
+    let _ = stdin.flush();
+    drop(stdin);
+
+    // Read responses — look for the tools/call result (id=2)
+    let mut result = None;
+    for _ in 0..40 {
+        match rx.recv_timeout(std::time::Duration::from_millis(150)) {
+            Ok(message) => {
+                if message.get("id").and_then(|v| v.as_u64()) == Some(2) {
+                    result = Some(message);
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.join();
+
+    match result {
+        Some(resp) => extract_mcp_call_result(&resp),
+        None => Err(anyhow!("MCP tool call timed out")),
+    }
+}
+
+/// Write a JSON-RPC request with Content-Length framing (MCP protocol).
+fn write_mcp_request(
+    writer: &mut dyn std::io::Write,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params
+    }))?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Read a Content-Length-framed JSON-RPC message.
+fn read_mcp_frame<R: std::io::BufRead>(reader: &mut R) -> Result<Option<serde_json::Value>> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((header, value)) = trimmed.split_once(':')
+            && header.eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+
+    let length = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
+    let mut buf = vec![0_u8; length];
+    std::io::Read::read_exact(reader, &mut buf)?;
+    Ok(Some(serde_json::from_slice(&buf)?))
+}
+
+/// Build ToolDefinition for the `mcp_search` meta-tool (lazy loading).
+fn mcp_search_tool_definition() -> deepseek_core::ToolDefinition {
+    deepseek_core::ToolDefinition {
+        tool_type: "function".to_string(),
+        function: deepseek_core::FunctionDefinition {
+            name: "mcp_search".to_string(),
+            description: "Search for available MCP tools by description or name. Use this when you need a capability from an external MCP server but don't know which tool to use.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to find matching MCP tools"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    }
+}
+
+/// Expand environment variables in a string (`${VAR}` and `${VAR:-default}`).
+pub fn expand_env_vars(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$'
+            && chars.peek() == Some(&'{')
+        {
+            chars.next(); // consume '{'
+            let mut var_expr = String::new();
+            for c in chars.by_ref() {
+                if c == '}' {
+                    break;
+                }
+                var_expr.push(c);
+            }
+            if let Some((var_name, default)) = var_expr.split_once(":-") {
+                result.push_str(
+                    &std::env::var(var_name).unwrap_or_else(|_| default.to_string()),
+                );
+            } else {
+                result.push_str(&std::env::var(&var_expr).unwrap_or_default());
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7558,5 +8044,80 @@ mod tests {
         let kept_stdout = parsed["stdout"].as_str().unwrap();
         assert!(kept_stdout.contains("stdout line 399"));
         assert!(kept_stdout.contains("lines omitted"));
+    }
+
+    #[test]
+    fn mcp_tool_to_definition_creates_valid_def() {
+        let tool = McpTool {
+            server_id: "my-server".to_string(),
+            name: "list_files".to_string(),
+            description: "List files in a directory".to_string(),
+        };
+        let def = mcp_tool_to_definition(&tool);
+        assert_eq!(def.tool_type, "function");
+        assert!(def.function.name.starts_with("mcp__"));
+        assert!(def.function.description.contains("MCP: my-server"));
+        assert!(def.function.description.contains("List files"));
+    }
+
+    #[test]
+    fn parse_mcp_tool_name_roundtrip() {
+        let parsed = parse_mcp_tool_name("mcp__myserver_list_files");
+        assert!(parsed.is_some());
+        let (server, tool) = parsed.unwrap();
+        assert_eq!(server, "myserver");
+        assert!(tool.contains("list"));
+    }
+
+    #[test]
+    fn parse_mcp_tool_name_rejects_non_mcp() {
+        assert!(parse_mcp_tool_name("fs_read").is_none());
+        assert!(parse_mcp_tool_name("bash_run").is_none());
+    }
+
+    #[test]
+    fn extract_mcp_call_result_text_content() {
+        let response = json!({
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "hello from MCP"
+                }]
+            }
+        });
+        let result = extract_mcp_call_result(&response).unwrap();
+        assert_eq!(result, "hello from MCP");
+    }
+
+    #[test]
+    fn extract_mcp_call_result_error() {
+        let response = json!({
+            "error": {
+                "code": -32600,
+                "message": "invalid request"
+            }
+        });
+        let result = extract_mcp_call_result(&response);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid request"));
+    }
+
+    #[test]
+    fn mcp_search_tool_definition_valid() {
+        let def = mcp_search_tool_definition();
+        assert_eq!(def.function.name, "mcp_search");
+        assert!(def.function.description.contains("MCP"));
+    }
+
+    #[test]
+    fn expand_env_vars_basic() {
+        let result = expand_env_vars("prefix-${NONEXISTENT_TEST_VAR_XYZ:-fallback}-suffix");
+        assert_eq!(result, "prefix-fallback-suffix");
+    }
+
+    #[test]
+    fn expand_env_vars_passthrough() {
+        let result = expand_env_vars("no variables here");
+        assert_eq!(result, "no variables here");
     }
 }

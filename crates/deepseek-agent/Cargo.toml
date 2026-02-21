@@ -24,3 +24,5 @@ deepseek-subagent = { path = "../deepseek-subagent" }
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-skills = { path = "../deepseek-skills" }
 deepseek-hooks = { path = "../deepseek-hooks" }
+deepseek-mcp = { path = "../deepseek-mcp" }
+reqwest.workspace = true
