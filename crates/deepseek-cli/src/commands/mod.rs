@@ -7,6 +7,7 @@ pub(crate) mod diff;
 pub(crate) mod exec;
 pub(crate) mod fork;
 pub(crate) mod git;
+pub(crate) mod intelligence;
 pub(crate) mod mcp;
 pub(crate) mod memory;
 pub(crate) mod profile;

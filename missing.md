@@ -255,9 +255,9 @@
 
 ### Phase 2: Competitive Parity (Months 3-4)
 **Goal:** Match Claude Code core features
-1. Visual verification improvements
-2. Framework-specific intelligence
-3. Better debugging capabilities
+1. ✅ Visual verification improvements (`visual analyze` now includes component hints + drift severity scoring)
+2. ✅ Framework-specific intelligence (`doctor` now reports detected frameworks and recommendations)
+3. ✅ Better debugging capabilities (`doctor --analyze-file/--analyze-text --mode ...` and `/debug analyze ...`)
 4. **Deliverable:** Competitive with Claude Code for most use cases
 
 ### Phase 3: Feature Leadership (Months 5-6)

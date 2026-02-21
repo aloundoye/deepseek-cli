@@ -14,11 +14,14 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::commands::intelligence::{
+    DebugAnalysisMode, FrameworkReport, analyze_debug_text, detect_frameworks,
+};
 use crate::context::*;
 use crate::output::*;
 use crate::util::*;
 use crate::{
-    CleanArgs, ConfigCmd, DoctorArgs, IndexCmd, PermissionModeArg, PermissionsCmd,
+    CleanArgs, ConfigCmd, DoctorArgs, DoctorModeArg, IndexCmd, PermissionModeArg, PermissionsCmd,
     PermissionsSetArgs, PluginCmd,
 };
 
@@ -153,7 +156,92 @@ pub(crate) fn parse_permission_mode(value: &str) -> Result<PermissionModeArg> {
     }
 }
 
-pub(crate) fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Result<()> {
+pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Result<()> {
+    let payload = doctor_payload(cwd, &args)?;
+    if json_mode {
+        print_json(&payload)?;
+    } else {
+        println!(
+            "doctor: os={} arch={} shell={}",
+            payload["os"].as_str().unwrap_or_default(),
+            payload["arch"].as_str().unwrap_or_default(),
+            payload["shell"].as_str().unwrap_or_default()
+        );
+        println!(
+            "toolchain: {} | {}",
+            payload["toolchain"]["rustc"]
+                .as_str()
+                .unwrap_or("unavailable"),
+            payload["toolchain"]["cargo"]
+                .as_str()
+                .unwrap_or("unavailable")
+        );
+        println!(
+            "llm: profile={} base={} max={} endpoint={} api_key_env_set={} api_key_configured={}",
+            payload["llm"]["profile"].as_str().unwrap_or_default(),
+            payload["llm"]["base_model"].as_str().unwrap_or_default(),
+            payload["llm"]["max_think_model"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["llm"]["endpoint"].as_str().unwrap_or_default(),
+            payload["llm"]["api_key_env_set"].as_bool().unwrap_or(false),
+            payload["llm"]["api_key_configured"]
+                .as_bool()
+                .unwrap_or(false),
+        );
+        println!(
+            "plugins: enabled={} installed={}",
+            payload["plugins"]["enabled"].as_u64().unwrap_or(0),
+            payload["plugins"]["installed"].as_u64().unwrap_or(0)
+        );
+        let framework_names = payload["frameworks"]["detected"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if framework_names.is_empty() {
+            println!("frameworks: none detected");
+        } else {
+            println!(
+                "frameworks: {} (primary={})",
+                framework_names,
+                payload["frameworks"]["primary_ecosystem"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            );
+        }
+        if let Some(debug) = payload.get("debug_analysis")
+            && !debug.is_null()
+        {
+            println!(
+                "debug analysis: mode={} issues={}",
+                debug["mode"].as_str().unwrap_or("unknown"),
+                debug["issues"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0)
+            );
+        }
+        if let Some(warnings) = payload["warnings"].as_array()
+            && !warnings.is_empty()
+        {
+            println!("warnings:");
+            for warning in warnings {
+                if let Some(text) = warning.as_str() {
+                    println!("- {text}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json::Value> {
     let cfg = AppConfig::ensure(cwd)?;
     let plugin_manager = PluginManager::new(cwd)?;
     let plugins = plugin_manager.list().unwrap_or_default();
@@ -204,6 +292,47 @@ pub(crate) fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Resu
         warnings.push("cargo not found in PATH".to_string());
     }
 
+    let frameworks = match detect_frameworks(cwd) {
+        Ok(report) => report,
+        Err(err) => {
+            warnings.push(format!("framework detection failed: {err}"));
+            FrameworkReport {
+                detected: Vec::new(),
+                primary_ecosystem: "unknown".to_string(),
+                recommendations: Vec::new(),
+            }
+        }
+    };
+
+    let debug_source = if let Some(file) = args.analyze_file.as_deref() {
+        Some(json!({
+            "kind": "file",
+            "path": file,
+        }))
+    } else if args.analyze_text.is_some() {
+        Some(json!({
+            "kind": "inline",
+            "path": serde_json::Value::Null,
+        }))
+    } else {
+        None
+    };
+
+    let debug_analysis = if let Some(text) = args.analyze_text.as_deref() {
+        Some(analyze_debug_text(text, debug_mode_from_arg(args.mode)))
+    } else if let Some(path) = args.analyze_file.as_deref() {
+        let content = fs::read_to_string(path).map_err(|err| {
+            anyhow!(
+                "failed to read --analyze-file {}: {}",
+                Path::new(path).display(),
+                err
+            )
+        })?;
+        Some(analyze_debug_text(&content, debug_mode_from_arg(args.mode)))
+    } else {
+        None
+    };
+
     let payload = json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -237,58 +366,22 @@ pub(crate) fn run_doctor(cwd: &Path, _args: DoctorArgs, json_mode: bool) -> Resu
             "enabled": plugins.iter().filter(|p| p.enabled).count(),
         },
         "checks": checks,
+        "frameworks": frameworks,
+        "debug_source": debug_source,
+        "debug_analysis": debug_analysis,
         "warnings": warnings,
     });
 
-    if json_mode {
-        print_json(&payload)?;
-    } else {
-        println!(
-            "doctor: os={} arch={} shell={}",
-            payload["os"].as_str().unwrap_or_default(),
-            payload["arch"].as_str().unwrap_or_default(),
-            payload["shell"].as_str().unwrap_or_default()
-        );
-        println!(
-            "toolchain: {} | {}",
-            payload["toolchain"]["rustc"]
-                .as_str()
-                .unwrap_or("unavailable"),
-            payload["toolchain"]["cargo"]
-                .as_str()
-                .unwrap_or("unavailable")
-        );
-        println!(
-            "llm: profile={} base={} max={} endpoint={} api_key_env_set={} api_key_configured={}",
-            payload["llm"]["profile"].as_str().unwrap_or_default(),
-            payload["llm"]["base_model"].as_str().unwrap_or_default(),
-            payload["llm"]["max_think_model"]
-                .as_str()
-                .unwrap_or_default(),
-            payload["llm"]["endpoint"].as_str().unwrap_or_default(),
-            payload["llm"]["api_key_env_set"].as_bool().unwrap_or(false),
-            payload["llm"]["api_key_configured"]
-                .as_bool()
-                .unwrap_or(false),
-        );
-        println!(
-            "plugins: enabled={} installed={}",
-            payload["plugins"]["enabled"].as_u64().unwrap_or(0),
-            payload["plugins"]["installed"].as_u64().unwrap_or(0)
-        );
-        if let Some(warnings) = payload["warnings"].as_array()
-            && !warnings.is_empty()
-        {
-            println!("warnings:");
-            for warning in warnings {
-                if let Some(text) = warning.as_str() {
-                    println!("- {text}");
-                }
-            }
-        }
-    }
+    Ok(payload)
+}
 
-    Ok(())
+fn debug_mode_from_arg(mode: DoctorModeArg) -> DebugAnalysisMode {
+    match mode {
+        DoctorModeArg::Auto => DebugAnalysisMode::Auto,
+        DoctorModeArg::Runtime => DebugAnalysisMode::Runtime,
+        DoctorModeArg::Test => DebugAnalysisMode::Test,
+        DoctorModeArg::Performance => DebugAnalysisMode::Performance,
+    }
 }
 
 pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()> {

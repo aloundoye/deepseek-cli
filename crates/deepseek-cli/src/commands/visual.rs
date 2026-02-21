@@ -4,7 +4,7 @@ use deepseek_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -86,6 +86,8 @@ pub(crate) struct VisualExpectationRule {
     pub(crate) max_height: Option<u32>,
     #[serde(default)]
     pub(crate) required_path_substrings: Vec<String>,
+    #[serde(default)]
+    pub(crate) required_component_hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +107,12 @@ pub(crate) struct VisualSemanticEntry {
     pub(crate) exists: bool,
     pub(crate) width: Option<u32>,
     pub(crate) height: Option<u32>,
+    #[serde(default)]
+    pub(crate) component_hints: Vec<String>,
+    #[serde(default)]
+    pub(crate) component_name: Option<String>,
+    #[serde(default)]
+    pub(crate) hierarchy: Vec<String>,
 }
 
 pub(crate) fn run_visual(cwd: &Path, cmd: VisualCmd, json_mode: bool) -> Result<()> {
@@ -169,6 +177,8 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
             let mut existing_count = 0usize;
             let mut baseline_entries = Vec::new();
             let mut semantic_entries = Vec::new();
+            let mut component_counts: HashMap<String, usize> = HashMap::new();
+            let mut unclassified_components = Vec::new();
 
             for artifact in artifacts {
                 let full = resolve_visual_artifact_path(cwd, &artifact.path);
@@ -196,10 +206,21 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                 } else {
                     (None, None)
                 };
+                let component_hints =
+                    infer_component_hints(&artifact_path, image_like, width, height);
+                let component_name = infer_component_name(&artifact_path);
+                let hierarchy = infer_path_hierarchy(&artifact_path);
                 if image_like {
                     image_like_count = image_like_count.saturating_add(1);
                     if exists && size_bytes < args.min_bytes {
                         tiny_artifacts.push(artifact_path.clone());
+                    }
+                    if component_hints.is_empty() {
+                        unclassified_components.push(artifact_path.clone());
+                    } else {
+                        for hint in &component_hints {
+                            *component_counts.entry(hint.clone()).or_insert(0) += 1;
+                        }
                     }
                 }
 
@@ -215,6 +236,9 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                     "sha256": sha256,
                     "width": width,
                     "height": height,
+                    "component_hints": component_hints,
+                    "component_name": component_name,
+                    "hierarchy": hierarchy,
                 }));
                 baseline_entries.push(VisualBaselineEntry {
                     path: artifact_path.clone(),
@@ -233,6 +257,9 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                     exists,
                     width,
                     height,
+                    component_hints,
+                    component_name,
+                    hierarchy,
                 });
             }
 
@@ -261,6 +288,14 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                     "{} artifacts are smaller than {} bytes",
                     tiny_artifacts.len(),
                     args.min_bytes
+                ));
+            }
+            if image_like_count >= 3
+                && unclassified_components.len().saturating_mul(2) >= image_like_count
+            {
+                warnings.push(format!(
+                    "{} image-like artifacts could not be mapped to known UI component hints",
+                    unclassified_components.len()
                 ));
             }
             let mut baseline_diff = json!(null);
@@ -303,12 +338,29 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                 new_artifacts.sort();
                 missing_from_current.sort();
                 changed_artifacts.sort();
+                let baseline_size = baseline_by_path.len();
+                let current_size = current_by_path.len();
+                let denominator = baseline_size.max(current_size).max(1) as f64;
+                let drift_pct = ((new_artifacts.len()
+                    + missing_from_current.len()
+                    + changed_artifacts.len()) as f64
+                    / denominator)
+                    * 100.0;
+                let drift_severity = if drift_pct >= 35.0 {
+                    "high"
+                } else if drift_pct >= 10.0 {
+                    "medium"
+                } else {
+                    "low"
+                };
                 baseline_diff = json!({
                     "source": baseline_path,
                     "schema": baseline.schema,
                     "new_artifacts": new_artifacts,
                     "missing_artifacts": missing_from_current,
                     "changed_artifacts": changed_artifacts,
+                    "drift_score_pct": (drift_pct * 10.0).round() / 10.0,
+                    "drift_severity": drift_severity,
                 });
 
                 if baseline_diff["new_artifacts"]
@@ -388,6 +440,15 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
             } else {
                 None
             };
+            let mut component_counts_json = serde_json::Map::new();
+            let mut sorted_component_types = component_counts
+                .iter()
+                .map(|(kind, count)| (kind.clone(), *count))
+                .collect::<Vec<_>>();
+            sorted_component_types.sort_by(|a, b| a.0.cmp(&b.0));
+            for (kind, count) in sorted_component_types {
+                component_counts_json.insert(kind, json!(count));
+            }
             let ok = warnings.is_empty();
             let payload = json!({
                 "ok": ok,
@@ -396,6 +457,7 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                     "existing_artifacts": existing_count,
                     "missing_artifacts": total.saturating_sub(existing_count),
                     "image_like_artifacts": image_like_count,
+                    "component_types_detected": component_counts_json.len(),
                     "min_bytes": args.min_bytes,
                     "min_artifacts": args.min_artifacts,
                     "min_image_artifacts": args.min_image_artifacts,
@@ -406,6 +468,11 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
                 "baseline_diff": baseline_diff,
                 "semantic": semantic,
                 "baseline_written": baseline_written,
+                "components": {
+                    "counts": component_counts_json,
+                    "unclassified_image_artifacts": unclassified_components.len(),
+                    "unclassified_paths": unclassified_components,
+                },
                 "artifacts": rows,
             });
             if args.strict && !ok {
@@ -620,6 +687,22 @@ pub(crate) fn evaluate_visual_semantics(
                     ));
                 }
             }
+            for required_hint in &rule.required_component_hints {
+                let normalized = required_hint.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    continue;
+                }
+                if !entry
+                    .component_hints
+                    .iter()
+                    .any(|hint| hint.eq_ignore_ascii_case(&normalized))
+                {
+                    rule_failures.push(format!(
+                        "{}:{} missing required component hint '{}'",
+                        label, entry.path, normalized
+                    ));
+                }
+            }
         }
 
         let ok = rule_failures.is_empty();
@@ -647,6 +730,99 @@ pub(crate) fn evaluate_visual_semantics(
         "failures": failures,
         "results": results,
     }))
+}
+
+fn infer_component_hints(
+    artifact_path: &str,
+    image_like: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Vec<String> {
+    if !image_like {
+        return Vec::new();
+    }
+    let lower = artifact_path.replace('\\', "/").to_ascii_lowercase();
+    let mut hints = BTreeSet::new();
+
+    for (needle, hint) in [
+        ("button", "button"),
+        ("btn", "button"),
+        ("modal", "modal"),
+        ("dialog", "modal"),
+        ("drawer", "sidebar"),
+        ("sidebar", "sidebar"),
+        ("navbar", "navigation"),
+        ("nav", "navigation"),
+        ("header", "header"),
+        ("footer", "footer"),
+        ("form", "form"),
+        ("input", "form"),
+        ("card", "card"),
+        ("table", "table"),
+        ("grid", "table"),
+        ("list", "list"),
+        ("chart", "chart"),
+        ("graph", "chart"),
+        ("hero", "hero"),
+        ("banner", "hero"),
+        ("screen", "screen"),
+        ("screenshot", "screen"),
+        ("login", "auth"),
+        ("signup", "auth"),
+        ("auth", "auth"),
+    ] {
+        if lower.contains(needle) {
+            hints.insert(hint.to_string());
+        }
+    }
+
+    if let (Some(w), Some(h)) = (width, height) {
+        if w <= 128 && h <= 128 {
+            hints.insert("icon".to_string());
+        }
+        if w >= 1100 && h <= 240 {
+            hints.insert("layout-header".to_string());
+        }
+        if h >= 1400 {
+            hints.insert("full-page".to_string());
+        }
+    }
+
+    hints.into_iter().collect()
+}
+
+fn infer_component_name(artifact_path: &str) -> Option<String> {
+    let stem = Path::new(artifact_path).file_stem()?.to_str()?;
+    let parts = stem
+        .split(|ch: char| ch == '-' || ch == '_' || ch == '.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.into_iter().take(4).collect::<Vec<_>>().join("-"))
+}
+
+fn infer_path_hierarchy(artifact_path: &str) -> Vec<String> {
+    let normalized = artifact_path.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for segment in parts.iter().take(parts.len().saturating_sub(1)) {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(segment);
+        out.push(current.clone());
+    }
+    out
 }
 
 pub(crate) fn read_visual_dimensions(path: &Path, mime: &str) -> Option<(u32, u32)> {
@@ -741,4 +917,57 @@ pub(crate) fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         idx += segment_len;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_component_hints_detects_common_tokens() {
+        let hints = infer_component_hints(
+            "artifacts/home/navbar-header.png",
+            true,
+            Some(1280),
+            Some(160),
+        );
+        assert!(hints.iter().any(|h| h == "navigation"));
+        assert!(hints.iter().any(|h| h == "header"));
+        assert!(hints.iter().any(|h| h == "layout-header"));
+    }
+
+    #[test]
+    fn semantic_rule_checks_component_hints() {
+        let entry = VisualSemanticEntry {
+            path: "artifacts/login/button-primary.png".to_string(),
+            mime: "image/png".to_string(),
+            size_bytes: 2048,
+            image_like: true,
+            exists: true,
+            width: Some(320),
+            height: Some(120),
+            component_hints: vec!["button".to_string()],
+            component_name: Some("button-primary".to_string()),
+            hierarchy: vec!["artifacts".to_string(), "artifacts/login".to_string()],
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let expectation = temp.path().join("visual-expect.json");
+        fs::write(
+            &expectation,
+            r#"{
+  "schema": "deepseek.visual.expectation.v1",
+  "rules": [
+    {
+      "name": "button-rule",
+      "path_glob": "artifacts/login/*",
+      "required_component_hints": ["button"]
+    }
+  ]
+}"#,
+        )
+        .expect("write expectation");
+        let result =
+            evaluate_visual_semantics(&[entry], &expectation).expect("semantic evaluation");
+        assert_eq!(result["rules_failed"], 0);
+    }
 }
