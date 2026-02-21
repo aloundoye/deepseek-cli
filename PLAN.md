@@ -207,38 +207,38 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 9: Memory & Configuration Parity
+## Phase 9: Memory & Configuration Parity ✅
 
 > Claude Code has hierarchical memory, modular rules, @imports, and path-specific rules.
 
-### 9.1 Modular rules directory
+### 9.1 Modular rules directory ✅
 - `.deepseek/rules/*.md` — project rules (shareable via git)
 - `~/.deepseek/rules/*.md` — user-level rules
 - Auto-load all `.md` files from rules directories into system prompt
 - Path-specific rules: `paths:` YAML frontmatter with glob patterns for conditional loading
 
-### 9.2 Hierarchical DEEPSEEK.md loading
+### 9.2 Hierarchical DEEPSEEK.md loading ✅
 - Load DEEPSEEK.md recursively upward from cwd to filesystem root
 - Child directory DEEPSEEK.md files loaded on demand
 - `DEEPSEEK.local.md` — project-local, gitignored
 - Load order: managed policy → user global → project → project local
 
-### 9.3 @import syntax in DEEPSEEK.md
+### 9.3 @import syntax in DEEPSEEK.md ✅
 - `@path/to/file` includes file contents into memory context
 - Recursive import with max depth 5
 - Relative paths resolved from DEEPSEEK.md location
 
-### 9.4 `#` key shortcut for quick memory add
+### 9.4 `#` key shortcut for quick memory add — DEFERRED to Phase 11
 - Press `#` in TUI to quick-add a memory entry
 - Opens mini-editor for the memory content
 - Appends to appropriate DEEPSEEK.md file
 
-### 9.5 Extended permission modes
+### 9.5 Extended permission modes ✅
 - Current: `ask`, `auto`, `plan`
 - Add: `acceptEdits` — auto-accepts file edits, still prompts for commands
 - Add: `dontAsk` — auto-denies unless pre-approved via allow rules
 
-### 9.6 Permission rule glob patterns
+### 9.6 Permission rule glob patterns ✅
 - Format: `Tool(specifier)` with glob patterns
 - `Bash(npm run *)`, `Bash(git commit *)` — command-specific bash permissions
 - `Read(//absolute/path)`, `Edit(src/**/*.rs)` — path-specific file permissions
@@ -246,7 +246,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 - `Task(AgentName)` — subagent-specific control
 - Evaluation order: **deny > ask > allow** (first match wins)
 
-### 9.7 Settings parity
+### 9.7 Settings parity ✅
 - `plansDirectory` — where plan files are stored
 - `outputStyle` — system prompt style adjustment
 - `language` — preferred response language
@@ -438,20 +438,13 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ## Phase 13: Permission & Sandbox Parity
 
-### 13.1 Full permission mode set
-- Current: `ask`, `auto`, `plan`
-- Add: `acceptEdits` — auto-accepts file edits, prompts for bash
-- Add: `dontAsk` — auto-denies all unless pre-approved
-- Add: `bypassPermissions` — skip all prompts (requires `--dangerously-skip-permissions` + `--allow-dangerously-skip-permissions`)
+### 13.1 Full permission mode set ✅ (done in Phase 9.5)
+- `acceptEdits`, `dontAsk` modes implemented
+- Remaining: `bypassPermissions` — skip all prompts (requires `--dangerously-skip-permissions` + `--allow-dangerously-skip-permissions`)
 
-### 13.2 Granular permission rules with glob patterns
-- `Bash(npm run *)` — allow specific bash patterns
-- `Read(src/**/*.rs)` — allow reading specific paths
-- `Edit(//absolute/path)` — allow editing specific files
-- `WebFetch(domain:example.com)` — allow specific domains
-- `mcp__<server>` / `mcp__<server>__<tool>` — MCP tool permissions
-- `Task(AgentName)` — subagent permissions
-- Evaluation: deny > ask > allow (first match wins)
+### 13.2 Granular permission rules with glob patterns ✅ (done in Phase 9.6)
+- `Bash(npm run *)`, `Read(src/**/*.rs)`, `Edit(...)`, `WebFetch(domain:...)`, `Task(...)` all implemented
+- Remaining: `mcp__<server>` / `mcp__<server>__<tool>` — MCP tool permissions (Phase 12)
 
 ### 13.3 Sandbox improvements
 - OS-level filesystem and network isolation for Bash commands
@@ -653,7 +646,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | 6 | ✅ Complete | Plan mode & subagent system |
 | 7 | ✅ Complete | Missing LLM tools (Skill, KillShell, background bash) |
 | 8 | ✅ Complete | Full hooks system (14 events, command handler, wired into agent) |
-| 9 | Pending | Memory & configuration parity |
+| 9 | ✅ Complete | Memory & configuration parity (rules, hierarchy, @imports, modes, globs, settings) |
 | 10 | Pending | CLI flags & slash commands full parity |
 | 11 | Pending | TUI & interaction parity (vim, shortcuts, checkpoints) |
 | 12 | Pending | MCP full integration |
@@ -670,9 +663,9 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | LLM Tools | ~40 | ~38 | Full parity ✅ |
 | Slash Commands | 23 | ~30 | /copy, /debug, /hooks, /rename, /stats, /theme, /usage, /add-dir |
 | Hook Events | 14 (all events) | 14 | Full parity ✅ (prompt/agent handlers deferred) |
-| Permission Modes | 3 | 5 | acceptEdits, dontAsk |
+| Permission Modes | 5 (ask/auto/plan/acceptEdits/dontAsk) | 5 | Full parity ✅ |
 | Subagent Types | 5 (explore/plan/task/bash/custom) | 6+ | Full parity ✅ |
-| Memory Features | 3-tier | Full hierarchy | rules/, @import, #shortcut, path-specific |
+| Memory Features | Full hierarchy + rules + @import | Full hierarchy | Full parity ✅ (#shortcut deferred) |
 | MCP | Discovery only | Full integration | Chat loop wiring, OAuth, search, serve |
 | Keyboard Shortcuts | ~5 | ~16 | Shift+Tab, Alt+P, Alt+T, @, #, !, Esc+Esc |
 | IDE | JSON-RPC stub | Full VS Code + JetBrains | Extensions needed |

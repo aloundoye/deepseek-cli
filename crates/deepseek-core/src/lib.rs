@@ -755,6 +755,52 @@ pub struct AppConfig {
     /// Stored as raw JSON, parsed by deepseek-hooks at runtime.
     #[serde(default)]
     pub hooks: serde_json::Value,
+    /// Directory for storing plan files (default: .deepseek/plans).
+    #[serde(default = "default_plans_directory")]
+    pub plans_directory: String,
+    /// Output style: adjusts system prompt tone ("concise", "verbose", "normal").
+    #[serde(default = "default_output_style")]
+    pub output_style: String,
+    /// Preferred response language (e.g. "en", "zh", "ja").
+    #[serde(default)]
+    pub language: String,
+    /// Git commit/PR attribution text.
+    #[serde(default = "default_attribution")]
+    pub attribution: String,
+    /// Restrict available models to this list. Empty = all models available.
+    #[serde(default)]
+    pub available_models: Vec<String>,
+    /// Session cleanup period in days (default: 30).
+    #[serde(default = "default_cleanup_period_days")]
+    pub cleanup_period_days: u32,
+    /// Custom status line script (shell command, stdout replaces status line).
+    #[serde(default)]
+    pub status_line: String,
+    /// Custom `@` file autocomplete script.
+    #[serde(default)]
+    pub file_suggestion: String,
+    /// Custom spinner action verbs.
+    #[serde(default)]
+    pub spinner_verbs: Vec<String>,
+    /// Whether to respect .gitignore when listing/searching files (default: true).
+    #[serde(default = "default_respect_gitignore")]
+    pub respect_gitignore: bool,
+}
+
+fn default_plans_directory() -> String {
+    ".deepseek/plans".to_string()
+}
+fn default_output_style() -> String {
+    "normal".to_string()
+}
+fn default_attribution() -> String {
+    "DeepSeek CLI".to_string()
+}
+fn default_cleanup_period_days() -> u32 {
+    30
+}
+fn default_respect_gitignore() -> bool {
+    true
 }
 
 impl AppConfig {
