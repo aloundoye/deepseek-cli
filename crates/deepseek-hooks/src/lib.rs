@@ -703,4 +703,184 @@ mod tests {
         assert_eq!(pre.len(), 1);
         assert_eq!(pre[0].matcher.as_deref(), Some("bash_run"));
     }
+
+    // ── Hook behavior tests (Phase 16.5) ────────────────────────────────
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn user_prompt_submit_hook_blocks_prompt() {
+        let mut events = HashMap::new();
+        events.insert(
+            "UserPromptSubmit".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: r#"echo '{"decision":"block","reason":"blocked by test"}' && exit 2"#
+                        .to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "UserPromptSubmit".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            prompt: Some("test prompt".to_string()),
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::UserPromptSubmit, &input);
+        assert!(result.blocked, "UserPromptSubmit with exit 2 should block");
+        assert!(
+            result
+                .block_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("blocked by test"),
+            "block reason should contain our message"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn pre_tool_use_hook_modifies_input() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: r#"echo '{"updatedInput":{"path":"modified.txt"}}'"#.to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("fs_read".to_string()),
+            tool_input: Some(serde_json::json!({"path": "original.txt"})),
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        assert!(!result.blocked);
+        assert!(result.updated_input.is_some(), "should have updated_input");
+        let updated = result.updated_input.unwrap();
+        assert_eq!(
+            updated.get("path").and_then(|v| v.as_str()),
+            Some("modified.txt")
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn hook_additional_context_is_collected() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: r#"echo '{"additionalContext":"injected context from hook"}'"#
+                        .to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        assert!(
+            result
+                .additional_context
+                .iter()
+                .any(|c| c.contains("injected context")),
+            "additional_context should contain hook output"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn post_tool_use_fires_but_cannot_block() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PostToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: r#"echo '{"decision":"block","reason":"attempt to block"}' && exit 2"#
+                        .to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PostToolUse".to_string(),
+            tool_name: Some("fs_read".to_string()),
+            tool_input: None,
+            tool_result: Some(serde_json::json!({"output": "file data"})),
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let result = rt.fire(HookEvent::PostToolUse, &input);
+        // PostToolUse does not support blocking (supports_blocking() returns false)
+        assert!(
+            !result.blocked,
+            "PostToolUse should not block even with exit 2 and block decision"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn hook_timeout_does_not_hang() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "sleep 10".to_string(),
+                    timeout: 1,
+                }],
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+        let start = std::time::Instant::now();
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "hook should complete within 5 seconds (got {:.1}s)",
+            elapsed.as_secs_f64()
+        );
+        assert_eq!(result.runs.len(), 1);
+        assert!(
+            result.runs[0].timed_out,
+            "hook should report timed_out=true"
+        );
+    }
 }

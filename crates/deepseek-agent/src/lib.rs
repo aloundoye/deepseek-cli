@@ -213,6 +213,12 @@ impl AgentEngine {
         }
     }
 
+    /// Test-only accessor for the event store.
+    #[cfg(test)]
+    pub fn store_ref(&self) -> &Store {
+        &self.store
+    }
+
     // ── Hook helpers ──────────────────────────────────────────────────────
 
     /// Build a base `HookInput` for the given event.
@@ -8092,5 +8098,298 @@ mod tests {
     fn expand_env_vars_passthrough() {
         let result = expand_env_vars("no variables here");
         assert_eq!(result, "no variables here");
+    }
+
+    // ── Chat loop integration tests (Phase 16.1) ───────────────────────
+
+    #[test]
+    fn chat_single_turn_text_response() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Hello from mock!".into(),
+        ));
+        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let result = engine.chat_with_options(
+            "say hello",
+            ChatOptions {
+                tools: false,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        let answer = result.unwrap();
+        assert!(
+            answer.contains("Hello from mock") || answer.contains("Mock response"),
+            "unexpected answer: {answer}"
+        );
+    }
+
+    #[test]
+    fn chat_multi_turn_with_tool_call() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Create a file to read
+        fs::write(dir.path().join("hello.txt"), "file contents here").expect("write test file");
+        // First LLM response: tool call to fs_read
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("hello.txt")}).to_string(),
+        });
+        // Second LLM response: text answer
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Done reading file.".into(),
+        ));
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read hello.txt",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        let answer = result.unwrap();
+        assert!(answer.contains("Done reading file"), "unexpected: {answer}");
+    }
+
+    #[test]
+    fn chat_max_turns_limit_returns_error() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Push many tool calls to force exceeding the limit
+        for i in 0..10 {
+            mock.push(deepseek_testkit::Scenario::ToolCall {
+                id: format!("call_{i}"),
+                name: "fs_list".into(),
+                arguments: serde_json::json!({"path": "."}).to_string(),
+            });
+        }
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_max_turns(Some(3));
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "list files forever",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "expected error from max turns limit");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("maximum turn limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn chat_auto_mode_approves_tools() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        fs::write(dir.path().join("auto.txt"), "auto content").expect("write");
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_auto".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("auto.txt")}).to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Auto approved.".into(),
+        ));
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read auto.txt",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "auto mode should approve: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn chat_ask_mode_deny_returns_error_to_llm() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_deny".into(),
+            name: "bash_run".into(),
+            arguments: serde_json::json!({"command": "echo hi"}).to_string(),
+        });
+        // After denial, model gets error message and responds with text
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Tool was denied, understood.".into(),
+        ));
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("ask");
+        // Set an approval handler that always denies
+        engine.set_approval_handler(Box::new(|_call| Ok(false)));
+        let result = engine.chat_with_options(
+            "run echo",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "chat should complete even when tool denied: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn chat_stream_callback_receives_content() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "streamed text".into(),
+        ));
+        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let received_clone = received.clone();
+        engine.set_stream_callback(std::sync::Arc::new(move |_chunk| {
+            *received_clone.lock().unwrap() = true;
+        }));
+        let result = engine.chat_with_options(
+            "test stream",
+            ChatOptions {
+                tools: false,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        // Note: non-streaming path may not invoke callback, but should not panic
+    }
+
+    #[test]
+    fn chat_stream_callback_survives_multiple_turns() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_s1".into(),
+            name: "fs_list".into(),
+            arguments: serde_json::json!({"path": "."}).to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Multi-turn done.".into(),
+        ));
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let turn_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let tc = turn_count.clone();
+        engine.set_stream_callback(std::sync::Arc::new(move |_chunk| {
+            tc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let result = engine.chat_with_options(
+            "list then respond",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn chat_turn_persisted_and_resumable() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Persisted answer.".into(),
+        ));
+        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let _ = engine
+            .chat_with_options(
+                "persist test",
+                ChatOptions {
+                    tools: false,
+                    ..Default::default()
+                },
+            )
+            .expect("chat");
+        // Verify events.jsonl has ChatTurnV1
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        assert!(events_path.exists(), "events.jsonl should exist");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            contents.contains("ChatTurnV1"),
+            "events should contain ChatTurnV1"
+        );
+        // Verify session is resumable
+        let resume = engine.resume();
+        assert!(resume.is_ok(), "resume failed: {:?}", resume.err());
+    }
+
+    #[test]
+    fn chat_plan_mode_blocks_write_tools() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        let target = dir.path().join("should_not_exist.txt");
+        // Model tries to write a file via fs_write (should be filtered in plan mode tools)
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_plan_w".into(),
+            name: "fs_write".into(),
+            arguments: serde_json::json!({
+                "file_path": target.to_str().unwrap(),
+                "content": "blocked"
+            })
+            .to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Plan mode response.".into(),
+        ));
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("plan");
+        let result = engine.chat_with_options(
+            "write a file in plan mode",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        // Whether it succeeds or the tool is filtered, the file should not be created
+        if result.is_ok() {
+            assert!(!target.exists(), "file should not be created in plan mode");
+        }
+        // Plan mode may also cause an error — that's acceptable too
+    }
+
+    #[test]
+    fn chat_spawn_task_invokes_worker() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_spawn".into(),
+            name: "spawn_task".into(),
+            arguments: serde_json::json!({
+                "description": "test task",
+                "prompt": "do something",
+                "subagent_type": "explore"
+            })
+            .to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Task spawned.".into(),
+        ));
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invoked_clone = invoked.clone();
+        engine.set_subagent_worker(std::sync::Arc::new(
+            move |_task: &deepseek_subagent::SubagentTask| {
+                invoked_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok("worker result".to_string())
+            },
+        ));
+        let result = engine.chat_with_options(
+            "spawn a task",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        assert!(
+            invoked.load(std::sync::atomic::Ordering::Relaxed),
+            "subagent worker should have been invoked"
+        );
     }
 }

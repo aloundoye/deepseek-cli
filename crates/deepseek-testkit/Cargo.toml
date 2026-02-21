@@ -8,5 +8,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 deepseek-agent = { path = "../deepseek-agent" }
+
+[dev-dependencies]
+reqwest = { workspace = true }

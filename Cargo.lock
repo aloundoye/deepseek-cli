@@ -635,12 +635,14 @@ dependencies = [
  "deepseek-skills",
  "deepseek-store",
  "deepseek-subagent",
+ "deepseek-testkit",
  "deepseek-tools",
  "ignore",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "uuid",
 ]
 
@@ -881,7 +883,9 @@ dependencies = [
  "anyhow",
  "deepseek-agent",
  "deepseek-core",
+ "reqwest",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -4241,4 +4241,99 @@ mod tests {
         let filtered = filter_tool_definitions(defs, None, None);
         assert_eq!(filtered.len(), original_count);
     }
+
+    // ── Parameter mapping tests (Phase 16.2) ────────────────────────────
+
+    #[test]
+    fn tool_definitions_required_fields_exist_in_properties() {
+        let defs = tool_definitions();
+        for def in &defs {
+            let params = &def.function.parameters;
+            let required = params
+                .get("required")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let properties = params.get("properties").and_then(|v| v.as_object());
+            for req in &required {
+                let field_name = req.as_str().unwrap_or("(non-string)");
+                if let Some(props) = properties {
+                    assert!(
+                        props.contains_key(field_name),
+                        "tool '{}': required field '{}' is missing from properties",
+                        def.function.name,
+                        field_name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plan_mode_tools_all_exist_in_definitions() {
+        let defs = tool_definitions();
+        let def_names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for tool_name in PLAN_MODE_TOOLS {
+            assert!(
+                def_names.contains(tool_name),
+                "PLAN_MODE_TOOLS contains '{}' which is not in tool_definitions()",
+                tool_name
+            );
+        }
+    }
+
+    #[test]
+    fn agent_level_tools_excluded_from_plan_mode() {
+        for tool_name in AGENT_LEVEL_TOOLS {
+            // Agent-level tools that ARE in plan mode are: user_question, task_*, spawn_task, exit_plan_mode
+            // The write-oriented agent-level tools should not be in plan mode:
+            // enter_plan_mode makes no sense inside plan mode, kill_shell is mutating, skill is execution
+            let expected_in_plan = matches!(
+                *tool_name,
+                "user_question"
+                    | "task_create"
+                    | "task_update"
+                    | "task_get"
+                    | "task_list"
+                    | "spawn_task"
+                    | "exit_plan_mode"
+            );
+            let in_plan = PLAN_MODE_TOOLS.contains(tool_name);
+            if !expected_in_plan {
+                assert!(
+                    !in_plan,
+                    "agent-level tool '{}' should not be in PLAN_MODE_TOOLS",
+                    tool_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_random_json_args_do_not_panic() {
+        let (workspace, host) = temp_host();
+        let fuzz_args = vec![
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"wrong_field": 42}),
+            serde_json::json!({"path": 123}),
+            serde_json::json!([]),
+        ];
+        let tool_names = ["fs.read", "fs.glob", "fs.grep"];
+        for tool_name in tool_names {
+            for args in &fuzz_args {
+                let approved = ApprovedToolCall {
+                    invocation_id: Uuid::now_v7(),
+                    call: ToolCall {
+                        name: tool_name.to_string(),
+                        args: args.clone(),
+                        requires_approval: false,
+                    },
+                };
+                // Should not panic — Ok or Err are both fine
+                let _result = host.execute(approved);
+            }
+        }
+        let _ = fs::remove_dir_all(&workspace);
+    }
 }

@@ -3167,4 +3167,115 @@ mod tests {
         let expanded = expand_at_mentions(input);
         assert!(expanded.contains("@/nonexistent/path/file.rs"));
     }
+
+    // ── TUI logic tests (Phase 16.3) ────────────────────────────────────
+
+    #[test]
+    fn all_slash_command_variants_parse() {
+        // Comprehensive test of all slash command variants
+        assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
+        assert_eq!(SlashCommand::parse("/copy"), Some(SlashCommand::Copy));
+        assert_eq!(SlashCommand::parse("/login"), Some(SlashCommand::Login));
+        assert_eq!(SlashCommand::parse("/logout"), Some(SlashCommand::Logout));
+        assert_eq!(SlashCommand::parse("/bug"), Some(SlashCommand::Bug));
+        assert_eq!(SlashCommand::parse("/usage"), Some(SlashCommand::Usage));
+        assert_eq!(
+            SlashCommand::parse("/rename foo"),
+            Some(SlashCommand::Rename(Some("foo".to_string())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/resume abc"),
+            Some(SlashCommand::Resume(Some("abc".to_string())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/add-dir /tmp"),
+            Some(SlashCommand::AddDir(vec!["/tmp".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/pr_comments 42"),
+            Some(SlashCommand::PrComments(vec!["42".to_string()]))
+        );
+        // Unknown command
+        let unknown = SlashCommand::parse("/foobar baz");
+        assert!(matches!(
+            unknown,
+            Some(SlashCommand::Unknown { ref name, .. }) if name == "foobar"
+        ));
+    }
+
+    #[test]
+    fn slash_command_parse_is_case_insensitive() {
+        assert_eq!(SlashCommand::parse("/HELP"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse("/Help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse("/CONTEXT"), Some(SlashCommand::Context));
+        assert_eq!(SlashCommand::parse("/EXIT"), Some(SlashCommand::Exit));
+        assert_eq!(SlashCommand::parse("/Plan"), Some(SlashCommand::Plan));
+    }
+
+    #[test]
+    fn render_statusline_plan_mode_label() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            permission_mode: "plan".to_string(),
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(
+            line.contains("[PLAN]"),
+            "plan mode should show [PLAN] label, got: {line}"
+        );
+    }
+
+    #[test]
+    fn render_statusline_context_percentage() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            permission_mode: "auto".to_string(),
+            context_used_tokens: 64_000,
+            context_max_tokens: 128_000,
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(
+            line.contains("ctx=64K/128K(50%)"),
+            "should show 50% context usage, got: {line}"
+        );
+    }
+
+    #[test]
+    fn keybindings_defaults_are_valid() {
+        let bindings = KeyBindings::default();
+        // Ctrl+D should exit session
+        assert_eq!(
+            bindings.exit_session,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::CONTROL
+            )
+        );
+        // Ctrl+C should exit
+        assert_eq!(
+            bindings.exit,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL
+            )
+        );
+        // Enter should submit
+        assert_eq!(
+            bindings.submit,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE
+            )
+        );
+        // Tab should autocomplete
+        assert_eq!(
+            bindings.autocomplete,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Tab,
+                crossterm::event::KeyModifiers::NONE
+            )
+        );
+    }
 }
