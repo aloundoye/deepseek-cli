@@ -102,17 +102,32 @@ impl ModelRouter for WeightedRouter {
             reason_codes.push("failure_streak".to_string());
         }
 
-        // Always use the base model (`deepseek-chat`); when the score is high,
-        // enable thinking mode instead of switching to `deepseek-reasoner`.
-        // This gives us reasoning + function calling simultaneously.
+        // For complex tasks, switch to max_think_model (deepseek-reasoner)
+        // when thinking is enabled, unless we need tool calling.
+        let selected_model = if high && unit == LlmUnit::Planner {
+            // Planners don't need tool calling during planning phase
+            self.cfg.max_think_model.clone()
+        } else if high {
+            // Executors need tool calling, so use base model with thinking mode
+            self.cfg.base_model.clone()
+        } else {
+            self.cfg.base_model.clone()
+        };
+
+        // Reasoner-directed: when complexity is high and this is an executor
+        // call, signal that the agent should use the two-model loop
+        // (deepseek-reasoner analyzes, deepseek-chat executes tools).
+        let reasoner_directed = high && matches!(unit, LlmUnit::Executor);
+
         RouterDecision {
             decision_id: Uuid::now_v7(),
             reason_codes,
-            selected_model: self.cfg.base_model.clone(),
             confidence: (1.0 - (score - self.cfg.threshold_high).abs()).clamp(0.1, 1.0),
             score,
             escalated: high,
-            thinking_enabled: high,
+            thinking_enabled: high && selected_model == self.cfg.base_model,
+            reasoner_directed,
+            selected_model,
         }
     }
 }
@@ -135,9 +150,11 @@ mod tests {
                 ambiguity_flags: 1.0,
             },
         );
-        assert_eq!(decision.selected_model, "deepseek-chat");
-        assert!(decision.thinking_enabled);
+        assert_eq!(decision.selected_model, "deepseek-reasoner");
+        assert!(!decision.thinking_enabled);
         assert!(decision.escalated);
+        // Planner units don't get reasoner_directed (only Executor does)
+        assert!(!decision.reasoner_directed);
     }
 
     #[test]
@@ -157,6 +174,7 @@ mod tests {
         assert_eq!(decision.selected_model, "deepseek-chat");
         assert!(!decision.escalated);
         assert!(!decision.thinking_enabled);
+        assert!(!decision.reasoner_directed);
     }
 
     #[test]
@@ -188,6 +206,8 @@ mod tests {
         );
         assert_eq!(decision.selected_model, "deepseek-chat");
         assert!(decision.thinking_enabled);
+        // Executor with high score should signal reasoner_directed
+        assert!(decision.reasoner_directed);
     }
 
     #[test]
@@ -237,8 +257,8 @@ mod tests {
             decision.escalated,
             "planner bias should escalate even with low score"
         );
-        assert_eq!(decision.selected_model, "deepseek-chat");
-        assert!(decision.thinking_enabled);
+        assert_eq!(decision.selected_model, "deepseek-reasoner");
+        assert!(!decision.thinking_enabled);
         assert!(
             decision
                 .reason_codes

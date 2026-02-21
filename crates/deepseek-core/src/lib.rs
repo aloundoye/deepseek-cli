@@ -177,7 +177,7 @@ impl Default for RouterWeights {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmUnit {
     Planner,
     Executor,
@@ -196,6 +196,11 @@ pub struct RouterDecision {
     /// `deepseek-chat` with `thinking: {type: "enabled", budget_tokens: N}`.
     #[serde(default)]
     pub thinking_enabled: bool,
+    /// When true, the agent should use reasoner-directed execution: call
+    /// `deepseek-reasoner` to analyze and direct strategy, then `deepseek-chat`
+    /// executes tool calls guided by the reasoning.
+    #[serde(default)]
+    pub reasoner_directed: bool,
 }
 
 /// Type-safe tool name enum covering all built-in tools.
@@ -1467,6 +1472,12 @@ pub struct RouterConfig {
     /// use a two-phase approach: first a thinking-only call (no tools) to reason
     /// about strategy, then a tools call (no thinking) with the reasoning as context.
     pub two_phase_thinking: bool,
+    /// When true, use `deepseek-reasoner` to analyze and direct strategy on every
+    /// tool-enabled turn, then `deepseek-chat` executes tool calls guided by that
+    /// reasoning. This is the primary workaround for the thinking+tools DSML leak.
+    pub reasoner_directed: bool,
+    /// Maximum number of reasoner calls per session to limit token cost.
+    pub reasoner_directed_max_turns: u32,
     pub w1: f32,
     pub w2: f32,
     pub w3: f32,
@@ -1483,6 +1494,8 @@ impl Default for RouterConfig {
             escalate_on_invalid_plan: true,
             max_escalations_per_unit: 1,
             two_phase_thinking: true,
+            reasoner_directed: true,
+            reasoner_directed_max_turns: 20,
             w1: 0.2,
             w2: 0.15,
             w3: 0.2,

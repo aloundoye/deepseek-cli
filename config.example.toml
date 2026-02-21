@@ -23,6 +23,11 @@ auto_max_think = true
 threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1
+# Reasoner-directed execution: deepseek-reasoner analyzes on every tool-enabled
+# turn, deepseek-chat executes tool calls guided by that reasoning.
+reasoner_directed = true
+# Maximum reasoner calls per session to limit token cost.
+reasoner_directed_max_turns = 20
 w1 = 0.2
 w2 = 0.15
 w3 = 0.2

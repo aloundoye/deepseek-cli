@@ -22,6 +22,11 @@ pub enum Scenario {
     },
     /// Return multiple tool calls in one response.
     MultiToolCall(Vec<ToolCallSpec>),
+    /// Return a response with reasoning_content and text (simulates deepseek-reasoner).
+    ReasonerResponse {
+        reasoning_content: String,
+        text: String,
+    },
     /// Return an HTTP error status code.
     HttpError(u16),
 }
@@ -266,6 +271,22 @@ fn handle_mock_llm_connection(
                     "message": {
                         "content": null,
                         "tool_calls": tool_calls
+                    }
+                }]
+            })
+            .to_string();
+            write_http_response(stream, 200, &payload)?;
+        }
+        Some(Scenario::ReasonerResponse {
+            reasoning_content,
+            text,
+        }) => {
+            let payload = serde_json::json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "reasoning_content": reasoning_content,
+                        "content": text
                     }
                 }]
             })

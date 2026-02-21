@@ -87,7 +87,9 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `fs.glob`, `bash.run`, `git.*`, `web.*`, `notebook.*`, `multi_edit`, and plugins.
 
-**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` instead of switching models. However, **thinking mode is forcibly disabled when tools are active** (see "Known DeepSeek API Limitations" below). Thinking mode is only applied for pure text responses (no tools) and the legacy planner path. `deepseek-reasoner` does NOT support function calling and is only used for legacy planner paths without tools.
+**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` and `reasoner_directed=true` (for executor units). However, **thinking mode is forcibly disabled when tools are active** (see "Known DeepSeek API Limitations" below). The reasoner-directed loop is the primary workaround for this limitation.
+
+**Reasoner-directed execution** (`deepseek-agent`): A two-model loop where `deepseek-reasoner` analyzes the situation and directs strategy on every tool-enabled turn, then `deepseek-chat` executes tool calls guided by that reasoning. Activated when `router.reasoner_directed = true` (default) and the router signals high complexity. The reasoner call produces a directive that is injected into the conversation history as an assistant message. If the reasoner outputs `TASK_COMPLETE`, the loop terminates and returns the final answer. Falls back gracefully if the reasoner call errors. Capped by `router.reasoner_directed_max_turns` (default 20) to limit token cost.
 
 **TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`.
 
@@ -126,7 +128,9 @@ When `thinking: {"type": "enabled", "budget_tokens": N}` is sent alongside `tool
 
 **What still gets thinking mode**: Pure text responses (no tools), the legacy planner path, and any turn where `options.tools = false`.
 
-**If DeepSeek fixes this upstream**: Remove the `&& !options.tools` guard in `chat_with_options()` and the `tools.is_empty()` check in the escalation retry. The DSML rescue parser can be kept as a defensive fallback.
+**Primary workaround — Reasoner-directed execution**: When the router detects high complexity for tool-enabled turns, `chat_with_options()` calls `deepseek-reasoner` (no tools, no thinking param — it has built-in CoT) to analyze and produce a strategy directive, then `deepseek-chat` (with tools, no thinking) executes tool calls with that directive injected as context. This gives us deep reasoning on every turn without triggering the DSML leak. The old two-phase thinking (first-turn only) is superseded when `router.reasoner_directed = true`.
+
+**If DeepSeek fixes this upstream**: Remove the `&& !options.tools` guard in `chat_with_options()` and the `tools.is_empty()` check in the escalation retry. The DSML rescue parser and reasoner-directed loop can be kept as defensive fallbacks, or the reasoner-directed mode can be disabled via `router.reasoner_directed = false`.
 
 ## Supply-Chain Security
 

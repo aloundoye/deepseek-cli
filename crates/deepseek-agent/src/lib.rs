@@ -1311,6 +1311,7 @@ impl AgentEngine {
         let mut turn_count: u64 = 0;
         let mut failure_streak: u32 = 0;
         let mut empty_response_count: u32 = 0;
+        let mut reasoner_turn_count: u64 = 0;
         let mut budget_warned = false;
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
@@ -1528,15 +1529,17 @@ impl AgentEngine {
                 }
             }
 
-            // Two-phase reasoning: when thinking is warranted but tools prevent it,
+            // Two-phase reasoning (legacy): when thinking is warranted but tools prevent it,
             // make a separate thinking-only call first to reason about strategy.
             // Only on the first turn — subsequent tool-result turns don't need
-            // full re-reasoning.
+            // full re-reasoning. Disabled when reasoner_directed is active (it
+            // supersedes this approach with per-turn reasoner calls).
             let mut reasoning_context: Option<String> = None;
             if decision.thinking_enabled
                 && options.tools
                 && turn_count == 1
                 && self.cfg.router.two_phase_thinking
+                && !self.cfg.router.reasoner_directed
             {
                 self.emit(
                     session.session_id,
@@ -1594,6 +1597,149 @@ impl AgentEngine {
                 });
             }
 
+            // ── Reasoner-directed execution ─────────────────────────────────
+            // When complexity warrants reasoning and tools are active, call
+            // `deepseek-reasoner` to analyze the situation and produce a
+            // directive. The executor call below will include that directive
+            // in its message history as guiding context.
+            let mut reasoner_directed_active = false;
+            if (decision.thinking_enabled || decision.reasoner_directed)
+                && options.tools
+                && self.cfg.router.reasoner_directed
+                && self.cfg.router.two_phase_thinking
+                && reasoner_turn_count < self.cfg.router.reasoner_directed_max_turns as u64
+            {
+                reasoner_directed_active = true;
+                reasoner_turn_count += 1;
+
+                self.emit(
+                    session.session_id,
+                    EventKind::RouterEscalationV1 {
+                        reason_codes: vec!["reasoner_directed".to_string()],
+                    },
+                )?;
+
+                let tool_names: Vec<String> = tools
+                    .iter()
+                    .map(|t| t.function.name.clone())
+                    .collect();
+                let directive_prompt =
+                    self.build_reasoner_directive_prompt(&tool_names, reasoner_turn_count);
+
+                // Build reasoner request: conversation messages + directive system prompt,
+                // NO tools, NO thinking param (reasoner has built-in CoT).
+                let mut reasoner_messages = vec![ChatMessage::System {
+                    content: directive_prompt,
+                }];
+                // Include conversation history (skip original system prompt at index 0)
+                for msg in messages.iter().skip(1) {
+                    reasoner_messages.push(msg.clone());
+                }
+
+                let reasoner_request = ChatRequest {
+                    model: self.cfg.llm.max_think_model.clone(),
+                    messages: reasoner_messages,
+                    tools: vec![],
+                    tool_choice: ToolChoice::none(),
+                    max_tokens: session.budgets.max_think_tokens.max(4096),
+                    temperature: None,
+                    thinking: None,
+                };
+
+                self.observer.verbose_log(&format!(
+                    "turn {turn_count}: reasoner-directed call model={} messages={} reasoner_turn={}",
+                    reasoner_request.model,
+                    reasoner_request.messages.len(),
+                    reasoner_turn_count,
+                ));
+
+                let reasoner_result = {
+                    let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                    if let Some(cb) = cb {
+                        self.llm
+                            .complete_chat_streaming(&reasoner_request, cb.clone())
+                    } else {
+                        self.llm.complete_chat(&reasoner_request)
+                    }
+                };
+
+                match reasoner_result {
+                    Ok(reasoner_response) => {
+                        // Extract the directive from text (preferred) or reasoning_content
+                        let directive = if !reasoner_response.text.is_empty() {
+                            reasoner_response.text.clone()
+                        } else if !reasoner_response.reasoning_content.is_empty() {
+                            reasoner_response.reasoning_content.clone()
+                        } else {
+                            String::new()
+                        };
+
+                        // Record reasoner usage
+                        let r_input_tok = estimate_tokens(&directive) + 200; // approximate
+                        let r_output_tok = estimate_tokens(&directive);
+                        self.emit(
+                            session.session_id,
+                            EventKind::UsageUpdatedV1 {
+                                unit: LlmUnit::Planner,
+                                model: self.cfg.llm.max_think_model.clone(),
+                                input_tokens: r_input_tok,
+                                output_tokens: r_output_tok,
+                            },
+                        )?;
+                        self.emit_cost_event(session.session_id, r_input_tok, r_output_tok)?;
+
+                        if !directive.trim().is_empty() {
+                            // Check for TASK_COMPLETE signal
+                            if let Some(complete_pos) =
+                                directive.find("TASK_COMPLETE")
+                            {
+                                let final_answer = directive
+                                    [complete_pos + "TASK_COMPLETE".len()..]
+                                    .trim()
+                                    .trim_start_matches(&['-', '—', ':'][..])
+                                    .trim()
+                                    .to_string();
+                                let answer = if final_answer.is_empty() {
+                                    directive[..complete_pos].trim().to_string()
+                                } else {
+                                    final_answer
+                                };
+
+                                self.emit(
+                                    session.session_id,
+                                    EventKind::TurnAddedV1 {
+                                        role: "assistant".to_string(),
+                                        content: answer.clone(),
+                                    },
+                                )?;
+                                let _ =
+                                    self.transition(&mut session, SessionState::Completed);
+                                return Ok(answer);
+                            }
+
+                            // Inject directive as assistant context for the executor
+                            messages.push(ChatMessage::Assistant {
+                                content: Some(format!(
+                                    "[Reasoner analysis — turn {reasoner_turn_count}]\n\
+                                     {directive}\n\n\
+                                     [Now executing with tools]"
+                                )),
+                                reasoning_content: None,
+                                tool_calls: vec![],
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        // Graceful fallback: log error and let executor work unguided
+                        self.observer.verbose_log(&format!(
+                            "turn {turn_count}: reasoner-directed call failed: {e}, \
+                             falling back to unguided execution"
+                        ));
+                        reasoner_directed_active = false;
+                    }
+                }
+            }
+
             let request = ChatRequest {
                 model: request_model.clone(),
                 messages: messages.clone(),
@@ -1628,12 +1774,15 @@ impl AgentEngine {
             };
 
             // Escalation retry: if base model returned empty response and thinking
-            // wasn't already enabled, retry with thinking mode on.
+            // wasn't already enabled, retry with thinking mode on. Skip when
+            // reasoner_directed was active — the reasoner already guided this turn
+            // so an empty response likely means the task is done, not a failure.
             let response = if response.text.is_empty()
                 && response.tool_calls.is_empty()
                 && turn_count <= 1
                 && self.cfg.router.auto_max_think
                 && !decision.thinking_enabled
+                && !reasoner_directed_active
             {
                 self.emit(
                     session.session_id,
@@ -2287,6 +2436,32 @@ impl AgentEngine {
             // with a compact summary to save context tokens.
             compress_repeated_tool_results(&mut messages);
         }
+    }
+
+    /// Build a system prompt that instructs `deepseek-reasoner` to analyze the
+    /// current conversation state and direct the next tool-execution step.
+    fn build_reasoner_directive_prompt(&self, tool_names: &[String], turn: u64) -> String {
+        let tools_list = if tool_names.is_empty() {
+            "all available tools".to_string()
+        } else {
+            tool_names.join(", ")
+        };
+        format!(
+            "You are a reasoning engine directing a coding agent. This is turn {turn}.\n\n\
+             ## Your role\n\
+             Analyze the current conversation (user request + prior tool results) and decide \
+             what the agent should do next.\n\n\
+             ## Available tools\n{tools_list}\n\n\
+             ## Instructions\n\
+             1. Assess the current state: what has been done, what information is available.\n\
+             2. Decide the strategy for the next step.\n\
+             3. Specify which tool(s) to call and with what arguments.\n\
+             4. If the task is complete, say TASK_COMPLETE on its own line, followed by the \
+             final answer to give to the user.\n\n\
+             ## Output format\n\
+             Respond with a concise analysis and clear next-action directives. \
+             The executor will use your response as guidance for tool selection."
+        )
     }
 
     /// Build a system prompt for chat-with-tools mode.
@@ -8973,6 +9148,8 @@ mod tests {
     #[test]
     fn chat_two_phase_injects_reasoning_on_first_turn() {
         let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Disable reasoner_directed so the legacy two-phase path fires
+        write_reasoner_directed_settings(dir.path(), false, 0);
         // Create a file the tool call will read
         fs::write(dir.path().join("data.txt"), "important data").expect("write test file");
         // Phase 1: thinking-only call returns reasoning text
@@ -9060,6 +9237,192 @@ mod tests {
         assert!(
             !contents.contains("two_phase_reasoning"),
             "events should NOT contain two_phase_reasoning when disabled, got:\n{contents}"
+        );
+    }
+
+    // ── Reasoner-directed execution tests ────────────────────────────────
+
+    /// Helper to write router settings with reasoner_directed config.
+    fn write_reasoner_directed_settings(dir: &Path, enabled: bool, max_turns: u32) {
+        let settings_path = dir.join(".deepseek/settings.local.json");
+        let existing: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("parse settings");
+        let mut settings = existing.as_object().unwrap().clone();
+        settings.insert(
+            "router".to_string(),
+            serde_json::json!({
+                "two_phase_thinking": true,
+                "reasoner_directed": enabled,
+                "reasoner_directed_max_turns": max_turns
+            }),
+        );
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).expect("serialize"),
+        )
+        .expect("write settings");
+    }
+
+    #[test]
+    fn chat_reasoner_directed_multi_turn() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        write_reasoner_directed_settings(dir.path(), true, 20);
+        fs::write(dir.path().join("target.txt"), "hello world").expect("write test file");
+
+        // Turn 1: reasoner analyzes, then executor calls fs_read
+        mock.push(deepseek_testkit::Scenario::ReasonerResponse {
+            reasoning_content: "Need to read the file first".into(),
+            text: "Next: read target.txt with fs_read".into(),
+        });
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_rd1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("target.txt")}).to_string(),
+        });
+        // Turn 2: reasoner sees file contents, signals TASK_COMPLETE
+        mock.push(deepseek_testkit::Scenario::ReasonerResponse {
+            reasoning_content: "File read successfully, contains hello world".into(),
+            text: "TASK_COMPLETE — The file contains: hello world".into(),
+        });
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read target.txt and tell me what it contains",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        let answer = result.unwrap();
+        assert!(
+            answer.contains("hello world"),
+            "answer should contain file contents, got: {answer}"
+        );
+
+        // Verify reasoner_directed escalation events were emitted
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            contents.contains(r#""reason_codes":["reasoner_directed"]"#),
+            "events should contain reasoner_directed escalation event"
+        );
+    }
+
+    #[test]
+    fn chat_reasoner_directed_fallback_on_error() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        write_reasoner_directed_settings(dir.path(), true, 20);
+
+        // Reasoner call returns HTTP 500, executor should still work unguided
+        mock.push(deepseek_testkit::Scenario::HttpError(500));
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Unguided response works.".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "do something complex requiring reasoning",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat should succeed on fallback: {:?}", result.err());
+        let answer = result.unwrap();
+        assert!(
+            answer.contains("Unguided response"),
+            "answer should be from fallback executor, got: {answer}"
+        );
+    }
+
+    #[test]
+    fn chat_reasoner_directed_respects_config() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Disable reasoner_directed
+        write_reasoner_directed_settings(dir.path(), false, 20);
+        fs::write(dir.path().join("info.txt"), "data").expect("write test file");
+
+        // With reasoner_directed=false, only executor calls should happen
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_cfg1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("info.txt")}).to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Read the file directly.".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read info.txt",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        // Verify no reasoner_directed escalation events
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            !contents.contains(r#""reason_codes":["reasoner_directed"]"#),
+            "events should NOT contain reasoner_directed escalation when disabled"
+        );
+    }
+
+    #[test]
+    fn chat_reasoner_directed_budget_limit() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Set max_turns to 1 — only one reasoner call allowed
+        write_reasoner_directed_settings(dir.path(), true, 1);
+        fs::write(dir.path().join("a.txt"), "aaa").expect("write");
+        fs::write(dir.path().join("b.txt"), "bbb").expect("write");
+
+        // Turn 1: reasoner + executor (within budget)
+        mock.push(deepseek_testkit::Scenario::ReasonerResponse {
+            reasoning_content: "Read file a first".into(),
+            text: "Next: fs_read a.txt".into(),
+        });
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_bl1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("a.txt")}).to_string(),
+        });
+        // Turn 2: reasoner budget exhausted, executor runs unguided
+        // No reasoner scenario pushed — the code should skip it
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Both files processed.".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read both files",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        // Count reasoner_directed escalation events — should be exactly 1
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        let escalation_marker = r#""reason_codes":["reasoner_directed"]"#;
+        let rd_count = contents.matches(escalation_marker).count();
+        assert_eq!(
+            rd_count, 1,
+            "should have exactly 1 reasoner_directed escalation event (budget=1), got {rd_count}"
         );
     }
 }
