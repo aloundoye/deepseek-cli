@@ -4,8 +4,9 @@ use deepseek_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -157,6 +158,10 @@ pub struct IdeRpcHandler {
     approvals: Mutex<HashMap<Uuid, PendingToolApproval>>,
     /// Per-session conversation histories (for prompt/execute streaming).
     conversations: Mutex<HashMap<Uuid, Vec<ChatMessage>>>,
+    /// Per-prompt queued partial message chunks for stream polling.
+    prompt_streams: Mutex<HashMap<Uuid, Vec<String>>>,
+    /// Whether partial-message streaming should be enabled by default.
+    include_partial_messages: bool,
     /// Context manager for intelligent file suggestions.
     context_manager: Mutex<Option<ContextManager>>,
 }
@@ -179,6 +184,8 @@ impl IdeRpcHandler {
             store: Arc::new(store),
             approvals: Mutex::new(HashMap::new()),
             conversations: Mutex::new(HashMap::new()),
+            prompt_streams: Mutex::new(HashMap::new()),
+            include_partial_messages: env_flag_enabled("DEEPSEEK_INCLUDE_PARTIAL_MESSAGES"),
             context_manager: Mutex::new(context_manager),
         })
     }
@@ -188,6 +195,8 @@ impl IdeRpcHandler {
             store,
             approvals: Mutex::new(HashMap::new()),
             conversations: Mutex::new(HashMap::new()),
+            prompt_streams: Mutex::new(HashMap::new()),
+            include_partial_messages: env_flag_enabled("DEEPSEEK_INCLUDE_PARTIAL_MESSAGES"),
             context_manager: Mutex::new(None),
         }
     }
@@ -332,11 +341,322 @@ impl IdeRpcHandler {
         // Actual LLM execution is handled by the agent runtime which the IDE
         // polls via `prompt/status` or receives tool events.
         let prompt_id = Uuid::now_v7();
+        let include_partial = params
+            .get("include_partial_messages")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(self.include_partial_messages);
+        if include_partial {
+            let seed = format!("Processing prompt: {prompt}");
+            let chunks = split_partial_chunks(&seed, 48);
+            self.prompt_streams
+                .lock()
+                .expect("prompt_streams lock")
+                .insert(prompt_id, chunks);
+        }
         Ok(serde_json::json!({
             "prompt_id": prompt_id.to_string(),
             "session_id": session_id.to_string(),
             "status": "queued",
             "prompt": prompt,
+            "partial_messages_enabled": include_partial,
+            "stream": if include_partial {
+                serde_json::json!({
+                    "method": "prompt/stream_next",
+                    "prompt_id": prompt_id.to_string(),
+                    "cursor": 0,
+                })
+            } else {
+                Value::Null
+            },
+        }))
+    }
+
+    fn handle_prompt_stream_next(&self, params: Value) -> Result<Value> {
+        let prompt_id = require_uuid(&params, "prompt_id")?;
+        let cursor = params.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let max_chunks = params
+            .get("max_chunks")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8) as usize;
+        let max_chunks = max_chunks.clamp(1, 128);
+
+        let mut streams = self.prompt_streams.lock().expect("prompt_streams lock");
+        let Some(chunks) = streams.get(&prompt_id) else {
+            return Ok(serde_json::json!({
+                "prompt_id": prompt_id.to_string(),
+                "chunks": [],
+                "next_cursor": cursor,
+                "done": true,
+                "missing": true,
+            }));
+        };
+
+        let start = cursor.min(chunks.len());
+        let end = (start + max_chunks).min(chunks.len());
+        let slice = &chunks[start..end];
+        let out_chunks = slice
+            .iter()
+            .enumerate()
+            .map(|(idx, delta)| {
+                serde_json::json!({
+                    "cursor": start + idx,
+                    "type": "assistant_partial",
+                    "delta": delta,
+                })
+            })
+            .collect::<Vec<_>>();
+        let done = end >= chunks.len();
+        if done {
+            streams.remove(&prompt_id);
+        }
+
+        Ok(serde_json::json!({
+            "prompt_id": prompt_id.to_string(),
+            "chunks": out_chunks,
+            "next_cursor": end,
+            "done": done,
+        }))
+    }
+
+    fn handle_session_handoff_export(&self, params: Value) -> Result<Value> {
+        let session_id = if let Some(session_id) = optional_uuid(&params, "session_id")? {
+            session_id
+        } else {
+            self.store
+                .load_latest_session()?
+                .map(|s| s.session_id)
+                .ok_or_else(|| anyhow!("no sessions available to export"))?
+        };
+        let session = self
+            .store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let projection = self.store.rebuild_from_events(session_id)?;
+        let bundle_id = Uuid::now_v7();
+        let output_path = params
+            .get("output_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                self.store
+                    .root
+                    .join("teleport")
+                    .join(format!("{bundle_id}.json"))
+            });
+        if let Some(parent) = output_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let payload = serde_json::json!({
+            "schema": "deepseek.handoff.v1",
+            "bundle_id": bundle_id.to_string(),
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+            "session": {
+                "session_id": session_id.to_string(),
+                "workspace_root": session.workspace_root,
+                "status": format!("{:?}", session.status),
+            },
+            "chat_messages": projection.chat_messages,
+            "transcript": projection.transcript,
+            "step_status": projection.step_status,
+            "router_models": projection.router_models,
+        });
+        fs::write(&output_path, serde_json::to_vec_pretty(&payload)?)?;
+        let seq = self.store.next_seq_no(session_id)?;
+        self.store.append_event(&deepseek_core::EventEnvelope {
+            seq_no: seq,
+            at: chrono::Utc::now(),
+            session_id,
+            kind: EventKind::TeleportBundleCreatedV1 {
+                bundle_id,
+                path: output_path.to_string_lossy().to_string(),
+            },
+        })?;
+
+        Ok(serde_json::json!({
+            "bundle_id": bundle_id.to_string(),
+            "session_id": session_id.to_string(),
+            "path": output_path.to_string_lossy().to_string(),
+            "turn_count": payload["chat_messages"].as_array().map_or(0, std::vec::Vec::len),
+        }))
+    }
+
+    fn handle_session_handoff_import(&self, params: Value) -> Result<Value> {
+        let bundle_path = params
+            .get("bundle_path")
+            .or_else(|| params.get("handoff_path"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing 'bundle_path' parameter"))?;
+        let raw = fs::read_to_string(bundle_path)?;
+        let payload: Value = serde_json::from_str(&raw)?;
+        if payload
+            .get("schema")
+            .and_then(|v| v.as_str())
+            .map(|value| value != "deepseek.handoff.v1")
+            .unwrap_or(false)
+        {
+            return Err(anyhow!("unsupported handoff schema"));
+        }
+
+        let workspace_root = params
+            .get("workspace_root")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .or_else(|| {
+                payload
+                    .get("session")
+                    .and_then(|s| s.get("workspace_root"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| ".".to_string());
+        let session_id = Uuid::now_v7();
+        let session = Session {
+            session_id,
+            workspace_root,
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 300,
+                max_think_tokens: 8192,
+            },
+            active_plan_id: None,
+        };
+        self.store.save_session(&session)?;
+
+        let chat_messages = payload
+            .get("chat_messages")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<ChatMessage>>(v).ok())
+            .unwrap_or_default();
+        for message in &chat_messages {
+            let seq = self.store.next_seq_no(session_id)?;
+            self.store.append_event(&deepseek_core::EventEnvelope {
+                seq_no: seq,
+                at: chrono::Utc::now(),
+                session_id,
+                kind: EventKind::ChatTurnV1 {
+                    message: message.clone(),
+                },
+            })?;
+        }
+        let resume_import = params
+            .get("resume")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if resume_import {
+            let seq = self.store.next_seq_no(session_id)?;
+            self.store.append_event(&deepseek_core::EventEnvelope {
+                seq_no: seq,
+                at: chrono::Utc::now(),
+                session_id,
+                kind: EventKind::SessionResumedV1 {
+                    session_id,
+                    events_replayed: chat_messages.len() as u64,
+                },
+            })?;
+        }
+        self.conversations
+            .lock()
+            .expect("conversations lock")
+            .insert(session_id, chat_messages.clone());
+
+        Ok(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "imported": true,
+            "bundle_path": bundle_path,
+            "turn_count": chat_messages.len(),
+            "status": "idle",
+            "resumed": resume_import,
+        }))
+    }
+
+    fn handle_session_remote_resume(&self, params: Value) -> Result<Value> {
+        if params.get("bundle_path").is_some() || params.get("handoff_path").is_some() {
+            let imported = self.handle_session_handoff_import(params)?;
+            return Ok(serde_json::json!({
+                "remote": true,
+                "mode": "handoff_import",
+                "session_id": imported["session_id"],
+                "status": imported["status"],
+                "turn_count": imported["turn_count"],
+            }));
+        }
+        let resumed = self.handle_session_resume(params.clone())?;
+        let session_id = resumed
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing resumed session id"))?;
+        let parsed = Uuid::parse_str(session_id)?;
+        let events_replayed = resumed
+            .get("turn_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let seq = self.store.next_seq_no(parsed)?;
+        self.store.append_event(&deepseek_core::EventEnvelope {
+            seq_no: seq,
+            at: chrono::Utc::now(),
+            session_id: parsed,
+            kind: EventKind::SessionResumedV1 {
+                session_id: parsed,
+                events_replayed,
+            },
+        })?;
+
+        Ok(serde_json::json!({
+            "remote": true,
+            "mode": "session_resume",
+            "session_id": session_id,
+            "status": resumed["status"],
+            "turn_count": resumed["turn_count"],
+            "workspace_root": resumed["workspace_root"],
+        }))
+    }
+
+    fn handle_events_poll(&self, params: Value) -> Result<Value> {
+        let session_id = require_uuid(&params, "session_id")?;
+        let after_seq = params
+            .get("after_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as i64;
+        let limit = limit.clamp(1, 500);
+
+        let conn = self.store.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq_no, at, kind, payload
+             FROM events
+             WHERE session_id = ?1 AND seq_no > ?2
+             ORDER BY seq_no ASC
+             LIMIT ?3",
+        )?;
+        let mut rows = stmt.query([
+            session_id.to_string(),
+            after_seq.to_string(),
+            limit.to_string(),
+        ])?;
+        let mut events = Vec::new();
+        let mut next_cursor = after_seq;
+        while let Some(row) = rows.next()? {
+            let seq_no = row.get::<_, i64>(0)?.max(0) as u64;
+            let payload_raw = row.get::<_, String>(3)?;
+            let payload_json = serde_json::from_str::<Value>(&payload_raw).unwrap_or(Value::Null);
+            events.push(serde_json::json!({
+                "seq_no": seq_no,
+                "at": row.get::<_, String>(1)?,
+                "kind": row.get::<_, String>(2)?,
+                "payload": payload_json,
+            }));
+            next_cursor = seq_no;
+        }
+        let done = events.len() < limit as usize;
+
+        Ok(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "events": events,
+            "next_cursor": next_cursor,
+            "done": done,
         }))
     }
 
@@ -672,18 +992,24 @@ impl RpcHandler for IdeRpcHandler {
             "initialize" => Ok(serde_json::json!({
                 "name": "deepseek-cli",
                 "version": env!("CARGO_PKG_VERSION"),
+                "partial_messages_enabled": self.include_partial_messages,
                 "capabilities": [
                     "session/open", "session/resume", "session/fork", "session/list",
-                    "prompt/execute",
+                    "session/remote_resume", "session/handoff_export", "session/handoff_import",
+                    "prompt/execute", "prompt/stream_next",
                     "tool/approve", "tool/deny",
                     "patch/preview", "patch/apply",
-                    "diagnostics/list",
+                    "diagnostics/list", "events/poll",
                     "context/suggest", "context/analyze", "context/compress", "context/related",
                     "task/list", "task/update",
                     "status", "cancel", "shutdown"
                 ]
             })),
-            "status" => Ok(serde_json::json!({"status": "ready", "handler": "ide"})),
+            "status" => Ok(serde_json::json!({
+                "status": "ready",
+                "handler": "ide",
+                "partial_messages_enabled": self.include_partial_messages,
+            })),
             "cancel" => Ok(serde_json::json!({"cancelled": true})),
 
             // Session management
@@ -691,9 +1017,13 @@ impl RpcHandler for IdeRpcHandler {
             "session/resume" => self.handle_session_resume(params),
             "session/fork" => self.handle_session_fork(params),
             "session/list" => self.handle_session_list(params),
+            "session/remote_resume" => self.handle_session_remote_resume(params),
+            "session/handoff_export" => self.handle_session_handoff_export(params),
+            "session/handoff_import" => self.handle_session_handoff_import(params),
 
             // Prompt execution
             "prompt/execute" => self.handle_prompt_execute(params),
+            "prompt/stream_next" => self.handle_prompt_stream_next(params),
 
             // Tool approval/denial
             "tool/approve" => self.handle_tool_approve(params),
@@ -705,6 +1035,7 @@ impl RpcHandler for IdeRpcHandler {
 
             // Diagnostics
             "diagnostics/list" => self.handle_diagnostics_list(params),
+            "events/poll" => self.handle_events_poll(params),
 
             // Context management
             "context/suggest" => self.handle_context_suggest(params),
@@ -728,6 +1059,52 @@ fn require_uuid(params: &Value, field: &str) -> Result<Uuid> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing '{field}' parameter"))?;
     Uuid::parse_str(s).map_err(|e| anyhow!("invalid UUID for '{field}': {e}"))
+}
+
+fn optional_uuid(params: &Value, field: &str) -> Result<Option<Uuid>> {
+    let Some(raw) = params.get(field).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        Uuid::parse_str(raw).map_err(|e| anyhow!("invalid UUID for '{field}': {e}"))?,
+    ))
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    }
+}
+
+fn split_partial_chunks(text: &str, max_chunk_bytes: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for token in text.split_whitespace() {
+        let candidate_len = if current.is_empty() {
+            token.len()
+        } else {
+            current.len() + 1 + token.len()
+        };
+        if candidate_len > max_chunk_bytes && !current.is_empty() {
+            out.push(current.clone());
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(token);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -797,6 +1174,11 @@ mod tests {
         let caps = result["capabilities"].as_array().unwrap();
         assert!(caps.iter().any(|c| c == "session/open"));
         assert!(caps.iter().any(|c| c == "prompt/execute"));
+        assert!(caps.iter().any(|c| c == "prompt/stream_next"));
+        assert!(caps.iter().any(|c| c == "session/handoff_export"));
+        assert!(caps.iter().any(|c| c == "session/handoff_import"));
+        assert!(caps.iter().any(|c| c == "session/remote_resume"));
+        assert!(caps.iter().any(|c| c == "events/poll"));
         assert!(caps.iter().any(|c| c == "tool/approve"));
         assert!(caps.iter().any(|c| c == "patch/preview"));
     }
@@ -879,6 +1261,116 @@ mod tests {
         assert_eq!(exec["status"], "queued");
         assert_eq!(exec["prompt"], "explain this code");
         assert!(exec["prompt_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn ide_handler_prompt_partial_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
+
+        let opened = handler
+            .handle("session/open", json!({"workspace_root": "/tmp/stream"}))
+            .unwrap();
+        let sid = opened["session_id"].as_str().unwrap();
+        let exec = handler
+            .handle(
+                "prompt/execute",
+                json!({
+                    "session_id": sid,
+                    "prompt": "stream this response please",
+                    "include_partial_messages": true
+                }),
+            )
+            .expect("prompt/execute");
+        assert_eq!(exec["partial_messages_enabled"], true);
+        let prompt_id = exec["prompt_id"].as_str().unwrap();
+
+        let chunk_1 = handler
+            .handle(
+                "prompt/stream_next",
+                json!({"prompt_id": prompt_id, "cursor": 0, "max_chunks": 1}),
+            )
+            .expect("prompt/stream_next first");
+        assert_eq!(chunk_1["chunks"].as_array().unwrap().len(), 1);
+        let next_cursor = chunk_1["next_cursor"].as_u64().unwrap();
+        assert!(next_cursor >= 1);
+        if !chunk_1["done"].as_bool().unwrap_or(false) {
+            let chunk_2 = handler
+                .handle(
+                    "prompt/stream_next",
+                    json!({"prompt_id": prompt_id, "cursor": next_cursor, "max_chunks": 100}),
+                )
+                .expect("prompt/stream_next second");
+            assert_eq!(chunk_2["done"], true);
+        }
+    }
+
+    #[test]
+    fn ide_handler_handoff_export_import_remote_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
+
+        let opened = handler
+            .handle("session/open", json!({"workspace_root": "/tmp/handoff"}))
+            .unwrap();
+        let sid = opened["session_id"].as_str().unwrap();
+        let _ = handler
+            .handle(
+                "prompt/execute",
+                json!({"session_id": sid, "prompt": "save this conversation"}),
+            )
+            .expect("prompt/execute");
+
+        let export = handler
+            .handle("session/handoff_export", json!({"session_id": sid}))
+            .expect("handoff_export");
+        let bundle_path = export["path"].as_str().unwrap();
+        assert!(std::path::Path::new(bundle_path).exists());
+
+        let imported = handler
+            .handle(
+                "session/handoff_import",
+                json!({"bundle_path": bundle_path, "resume": true}),
+            )
+            .expect("handoff_import");
+        assert_eq!(imported["imported"], true);
+        let imported_id = imported["session_id"].as_str().unwrap();
+        assert!(!imported_id.is_empty());
+
+        let remote = handler
+            .handle(
+                "session/remote_resume",
+                json!({"session_id": imported_id, "transport": "stdio"}),
+            )
+            .expect("remote_resume");
+        assert_eq!(remote["remote"], true);
+        assert_eq!(remote["session_id"], imported_id);
+    }
+
+    #[test]
+    fn ide_handler_events_poll_returns_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
+        let opened = handler
+            .handle("session/open", json!({"workspace_root": "/tmp/events"}))
+            .unwrap();
+        let sid = opened["session_id"].as_str().unwrap();
+        let _ = handler
+            .handle(
+                "prompt/execute",
+                json!({"session_id": sid, "prompt": "hello"}),
+            )
+            .expect("prompt/execute");
+
+        let poll = handler
+            .handle(
+                "events/poll",
+                json!({"session_id": sid, "after_seq": 0, "limit": 10}),
+            )
+            .expect("events/poll");
+        let events = poll["events"].as_array().unwrap();
+        assert!(!events.is_empty());
+        assert!(events[0]["seq_no"].as_u64().is_some());
     }
 
     #[test]

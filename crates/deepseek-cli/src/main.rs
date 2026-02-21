@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use deepseek_agent::AgentEngine;
+use deepseek_core::AppConfig;
 use deepseek_mcp::McpTransport;
 use deepseek_memory::MemoryManager;
 use deepseek_policy::load_managed_settings;
@@ -29,6 +30,7 @@ use commands::diff::{run_apply, run_diff};
 use commands::exec::run_exec;
 use commands::fork::run_fork;
 use commands::git::run_git;
+use commands::leadership::run_leadership;
 use commands::mcp::run_mcp;
 use commands::memory::{run_export, run_memory};
 use commands::profile::{run_benchmark, run_profile};
@@ -41,6 +43,7 @@ use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
 use commands::teleport::run_teleport;
+use commands::update::run_update;
 use commands::visual::run_visual;
 use context::{apply_cli_flags, chat_options_from_cli, ensure_llm_ready, wire_subagent_worker};
 use output::print_json;
@@ -104,11 +107,21 @@ struct Cli {
     allow_dangerously_skip_permissions: bool,
 
     /// Only allow these tools (comma-separated function names, e.g. fs_read,fs_grep).
-    #[arg(long = "allowed-tools", global = true, value_delimiter = ',')]
+    #[arg(
+        long = "allowed-tools",
+        visible_alias = "allowedTools",
+        global = true,
+        value_delimiter = ','
+    )]
     allowed_tools: Vec<String>,
 
     /// Disallow these tools (comma-separated function names, e.g. bash_run,fs_write).
-    #[arg(long = "disallowed-tools", global = true, value_delimiter = ',')]
+    #[arg(
+        long = "disallowed-tools",
+        visible_alias = "disallowedTools",
+        global = true,
+        value_delimiter = ','
+    )]
     disallowed_tools: Vec<String>,
 
     /// Replace the default system prompt entirely.
@@ -142,6 +155,38 @@ struct Cli {
     /// Define custom subagents dynamically (JSON array).
     #[arg(long = "agents")]
     agents: Option<String>,
+
+    /// Enable IDE integration mode (compatibility flag).
+    #[arg(long = "ide", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    ide: bool,
+
+    /// Enable remote workflow mode (compatibility flag).
+    #[arg(long = "remote", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    remote: bool,
+
+    /// Enable teammate orchestration mode (compatibility flag).
+    #[arg(long = "teammate-mode", global = true)]
+    teammate_mode: Option<String>,
+
+    /// Enable beta features by name.
+    #[arg(long = "betas", global = true, value_delimiter = ',')]
+    betas: Vec<String>,
+
+    /// Run in maintenance mode.
+    #[arg(long = "maintenance", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    maintenance: bool,
+
+    /// Print effective settings source paths and exit.
+    #[arg(long = "setting-sources", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    setting_sources: bool,
+
+    /// Include partial message chunks in stream interfaces.
+    #[arg(long = "include-partial-messages", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    include_partial_messages: bool,
+
+    /// Flag form for teleport handoff.
+    #[arg(long = "teleport", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    teleport_flag: bool,
 
     /// Enable Chrome browser integration.
     #[arg(long = "chrome")]
@@ -276,6 +321,8 @@ enum Commands {
     Usage(UsageArgs),
     Compact(CompactArgs),
     Doctor(DoctorArgs),
+    Leadership(LeadershipArgs),
+    Update(UpdateArgs),
     Index {
         #[command(subcommand)]
         command: IndexCmd,
@@ -542,6 +589,38 @@ impl Default for DoctorArgs {
             mode: DoctorModeArg::Auto,
         }
     }
+}
+
+#[derive(Args, Clone)]
+struct LeadershipArgs {
+    /// Audit lookback window (hours) for enterprise report metrics.
+    #[arg(long, default_value_t = 24)]
+    audit_window_hours: u64,
+    /// Optional file path to write report JSON (pretty-printed).
+    #[arg(long)]
+    export: Option<String>,
+    /// Exit with non-zero status when readiness checks fail.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    strict: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum UpdateChannelArg {
+    Stable,
+    Nightly,
+}
+
+#[derive(Args, Clone)]
+struct UpdateArgs {
+    /// Check update metadata only, do not perform update.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    check: bool,
+    /// Print what would run without executing update commands.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    dry_run: bool,
+    /// Update channel.
+    #[arg(long, value_enum, default_value_t = UpdateChannelArg::Stable)]
+    channel: UpdateChannelArg,
 }
 
 #[derive(Args)]
@@ -1162,6 +1241,50 @@ fn run() -> Result<()> {
     validate_cli_flags(&cli)?;
     let cwd = std::env::current_dir()?;
 
+    if cli.ide {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_IDE_MODE", "1") };
+    }
+    if cli.remote {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_REMOTE_MODE", "1") };
+    }
+    if let Some(mode) = cli.teammate_mode.as_deref() {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_TEAMMATE_MODE", mode) };
+    }
+    if !cli.betas.is_empty() {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_BETAS", cli.betas.join(",")) };
+    }
+    if cli.maintenance {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_MAINTENANCE_MODE", "1") };
+    }
+    if cli.include_partial_messages {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_INCLUDE_PARTIAL_MESSAGES", "1") };
+    }
+
+    if cli.setting_sources {
+        let payload = json!({
+            "schema": "deepseek.settings_sources.v1",
+            "user": AppConfig::user_settings_path(),
+            "project": AppConfig::project_settings_path(&cwd),
+            "project_local": AppConfig::project_local_settings_path(&cwd),
+            "legacy_toml": AppConfig::legacy_toml_path(&cwd),
+            "managed": deepseek_policy::managed_settings_path(),
+            "team_policy_env": std::env::var("DEEPSEEK_TEAM_POLICY_PATH").ok(),
+            "managed_env": std::env::var("DEEPSEEK_MANAGED_SETTINGS_PATH").ok(),
+        });
+        if cli.json {
+            print_json(&payload)?;
+        } else {
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        return Ok(());
+    }
+
     // Handle --init: create DEEPSEEK.md and exit
     if cli.init {
         let manager = MemoryManager::new(&cwd)?;
@@ -1207,6 +1330,10 @@ fn run() -> Result<()> {
     // Handle --resume SESSION_ID: resume specific session
     if let Some(ref session_id) = cli.resume_session {
         return run_resume_specific(&cwd, session_id, cli.json, cli.model.as_deref());
+    }
+
+    if cli.teleport_flag && cli.command.is_none() {
+        return run_teleport(&cwd, TeleportArgs::default(), cli.json);
     }
 
     let command = cli
@@ -1269,6 +1396,8 @@ fn run() -> Result<()> {
         Commands::Usage(args) => run_usage(&cwd, args, cli.json),
         Commands::Compact(args) => run_compact(&cwd, args, cli.json),
         Commands::Doctor(args) => run_doctor(&cwd, args, cli.json),
+        Commands::Leadership(args) => run_leadership(&cwd, args, cli.json),
+        Commands::Update(args) => run_update(&cwd, args, cli.json),
         Commands::Index { command } => run_index(&cwd, command, cli.json),
         Commands::Config { command } => run_config(&cwd, command, cli.json),
         Commands::Benchmark { command } => run_benchmark(cwd.as_path(), command, cli.json),

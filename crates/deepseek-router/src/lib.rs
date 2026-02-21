@@ -80,11 +80,19 @@ impl WeightedRouter {
 impl ModelRouter for WeightedRouter {
     fn select(&self, unit: LlmUnit, signals: RouterSignals) -> RouterDecision {
         let score = self.score(&signals);
-        let planner_bias = matches!(unit, LlmUnit::Planner) && signals.repo_breadth > 0.5;
-        let high = score >= self.cfg.threshold_high || planner_bias;
+        let score_high = score >= self.cfg.threshold_high;
+        // Planner bias should only kick in for broad, uncertain planning states.
+        // This keeps default hybrid routing chat-first for routine prompts.
+        let planner_bias = matches!(unit, LlmUnit::Planner)
+            && signals.repo_breadth >= 0.85
+            && (signals.low_confidence >= 0.55
+                || signals.failure_streak >= 0.45
+                || signals.verification_failures >= 0.35
+                || signals.ambiguity_flags >= 0.65);
+        let high = score_high || planner_bias;
         let mut reason_codes = Vec::new();
 
-        if high {
+        if score_high {
             reason_codes.push("threshold_high".to_string());
         }
         if planner_bias {
@@ -214,10 +222,10 @@ mod tests {
             LlmUnit::Planner,
             RouterSignals {
                 prompt_complexity: 0.0,
-                repo_breadth: 0.6, // > 0.5 triggers planner bias
+                repo_breadth: 0.9, // broad scope
                 failure_streak: 0.0,
                 verification_failures: 0.0,
-                low_confidence: 0.0,
+                low_confidence: 0.8, // uncertain prompt requires stronger reasoning
                 ambiguity_flags: 0.0,
             },
         );
@@ -226,6 +234,37 @@ mod tests {
             "planner bias should escalate even with low score"
         );
         assert_eq!(decision.selected_model, "deepseek-reasoner");
+        assert!(
+            decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "planner_repo_breadth_bias")
+        );
+        assert!(
+            !decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "threshold_high"),
+            "planner bias escalation should not report threshold_high unless score crossed threshold"
+        );
+    }
+
+    #[test]
+    fn planner_bias_does_not_trigger_on_routine_scope() {
+        let router = WeightedRouter::new(RouterConfig::default());
+        let decision = router.select(
+            LlmUnit::Planner,
+            RouterSignals {
+                prompt_complexity: 0.1,
+                repo_breadth: 0.6,
+                failure_streak: 0.0,
+                verification_failures: 0.0,
+                low_confidence: 0.2,
+                ambiguity_flags: 0.1,
+            },
+        );
+        assert!(!decision.escalated);
+        assert_eq!(decision.selected_model, "deepseek-chat");
     }
 
     #[test]

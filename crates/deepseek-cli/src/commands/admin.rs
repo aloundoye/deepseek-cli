@@ -17,6 +17,7 @@ use std::time::Duration;
 use crate::commands::intelligence::{
     DebugAnalysisMode, FrameworkReport, analyze_debug_text, detect_frameworks,
 };
+use crate::commands::leadership::{LeadershipReport, build_leadership_report};
 use crate::context::*;
 use crate::output::*;
 use crate::util::*;
@@ -214,6 +215,21 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                     .unwrap_or("unknown")
             );
         }
+        if let Some(leadership) = payload.get("leadership") {
+            println!(
+                "leadership: score={} ok={} integrations={} deployment_risks={}",
+                leadership["readiness"]["score"].as_u64().unwrap_or(0),
+                leadership["readiness"]["ok"].as_bool().unwrap_or(false),
+                leadership["ecosystem"]["integrations"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0),
+                leadership["deployment"]["risks"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0)
+            );
+        }
         if let Some(debug) = payload.get("debug_analysis")
             && !debug.is_null()
         {
@@ -303,6 +319,13 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             }
         }
     };
+    let leadership = match build_leadership_report(cwd, 24) {
+        Ok(report) => report,
+        Err(err) => {
+            warnings.push(format!("leadership analysis failed: {err}"));
+            LeadershipReport::default()
+        }
+    };
 
     let debug_source = if let Some(file) = args.analyze_file.as_deref() {
         Some(json!({
@@ -367,6 +390,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         },
         "checks": checks,
         "frameworks": frameworks,
+        "leadership": leadership,
         "debug_source": debug_source,
         "debug_analysis": debug_analysis,
         "warnings": warnings,

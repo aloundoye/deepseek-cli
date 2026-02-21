@@ -34,6 +34,10 @@ jobs:
       - name: tests
         run: cargo test --workspace --all-targets
 
+      - name: parity regression checklist
+        if: runner.os == 'Linux'
+        run: bash scripts/parity_regression_check.sh
+
       - name: build
         run: cargo build --workspace
 

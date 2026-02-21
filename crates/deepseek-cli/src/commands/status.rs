@@ -6,6 +6,7 @@ use deepseek_tools::PluginManager;
 use deepseek_ui::UiStatus;
 use serde_json::json;
 use std::path::Path;
+use uuid::Uuid;
 
 use crate::UsageArgs;
 use crate::output::*;
@@ -36,6 +37,11 @@ pub(crate) fn current_ui_status(
         .tool_invocations
         .len()
         .saturating_sub(projection.approved_invocations.len());
+    let pr_review_status = resolve_pr_review_status(
+        &store,
+        session.as_ref().map(|s| s.session_id),
+        projection.review_ids.len(),
+    )?;
     let estimated_cost_usd = (usage.input_tokens as f64 / 1_000_000.0)
         * cfg.usage.cost_per_million_input
         + (usage.output_tokens as f64 / 1_000_000.0) * cfg.usage.cost_per_million_output;
@@ -73,7 +79,54 @@ pub(crate) fn current_ui_status(
         context_max_tokens: cfg.llm.context_window_tokens,
         session_turns: projection.transcript.len(),
         working_directory: cwd.display().to_string(),
+        pr_review_status,
     })
+}
+
+fn resolve_pr_review_status(
+    store: &Store,
+    session_id: Option<Uuid>,
+    started_reviews: usize,
+) -> Result<Option<String>> {
+    if let Ok(raw) = std::env::var("DEEPSEEK_PR_REVIEW_STATUS")
+        && let Some(status) = normalize_review_status(&raw)
+    {
+        return Ok(Some(status.to_string()));
+    }
+
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let reviews = store.list_review_runs(session_id)?;
+    if started_reviews > reviews.len() {
+        return Ok(Some("pending".to_string()));
+    }
+    let Some(latest) = reviews.first() else {
+        return Ok(None);
+    };
+    let target = latest.target.to_ascii_lowercase();
+    if target.contains("merged") {
+        return Ok(Some("merged".to_string()));
+    }
+    if target.contains("draft") {
+        return Ok(Some("draft".to_string()));
+    }
+    if latest.critical_count > 0 || latest.findings_count > 0 {
+        return Ok(Some("changes_requested".to_string()));
+    }
+    Ok(Some("approved".to_string()))
+}
+
+fn normalize_review_status(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "approved" => Some("approved"),
+        "pending" => Some("pending"),
+        "changes_requested" => Some("changes_requested"),
+        "draft" => Some("draft"),
+        "merged" => Some("merged"),
+        _ => None,
+    }
 }
 
 pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
