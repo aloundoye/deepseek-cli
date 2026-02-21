@@ -90,6 +90,22 @@ pub enum SlashCommand {
     TerminalSetup,
     Keybindings,
     Doctor,
+    Copy,
+    Debug(Vec<String>),
+    Exit,
+    Hooks(Vec<String>),
+    Rename(Option<String>),
+    Resume(Option<String>),
+    Stats,
+    Statusline(Vec<String>),
+    Theme(Option<String>),
+    Usage,
+    AddDir(Vec<String>),
+    Bug,
+    PrComments(Vec<String>),
+    ReleaseNotes(Vec<String>),
+    Login,
+    Logout,
     Unknown { name: String, args: Vec<String> },
 }
 
@@ -134,6 +150,22 @@ impl SlashCommand {
             "terminal-setup" => Self::TerminalSetup,
             "keybindings" => Self::Keybindings,
             "doctor" => Self::Doctor,
+            "copy" => Self::Copy,
+            "debug" => Self::Debug(args),
+            "exit" | "quit" => Self::Exit,
+            "hooks" => Self::Hooks(args),
+            "rename" => Self::Rename(args.first().cloned()),
+            "resume" => Self::Resume(args.first().cloned()),
+            "stats" => Self::Stats,
+            "statusline" => Self::Statusline(args),
+            "theme" => Self::Theme(args.first().cloned()),
+            "usage" => Self::Usage,
+            "add-dir" => Self::AddDir(args),
+            "bug" => Self::Bug,
+            "pr_comments" | "pr-comments" => Self::PrComments(args),
+            "release-notes" | "release_notes" => Self::ReleaseNotes(args),
+            "login" => Self::Login,
+            "logout" => Self::Logout,
             other => Self::Unknown {
                 name: other.to_string(),
                 args,
@@ -2622,6 +2654,50 @@ mod tests {
             Some(SlashCommand::Vim(vec!["normal".to_string()]))
         );
         assert_eq!(SlashCommand::parse("/doctor"), Some(SlashCommand::Doctor));
+        assert_eq!(SlashCommand::parse("/copy"), Some(SlashCommand::Copy));
+        assert_eq!(
+            SlashCommand::parse("/debug connection"),
+            Some(SlashCommand::Debug(vec!["connection".to_string()]))
+        );
+        assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
+        assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit));
+        assert_eq!(
+            SlashCommand::parse("/hooks list"),
+            Some(SlashCommand::Hooks(vec!["list".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/rename my-session"),
+            Some(SlashCommand::Rename(Some("my-session".to_string())))
+        );
+        assert_eq!(
+            SlashCommand::parse("/resume abc123"),
+            Some(SlashCommand::Resume(Some("abc123".to_string())))
+        );
+        assert_eq!(SlashCommand::parse("/stats"), Some(SlashCommand::Stats));
+        assert_eq!(
+            SlashCommand::parse("/theme dark"),
+            Some(SlashCommand::Theme(Some("dark".to_string())))
+        );
+        assert_eq!(SlashCommand::parse("/usage"), Some(SlashCommand::Usage));
+        assert_eq!(
+            SlashCommand::parse("/add-dir /tmp/extra"),
+            Some(SlashCommand::AddDir(vec!["/tmp/extra".to_string()]))
+        );
+        assert_eq!(SlashCommand::parse("/bug"), Some(SlashCommand::Bug));
+        assert_eq!(
+            SlashCommand::parse("/pr_comments 42"),
+            Some(SlashCommand::PrComments(vec!["42".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/pr-comments 42"),
+            Some(SlashCommand::PrComments(vec!["42".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/release-notes v1.0..v2.0"),
+            Some(SlashCommand::ReleaseNotes(vec!["v1.0..v2.0".to_string()]))
+        );
+        assert_eq!(SlashCommand::parse("/login"), Some(SlashCommand::Login));
+        assert_eq!(SlashCommand::parse("/logout"), Some(SlashCommand::Logout));
     }
 
     #[test]

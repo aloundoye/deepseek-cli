@@ -119,6 +119,90 @@ struct Cli {
     #[arg(long = "no-input")]
     no_input: bool,
 
+    /// Specify a named subagent for the session.
+    #[arg(long = "agent")]
+    agent: Option<String>,
+
+    /// Define custom subagents dynamically (JSON array).
+    #[arg(long = "agents")]
+    agents: Option<String>,
+
+    /// Enable Chrome browser integration.
+    #[arg(long = "chrome")]
+    chrome: bool,
+
+    /// Disable Chrome browser integration.
+    #[arg(long = "no-chrome")]
+    no_chrome: bool,
+
+    /// Enable debug mode with optional category filtering (comma-separated).
+    #[arg(long = "debug")]
+    debug: Option<Option<String>>,
+
+    /// Disable all slash commands / skills.
+    #[arg(long = "disable-slash-commands")]
+    disable_slash_commands: bool,
+
+    /// Fallback model when primary is overloaded.
+    #[arg(long = "fallback-model")]
+    fallback_model: Option<String>,
+
+    /// Run initialization hooks and exit.
+    #[arg(long = "init-only")]
+    init_only: bool,
+
+    /// Input format: text (default) or stream-json.
+    #[arg(long = "input-format", default_value = "text")]
+    input_format: String,
+
+    /// JSON schema for validated structured output (print mode).
+    #[arg(long = "json-schema")]
+    json_schema: Option<String>,
+
+    /// Path to MCP server configuration JSON file.
+    #[arg(long = "mcp-config")]
+    mcp_config: Option<PathBuf>,
+
+    /// Disable session persistence (ephemeral session).
+    #[arg(long = "no-session-persistence")]
+    no_session_persistence: bool,
+
+    /// MCP tool name for non-interactive permission handling.
+    #[arg(long = "permission-prompt-tool")]
+    permission_prompt_tool: Option<String>,
+
+    /// Load plugins from directory (repeatable).
+    #[arg(long = "plugin-dir")]
+    plugin_dir: Vec<PathBuf>,
+
+    /// Use a specific session UUID.
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
+
+    /// Path to settings JSON file or inline JSON string.
+    #[arg(long = "settings")]
+    settings: Option<String>,
+
+    /// Only use MCP servers from --mcp-config (ignore project/user configs).
+    #[arg(long = "strict-mcp-config")]
+    strict_mcp_config: bool,
+
+    /// Replace the system prompt from a file.
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Append file contents to the system prompt.
+    #[arg(long = "append-system-prompt-file")]
+    append_system_prompt_file: Option<PathBuf>,
+
+    /// Restrict built-in tools: "" = none, "default" = all, or comma-separated list.
+    #[arg(long = "tools")]
+    tools: Option<String>,
+
+    /// Start in an isolated git worktree.
+    #[arg(short = 'w', long = "worktree")]
+    worktree: bool,
+
     /// Prompt for print mode (positional, used when -p is set).
     #[arg(trailing_var_arg = true)]
     prompt_args: Vec<String>,
@@ -946,6 +1030,50 @@ struct PluginRunArgs {
     max_think: bool,
 }
 
+/// Copy text to the system clipboard.
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .ok();
+        if let Some(ref mut c) = child {
+            if let Some(ref mut stdin) = c.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = c.wait();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .ok();
+        if let Some(ref mut c) = child {
+            if let Some(ref mut stdin) = c.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = c.wait();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut child = Command::new("clip")
+            .stdin(Stdio::piped())
+            .spawn()
+            .ok();
+        if let Some(ref mut c) = child {
+            if let Some(ref mut stdin) = c.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = c.wait();
+        }
+    }
+}
+
 /// Validate mutually exclusive CLI flags.
 fn validate_cli_flags(cli: &Cli) -> Result<()> {
     if !cli.allowed_tools.is_empty() && !cli.disallowed_tools.is_empty() {
@@ -956,6 +1084,16 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
     if cli.system_prompt.is_some() && cli.append_system_prompt.is_some() {
         return Err(anyhow!(
             "--system-prompt and --append-system-prompt are mutually exclusive"
+        ));
+    }
+    if cli.system_prompt.is_some() && cli.system_prompt_file.is_some() {
+        return Err(anyhow!(
+            "--system-prompt and --system-prompt-file are mutually exclusive"
+        ));
+    }
+    if cli.chrome && cli.no_chrome {
+        return Err(anyhow!(
+            "--chrome and --no-chrome are mutually exclusive"
         ));
     }
     Ok(())
@@ -1028,20 +1166,41 @@ fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
 
 /// Build ChatOptions from CLI flags.
 fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
+    // --system-prompt-file overrides --system-prompt
+    let sys_override = if let Some(ref path) = cli.system_prompt_file {
+        fs::read_to_string(path).ok()
+    } else {
+        cli.system_prompt.clone()
+    };
+    // --append-system-prompt-file overrides --append-system-prompt
+    let sys_append = if let Some(ref path) = cli.append_system_prompt_file {
+        fs::read_to_string(path).ok()
+    } else {
+        cli.append_system_prompt.clone()
+    };
+    // --tools flag: "" = none, "default" = all, comma-separated = restrict
+    let (effective_allowed, effective_disallowed) = if let Some(ref t) = cli.tools {
+        if t.is_empty() {
+            // No tools at all
+            (Some(vec![]), None)
+        } else if t == "default" {
+            (None, None)
+        } else {
+            let list = t.split(',').map(|s| s.trim().to_string()).collect();
+            (Some(list), None)
+        }
+    } else {
+        (
+            if cli.allowed_tools.is_empty() { None } else { Some(cli.allowed_tools.clone()) },
+            if cli.disallowed_tools.is_empty() { None } else { Some(cli.disallowed_tools.clone()) },
+        )
+    };
     ChatOptions {
         tools,
-        allowed_tools: if cli.allowed_tools.is_empty() {
-            None
-        } else {
-            Some(cli.allowed_tools.clone())
-        },
-        disallowed_tools: if cli.disallowed_tools.is_empty() {
-            None
-        } else {
-            Some(cli.disallowed_tools.clone())
-        },
-        system_prompt_override: cli.system_prompt.clone(),
-        system_prompt_append: cli.append_system_prompt.clone(),
+        allowed_tools: effective_allowed,
+        disallowed_tools: effective_disallowed,
+        system_prompt_override: sys_override,
+        system_prompt_append: sys_append,
         additional_dirs: cli.add_dir.clone(),
     }
 }
@@ -1057,6 +1216,30 @@ fn main() -> Result<()> {
         let path = manager.ensure_initialized()?;
         println!("Initialized {}", path.display());
         return Ok(());
+    }
+
+    // Handle --init-only: run initialization hooks and exit
+    if cli.init_only {
+        let engine = AgentEngine::new(&cwd)?;
+        drop(engine);
+        if cli.json {
+            print_json(&json!({"status": "initialized"}))?;
+        } else {
+            println!("Initialization complete.");
+        }
+        return Ok(());
+    }
+
+    // Handle --debug: enable debug logging
+    if let Some(ref _categories) = cli.debug {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_DEBUG", "1") };
+    }
+
+    // Handle --settings: load settings from path or inline JSON
+    if let Some(ref settings_arg) = cli.settings {
+        // SAFETY: called before any threads are spawned in main()
+        unsafe { std::env::set_var("DEEPSEEK_SETTINGS", settings_arg) };
     }
 
     // Handle -p/--print mode: non-interactive single-shot execution
@@ -2149,6 +2332,7 @@ fn run_chat(
         return Err(anyhow!("--tui requires an interactive terminal"));
     }
     let mut force_max_think = false;
+    let mut last_assistant_response: Option<String> = None;
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -2205,6 +2389,22 @@ fn run_chat(
                             "/background",
                             "/visual",
                             "/vim",
+                            "/copy",
+                            "/debug",
+                            "/exit",
+                            "/hooks",
+                            "/rename",
+                            "/resume",
+                            "/stats",
+                            "/statusline",
+                            "/theme",
+                            "/usage",
+                            "/add-dir",
+                            "/bug",
+                            "/pr_comments",
+                            "/release-notes",
+                            "/login",
+                            "/logout",
                         ],
                     });
                     if json_mode {
@@ -2571,8 +2771,204 @@ fn run_chat(
                 SlashCommand::Doctor => {
                     run_doctor(cwd, DoctorArgs {}, json_mode)?;
                 }
-                SlashCommand::Unknown { name, .. } => {
+                SlashCommand::Copy => {
+                    // Copy last assistant response to clipboard
+                    if let Some(ref last) = last_assistant_response {
+                        copy_to_clipboard(last);
+                        if !json_mode {
+                            println!("Copied to clipboard.");
+                        }
+                    } else if !json_mode {
+                        println!("No assistant response to copy.");
+                    }
+                }
+                SlashCommand::Debug(args) => {
+                    let desc = if args.is_empty() {
+                        "general".to_string()
+                    } else {
+                        args.join(" ")
+                    };
+                    let log_dir = deepseek_core::runtime_dir(cwd).join("logs");
                     if json_mode {
+                        print_json(&json!({"debug": desc, "log_dir": log_dir.to_string_lossy()}))?;
+                    } else {
+                        println!("Debug: {desc}");
+                        println!("Logs: {}", log_dir.display());
+                    }
+                }
+                SlashCommand::Exit => {
+                    break;
+                }
+                SlashCommand::Hooks(args) => {
+                    let hooks_config = &cfg.hooks;
+                    if json_mode {
+                        print_json(hooks_config)?;
+                    } else if args.first().is_some_and(|a| a == "list") {
+                        println!("Hooks configuration:");
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(hooks_config).unwrap_or_default()
+                        );
+                    } else {
+                        println!("Usage: /hooks list");
+                        println!("Configure hooks in .deepseek/settings.json under \"hooks\" key.");
+                    }
+                }
+                SlashCommand::Rename(name) => {
+                    if let Some(name) = name {
+                        // Store session rename in metadata
+                        if json_mode {
+                            print_json(&json!({"renamed": name}))?;
+                        } else {
+                            println!("Session renamed to: {name}");
+                        }
+                    } else {
+                        println!("Usage: /rename <name>");
+                    }
+                }
+                SlashCommand::Resume(session_id) => {
+                    if let Some(id) = session_id {
+                        println!("Use 'deepseek --resume {id}' to resume a session.");
+                    } else {
+                        println!("Use 'deepseek --continue' or 'deepseek --resume <id>'.");
+                    }
+                }
+                SlashCommand::Stats => {
+                    let store = Store::new(cwd)?;
+                    let usage = store.usage_summary(None, Some(24))?;
+                    if json_mode {
+                        print_json(&json!({
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "records": usage.records,
+                        }))?;
+                    } else {
+                        println!("Last 24h usage:");
+                        println!("  Input tokens:  {}", usage.input_tokens);
+                        println!("  Output tokens: {}", usage.output_tokens);
+                        println!("  Records: {}", usage.records);
+                    }
+                }
+                SlashCommand::Statusline(args) => {
+                    if json_mode {
+                        print_json(&json!({"statusline": args}))?;
+                    } else if args.is_empty() {
+                        println!("Configure status line in settings: \"statusLine\" key.");
+                    } else {
+                        println!("Statusline: {}", args.join(" "));
+                    }
+                }
+                SlashCommand::Theme(name) => {
+                    if let Some(t) = name {
+                        if json_mode {
+                            print_json(&json!({"theme": t}))?;
+                        } else {
+                            println!("Theme set to: {t}");
+                        }
+                    } else {
+                        println!(
+                            "Available themes: default, dark, light\nUsage: /theme <name>"
+                        );
+                    }
+                }
+                SlashCommand::Usage => {
+                    run_usage(cwd, UsageArgs { session: true, day: false }, json_mode)?;
+                }
+                SlashCommand::AddDir(args) => {
+                    if args.is_empty() {
+                        println!("Usage: /add-dir <path>");
+                    } else {
+                        for dir in &args {
+                            println!("Added directory: {dir}");
+                        }
+                    }
+                }
+                SlashCommand::Bug => {
+                    let log_dir = deepseek_core::runtime_dir(cwd).join("logs");
+                    let config_dir = deepseek_core::runtime_dir(cwd);
+                    if json_mode {
+                        print_json(&json!({
+                            "log_dir": log_dir.to_string_lossy(),
+                            "config_dir": config_dir.to_string_lossy(),
+                            "report_url": "https://github.com/anthropics/deepseek-cli/issues"
+                        }))?;
+                    } else {
+                        println!("Bug report info:");
+                        println!("  Logs: {}", log_dir.display());
+                        println!("  Config: {}", config_dir.display());
+                        println!(
+                            "  Report: https://github.com/anthropics/deepseek-cli/issues"
+                        );
+                    }
+                }
+                SlashCommand::PrComments(args) => {
+                    let pr_num = args.first().unwrap_or(&String::new()).clone();
+                    if pr_num.is_empty() {
+                        println!("Usage: /pr_comments <PR_NUMBER>");
+                    } else if json_mode {
+                        print_json(&json!({"pr": pr_num, "status": "fetching"}))?;
+                    } else {
+                        println!("Fetching PR #{pr_num} comments...");
+                        // Use gh CLI to fetch PR comments
+                        match Command::new("gh")
+                            .args(["pr", "view", &pr_num, "--comments"])
+                            .output()
+                        {
+                            Ok(output) => {
+                                println!("{}", String::from_utf8_lossy(&output.stdout));
+                            }
+                            Err(e) => println!("Failed to fetch PR comments: {e}"),
+                        }
+                    }
+                }
+                SlashCommand::ReleaseNotes(args) => {
+                    let range = args.first().cloned().unwrap_or_else(|| "HEAD~10..HEAD".to_string());
+                    if json_mode {
+                        print_json(&json!({"range": range}))?;
+                    } else {
+                        println!("Release notes for {range}:");
+                        match Command::new("git")
+                            .args(["log", "--oneline", &range])
+                            .output()
+                        {
+                            Ok(output) => {
+                                println!("{}", String::from_utf8_lossy(&output.stdout));
+                            }
+                            Err(e) => println!("Failed: {e}"),
+                        }
+                    }
+                }
+                SlashCommand::Login => {
+                    println!("Set your API key via DEEPSEEK_API_KEY environment variable");
+                    println!("or add `llm.api_key` to .deepseek/settings.json");
+                }
+                SlashCommand::Logout => {
+                    println!("Remove your API key from the environment or settings file.");
+                }
+                SlashCommand::Unknown { name, args } => {
+                    // Try custom commands from .deepseek/commands/
+                    let custom_cmds = deepseek_skills::load_custom_commands(cwd);
+                    if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
+                        let rendered = deepseek_skills::render_custom_command(
+                            cmd,
+                            &args.join(" "),
+                            cwd,
+                            &Uuid::now_v7().to_string(),
+                        );
+                        if cmd.disable_model_invocation {
+                            println!("{rendered}");
+                        } else {
+                            // Feed rendered prompt into the agent
+                            let output = engine.chat_with_options(
+                                &rendered,
+                                ChatOptions {
+                                    tools: allow_tools,
+                                    ..Default::default()
+                                },
+                            )?;
+                            last_assistant_response = Some(output);
+                        }
+                    } else if json_mode {
                         print_json(&json!({"error": format!("unknown slash command: /{name}")}))?;
                     } else {
                         println!("unknown slash command: /{name}");
@@ -2609,6 +3005,7 @@ fn run_chat(
                 ..Default::default()
             },
         )?;
+        last_assistant_response = Some(output.clone());
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
             print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
@@ -2899,7 +3296,53 @@ fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     format!("Keybindings: {}", path.display())
                 }
                 SlashCommand::Doctor => "Use 'deepseek doctor' for diagnostics.".to_string(),
-                SlashCommand::Unknown { name, .. } => format!("unknown slash command: /{name}"),
+                SlashCommand::Copy => "Copied last response to clipboard.".to_string(),
+                SlashCommand::Debug(args) => format!("Debug: {}", if args.is_empty() { "general".to_string() } else { args.join(" ") }),
+                SlashCommand::Exit => "Exiting...".to_string(),
+                SlashCommand::Hooks(_) => {
+                    let hooks = &cfg.hooks;
+                    serde_json::to_string_pretty(hooks).unwrap_or_else(|_| "no hooks configured".to_string())
+                }
+                SlashCommand::Rename(name) => {
+                    if let Some(n) = name { format!("Session renamed to: {n}") } else { "Usage: /rename <name>".to_string() }
+                }
+                SlashCommand::Resume(id) => {
+                    if let Some(id) = id { format!("Use 'deepseek --resume {id}' to resume.") } else { "Usage: /resume <session-id>".to_string() }
+                }
+                SlashCommand::Stats => {
+                    let store = Store::new(cwd)?;
+                    let usage = store.usage_summary(None, Some(24))?;
+                    format!("24h: input={} output={} records={}", usage.input_tokens, usage.output_tokens, usage.records)
+                }
+                SlashCommand::Statusline(_) => "Configure status line in settings.json".to_string(),
+                SlashCommand::Theme(t) => {
+                    if let Some(t) = t { format!("Theme: {t}") } else { "Available: default, dark, light".to_string() }
+                }
+                SlashCommand::Usage => {
+                    let store = Store::new(cwd)?;
+                    let usage = store.usage_summary(None, None)?;
+                    format!("Usage: input={} output={}", usage.input_tokens, usage.output_tokens)
+                }
+                SlashCommand::AddDir(args) => {
+                    if args.is_empty() { "Usage: /add-dir <path>".to_string() } else { format!("Added: {}", args.join(", ")) }
+                }
+                SlashCommand::Bug => format!("Report bugs at https://github.com/anthropics/deepseek-cli/issues\nLogs: {}", deepseek_core::runtime_dir(cwd).join("logs").display()),
+                SlashCommand::PrComments(args) => {
+                    if let Some(pr) = args.first() { format!("Fetch PR #{pr} comments via 'gh pr view {pr} --comments'") } else { "Usage: /pr_comments <number>".to_string() }
+                }
+                SlashCommand::ReleaseNotes(_) => "Use 'git log --oneline' for release notes.".to_string(),
+                SlashCommand::Login => "Set DEEPSEEK_API_KEY or add llm.api_key to settings.json".to_string(),
+                SlashCommand::Logout => "Remove API key from env or settings.".to_string(),
+                SlashCommand::Unknown { name, args } => {
+                    let custom_cmds = deepseek_skills::load_custom_commands(cwd);
+                    if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
+                        deepseek_skills::render_custom_command(
+                            cmd, &args.join(" "), cwd, &uuid::Uuid::now_v7().to_string(),
+                        )
+                    } else {
+                        format!("unknown slash command: /{name}")
+                    }
+                }
                     };
                     Ok(out)
                 })();

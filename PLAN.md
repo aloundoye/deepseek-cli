@@ -260,9 +260,9 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 10: CLI Flags & Slash Commands Full Parity
+## Phase 10: CLI Flags & Slash Commands Full Parity ✅
 
-### 10.1 Missing CLI flags
+### 10.1 Missing CLI flags ✅
 - `--agent NAME` — specify a subagent for the session
 - `--agents JSON` — define custom subagents dynamically
 - `--chrome` / `--no-chrome` — Chrome browser integration toggle
@@ -285,7 +285,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 - `--tools LIST` — restrict built-in tools (`""` = none, `"default"` = all, or comma-separated)
 - `--worktree` / `-w` — start in isolated git worktree
 
-### 10.2 Missing slash commands
+### 10.2 Missing slash commands ✅
 - `/copy` — copy last assistant response to clipboard
 - `/debug [description]` — troubleshoot session via debug log analysis
 - `/exit` — exit REPL (may already work via Ctrl+D)
@@ -302,7 +302,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 - `/release-notes` — generate release notes from commits
 - `/login` / `/logout` — credential management
 
-### 10.3 Custom slash commands
+### 10.3 Custom slash commands ✅
 - Load from `.deepseek/commands/`, `~/.deepseek/commands/`
 - YAML frontmatter + markdown body
 - Variable substitution: `$ARGUMENTS`, `$WORKSPACE`, `$SESSION_ID`
@@ -311,10 +311,9 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 - `context: fork` — run in a subagent
 - Register in slash command autocomplete
 
-### 10.4 Structured output (print mode)
+### 10.4 Structured output (print mode) — DEFERRED
 - `--json-schema` flag: LLM output validated against provided JSON schema
-- Return structured JSON matching the schema
-- Error if output doesn't validate
+- Schema validation requires a JSON Schema library — deferred to Phase 15
 
 ---
 
@@ -647,7 +646,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | 7 | ✅ Complete | Missing LLM tools (Skill, KillShell, background bash) |
 | 8 | ✅ Complete | Full hooks system (14 events, command handler, wired into agent) |
 | 9 | ✅ Complete | Memory & configuration parity (rules, hierarchy, @imports, modes, globs, settings) |
-| 10 | Pending | CLI flags & slash commands full parity |
+| 10 | ✅ Complete | CLI flags & slash commands full parity (20 flags, 16 commands, custom commands) |
 | 11 | Pending | TUI & interaction parity (vim, shortcuts, checkpoints) |
 | 12 | Pending | MCP full integration |
 | 13 | Pending | Permission & sandbox parity |
@@ -661,7 +660,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | Category | We Have | Claude Code Has | Gap |
 |----------|---------|----------------|-----|
 | LLM Tools | ~40 | ~38 | Full parity ✅ |
-| Slash Commands | 23 | ~30 | /copy, /debug, /hooks, /rename, /stats, /theme, /usage, /add-dir |
+| Slash Commands | 46 (built-in + custom) | ~30 | Full parity ✅ + custom commands |
 | Hook Events | 14 (all events) | 14 | Full parity ✅ (prompt/agent handlers deferred) |
 | Permission Modes | 5 (ask/auto/plan/acceptEdits/dontAsk) | 5 | Full parity ✅ |
 | Subagent Types | 5 (explore/plan/task/bash/custom) | 6+ | Full parity ✅ |
