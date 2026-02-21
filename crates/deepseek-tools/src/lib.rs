@@ -31,16 +31,10 @@ use uuid::Uuid;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const READ_MAX_BYTES_DEFAULT: usize = 1_000_000;
 
-/// Tools that are forbidden during review mode (read-only pipeline).
-const REVIEW_BLOCKED_TOOLS: &[&str] = &[
-    "fs.write",
-    "fs.edit",
-    "multi_edit",
-    "patch.stage",
-    "patch.apply",
-    "bash.run",
-    "notebook.edit",
-];
+/// Check whether a tool (by internal name) is blocked in review mode.
+fn is_review_blocked(tool_name: &str) -> bool {
+    deepseek_core::ToolName::from_internal_name(tool_name).is_some_and(|t| t.is_review_blocked())
+}
 
 pub struct LocalToolHost {
     workspace: PathBuf,
@@ -126,7 +120,7 @@ impl LocalToolHost {
 
     fn run_tool(&self, call: &ToolCall) -> Result<serde_json::Value> {
         // Enforce review mode: block all non-read tools
-        if self.review_mode && REVIEW_BLOCKED_TOOLS.contains(&call.name.as_str()) {
+        if self.review_mode && is_review_blocked(&call.name) {
             return Err(anyhow!(
                 "tool '{}' is blocked during review mode (read-only pipeline)",
                 call.name
@@ -2039,6 +2033,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 }
 
 /// Tools allowed in plan mode (read-only operations only).
+/// Built from `ToolName::is_read_only()`.
 pub const PLAN_MODE_TOOLS: &[&str] = &[
     "fs_read",
     "fs_list",
@@ -2052,7 +2047,6 @@ pub const PLAN_MODE_TOOLS: &[&str] = &[
     "index_query",
     "notebook_read",
     "diagnostics_check",
-    // Agent-level tools are always allowed
     "user_question",
     "task_create",
     "task_update",
@@ -2091,46 +2085,13 @@ pub fn filter_tool_definitions(
 }
 
 /// Map tool definition function names (underscored) to internal tool names (dotted).
+///
+/// Delegates to [`deepseek_core::ToolName`] for known tools. Unknown names
+/// (plugins, MCP tools) pass through unchanged.
 pub fn map_tool_name(function_name: &str) -> &str {
-    match function_name {
-        "fs_read" => "fs.read",
-        "fs_write" => "fs.write",
-        "fs_edit" => "fs.edit",
-        "fs_list" => "fs.list",
-        "fs_glob" => "fs.glob",
-        "fs_grep" => "fs.grep",
-        "bash_run" => "bash.run",
-        "multi_edit" => "multi_edit",
-        "git_status" => "git.status",
-        "git_diff" => "git.diff",
-        "git_show" => "git.show",
-        "web_fetch" => "web.fetch",
-        "web_search" => "web.search",
-        "notebook_read" => "notebook.read",
-        "notebook_edit" => "notebook.edit",
-        "index_query" => "index.query",
-        "patch_stage" => "patch.stage",
-        "patch_apply" => "patch.apply",
-        "diagnostics_check" => "diagnostics.check",
-        "chrome_navigate" => "chrome.navigate",
-        "chrome_click" => "chrome.click",
-        "chrome_type_text" => "chrome.type_text",
-        "chrome_screenshot" => "chrome.screenshot",
-        "chrome_read_console" => "chrome.read_console",
-        "chrome_evaluate" => "chrome.evaluate",
-        "user_question" => "user_question",
-        "task_create" => "task_create",
-        "task_update" => "task_update",
-        "task_get" => "task_get",
-        "task_list" => "task_list",
-        "spawn_task" => "spawn_task",
-        "task_output" => "task_output",
-        "task_stop" => "task_stop",
-        "enter_plan_mode" => "enter_plan_mode",
-        "exit_plan_mode" => "exit_plan_mode",
-        "skill" => "skill",
-        "kill_shell" => "kill_shell",
-        other => other,
+    match deepseek_core::ToolName::from_api_name(function_name) {
+        Some(t) => t.as_internal(),
+        None => function_name,
     }
 }
 
@@ -3597,7 +3558,7 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace");
         let mut cfg = AppConfig::default();
         cfg.policy.allowlist = vec!["touch *".to_string()];
-        cfg.policy.sandbox_mode = "read-only".to_string();
+        cfg.policy.sandbox_mode = deepseek_core::SandboxMode::ReadOnly;
         cfg.save(&workspace).expect("save config");
         let policy = PolicyEngine::from_app_config(&cfg.policy);
         let runner = RecordingRunner::default();
@@ -3630,7 +3591,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.policy.allowlist = vec!["cat *".to_string()];
-        cfg.policy.sandbox_mode = "workspace-write".to_string();
+        cfg.policy.sandbox_mode = deepseek_core::SandboxMode::WorkspaceWrite;
         cfg.save(&workspace).expect("save config");
         let policy = PolicyEngine::from_app_config(&cfg.policy);
         let runner = RecordingRunner::default();
@@ -3663,7 +3624,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.policy.allowlist = vec!["cat *".to_string()];
-        cfg.policy.sandbox_mode = "workspace-write".to_string();
+        cfg.policy.sandbox_mode = deepseek_core::SandboxMode::WorkspaceWrite;
         cfg.save(&workspace).expect("save config");
         let policy = PolicyEngine::from_app_config(&cfg.policy);
         let runner = RecordingRunner::default();
@@ -3688,7 +3649,7 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace");
         let mut cfg = AppConfig::default();
         cfg.policy.allowlist = vec!["curl *".to_string()];
-        cfg.policy.sandbox_mode = "read-only".to_string();
+        cfg.policy.sandbox_mode = deepseek_core::SandboxMode::ReadOnly;
         cfg.save(&workspace).expect("save config");
         let policy = PolicyEngine::from_app_config(&cfg.policy);
         let runner = RecordingRunner::default();
@@ -3721,7 +3682,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.policy.allowlist = vec!["cat *".to_string()];
-        cfg.policy.sandbox_mode = "isolated".to_string();
+        cfg.policy.sandbox_mode = deepseek_core::SandboxMode::Isolated;
         cfg.policy.sandbox_wrapper =
             Some("sandboxctl --workspace {workspace} --cmd {cmd}".to_string());
         cfg.save(&workspace).expect("save config");
@@ -3757,7 +3718,7 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.policy.allowlist = vec!["cat *".to_string()];
-        cfg.policy.sandbox_mode = "isolated".to_string();
+        cfg.policy.sandbox_mode = deepseek_core::SandboxMode::Isolated;
         cfg.policy.sandbox_wrapper = Some("sandboxctl --workspace {workspace}".to_string());
         cfg.save(&workspace).expect("save config");
         let policy = PolicyEngine::from_app_config(&cfg.policy);

@@ -223,6 +223,7 @@ fn glob_command_matches(pattern: &str, cmd: &str) -> bool {
 /// Evaluate permission rules against a tool call.
 /// Returns: "allow", "deny", "ask", or None if no rule matched.
 /// Evaluation order: deny > ask > allow (strongest match wins).
+#[must_use]
 pub fn evaluate_permission_rules(rules: &[PermissionRule], call: &ToolCall) -> Option<String> {
     let mut result: Option<&str> = None;
     for rule in rules {
@@ -369,8 +370,8 @@ impl PolicyEngine {
     pub fn from_app_config(cfg: &deepseek_core::PolicyConfig) -> Self {
         let defaults = PolicyConfig::default();
         let mut mapped = PolicyConfig {
-            approve_edits: parse_approval_mode(&cfg.approve_edits),
-            approve_bash: parse_approval_mode(&cfg.approve_bash),
+            approve_edits: cfg.approve_edits != deepseek_core::ApprovalMode::Never,
+            approve_bash: cfg.approve_bash != deepseek_core::ApprovalMode::Never,
             allowlist: cfg.allowlist.clone(),
             denied_secret_paths: if cfg.block_paths.is_empty() {
                 defaults.denied_secret_paths.clone()
@@ -383,17 +384,13 @@ impl PolicyEngine {
             } else {
                 cfg.redact_patterns.clone()
             },
-            sandbox_mode: if cfg.sandbox_mode.trim().is_empty() {
-                defaults.sandbox_mode
-            } else {
-                cfg.sandbox_mode.trim().to_ascii_lowercase()
-            },
+            sandbox_mode: cfg.sandbox_mode.to_string(),
             sandbox_wrapper: cfg
                 .sandbox_wrapper
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            permission_mode: PermissionMode::from_str_lossy(&cfg.permission_mode),
+            permission_mode: PermissionMode::from_str_lossy(&cfg.permission_mode.to_string()),
             permission_rules: vec![],
         };
         if let Some(team_policy) = load_team_policy_override() {
@@ -1186,7 +1183,7 @@ mod tests {
             std::env::remove_var("DEEPSEEK_TEAM_POLICY_PATH");
         }
         let cfg = deepseek_core::PolicyConfig {
-            sandbox_mode: "read-only".to_string(),
+            sandbox_mode: deepseek_core::SandboxMode::ReadOnly,
             ..deepseek_core::PolicyConfig::default()
         };
         let policy = PolicyEngine::from_app_config(&cfg);

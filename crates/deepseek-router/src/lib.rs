@@ -55,6 +55,7 @@ impl WeightedRouter {
         }
     }
 
+    #[must_use]
     pub fn score(&self, s: &RouterSignals) -> f32 {
         self.weights.w1 * s.prompt_complexity
             + self.weights.w2 * s.repo_breadth
@@ -64,6 +65,7 @@ impl WeightedRouter {
             + self.weights.w6 * s.ambiguity_flags
     }
 
+    #[must_use]
     pub fn should_escalate_retry(&self, unit: &LlmUnit, invalid_output: bool, retries: u8) -> bool {
         if retries >= self.cfg.max_escalations_per_unit || !invalid_output {
             return false;
@@ -126,5 +128,140 @@ mod tests {
             },
         );
         assert_eq!(decision.selected_model, "deepseek-reasoner");
+    }
+
+    #[test]
+    fn low_score_selects_base_model() {
+        let router = WeightedRouter::new(RouterConfig::default());
+        let decision = router.select(
+            LlmUnit::Executor,
+            RouterSignals {
+                prompt_complexity: 0.0,
+                repo_breadth: 0.0,
+                failure_streak: 0.0,
+                verification_failures: 0.0,
+                low_confidence: 0.0,
+                ambiguity_flags: 0.0,
+            },
+        );
+        assert_eq!(decision.selected_model, "deepseek-chat");
+        assert!(!decision.escalated);
+    }
+
+    #[test]
+    fn threshold_boundary_exactly_at_072() {
+        let mut router = WeightedRouter::new(RouterConfig::default());
+        // Set all weights to 1.0 and all signals to produce exactly 0.72
+        router.weights = RouterWeights {
+            w1: 1.0,
+            w2: 0.0,
+            w3: 0.0,
+            w4: 0.0,
+            w5: 0.0,
+            w6: 0.0,
+        };
+        let decision = router.select(
+            LlmUnit::Executor,
+            RouterSignals {
+                prompt_complexity: 0.72,
+                repo_breadth: 0.0,
+                failure_streak: 0.0,
+                verification_failures: 0.0,
+                low_confidence: 0.0,
+                ambiguity_flags: 0.0,
+            },
+        );
+        assert!(
+            decision.escalated,
+            "score exactly at threshold should escalate"
+        );
+        assert_eq!(decision.selected_model, "deepseek-reasoner");
+    }
+
+    #[test]
+    fn threshold_boundary_just_below_072() {
+        let mut router = WeightedRouter::new(RouterConfig::default());
+        router.weights = RouterWeights {
+            w1: 1.0,
+            w2: 0.0,
+            w3: 0.0,
+            w4: 0.0,
+            w5: 0.0,
+            w6: 0.0,
+        };
+        let decision = router.select(
+            LlmUnit::Executor,
+            RouterSignals {
+                prompt_complexity: 0.71,
+                repo_breadth: 0.0,
+                failure_streak: 0.0,
+                verification_failures: 0.0,
+                low_confidence: 0.0,
+                ambiguity_flags: 0.0,
+            },
+        );
+        assert!(
+            !decision.escalated,
+            "score below threshold should not escalate"
+        );
+        assert_eq!(decision.selected_model, "deepseek-chat");
+    }
+
+    #[test]
+    fn planner_bias_overrides_low_score() {
+        let router = WeightedRouter::new(RouterConfig::default());
+        let decision = router.select(
+            LlmUnit::Planner,
+            RouterSignals {
+                prompt_complexity: 0.0,
+                repo_breadth: 0.6, // > 0.5 triggers planner bias
+                failure_streak: 0.0,
+                verification_failures: 0.0,
+                low_confidence: 0.0,
+                ambiguity_flags: 0.0,
+            },
+        );
+        assert!(
+            decision.escalated,
+            "planner bias should escalate even with low score"
+        );
+        assert_eq!(decision.selected_model, "deepseek-reasoner");
+    }
+
+    #[test]
+    fn should_escalate_retry_respects_max() {
+        let router = WeightedRouter::new(RouterConfig {
+            max_escalations_per_unit: 1,
+            ..RouterConfig::default()
+        });
+        assert!(router.should_escalate_retry(&LlmUnit::Planner, true, 0));
+        assert!(!router.should_escalate_retry(&LlmUnit::Planner, true, 1));
+        assert!(!router.should_escalate_retry(&LlmUnit::Planner, false, 0));
+    }
+
+    #[test]
+    fn custom_weights_change_score() {
+        let mut router = WeightedRouter::new(RouterConfig::default());
+        let signals = RouterSignals {
+            prompt_complexity: 0.5,
+            repo_breadth: 0.5,
+            failure_streak: 0.0,
+            verification_failures: 0.0,
+            low_confidence: 0.0,
+            ambiguity_flags: 0.0,
+        };
+        let default_score = router.score(&signals);
+
+        router.weights = RouterWeights {
+            w1: 2.0,
+            w2: 0.0,
+            w3: 0.0,
+            w4: 0.0,
+            w5: 0.0,
+            w6: 0.0,
+        };
+        let custom_score = router.score(&signals);
+        assert!((custom_score - 1.0).abs() < f32::EPSILON);
+        assert!((custom_score - default_score).abs() > f32::EPSILON);
     }
 }

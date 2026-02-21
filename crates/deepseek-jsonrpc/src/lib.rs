@@ -218,7 +218,7 @@ impl IdeRpcHandler {
         // Cache the conversation history.
         self.conversations
             .lock()
-            .unwrap()
+            .expect("conversations lock")
             .insert(session_id, projection.chat_messages);
 
         Ok(serde_json::json!({
@@ -234,13 +234,13 @@ impl IdeRpcHandler {
         let forked = self.store.fork_session(from_id)?;
 
         // Copy conversation history to the new session.
-        let conv = self.conversations.lock().unwrap();
+        let conv = self.conversations.lock().expect("conversations lock");
         if let Some(messages) = conv.get(&from_id) {
             let cloned = messages.clone();
             drop(conv);
             self.conversations
                 .lock()
-                .unwrap()
+                .expect("conversations lock")
                 .insert(forked.session_id, cloned);
         }
 
@@ -290,7 +290,7 @@ impl IdeRpcHandler {
         // Store the user message in conversation cache.
         self.conversations
             .lock()
-            .unwrap()
+            .expect("conversations lock")
             .entry(session_id)
             .or_default()
             .push(ChatMessage::User {
@@ -333,7 +333,7 @@ impl IdeRpcHandler {
         let invocation_id = Uuid::parse_str(invocation_id_str)?;
 
         // Remove from pending approvals.
-        let mut approvals = self.approvals.lock().unwrap();
+        let mut approvals = self.approvals.lock().expect("approvals lock");
         let tool_name = approvals
             .get_mut(&session_id)
             .and_then(|pa| pa.pending.remove(invocation_id_str))
@@ -363,7 +363,7 @@ impl IdeRpcHandler {
             .ok_or_else(|| anyhow!("missing 'invocation_id' parameter"))?;
 
         // Remove from pending approvals.
-        let mut approvals = self.approvals.lock().unwrap();
+        let mut approvals = self.approvals.lock().expect("approvals lock");
         let tool_name = approvals
             .get_mut(&session_id)
             .and_then(|pa| pa.pending.remove(invocation_id_str))
@@ -492,7 +492,7 @@ impl IdeRpcHandler {
     pub fn add_pending_approval(&self, session_id: Uuid, invocation_id: &str, tool_name: &str) {
         self.approvals
             .lock()
-            .unwrap()
+            .expect("approvals lock")
             .entry(session_id)
             .or_default()
             .pending
