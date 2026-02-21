@@ -87,7 +87,7 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `fs.glob`, `bash.run`, `git.*`, `web.*`, `notebook.*`, `multi_edit`, and plugins.
 
-**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` instead of switching models. This uses `deepseek-chat` with `thinking: {"type": "enabled", "budget_tokens": N}` — giving us reasoning + function calling simultaneously. `deepseek-reasoner` does NOT support function calling and is only used for legacy planner paths without tools.
+**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` instead of switching models. However, **thinking mode is forcibly disabled when tools are active** (see "Known DeepSeek API Limitations" below). Thinking mode is only applied for pure text responses (no tools) and the legacy planner path. `deepseek-reasoner` does NOT support function calling and is only used for legacy planner paths without tools.
 
 **TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`.
 
@@ -111,6 +111,22 @@ Load order (later overrides earlier):
 4. `.deepseek/settings.local.json` (machine-local, gitignored)
 
 Config sections: `llm`, `router`, `policy`, `plugins`, `skills`, `usage`, `context`, `autopilot`, `scheduling`, `replay`, `ui`, `experiments`, `telemetry`, `index`, `budgets`, `theme`. See `config.example.toml` for all fields.
+
+## Known DeepSeek API Limitations
+
+### Thinking mode + tools = DSML markup leak
+
+When `thinking: {"type": "enabled", "budget_tokens": N}` is sent alongside `tools: [...]` in a `/chat/completions` request, the DeepSeek API intermittently outputs **raw DSML markup** (e.g. `<｜DSML｜function_calls>`, `<｜DSML｜invoke name="...">`) in the content stream instead of returning structured `tool_calls` in the response. This is a known upstream issue (tracked in sglang #14695, vllm #28219, vercel/ai #10778).
+
+**Consequence**: Thinking mode and function calling are mutually exclusive in practice. The codebase enforces this in two places:
+
+1. **`deepseek-agent/src/lib.rs` — `chat_with_options()`**: The `thinking` config is only built when `decision.thinking_enabled && !options.tools`. When tools are active, `thinking` is always `None` and `temperature` is set to `Some(0.0)`. The escalation retry path also skips thinking when tools are present.
+
+2. **`deepseek-llm/src/lib.rs` — DSML rescue parser**: As a safety net, `rescue_raw_tool_calls()` detects DSML markup in response content and parses it into proper `Vec<LlmToolCall>`. This covers both Format A (`<｜DSML｜invoke>` blocks) and Format B (legacy `<｜tool▁call▁begin｜>` markers). The rescue runs on all three response paths: non-streaming, streaming payload, and live streaming. The streaming path also buffers DSML content to prevent raw markup from appearing in the TUI.
+
+**What still gets thinking mode**: Pure text responses (no tools), the legacy planner path, and any turn where `options.tools = false`.
+
+**If DeepSeek fixes this upstream**: Remove the `&& !options.tools` guard in `chat_with_options()` and the `tools.is_empty()` check in the escalation retry. The DSML rescue parser can be kept as a defensive fallback.
 
 ## Supply-Chain Security
 

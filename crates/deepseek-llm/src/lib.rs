@@ -326,6 +326,9 @@ impl DeepSeekClient {
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
                         let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
+                        // Track whether we're inside a DSML markup block so we
+                        // can buffer it instead of emitting to the TUI.
+                        let mut dsml_buffering = false;
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
@@ -365,7 +368,20 @@ impl DeepSeekClient {
                                 if let Some(content) = delta.get("content").and_then(|v| v.as_str())
                                 {
                                     content_out.push_str(content);
-                                    cb(StreamChunk::ContentDelta(content.to_string()));
+                                    // Suppress DSML markup from the streaming
+                                    // display — buffer it instead of emitting.
+                                    if !dsml_buffering && contains_dsml_markup(content) {
+                                        dsml_buffering = true;
+                                    }
+                                    if !dsml_buffering {
+                                        // Check if accumulated content started
+                                        // a DSML block we missed on earlier chunks.
+                                        if contains_dsml_markup(&content_out) {
+                                            dsml_buffering = true;
+                                        } else {
+                                            cb(StreamChunk::ContentDelta(content.to_string()));
+                                        }
+                                    }
                                 }
                                 if let Some(reasoning) =
                                     delta.get("reasoning_content").and_then(|v| v.as_str())
@@ -411,6 +427,19 @@ impl DeepSeekClient {
                         } else {
                             String::new()
                         };
+
+                        // DSML rescue: if we buffered DSML content, parse it
+                        // into proper tool calls.
+                        let (text, tool_calls) = if tool_calls.is_empty() {
+                            if let Some((cleaned, rescued)) = rescue_raw_tool_calls(&text) {
+                                (cleaned, rescued)
+                            } else {
+                                (text, tool_calls)
+                            }
+                        } else {
+                            (text, tool_calls)
+                        };
+
                         return Ok(LlmResponse {
                             text,
                             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
@@ -924,6 +953,18 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
     } else {
         content
     };
+    // DSML rescue: if the API returned no structured tool_calls but the content
+    // contains raw DSML markup, parse it into proper tool calls.
+    let (text, tool_calls) = if tool_calls.is_empty() {
+        if let Some((cleaned, rescued)) = rescue_raw_tool_calls(&text) {
+            (cleaned, rescued)
+        } else {
+            (text, tool_calls)
+        }
+    } else {
+        (text, tool_calls)
+    };
+
     Ok(LlmResponse {
         text,
         finish_reason,
@@ -1015,6 +1056,16 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
         } else {
             reasoning_out.clone()
         };
+        // DSML rescue: if no structured tool_calls but content has raw markup
+        let (text, tool_calls) = if tool_calls.is_empty() {
+            if let Some((cleaned, rescued)) = rescue_raw_tool_calls(&text) {
+                (cleaned, rescued)
+            } else {
+                (text, tool_calls)
+            }
+        } else {
+            (text, tool_calls)
+        };
         Ok(LlmResponse {
             text,
             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
@@ -1099,6 +1150,240 @@ fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
             })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// DSML rescue parser — safety net for raw markup leaks
+// ---------------------------------------------------------------------------
+//
+// When DeepSeek API thinking mode is accidentally combined with tools, the
+// model sometimes outputs raw DSML markup in the content stream instead of
+// structured tool_calls.  Two known formats:
+//
+//   Format A (full-width delimiters):
+//     <｜DSML｜function_calls>
+//     <｜DSML｜invoke name="fs_read">
+//     <｜DSML｜parameter name="path" string="true">/README.md</｜DSML｜parameter>
+//     </｜DSML｜invoke>
+//     </｜DSML｜function_calls>
+//
+//   Format B (legacy token markers):
+//     <｜tool▁calls▁begin｜>
+//     <｜tool▁call▁begin｜>function_name<｜tool▁sep｜>{"arg":"val"}
+//     <｜tool▁call▁end｜>
+//     <｜tool▁calls▁end｜>
+
+/// Marker substrings that indicate DSML markup is present in content.
+const DSML_MARKERS: &[&str] = &[
+    "\u{ff5c}DSML\u{ff5c}",            // ｜DSML｜
+    "\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}", // ｜tool▁calls▁begin｜
+];
+
+/// Returns `true` if the content contains DSML markup that should be rescued.
+fn contains_dsml_markup(content: &str) -> bool {
+    DSML_MARKERS.iter().any(|marker| content.contains(marker))
+}
+
+/// Attempt to parse raw DSML markup out of content and return extracted tool
+/// calls plus the cleaned content (markup stripped).  Returns `None` if no
+/// DSML markup is detected.
+fn rescue_raw_tool_calls(content: &str) -> Option<(String, Vec<LlmToolCall>)> {
+    if !contains_dsml_markup(content) {
+        return None;
+    }
+
+    let mut tool_calls = Vec::new();
+    let mut call_counter: usize = 0;
+
+    // Try Format A: <｜DSML｜invoke name="..."> blocks
+    rescue_dsml_format_a(content, &mut tool_calls, &mut call_counter);
+
+    // Try Format B: <｜tool▁call▁begin｜> blocks
+    if tool_calls.is_empty() {
+        rescue_dsml_format_b(content, &mut tool_calls, &mut call_counter);
+    }
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    // Strip all DSML markup from content to produce clean text
+    let cleaned = strip_dsml_markup(content);
+    Some((cleaned, tool_calls))
+}
+
+/// Parse Format A DSML invoke blocks.
+fn rescue_dsml_format_a(
+    content: &str,
+    tool_calls: &mut Vec<LlmToolCall>,
+    call_counter: &mut usize,
+) {
+    // Match <｜DSML｜invoke name="TOOL_NAME"> ... </｜DSML｜invoke> blocks
+    let invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke";
+    let invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
+    let param_open = "<\u{ff5c}DSML\u{ff5c}parameter";
+    let param_close = "</\u{ff5c}DSML\u{ff5c}parameter>";
+
+    let mut search_from = 0;
+    while let Some(start) = content[search_from..].find(invoke_open) {
+        let abs_start = search_from + start;
+        let Some(end) = content[abs_start..].find(invoke_close) else {
+            break;
+        };
+        let block = &content[abs_start..abs_start + end + invoke_close.len()];
+        search_from = abs_start + end + invoke_close.len();
+
+        // Extract tool name from name="..."
+        let name = extract_attribute(block, "name").unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+
+        // Extract parameters
+        let mut args = serde_json::Map::new();
+        let mut param_from = 0;
+        while let Some(ps) = block[param_from..].find(param_open) {
+            let p_abs = param_from + ps;
+            let Some(pe) = block[p_abs..].find(param_close) else {
+                break;
+            };
+            let param_block = &block[p_abs..p_abs + pe + param_close.len()];
+            param_from = p_abs + pe + param_close.len();
+
+            let param_name = extract_attribute(param_block, "name").unwrap_or_default();
+            if param_name.is_empty() {
+                continue;
+            }
+            let is_string = extract_attribute(param_block, "string")
+                .map(|v| v == "true")
+                .unwrap_or(true);
+
+            // Value is between the closing > of the open tag and the param_close tag
+            let value_str = if let Some(gt_pos) = param_block.find('>') {
+                let after_open = &param_block[gt_pos + 1..];
+                // Strip the closing tag suffix
+                after_open
+                    .strip_suffix(param_close)
+                    .or_else(|| {
+                        // The close tag is already included in our slice calculation,
+                        // so trim from the end
+                        let close_start = after_open.rfind('<')?;
+                        Some(&after_open[..close_start])
+                    })
+                    .unwrap_or(after_open)
+                    .to_string()
+            } else {
+                String::new()
+            };
+
+            if is_string {
+                args.insert(param_name, serde_json::Value::String(value_str));
+            } else {
+                // Try to parse as JSON value, fall back to string
+                let json_val = serde_json::from_str(&value_str)
+                    .unwrap_or(serde_json::Value::String(value_str));
+                args.insert(param_name, json_val);
+            }
+        }
+
+        *call_counter += 1;
+        tool_calls.push(LlmToolCall {
+            id: format!("dsml_rescue_{call_counter}"),
+            name,
+            arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+        });
+    }
+}
+
+/// Parse Format B legacy tool call markers.
+fn rescue_dsml_format_b(
+    content: &str,
+    tool_calls: &mut Vec<LlmToolCall>,
+    call_counter: &mut usize,
+) {
+    let call_begin = "<\u{ff5c}tool\u{2581}call\u{2581}begin\u{ff5c}>";
+    let call_end = "<\u{ff5c}tool\u{2581}call\u{2581}end\u{ff5c}>";
+    let separator = "<\u{ff5c}tool\u{2581}sep\u{ff5c}>";
+
+    let mut search_from = 0;
+    while let Some(start) = content[search_from..].find(call_begin) {
+        let abs_start = search_from + start + call_begin.len();
+        let Some(end) = content[abs_start..].find(call_end) else {
+            break;
+        };
+        let block = &content[abs_start..abs_start + end];
+        search_from = abs_start + end + call_end.len();
+
+        // Format: function_name<｜tool▁sep｜>{"arg":"val"}
+        let (name, arguments) = if let Some(sep_pos) = block.find(separator) {
+            (
+                block[..sep_pos].trim().to_string(),
+                block[sep_pos + separator.len()..].trim().to_string(),
+            )
+        } else {
+            // Just a function name with no arguments
+            (block.trim().to_string(), "{}".to_string())
+        };
+
+        if name.is_empty() {
+            continue;
+        }
+
+        *call_counter += 1;
+        tool_calls.push(LlmToolCall {
+            id: format!("dsml_rescue_{call_counter}"),
+            name,
+            arguments,
+        });
+    }
+}
+
+/// Extract an XML-like attribute value: `name="value"` → `value`.
+fn extract_attribute(text: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let start = text.find(&pattern)? + pattern.len();
+    let end = text[start..].find('"')? + start;
+    Some(text[start..end].to_string())
+}
+
+/// Strip all DSML markup from content, leaving only non-markup text.
+fn strip_dsml_markup(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut remaining = content;
+
+    // Strip Format A blocks: <｜DSML｜function_calls>...</｜DSML｜function_calls>
+    let fc_open = "<\u{ff5c}DSML\u{ff5c}function_calls>";
+    let fc_close = "</\u{ff5c}DSML\u{ff5c}function_calls>";
+
+    while let Some(start) = remaining.find(fc_open) {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find(fc_close) {
+            remaining = &remaining[start + end + fc_close.len()..];
+        } else {
+            // Unclosed block — strip everything from the marker onward
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+
+    // Strip Format B blocks: <｜tool▁calls▁begin｜>...</｜tool▁calls▁end｜>
+    let tc_open = "<\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}>";
+    let tc_close = "<\u{ff5c}tool\u{2581}calls\u{2581}end\u{ff5c}>";
+    let mut cleaned = String::with_capacity(result.len());
+    remaining = &result;
+    while let Some(start) = remaining.find(tc_open) {
+        cleaned.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find(tc_close) {
+            remaining = &remaining[start + end + tc_close.len()..];
+        } else {
+            remaining = "";
+            break;
+        }
+    }
+    cleaned.push_str(remaining);
+
+    cleaned.trim().to_string()
 }
 
 #[cfg(test)]
@@ -1877,5 +2162,122 @@ mod tests {
         unsafe {
             std::env::remove_var("DEEPSEEK_API_KEY_STREAM_TEST");
         }
+    }
+
+    // ----- DSML rescue parser tests -----
+
+    #[test]
+    fn dsml_rescue_format_a_single_tool() {
+        let content = r#"Here is my analysis.
+<｜DSML｜function_calls>
+<｜DSML｜invoke name="fs_read">
+<｜DSML｜parameter name="path" string="true">/README.md</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"#;
+
+        let (cleaned, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs_read");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["path"], "/README.md");
+        assert!(cleaned.contains("Here is my analysis"));
+        assert!(!cleaned.contains("DSML"));
+    }
+
+    #[test]
+    fn dsml_rescue_format_a_multiple_params() {
+        let content = r#"<｜DSML｜function_calls>
+<｜DSML｜invoke name="fs_write">
+<｜DSML｜parameter name="path" string="true">/tmp/test.txt</｜DSML｜parameter>
+<｜DSML｜parameter name="content" string="true">hello world</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"#;
+
+        let (_, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs_write");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["path"], "/tmp/test.txt");
+        assert_eq!(args["content"], "hello world");
+    }
+
+    #[test]
+    fn dsml_rescue_format_a_non_string_param() {
+        let content = r#"<｜DSML｜function_calls>
+<｜DSML｜invoke name="bash_run">
+<｜DSML｜parameter name="command" string="true">ls -la</｜DSML｜parameter>
+<｜DSML｜parameter name="timeout" string="false">30000</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"#;
+
+        let (_, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["command"], "ls -la");
+        assert_eq!(args["timeout"], 30000);
+    }
+
+    #[test]
+    fn dsml_rescue_format_b_single_tool() {
+        let content = "<\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}>\n<\u{ff5c}tool\u{2581}call\u{2581}begin\u{ff5c}>fs_read<\u{ff5c}tool\u{2581}sep\u{ff5c}>{\"path\":\"/README.md\"}\n<\u{ff5c}tool\u{2581}call\u{2581}end\u{ff5c}>\n<\u{ff5c}tool\u{2581}calls\u{2581}end\u{ff5c}>";
+
+        let (cleaned, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs_read");
+        assert_eq!(calls[0].arguments, "{\"path\":\"/README.md\"}");
+        assert!(cleaned.is_empty() || !contains_dsml_markup(&cleaned));
+    }
+
+    #[test]
+    fn dsml_rescue_format_a_multiple_invocations() {
+        let content = r#"<｜DSML｜function_calls>
+<｜DSML｜invoke name="fs_read">
+<｜DSML｜parameter name="path" string="true">/a.txt</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="fs_read">
+<｜DSML｜parameter name="path" string="true">/b.txt</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"#;
+
+        let (_, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "fs_read");
+        assert_eq!(calls[1].name, "fs_read");
+    }
+
+    #[test]
+    fn dsml_rescue_returns_none_for_normal_content() {
+        let content = "This is a normal response with no DSML markup at all.";
+        assert!(rescue_raw_tool_calls(content).is_none());
+    }
+
+    #[test]
+    fn dsml_contains_detects_markers() {
+        assert!(contains_dsml_markup("some <\u{ff5c}DSML\u{ff5c}invoke> text"));
+        assert!(contains_dsml_markup(
+            "some <\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}> text"
+        ));
+        assert!(!contains_dsml_markup("just normal text"));
+    }
+
+    #[test]
+    fn dsml_strip_removes_all_markup() {
+        let content = "Before <\u{ff5c}DSML\u{ff5c}function_calls>stuff</\u{ff5c}DSML\u{ff5c}function_calls> After";
+        let stripped = strip_dsml_markup(content);
+        assert_eq!(stripped, "Before  After");
+        assert!(!contains_dsml_markup(&stripped));
+    }
+
+    #[test]
+    fn dsml_rescue_non_streaming_integration() {
+        // Simulates what happens when the API returns DSML in content with no tool_calls
+        let body = r#"{"choices":[{"message":{"content":"<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"fs_read\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/README.md</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>"},"finish_reason":"stop"}]}"#;
+        let got = parse_non_streaming_payload(body).expect("parse");
+        assert_eq!(got.tool_calls.len(), 1);
+        assert_eq!(got.tool_calls[0].name, "fs_read");
+        assert!(!got.text.contains("DSML"));
     }
 }

@@ -1507,7 +1507,10 @@ impl AgentEngine {
             let request_model = decision.selected_model.clone();
 
             // Build thinking config when the router (or user) requests thinking mode.
-            let thinking = if decision.thinking_enabled {
+            // IMPORTANT: Never enable thinking when tools are active — DeepSeek API
+            // outputs raw DSML markup instead of structured tool_calls when thinking
+            // is combined with the tools parameter.
+            let thinking = if decision.thinking_enabled && !options.tools {
                 Some(ThinkingConfig::enabled(
                     session.budgets.max_think_tokens.max(4096),
                 ))
@@ -1537,7 +1540,7 @@ impl AgentEngine {
                 },
                 max_tokens: session.budgets.max_think_tokens.max(4096),
                 // DeepSeek API requires temperature to be omitted when thinking is enabled.
-                temperature: if decision.thinking_enabled {
+                temperature: if thinking.is_some() {
                     None
                 } else {
                     Some(0.0)
@@ -1577,12 +1580,19 @@ impl AgentEngine {
                         reason_codes: vec!["empty_response_escalation".to_string()],
                     },
                 )?;
-                let escalated_request = ChatRequest {
-                    thinking: Some(ThinkingConfig::enabled(
-                        session.budgets.max_think_tokens.max(4096),
-                    )),
-                    temperature: None,
-                    ..request
+                // Only escalate with thinking if tools are not active — thinking
+                // + tools causes DSML markup leaks. When tools are active, just retry
+                // the same request without thinking mode.
+                let escalated_request = if tools.is_empty() {
+                    ChatRequest {
+                        thinking: Some(ThinkingConfig::enabled(
+                            session.budgets.max_think_tokens.max(4096),
+                        )),
+                        temperature: None,
+                        ..request
+                    }
+                } else {
+                    request.clone()
                 };
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
                 if let Some(cb) = cb {
