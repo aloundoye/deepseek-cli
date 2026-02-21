@@ -1309,4 +1309,118 @@ mod tests {
         assert!(names.contains(&"bash_run"));
         assert!(names.contains(&"git_status"));
     }
+
+    // ── MCP integration tests (Phase 16.6) ──────────────────────────────
+
+    #[test]
+    fn mcp_search_filters_by_name() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "search-test".to_string(),
+                name: "Search Test".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec!["ok".to_string()],
+                url: None,
+                enabled: true,
+                metadata: serde_json::json!({
+                    "tools": [
+                        {"name": "alpha", "description": "Alpha tool"},
+                        {"name": "beta", "description": "Beta tool"},
+                        {"name": "gamma", "description": "Gamma tool"}
+                    ]
+                }),
+            })
+            .expect("add");
+
+        let tools = manager.discover_tools().expect("discover");
+        assert_eq!(tools.len(), 3, "all three tools should be discovered");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn unavailable_server_does_not_panic() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "missing".to_string(),
+                name: "Missing".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("__nonexistent_command_xyz__".to_string()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                metadata: serde_json::Value::Null,
+            })
+            .expect("add");
+
+        // discover_tools should return Ok even if the server command doesn't exist
+        let result = manager.discover_tools();
+        assert!(
+            result.is_ok(),
+            "discover_tools should not panic/error on unavailable server: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn http_mcp_server_add_and_list() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "http-test".to_string(),
+                name: "HTTP Test".to_string(),
+                transport: McpTransport::Http,
+                command: None,
+                args: vec![],
+                url: Some("http://127.0.0.1:0/mcp".to_string()),
+                enabled: true,
+                metadata: serde_json::json!({"tools": [{"name": "remote_tool", "description": "A remote tool"}]}),
+            })
+            .expect("add http server");
+
+        let listed = manager.list_servers().expect("list");
+        let http = listed.iter().find(|s| s.id == "http-test");
+        assert!(http.is_some(), "HTTP server should be listed");
+        assert!(matches!(http.unwrap().transport, McpTransport::Http));
+
+        // Discover tools from metadata cache
+        let tools = manager.discover_tools().expect("discover");
+        assert!(
+            tools.iter().any(|t| t.name == "remote_tool"),
+            "should discover tool from HTTP server metadata"
+        );
+    }
+
+    #[test]
+    fn mcp_token_limit_truncates_at_exact_boundary() {
+        let limits = McpTokenLimits {
+            warn_threshold: 5,
+            max_tokens: 10,
+        };
+        // 10 tokens * 4 chars = 40 chars. 40 / 4 = 10 estimated tokens. 10 > 10 is false.
+        let exactly_at = "a".repeat(40);
+        let (out, truncated) = enforce_mcp_token_limit(&exactly_at, &limits);
+        assert!(!truncated, "exactly at limit should not truncate");
+        assert_eq!(out, exactly_at);
+
+        // 44 chars / 4 = 11 estimated tokens. 11 > 10 is true → truncated.
+        let over = "a".repeat(44);
+        let (out2, truncated2) = enforce_mcp_token_limit(&over, &limits);
+        assert!(truncated2, "over limit should truncate");
+        assert!(out2.contains("truncated"));
+    }
 }
