@@ -1839,30 +1839,180 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "spawn_task".to_string(),
-                description: "Spawn an autonomous subagent to work on a subtask in parallel. The subagent runs independently with its own context and returns results when complete. Use for tasks that can be done independently (research, exploration, isolated code changes).".to_string(),
+                description: "Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it. Launch multiple agents concurrently whenever possible to maximize performance.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "name": {
+                        "description": {
                             "type": "string",
-                            "description": "Short name for the subagent (e.g. 'explore-auth', 'fix-tests')"
+                            "description": "A short (3-5 word) description of the task"
                         },
-                        "goal": {
+                        "prompt": {
                             "type": "string",
-                            "description": "Detailed description of what the subagent should accomplish"
+                            "description": "The task for the agent to perform"
                         },
-                        "role": {
+                        "subagent_type": {
                             "type": "string",
-                            "enum": ["explore", "plan", "task"],
-                            "description": "Subagent role: 'explore' for research/information gathering, 'plan' for breaking down tasks, 'task' for executing specific work"
+                            "enum": ["explore", "plan", "bash", "general-purpose"],
+                            "description": "The type of specialized agent: 'explore' for codebase search/read, 'plan' for designing approaches, 'bash' for command execution, 'general-purpose' for complex multi-step tasks"
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional model override for this agent"
+                        },
+                        "max_turns": {
+                            "type": "integer",
+                            "description": "Maximum number of agentic turns before stopping"
+                        },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": "Set to true to run this agent in the background. Returns immediately with a task_id. Use task_output to retrieve the result later."
+                        },
+                        "resume": {
+                            "type": "string",
+                            "description": "Optional agent ID to resume from a previous invocation"
                         }
                     },
-                    "required": ["name", "goal", "role"]
+                    "required": ["description", "prompt", "subagent_type"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_output".to_string(),
+                description: "Retrieve output from a running or completed background task. Use block=true to wait for completion, block=false for non-blocking status check.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to get output from"
+                        },
+                        "block": {
+                            "type": "boolean",
+                            "description": "Whether to wait for completion (default true)"
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Max wait time in milliseconds (default 30000)"
+                        }
+                    },
+                    "required": ["task_id"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_stop".to_string(),
+                description: "Stop a running background task by its ID.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The ID of the background task to stop"
+                        }
+                    },
+                    "required": ["task_id"]
+                }),
+            },
+        },
+        // ── Plan mode tools (handled by AgentEngine) ──────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "enter_plan_mode".to_string(),
+                description: "Enter plan mode to design an implementation approach before writing code. In plan mode, you can only use read-only tools (Read, Glob, Grep, search, git status/diff). Use this proactively when the task requires planning: new features, multiple valid approaches, multi-file changes, or unclear requirements. You will explore the codebase, design a plan, and present it for user approval before executing.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "exit_plan_mode".to_string(),
+                description: "Exit plan mode after writing your plan. This signals that you are done planning and ready for the user to review and approve. The user will see the plan and decide whether to let you proceed with execution. Only use this after you have completed your plan.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "allowedPrompts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": { "type": "string", "description": "The tool this permission applies to (e.g. 'bash_run')" },
+                                    "prompt": { "type": "string", "description": "Description of the action (e.g. 'run tests', 'install dependencies')" }
+                                },
+                                "required": ["tool", "prompt"]
+                            },
+                            "description": "Prompt-based permissions needed to implement the plan"
+                        }
+                    },
+                    "required": []
+                }),
+            },
+        },
+        // ── Background task management tools (handled by AgentEngine) ─────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_get".to_string(),
+                description: "Retrieve full details of a task by its ID, including description, status, and dependencies.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The ID of the task to retrieve"
+                        }
+                    },
+                    "required": ["task_id"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "task_list".to_string(),
+                description: "List all tasks in the task list with summary info: id, subject, status, owner, blockedBy.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }),
             },
         },
     ]
 }
+
+/// Tools allowed in plan mode (read-only operations only).
+pub const PLAN_MODE_TOOLS: &[&str] = &[
+    "fs_read",
+    "fs_list",
+    "fs_glob",
+    "fs_grep",
+    "git_status",
+    "git_diff",
+    "git_show",
+    "web_fetch",
+    "web_search",
+    "index_query",
+    "notebook_read",
+    "diagnostics_check",
+    // Agent-level tools are always allowed
+    "user_question",
+    "task_create",
+    "task_update",
+    "task_get",
+    "task_list",
+    "spawn_task",
+    "exit_plan_mode",
+];
 
 /// Filter tool definitions by allowed/disallowed lists.
 ///
@@ -1923,7 +2073,13 @@ pub fn map_tool_name(function_name: &str) -> &str {
         "user_question" => "user_question",
         "task_create" => "task_create",
         "task_update" => "task_update",
+        "task_get" => "task_get",
+        "task_list" => "task_list",
         "spawn_task" => "spawn_task",
+        "task_output" => "task_output",
+        "task_stop" => "task_stop",
+        "enter_plan_mode" => "enter_plan_mode",
+        "exit_plan_mode" => "exit_plan_mode",
         other => other,
     }
 }
@@ -1971,8 +2127,18 @@ pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
 }
 
 /// Tools that are handled by AgentEngine directly, not by LocalToolHost.
-pub const AGENT_LEVEL_TOOLS: &[&str] =
-    &["user_question", "task_create", "task_update", "spawn_task"];
+pub const AGENT_LEVEL_TOOLS: &[&str] = &[
+    "user_question",
+    "task_create",
+    "task_update",
+    "task_get",
+    "task_list",
+    "spawn_task",
+    "task_output",
+    "task_stop",
+    "enter_plan_mode",
+    "exit_plan_mode",
+];
 
 fn should_skip_rel_path(path: &Path) -> bool {
     path.components().any(|c| {

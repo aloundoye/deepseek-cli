@@ -34,6 +34,7 @@ deepseek-ui = { path = "../deepseek-ui" }
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-mcp = { path = "../deepseek-mcp" }
 deepseek-skills = { path = "../deepseek-skills" }
+deepseek-subagent = { path = "../deepseek-subagent" }
 deepseek-jsonrpc = { path = "../deepseek-jsonrpc" }
 
 [dev-dependencies]

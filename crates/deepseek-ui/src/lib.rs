@@ -169,6 +169,7 @@ fn default_context_max() -> u64 {
 pub fn render_statusline(status: &UiStatus) -> String {
     let mode_indicator = match status.permission_mode.as_str() {
         "auto" => "[AUTO]",
+        "plan" => "[PLAN]",
         "locked" => "[LOCKED]",
         _ => "[ASK]",
     };
@@ -220,11 +221,13 @@ fn render_statusline_spans(
 ) -> Vec<Span<'static>> {
     let mode_color = match status.permission_mode.as_str() {
         "auto" => Color::Green,
+        "plan" => Color::Blue,
         "locked" => Color::Red,
         _ => Color::Yellow,
     };
     let mode_label = match status.permission_mode.as_str() {
         "auto" => " AUTO ",
+        "plan" => " PLAN ",
         "locked" => " LOCKED ",
         _ => " ASK ",
     };
@@ -1996,7 +1999,8 @@ where
         if key == bindings.cycle_permission_mode {
             let current = status.permission_mode.clone();
             let next = match current.as_str() {
-                "ask" => "auto",
+                "ask" => "plan",
+                "plan" => "auto",
                 "auto" => "locked",
                 _ => "ask",
             };

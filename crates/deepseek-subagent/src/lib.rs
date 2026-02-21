@@ -34,6 +34,9 @@ pub struct SubagentTask {
     /// Set automatically on retry when a permission denial is detected.
     #[serde(default)]
     pub read_only_fallback: bool,
+    /// Optional custom agent definition (from .deepseek/agents/*.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent: Option<CustomAgentDef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +426,7 @@ mod tests {
                 role: SubagentRole::Task,
                 team: "default".to_string(),
                 read_only_fallback: false,
+                custom_agent: None,
             })
             .collect::<Vec<_>>();
 
@@ -455,6 +459,7 @@ mod tests {
             role: SubagentRole::Task,
             team: "execution".to_string(),
             read_only_fallback: false,
+            custom_agent: None,
         };
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_w = Arc::clone(&attempts);
@@ -486,6 +491,7 @@ mod tests {
                 role,
                 team: team.to_string(),
                 read_only_fallback: false,
+                custom_agent: None,
             });
         }
         let results = manager.run_tasks(tasks, |task| Ok(format!("ok:{}", task.name)));
@@ -508,6 +514,7 @@ mod tests {
             role: SubagentRole::Task,
             team: "execution".to_string(),
             read_only_fallback: false,
+            custom_agent: None,
         };
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_w = Arc::clone(&attempts);
@@ -571,6 +578,7 @@ mod tests {
                 role: SubagentRole::Task,
                 team: "alpha".to_string(),
                 read_only_fallback: false,
+                custom_agent: None,
             })
             .collect();
 

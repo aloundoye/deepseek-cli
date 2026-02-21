@@ -2780,6 +2780,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::BudgetExceededV1 { .. } => "BudgetExceeded@v1",
         EventKind::TaskUpdatedV1 { .. } => "TaskUpdated@v1",
         EventKind::TaskDeletedV1 { .. } => "TaskDeleted@v1",
+        EventKind::EnterPlanModeV1 { .. } => "EnterPlanMode@v1",
         EventKind::ExitPlanModeV1 { .. } => "ExitPlanMode@v1",
         EventKind::ProviderSelectedV1 { .. } => "ProviderSelected@v1",
     }
