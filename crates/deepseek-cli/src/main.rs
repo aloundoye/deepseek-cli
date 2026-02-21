@@ -12,7 +12,9 @@ use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
 use deepseek_mcp::{McpManager, McpServer, McpTransport};
 use deepseek_memory::{ExportFormat, MemoryManager};
-use deepseek_policy::{PolicyEngine, TeamPolicyLocks, team_policy_locks};
+use deepseek_policy::{
+    PolicyEngine, TeamPolicyLocks, load_managed_settings, team_policy_locks,
+};
 use deepseek_skills::SkillManager;
 use deepseek_store::{AutopilotRunRecord, BackgroundJobRecord, ReplayCassetteRecord, Store};
 use deepseek_tools::PluginManager;
@@ -84,8 +86,14 @@ struct Cli {
     permission_mode: Option<String>,
 
     /// Skip all permission checks (dangerous — use only in trusted environments).
+    /// Requires `--allow-dangerously-skip-permissions` to also be set.
     #[arg(long = "dangerously-skip-permissions", global = true)]
     dangerously_skip_permissions: bool,
+
+    /// Confirm intent to skip all permission checks.
+    /// Must be combined with `--dangerously-skip-permissions`.
+    #[arg(long = "allow-dangerously-skip-permissions", global = true)]
+    allow_dangerously_skip_permissions: bool,
 
     /// Only allow these tools (comma-separated function names, e.g. fs_read,fs_grep).
     #[arg(long = "allowed-tools", global = true, value_delimiter = ',')]
@@ -1096,13 +1104,33 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
             "--chrome and --no-chrome are mutually exclusive"
         ));
     }
+    if cli.dangerously_skip_permissions && !cli.allow_dangerously_skip_permissions {
+        return Err(anyhow!(
+            "--dangerously-skip-permissions requires --allow-dangerously-skip-permissions to confirm intent"
+        ));
+    }
+    if cli.allow_dangerously_skip_permissions && !cli.dangerously_skip_permissions {
+        return Err(anyhow!(
+            "--allow-dangerously-skip-permissions has no effect without --dangerously-skip-permissions"
+        ));
+    }
+    // Check managed settings: enterprise may disable bypass mode.
+    if cli.dangerously_skip_permissions
+        && cli.allow_dangerously_skip_permissions
+        && let Some(managed) = load_managed_settings()
+        && managed.disable_bypass_permissions_mode
+    {
+        return Err(anyhow!(
+            "bypass permissions mode is disabled by managed settings"
+        ));
+    }
     Ok(())
 }
 
 /// Apply CLI-level engine overrides (permission mode, verbose, budget limits).
 fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
-    if cli.dangerously_skip_permissions {
-        engine.set_permission_mode("auto");
+    if cli.dangerously_skip_permissions && cli.allow_dangerously_skip_permissions {
+        engine.set_permission_mode("bypassPermissions");
     } else if let Some(ref mode) = cli.permission_mode {
         engine.set_permission_mode(mode);
     }
