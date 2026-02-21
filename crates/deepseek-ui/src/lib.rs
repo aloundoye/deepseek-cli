@@ -942,26 +942,6 @@ pub struct TranscriptEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RightPane {
-    Plan,
-    Tools,
-    MissionControl,
-    Artifacts,
-}
-
-#[cfg(test)]
-impl RightPane {
-    fn cycle(self) -> Self {
-        match self {
-            Self::Plan => Self::Tools,
-            Self::Tools => Self::MissionControl,
-            Self::MissionControl => Self::Artifacts,
-            Self::Artifacts => Self::Plan,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VimMode {
     Insert,
     Normal,
@@ -2947,19 +2927,6 @@ mod tests {
         assert!(text2.contains("INSERT"));
         assert!(text2.contains("42%"));
         assert!(text2.contains("\u{2193} new"));
-    }
-
-    #[test]
-    fn right_pane_cycles_through_all_variants() {
-        let mut pane = RightPane::Plan;
-        pane = pane.cycle();
-        assert_eq!(pane, RightPane::Tools);
-        pane = pane.cycle();
-        assert_eq!(pane, RightPane::MissionControl);
-        pane = pane.cycle();
-        assert_eq!(pane, RightPane::Artifacts);
-        pane = pane.cycle();
-        assert_eq!(pane, RightPane::Plan);
     }
 
     #[test]

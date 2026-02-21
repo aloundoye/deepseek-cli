@@ -145,19 +145,6 @@ pub struct PlanStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Failure {
-    pub summary: String,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StepOutcome {
-    pub step_id: Uuid,
-    pub success: bool,
-    pub notes: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterSignals {
     pub prompt_complexity: f32,
     pub repo_breadth: f32,
@@ -204,20 +191,6 @@ pub struct RouterDecision {
     pub confidence: f32,
     pub score: f32,
     pub escalated: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanContext {
-    pub session: Session,
-    pub user_prompt: String,
-    pub prior_failures: Vec<Failure>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecContext {
-    pub session: Session,
-    pub plan: Plan,
-    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -566,15 +539,6 @@ pub enum EventKind {
         provider: String,
         model: String,
     },
-}
-
-pub trait Planner {
-    fn create_plan(&self, ctx: PlanContext) -> Result<Plan>;
-    fn revise_plan(&self, ctx: PlanContext, last_plan: &Plan, failure: Failure) -> Result<Plan>;
-}
-
-pub trait Executor {
-    fn run_step(&self, ctx: ExecContext, step: &PlanStep) -> Result<StepOutcome>;
 }
 
 pub trait ModelRouter {

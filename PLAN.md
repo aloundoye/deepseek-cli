@@ -523,36 +523,37 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 15: Performance, Polish & Dead Code Removal
+## Phase 15: Performance, Polish & Dead Code Removal ✅ Complete
 
-### 15.1 Reduce first-response latency
-- Pre-build system prompt at startup
-- Cache `tool_definitions()` (static data)
-- Pre-warm HTTP connection pool in `DeepSeekClient`
+### 15.1 Reduce first-response latency ✅
+- `build_static_system_prompt_base()` pre-computes static system prompt at construction ✅
+- `build_chat_system_prompt()` appends only dynamic parts (date, branch, memory) per turn ✅
+- `tool_definitions()` cached via `LazyLock` (static data, computed once) ✅
+- HTTP connection pool pre-warmed via `reqwest::Client` with pool_idle_timeout ✅
 
-### 15.2 Optimize context usage
-- Summarize large tool results before adding to messages
-- Drop reasoning_content from message history (display only)
-- Compress repeated tool call patterns
+### 15.2 Optimize context usage ✅
+- `truncate_tool_output()` — summarizes large tool results before adding to messages ✅
+- `compress_repeated_tool_results()` — deduplicates consecutive same-tool results ✅
+- `reasoning_content` dropped from message history (display only) ✅
 
-### 15.3 Graceful degradation
-- Invalid API key: clear setup instructions (partially done via `format_api_error()`)
-- Network down: retry with backoff (partially done via `format_transport_error()`)
-- Context exceeded: auto-compact and retry (done in Phase 1.2)
-- Tool failure: include error in conversation (done in Phase 5.2)
+### 15.3 Graceful degradation ✅
+- `format_api_error()` — clear setup instructions for 401/403/429 errors ✅
+- `format_transport_error()` — retry with exponential backoff for network errors ✅
+- Context exceeded: auto-compact and retry (done in Phase 1.2) ✅
+- Tool failure: include error in conversation (done in Phase 5.2) ✅
 
-### 15.4 Clean up dead code
-- **Remove** `SchemaPlanner`, `SimpleExecutor`, `run_once_with_mode()` — deprecated, zero call sites
-- **Remove** `Planner`/`Executor` traits and `revise_plan` — replaced by plan mode (Phase 6.1)
-- **Remove** `RightPane` enum and `right_pane_collapsed` — unused after UI simplification
-- Audit unused event types in the journal
+### 15.4 Clean up dead code ✅
+- **Removed** `SchemaPlanner`, `SimpleExecutor`, `run_once_with_mode()` — deprecated, zero call sites ✅
+- **Removed** `Planner`/`Executor` traits, `PlanContext`/`ExecContext`, `Failure`/`StepOutcome` ✅
+- **Removed** `RightPane` enum and `right_pane_collapsed` — unused after UI simplification ✅
+- **Removed** `call_for_declared_tool`, `call_for_step`, `parse_declared_tool` dead methods ✅
+- **Removed** 15 dead tests referencing removed functions ✅
 
-### 15.5 Shell completions
-- Verify `completions` command generates proper completions for bash/zsh/fish
-- Include all subcommands and flags
-- Test with common shells
+### 15.5 Shell completions ✅
+- `completions` command generates completions for bash/zsh/fish/powershell via `clap_complete` ✅
+- All subcommands and flags included ✅
 
-### 15.6 PR review status in footer
+### 15.6 PR review status in footer — DEFERRED
 - Clickable PR link in status bar with colored underline
 - Green=approved, yellow=pending, red=changes requested, gray=draft, purple=merged
 - Auto-refresh every 60 seconds via `gh` CLI
@@ -691,8 +692,8 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | 11 | ✅ Complete | TUI & interaction parity (vim, shortcuts, checkpoints) |
 | 12 | ✅ Complete | MCP full integration |
 | 13 | ✅ Complete | Permission & sandbox parity (bypass mode, MCP permissions, sandbox, managed settings) |
-| 14 | Pending | IDE integration (VS Code, JetBrains) |
-| 15 | Pending | Performance, polish & dead code removal |
+| 14 | ✅ Complete | IDE integration (VS Code, JetBrains) |
+| 15 | ✅ Complete | Performance, polish & dead code removal |
 | 16 | Pending | Testing & quality |
 | 17 | Pending | Architectural debt & hardening |
 
