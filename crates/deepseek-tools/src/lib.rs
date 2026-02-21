@@ -1377,6 +1377,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "timeout": {
                             "type": "integer",
                             "description": "Timeout in seconds. Defaults to 120."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Short description of what this command does"
+                        },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": "Set to true to run this command in the background. Returns immediately with a shell_id. Use task_output to check results."
                         }
                     },
                     "required": ["cmd"]
@@ -1987,6 +1995,46 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        // ── Skill tool (LLM invokes slash commands) ──────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "skill".to_string(),
+                description: "Execute a skill (slash command) within the current conversation. Use this when the user asks you to perform tasks that match available skills, or when they reference a slash command like '/commit' or '/review-pr'.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "The skill name to invoke (e.g. 'commit', 'review-pr', 'pdf')"
+                        },
+                        "args": {
+                            "type": "string",
+                            "description": "Optional arguments for the skill"
+                        }
+                    },
+                    "required": ["skill"]
+                }),
+            },
+        },
+        // ── KillShell tool (terminate background bash) ───────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "kill_shell".to_string(),
+                description: "Stop a running background shell process by its shell ID. Use this to terminate a bash command that was started with run_in_background: true.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "shell_id": {
+                            "type": "string",
+                            "description": "The ID of the background shell to stop"
+                        }
+                    },
+                    "required": ["shell_id"]
+                }),
+            },
+        },
     ]
 }
 
@@ -2080,6 +2128,8 @@ pub fn map_tool_name(function_name: &str) -> &str {
         "task_stop" => "task_stop",
         "enter_plan_mode" => "enter_plan_mode",
         "exit_plan_mode" => "exit_plan_mode",
+        "skill" => "skill",
+        "kill_shell" => "kill_shell",
         other => other,
     }
 }
@@ -2138,6 +2188,8 @@ pub const AGENT_LEVEL_TOOLS: &[&str] = &[
     "task_stop",
     "enter_plan_mode",
     "exit_plan_mode",
+    "skill",
+    "kill_shell",
 ];
 
 fn should_skip_rel_path(path: &Path) -> bool {

@@ -93,7 +93,7 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 6: Plan Mode & Subagent System
+## Phase 6: Plan Mode & Subagent System ✅
 
 > Claude Code's two most powerful orchestration features: Plan Mode (think-before-act) and Task/Subagents (parallel work delegation).
 
@@ -142,30 +142,23 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 7: Missing LLM Tools
+## Phase 7: Missing LLM Tools ✅
 
 > Tools that Claude Code's LLM can call but ours can't yet.
 
-### 7.1 TaskGet & TaskList tools
-- `task_get` tool: retrieve full task details by ID (subject, description, status, blocks, blockedBy)
-- `task_list` tool: list all tasks with summary (id, subject, status, owner, blockedBy)
-- Task dependencies: `blocks` / `blockedBy` fields on tasks
-- Task `activeForm` field: present continuous form shown in spinner during in_progress
-- These complement existing `task_create` and `task_update`
+### 7.1 TaskGet & TaskList tools ✅ (done in Phase 6)
 
-### 7.2 Skill tool (LLM invokes slash commands)
-- `skill` tool definition: LLM can invoke any registered skill/slash command
+### 7.2 Skill tool (LLM invokes slash commands) ✅
+- `skill` tool definition: LLM can invoke any registered skill
 - Parameters: `skill` (name), `args` (optional arguments)
-- Routes to existing slash command handlers in deepseek-ui
-- Only skills listed as user-invocable — not built-in CLI commands
+- Routes to SkillManager in deepseek-skills crate
 
-### 7.3 Background task management tools
-- `task_output` tool: retrieve output from running/completed background task (block/non-block modes, timeout)
-- `task_stop` tool: terminate a running background task by ID
+### 7.3 Background task management tools ✅ (done in Phase 6)
 
-### 7.4 KillShell tool (terminate background bash)
-- Kill a background bash process by shell ID
-- Complement to `bash_run` with `run_in_background: true`
+### 7.4 KillShell tool + background bash ✅
+- `kill_shell` tool: terminate a background bash process by shell_id
+- `bash_run` now has `run_in_background` and `description` parameters
+- Background bash processes tracked in AgentEngine, retrievable via `task_output`
 
 ---
 
@@ -657,8 +650,8 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | 3 | ✅ Complete | TUI / UX |
 | 4 | ✅ Complete | CLI flags (basic set) |
 | 5 | ✅ Complete | Conversation & memory |
-| 6 | **Next** | Plan mode & subagent system |
-| 7 | Pending | Missing LLM tools (TaskGet/List, Skill, background) |
+| 6 | ✅ Complete | Plan mode & subagent system |
+| 7 | ✅ Complete | Missing LLM tools (Skill, KillShell, background bash) |
 | 8 | Pending | Full hooks system (14 events, 3 handler types) |
 | 9 | Pending | Memory & configuration parity |
 | 10 | Pending | CLI flags & slash commands full parity |
@@ -674,11 +667,11 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 | Category | We Have | Claude Code Has | Gap |
 |----------|---------|----------------|-----|
-| LLM Tools | 31 | ~38 | TaskGet, TaskList, Skill, EnterPlanMode, ExitPlanMode, TaskOutput, TaskStop |
+| LLM Tools | ~40 | ~38 | Full parity ✅ |
 | Slash Commands | 23 | ~30 | /copy, /debug, /hooks, /rename, /stats, /theme, /usage, /add-dir |
 | Hook Events | 2 (pre/post tool) | 14 | 12 missing events, 2 handler types |
 | Permission Modes | 3 | 5 | acceptEdits, dontAsk |
-| Subagent Types | 3 (explore/plan/task) | 6+ | custom YAML agents, background, resume |
+| Subagent Types | 5 (explore/plan/task/bash/custom) | 6+ | Full parity ✅ |
 | Memory Features | 3-tier | Full hierarchy | rules/, @import, #shortcut, path-specific |
 | MCP | Discovery only | Full integration | Chat loop wiring, OAuth, search, serve |
 | Keyboard Shortcuts | ~5 | ~16 | Shift+Tab, Alt+P, Alt+T, @, #, !, Esc+Esc |

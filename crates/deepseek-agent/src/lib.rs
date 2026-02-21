@@ -236,6 +236,16 @@ struct BackgroundTask {
     stopped: bool,
 }
 
+/// Tracks a background bash process spawned with `bash_run` + `run_in_background: true`.
+#[allow(dead_code)]
+struct BackgroundShell {
+    shell_id: Uuid,
+    cmd: String,
+    handle: Option<thread::JoinHandle<deepseek_core::ToolResult>>,
+    result: Option<deepseek_core::ToolResult>,
+    stopped: bool,
+}
+
 pub struct AgentEngine {
     workspace: PathBuf,
     store: Store,
@@ -261,6 +271,8 @@ pub struct AgentEngine {
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     /// Background subagent tasks (spawn_task with run_in_background: true).
     background_tasks: Mutex<VecDeque<BackgroundTask>>,
+    /// Background bash shells (bash_run with run_in_background: true).
+    background_shells: Mutex<VecDeque<BackgroundShell>>,
 }
 
 impl AgentEngine {
@@ -293,6 +305,7 @@ impl AgentEngine {
             user_question_handler: Mutex::new(None),
             subagent_worker: Mutex::new(None),
             background_tasks: Mutex::new(VecDeque::new()),
+            background_shells: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1629,6 +1642,56 @@ impl AgentEngine {
                             "\n[tool: {}]{detail}\n",
                             internal_name
                         )));
+                    }
+
+                    // Intercept bash.run with run_in_background: true
+                    if internal_name == "bash.run"
+                        && args
+                            .get("run_in_background")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    {
+                        let shell_id = Uuid::now_v7();
+                        let cmd_str = args
+                            .get("cmd")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let host = Arc::clone(&self.tool_host);
+                        let approved_call = ApprovedToolCall {
+                            invocation_id: proposal.invocation_id,
+                            call: proposal.call,
+                        };
+                        let handle = thread::spawn(move || host.execute(approved_call));
+
+                        if let Ok(mut shells) = self.background_shells.lock() {
+                            shells.push_back(BackgroundShell {
+                                shell_id,
+                                cmd: cmd_str.clone(),
+                                handle: Some(handle),
+                                result: None,
+                                stopped: false,
+                            });
+                        }
+
+                        messages.push(ChatMessage::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: serde_json::to_string(&json!({
+                                "shell_id": shell_id.to_string(),
+                                "status": "running",
+                                "cmd": cmd_str,
+                                "message": "Command started in background. Use task_output with this shell_id to check results, or kill_shell to stop it."
+                            }))?,
+                        });
+                        self.emit(
+                            session.session_id,
+                            EventKind::BackgroundJobStartedV1 {
+                                job_id: shell_id,
+                                kind: "bash".to_string(),
+                                reference: cmd_str,
+                            },
+                        )?;
+                        continue;
                     }
 
                     let tool_start = Instant::now();
@@ -3182,11 +3245,13 @@ impl AgentEngine {
             "spawn_task" => self.handle_spawn_task(args),
             "task_output" => self.handle_task_output(args),
             "task_stop" => self.handle_task_stop(args),
+            "skill" => self.handle_skill(args),
+            "kill_shell" => self.handle_kill_shell(args),
             // Plan mode tools are handled inline in chat loop, not here
             "enter_plan_mode" | "exit_plan_mode" => {
                 Ok("Plan mode transition handled.".to_string())
             }
-            _ => Err(anyhow::anyhow!("unknown agent tool: {tool_name}")),
+            _ => Err(anyhow!("unknown agent tool: {tool_name}")),
         };
         let tool_elapsed = tool_start.elapsed();
 
@@ -3547,6 +3612,43 @@ impl AgentEngine {
             .and_then(|v| v.as_u64())
             .unwrap_or(30_000);
 
+        // Check background subagent tasks first.
+        let found_in_tasks = self
+            .background_tasks
+            .lock()
+            .ok()
+            .is_some_and(|bg| bg.iter().any(|t| t.task_id == task_id));
+
+        if found_in_tasks {
+            return self.poll_background_task(task_id_str, task_id, block, timeout_ms);
+        }
+
+        // Check background bash shells.
+        let found_in_shells = self
+            .background_shells
+            .lock()
+            .ok()
+            .is_some_and(|bg| bg.iter().any(|s| s.shell_id == task_id));
+
+        if found_in_shells {
+            return self.poll_background_shell(task_id_str, task_id, block, timeout_ms);
+        }
+
+        Ok(serde_json::to_string(&json!({
+            "task_id": task_id_str,
+            "status": "unknown",
+            "error": format!("no background task or shell with id {task_id_str}")
+        }))?)
+    }
+
+    /// Poll a background subagent task for its result.
+    fn poll_background_task(
+        &self,
+        task_id_str: &str,
+        task_id: Uuid,
+        block: bool,
+        timeout_ms: u64,
+    ) -> Result<String> {
         let mut bg = self
             .background_tasks
             .lock()
@@ -3557,7 +3659,6 @@ impl AgentEngine {
             .find(|t| t.task_id == task_id)
             .ok_or_else(|| anyhow!("no background task with id {task_id_str}"))?;
 
-        // If we already have a result, return it immediately.
         if let Some(ref output) = entry.result {
             return Ok(serde_json::to_string(&json!({
                 "task_id": task_id_str,
@@ -3574,15 +3675,12 @@ impl AgentEngine {
             }))?);
         }
 
-        // Take the handle out so we can join without holding the mutex.
         let handle = entry.handle.take();
         drop(bg);
 
         if let Some(handle) = handle {
             if block {
-                // Wait up to timeout_ms for completion.
-                let deadline =
-                    Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 loop {
                     if handle.is_finished() {
                         let output = handle
@@ -3600,7 +3698,6 @@ impl AgentEngine {
                         }))?);
                     }
                     if Instant::now() >= deadline {
-                        // Put the handle back — still running.
                         if let Ok(mut bg) = self.background_tasks.lock()
                             && let Some(entry) = bg.iter_mut().find(|t| t.task_id == task_id)
                         {
@@ -3615,7 +3712,6 @@ impl AgentEngine {
                     thread::sleep(std::time::Duration::from_millis(100));
                 }
             } else {
-                // Non-blocking check.
                 if handle.is_finished() {
                     let output = handle
                         .join()
@@ -3631,7 +3727,6 @@ impl AgentEngine {
                         "output": output
                     }))?);
                 }
-                // Still running — put handle back.
                 if let Ok(mut bg) = self.background_tasks.lock()
                     && let Some(entry) = bg.iter_mut().find(|t| t.task_id == task_id)
                 {
@@ -3644,11 +3739,128 @@ impl AgentEngine {
             }
         }
 
-        // No handle and no result — probably already collected.
         Ok(serde_json::to_string(&json!({
             "task_id": task_id_str,
             "status": "unknown",
             "message": "Task handle already consumed"
+        }))?)
+    }
+
+    /// Poll a background shell for its result.
+    fn poll_background_shell(
+        &self,
+        shell_id_str: &str,
+        shell_id: Uuid,
+        block: bool,
+        timeout_ms: u64,
+    ) -> Result<String> {
+        let mut shells = self
+            .background_shells
+            .lock()
+            .map_err(|_| anyhow!("background_shells lock poisoned"))?;
+
+        let entry = shells
+            .iter_mut()
+            .find(|s| s.shell_id == shell_id)
+            .ok_or_else(|| anyhow!("no background shell with id {shell_id_str}"))?;
+
+        if let Some(ref result) = entry.result {
+            return Ok(serde_json::to_string(&json!({
+                "task_id": shell_id_str,
+                "status": if entry.stopped { "stopped" } else { "completed" },
+                "output": result.output
+            }))?);
+        }
+
+        if entry.stopped {
+            return Ok(serde_json::to_string(&json!({
+                "task_id": shell_id_str,
+                "status": "stopped",
+                "output": ""
+            }))?);
+        }
+
+        let handle = entry.handle.take();
+        drop(shells);
+
+        if let Some(handle) = handle {
+            if block {
+                let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                loop {
+                    if handle.is_finished() {
+                        let result = handle.join().unwrap_or_else(|_| {
+                            deepseek_core::ToolResult {
+                                invocation_id: Uuid::nil(),
+                                success: false,
+                                output: json!({"error": "shell thread panicked"}),
+                            }
+                        });
+                        let output = result.output.clone();
+                        if let Ok(mut shells) = self.background_shells.lock()
+                            && let Some(entry) =
+                                shells.iter_mut().find(|s| s.shell_id == shell_id)
+                        {
+                            entry.result = Some(result);
+                        }
+                        return Ok(serde_json::to_string(&json!({
+                            "task_id": shell_id_str,
+                            "status": "completed",
+                            "output": output
+                        }))?);
+                    }
+                    if Instant::now() >= deadline {
+                        if let Ok(mut shells) = self.background_shells.lock()
+                            && let Some(entry) =
+                                shells.iter_mut().find(|s| s.shell_id == shell_id)
+                        {
+                            entry.handle = Some(handle);
+                        }
+                        return Ok(serde_json::to_string(&json!({
+                            "task_id": shell_id_str,
+                            "status": "running",
+                            "message": format!("Shell still running after {timeout_ms}ms timeout")
+                        }))?);
+                    }
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+            } else {
+                if handle.is_finished() {
+                    let result = handle.join().unwrap_or_else(|_| {
+                        deepseek_core::ToolResult {
+                            invocation_id: Uuid::nil(),
+                            success: false,
+                            output: json!({"error": "shell thread panicked"}),
+                        }
+                    });
+                    let output = result.output.clone();
+                    if let Ok(mut shells) = self.background_shells.lock()
+                        && let Some(entry) =
+                            shells.iter_mut().find(|s| s.shell_id == shell_id)
+                    {
+                        entry.result = Some(result);
+                    }
+                    return Ok(serde_json::to_string(&json!({
+                        "task_id": shell_id_str,
+                        "status": "completed",
+                        "output": output
+                    }))?);
+                }
+                if let Ok(mut shells) = self.background_shells.lock()
+                    && let Some(entry) = shells.iter_mut().find(|s| s.shell_id == shell_id)
+                {
+                    entry.handle = Some(handle);
+                }
+                return Ok(serde_json::to_string(&json!({
+                    "task_id": shell_id_str,
+                    "status": "running"
+                }))?);
+            }
+        }
+
+        Ok(serde_json::to_string(&json!({
+            "task_id": shell_id_str,
+            "status": "unknown",
+            "message": "Shell handle already consumed"
         }))?)
     }
 
@@ -3679,6 +3891,57 @@ impl AgentEngine {
 
         Ok(serde_json::to_string(&json!({
             "task_id": task_id_str,
+            "status": "stopped",
+            "was_running": was_running
+        }))?)
+    }
+
+    /// Handle the skill tool: invoke a registered skill/slash command.
+    fn handle_skill(&self, args: &serde_json::Value) -> Result<String> {
+        let skill_name = args
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("skill parameter is required"))?;
+        let skill_args = args.get("args").and_then(|v| v.as_str());
+
+        let mgr = deepseek_skills::SkillManager::new(&self.workspace)?;
+        let configured_paths = &self.cfg.skills.paths;
+
+        match mgr.run(skill_name, skill_args, configured_paths) {
+            Ok(output) => Ok(serde_json::to_string(&json!({
+                "skill": skill_name,
+                "rendered_prompt": output.rendered_prompt,
+                "source_path": output.source_path.to_string_lossy(),
+            }))?),
+            Err(e) => Ok(serde_json::to_string(&json!({
+                "error": format!("skill '{}' not found or failed: {}", skill_name, e)
+            }))?),
+        }
+    }
+
+    /// Handle the kill_shell tool: stop a background bash process.
+    fn handle_kill_shell(&self, args: &serde_json::Value) -> Result<String> {
+        let shell_id_str = args
+            .get("shell_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("shell_id parameter is required"))?;
+        let shell_id = Uuid::parse_str(shell_id_str)?;
+
+        let mut shells = self
+            .background_shells
+            .lock()
+            .map_err(|_| anyhow!("background_shells lock poisoned"))?;
+
+        let entry = shells
+            .iter_mut()
+            .find(|s| s.shell_id == shell_id)
+            .ok_or_else(|| anyhow!("no background shell with id {shell_id_str}"))?;
+
+        entry.stopped = true;
+        let was_running = entry.handle.take().is_some();
+
+        Ok(serde_json::to_string(&json!({
+            "shell_id": shell_id_str,
             "status": "stopped",
             "was_running": was_running
         }))?)

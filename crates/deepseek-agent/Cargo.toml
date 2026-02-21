@@ -22,3 +22,4 @@ deepseek-store = { path = "../deepseek-store" }
 deepseek-tools = { path = "../deepseek-tools" }
 deepseek-subagent = { path = "../deepseek-subagent" }
 deepseek-memory = { path = "../deepseek-memory" }
+deepseek-skills = { path = "../deepseek-skills" }
