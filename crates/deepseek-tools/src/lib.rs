@@ -3098,10 +3098,13 @@ fn build_seatbelt_profile(workspace: &Path, config: &deepseek_core::SandboxConfi
     // Network access
     if config.network.block_all {
         profile.push_str("(deny network*)\n");
-    } else if !config.network.allowed_domains.is_empty() {
-        // Allow network but note: Seatbelt doesn't support per-domain filtering natively.
-        // Allow all network when specific domains are requested (filtering done at app level).
-        profile.push_str("(allow network*)\n");
+        // Even when blocking network, allow local binding if configured
+        if config.network.allow_local_binding {
+            profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+        }
+        if config.network.allow_unix_sockets {
+            profile.push_str("(allow network* (local unix-socket))\n");
+        }
     } else {
         profile.push_str("(allow network*)\n");
     }
@@ -3144,7 +3147,13 @@ fn build_bwrap_command(
     parts.push("/tmp".to_string());
     // Network
     if config.network.block_all {
-        parts.push("--unshare-net".to_string());
+        if config.network.allow_local_binding || config.network.allow_unix_sockets {
+            // When local binding or unix sockets are allowed, we can't fully unshare
+            // network. Instead we rely on application-level filtering.
+            // bwrap doesn't support fine-grained socket filtering natively.
+        } else {
+            parts.push("--unshare-net".to_string());
+        }
     }
     // Proc and dev
     parts.push("--proc".to_string());
@@ -3933,11 +3942,7 @@ mod tests {
         let workspace = std::path::Path::new("/tmp/test-project");
         let config = deepseek_core::SandboxConfig {
             enabled: true,
-            network: deepseek_core::SandboxNetworkConfig {
-                allowed_domains: vec![],
-                block_all: false,
-            },
-            excluded_commands: vec![],
+            ..Default::default()
         };
         let profile = super::build_seatbelt_profile(workspace, &config);
         assert!(profile.contains("/tmp/test-project"));
@@ -3951,10 +3956,10 @@ mod tests {
         let config = deepseek_core::SandboxConfig {
             enabled: true,
             network: deepseek_core::SandboxNetworkConfig {
-                allowed_domains: vec![],
                 block_all: true,
+                ..Default::default()
             },
-            excluded_commands: vec![],
+            ..Default::default()
         };
         let profile = super::build_seatbelt_profile(workspace, &config);
         assert!(profile.contains("(deny network*)"));
@@ -3965,11 +3970,7 @@ mod tests {
         let workspace = std::path::Path::new("/home/user/project");
         let config = deepseek_core::SandboxConfig {
             enabled: true,
-            network: deepseek_core::SandboxNetworkConfig {
-                allowed_domains: vec![],
-                block_all: false,
-            },
-            excluded_commands: vec![],
+            ..Default::default()
         };
         let result = super::build_bwrap_command(workspace, "ls -la", &config);
         assert!(result.contains("bwrap"));
@@ -3983,10 +3984,10 @@ mod tests {
         let config = deepseek_core::SandboxConfig {
             enabled: true,
             network: deepseek_core::SandboxNetworkConfig {
-                allowed_domains: vec![],
                 block_all: true,
+                ..Default::default()
             },
-            excluded_commands: vec![],
+            ..Default::default()
         };
         let result = super::build_bwrap_command(workspace, "echo hi", &config);
         assert!(result.contains("--unshare-net"));
@@ -4008,8 +4009,8 @@ mod tests {
         let workspace = std::path::Path::new("/tmp/test");
         let config = deepseek_core::SandboxConfig {
             enabled: true,
-            network: deepseek_core::SandboxNetworkConfig::default(),
             excluded_commands: vec!["cargo".to_string()],
+            ..Default::default()
         };
         let result = super::sandbox_wrap_command(workspace, "cargo test", &config);
         assert_eq!(result, "cargo test");
@@ -4030,6 +4031,40 @@ mod tests {
         let result = super::build_bwrap_command(workspace, "ls", &config);
         assert!(result.contains("--proc"));
         assert!(result.contains("--dev"));
+    }
+
+    #[test]
+    fn seatbelt_allows_local_binding_when_configured() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig {
+                block_all: true,
+                allow_local_binding: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let profile = super::build_seatbelt_profile(workspace, &config);
+        assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("localhost"));
+    }
+
+    #[test]
+    fn bwrap_preserves_net_when_local_binding_allowed() {
+        let workspace = std::path::Path::new("/tmp/test");
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            network: deepseek_core::SandboxNetworkConfig {
+                block_all: true,
+                allow_local_binding: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = super::build_bwrap_command(workspace, "node server.js", &config);
+        // When local binding is allowed, we can't fully unshare network
+        assert!(!result.contains("--unshare-net"));
     }
 
     #[test]

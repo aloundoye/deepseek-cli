@@ -989,6 +989,8 @@ impl Default for RouterConfig {
 #[serde(default)]
 pub struct SandboxConfig {
     pub enabled: bool,
+    /// When true and sandbox is enabled, auto-approve bash commands without prompting.
+    pub auto_allow_bash_if_sandboxed: bool,
     pub network: SandboxNetworkConfig,
     pub excluded_commands: Vec<String>,
 }
@@ -998,6 +1000,10 @@ pub struct SandboxConfig {
 pub struct SandboxNetworkConfig {
     pub allowed_domains: Vec<String>,
     pub block_all: bool,
+    /// Allow binding to localhost ports (e.g., for dev servers).
+    pub allow_local_binding: bool,
+    /// Allow Unix domain sockets.
+    pub allow_unix_sockets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

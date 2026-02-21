@@ -1790,8 +1790,29 @@ impl AgentEngine {
                     continue;
                 }
 
-                // ── MCP tool calls (routed to MCP servers) ──
+                // ── MCP tool calls (routed to MCP servers, with permission check) ──
                 if Self::is_mcp_tool(&tc.name) {
+                    // Build a ToolCall for the permission engine
+                    let mcp_tool_call = ToolCall {
+                        name: tc.name.clone(),
+                        args: args.clone(),
+                        requires_approval: true,
+                    };
+                    if self.policy.requires_approval(&mcp_tool_call)
+                        && !self
+                            .request_tool_approval(&mcp_tool_call)
+                            .unwrap_or(false)
+                    {
+                        messages.push(ChatMessage::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: format!(
+                                "Error: MCP tool '{}' was denied by permission policy",
+                                tc.name
+                            ),
+                        });
+                        continue;
+                    }
+
                     if let Ok(cb) = self.stream_callback.lock()
                         && let Some(ref cb) = *cb
                     {
@@ -3616,6 +3637,7 @@ impl AgentEngine {
 
     /// Discover MCP tools from all enabled servers and return ToolDefinitions.
     /// Results are cached in `self.mcp_tools` for routing tool calls later.
+    /// Respects managed settings MCP server allow/deny lists.
     fn discover_mcp_tool_definitions(&self) -> Vec<deepseek_core::ToolDefinition> {
         let Some(ref mcp) = self.mcp else {
             return vec![];
@@ -3628,10 +3650,20 @@ impl AgentEngine {
                 return vec![];
             }
         };
+        // Filter tools by managed settings MCP server allow/deny lists
+        let managed = deepseek_policy::load_managed_settings();
+        let filtered: Vec<McpTool> = if let Some(ref managed) = managed {
+            tools
+                .into_iter()
+                .filter(|t| deepseek_policy::is_mcp_server_allowed(&t.server_id, managed))
+                .collect()
+        } else {
+            tools
+        };
         if let Ok(mut cache) = self.mcp_tools.lock() {
-            *cache = tools.clone();
+            *cache = filtered.clone();
         }
-        tools
+        filtered
             .into_iter()
             .map(|t| mcp_tool_to_definition(&t))
             .collect()

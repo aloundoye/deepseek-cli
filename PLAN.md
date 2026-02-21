@@ -440,28 +440,44 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 13: Permission & Sandbox Parity
+## Phase 13: Permission & Sandbox Parity ✅ Complete
 
-### 13.1 Full permission mode set ✅ (done in Phase 9.5)
-- `acceptEdits`, `dontAsk` modes implemented
-- Remaining: `bypassPermissions` — skip all prompts (requires `--dangerously-skip-permissions` + `--allow-dangerously-skip-permissions`)
+### 13.1 Full permission mode set ✅
+- `acceptEdits`, `dontAsk` modes implemented (Phase 9.5)
+- `BypassPermissions` mode added — skips ALL permission checks ✅
+- Requires both `--dangerously-skip-permissions` AND `--allow-dangerously-skip-permissions` flags ✅
+- CLI validates both flags are present together (errors if only one) ✅
+- Not included in Shift+Tab cycle (must be set explicitly) ✅
 
-### 13.2 Granular permission rules with glob patterns ✅ (done in Phase 9.6)
-- `Bash(npm run *)`, `Read(src/**/*.rs)`, `Edit(...)`, `WebFetch(domain:...)`, `Task(...)` all implemented
-- Remaining: `mcp__<server>` / `mcp__<server>__<tool>` — MCP tool permissions (Phase 12)
+### 13.2 Granular permission rules with glob patterns ✅
+- `Bash(npm run *)`, `Read(src/**/*.rs)`, `Edit(...)`, `WebFetch(domain:...)`, `Task(...)` (Phase 9.6)
+- `Mcp(server_id)` — matches all tools on a server ✅
+- `Mcp(server_id__tool_name)` — matches specific server+tool ✅
+- `Mcp(*)` — matches all MCP tools ✅
+- MCP tools now routed through proposal/approval system (no longer bypass permissions) ✅
+- MCP tools require approval in Ask, Plan, Locked, AcceptEdits, DontAsk modes ✅
+- Permission rules evaluation takes priority (deny > ask > allow) ✅
 
-### 13.3 Sandbox improvements
-- OS-level filesystem and network isolation for Bash commands
-- `sandbox.enabled`, `sandbox.autoAllowBashIfSandboxed`
-- Network: `allowedDomains`, `allowLocalBinding`, `allowUnixSockets`
-- `sandbox.excludedCommands` — commands that bypass sandbox
+### 13.3 Sandbox improvements ✅
+- `sandbox.auto_allow_bash_if_sandboxed` — auto-approve bash when sandbox is enabled ✅
+- `sandbox.network.allow_local_binding` — allow localhost port binding in sandboxed mode ✅
+- `sandbox.network.allow_unix_sockets` — allow Unix domain sockets ✅
+- Seatbelt profile updated: local binding and unix socket exceptions when network blocked ✅
+- Bwrap command updated: preserves network when local binding/unix sockets needed ✅
+- PolicyEngine reads sandbox config and auto-approves bash when configured ✅
 
-### 13.4 Managed settings (enterprise/team)
-- System-wide paths: macOS `/Library/Application Support/DeepSeekCLI/managed-settings.json`
-- `disableBypassPermissionsMode` — prevent bypass
-- `allowManagedPermissionRulesOnly` — only managed rules apply
-- `allowManagedHooksOnly` — only managed hooks load
-- `allowedMcpServers` / `deniedMcpServers` — MCP server allowlists
+### 13.4 Managed settings (enterprise/team) ✅
+- `ManagedSettings` struct with enterprise controls ✅
+- Platform-specific paths: macOS `/Library/Application Support/DeepSeekCLI/managed-settings.json`, Linux `/etc/deepseek-cli/managed-settings.json`, Windows `%ProgramData%\DeepSeekCLI\managed-settings.json` ✅
+- `DEEPSEEK_MANAGED_SETTINGS_PATH` env var override ✅
+- `disable_bypass_permissions_mode` — prevents bypass mode at CLI validation and PolicyEngine level ✅
+- `allow_managed_permission_rules_only` — replaces user rules with managed rules ✅
+- `allow_managed_hooks_only` — flag for hook system to check ✅
+- `allowed_mcp_servers` / `denied_mcp_servers` — MCP server allow/deny lists ✅
+- `is_mcp_server_allowed()` — checks server against managed lists ✅
+- MCP tool discovery filters by managed server allow/deny lists ✅
+- Managed settings applied as final overrides in `PolicyEngine::from_app_config()` ✅
+- Managed permission rules prepended (higher priority) when merging with user rules ✅
 
 ---
 
@@ -652,9 +668,9 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 | 8 | ✅ Complete | Full hooks system (14 events, command handler, wired into agent) |
 | 9 | ✅ Complete | Memory & configuration parity (rules, hierarchy, @imports, modes, globs, settings) |
 | 10 | ✅ Complete | CLI flags & slash commands full parity (20 flags, 16 commands, custom commands) |
-| 11 | Pending | TUI & interaction parity (vim, shortcuts, checkpoints) |
-| 12 | Pending | MCP full integration |
-| 13 | Pending | Permission & sandbox parity |
+| 11 | ✅ Complete | TUI & interaction parity (vim, shortcuts, checkpoints) |
+| 12 | ✅ Complete | MCP full integration |
+| 13 | ✅ Complete | Permission & sandbox parity (bypass mode, MCP permissions, sandbox, managed settings) |
 | 14 | Pending | IDE integration (VS Code, JetBrains) |
 | 15 | Pending | Performance, polish & dead code removal |
 | 16 | Pending | Testing & quality |

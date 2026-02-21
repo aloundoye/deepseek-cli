@@ -15,6 +15,9 @@ pub enum PermissionMode {
     /// Auto-denies everything unless pre-approved via allow rules.
     DontAsk,
     Locked,
+    /// Skip ALL permission checks — requires both `--dangerously-skip-permissions`
+    /// and `--allow-dangerously-skip-permissions` CLI flags.
+    BypassPermissions,
 }
 
 impl PermissionMode {
@@ -25,6 +28,9 @@ impl PermissionMode {
             "acceptedits" | "accept-edits" | "accept_edits" => PermissionMode::AcceptEdits,
             "dontask" | "dont-ask" | "dont_ask" => PermissionMode::DontAsk,
             "locked" => PermissionMode::Locked,
+            "bypasspermissions" | "bypass-permissions" | "bypass_permissions" | "bypass" => {
+                PermissionMode::BypassPermissions
+            }
             _ => PermissionMode::Ask,
         }
     }
@@ -37,10 +43,12 @@ impl PermissionMode {
             PermissionMode::AcceptEdits => "acceptEdits",
             PermissionMode::DontAsk => "dontAsk",
             PermissionMode::Locked => "locked",
+            PermissionMode::BypassPermissions => "bypassPermissions",
         }
     }
 
     /// Cycle to the next mode: ask → auto → acceptEdits → plan → dontAsk → locked → ask.
+    /// BypassPermissions is NOT included in the cycle — it must be set explicitly.
     pub fn cycle(&self) -> Self {
         match self {
             PermissionMode::Ask => PermissionMode::Auto,
@@ -49,6 +57,7 @@ impl PermissionMode {
             PermissionMode::Plan => PermissionMode::DontAsk,
             PermissionMode::DontAsk => PermissionMode::Locked,
             PermissionMode::Locked => PermissionMode::Ask,
+            PermissionMode::BypassPermissions => PermissionMode::Ask,
         }
     }
 }
@@ -74,6 +83,33 @@ impl PermissionRule {
     /// Returns `Some(decision)` if matched, `None` otherwise.
     pub fn matches(&self, call: &ToolCall) -> Option<&str> {
         let (tool_prefix, specifier) = parse_rule_syntax(&self.rule)?;
+
+        // MCP tool rules: Mcp(server_id) or Mcp(server_id__tool_name)
+        if tool_prefix.eq_ignore_ascii_case("mcp") {
+            if !call.name.starts_with("mcp__") {
+                return None;
+            }
+            // specifier is either "server_id" (matches all tools) or "server_id__tool_name"
+            let call_rest = &call.name["mcp__".len()..];
+            if specifier == "*" {
+                return Some(&self.decision);
+            }
+            if specifier.contains("__") {
+                // Exact server+tool match
+                if call_rest == specifier {
+                    return Some(&self.decision);
+                }
+            } else {
+                // Server-only match: "server_id" matches "mcp__server_id__*"
+                if call_rest.starts_with(&specifier)
+                    && call_rest[specifier.len()..].starts_with("__")
+                {
+                    return Some(&self.decision);
+                }
+            }
+            return None;
+        }
+
         let tool_name = match tool_prefix.as_str() {
             "Bash" | "bash" => "bash.run",
             "Read" | "read" => "fs.read",
@@ -299,6 +335,8 @@ pub struct PolicyEngine {
     cfg: PolicyConfig,
     secret_regexes: Vec<Regex>,
     permission_mode: PermissionMode,
+    /// When sandbox is enabled with auto_allow_bash_if_sandboxed, auto-approve bash.
+    sandbox_auto_allow_bash: bool,
 }
 
 impl PolicyEngine {
@@ -320,6 +358,7 @@ impl PolicyEngine {
             cfg,
             secret_regexes,
             permission_mode,
+            sandbox_auto_allow_bash: false,
         }
     }
 
@@ -365,7 +404,15 @@ impl PolicyEngine {
         if let Some(team_policy) = load_team_policy_override() {
             mapped = apply_team_policy_override(mapped, &team_policy);
         }
-        Self::new(mapped)
+        let sandbox_auto_allow_bash =
+            cfg.sandbox.enabled && cfg.sandbox.auto_allow_bash_if_sandboxed;
+        let mut engine = Self::new(mapped);
+        engine.sandbox_auto_allow_bash = sandbox_auto_allow_bash;
+        // Apply managed settings (enterprise overrides).
+        if let Some(managed) = load_managed_settings() {
+            apply_managed_settings(&mut engine, &managed);
+        }
+        engine
     }
 
     pub fn check_path(&self, path: &str) -> Result<(), PolicyError> {
@@ -420,9 +467,33 @@ impl PolicyEngine {
     }
 
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
+        // Check granular permission rules first (they take priority).
+        if !self.cfg.permission_rules.is_empty()
+            && let Some(decision) = evaluate_permission_rules(&self.cfg.permission_rules, call)
+        {
+            return match decision.as_str() {
+                "allow" => false,
+                "deny" | "ask" => true,
+                _ => true,
+            };
+        }
+
+        // Sandbox auto-approve: if sandbox is enabled with auto_allow_bash_if_sandboxed,
+        // bash commands don't need approval since they'll be sandboxed at execution time.
+        if self.sandbox_auto_allow_bash && call.name == "bash.run" {
+            return false;
+        }
+
+        // MCP tools are non-read-only and require approval under most modes.
+        let is_mcp = call.name.starts_with("mcp__");
+
         match self.permission_mode {
+            PermissionMode::BypassPermissions => false,
             PermissionMode::Locked => {
                 // In locked mode, all non-read tools require approval (and will be denied).
+                if is_mcp {
+                    return true;
+                }
                 !is_read_only_tool(&call.name)
             }
             PermissionMode::DontAsk => {
@@ -443,7 +514,10 @@ impl PolicyEngine {
                 !is_read_only_tool(&call.name)
             }
             PermissionMode::AcceptEdits => {
-                // AcceptEdits: file edits auto-approve; bash still needs approval.
+                // AcceptEdits: file edits auto-approve; bash/MCP still needs approval.
+                if is_mcp {
+                    return true;
+                }
                 if is_read_only_tool(&call.name) || is_edit_tool(&call.name) {
                     false
                 } else if call.name == "bash.run" {
@@ -490,6 +564,7 @@ impl PolicyEngine {
     /// Dry-run evaluator: returns what would happen to a tool call under the current mode.
     pub fn dry_run(&self, call: &ToolCall) -> PermissionDryRunResult {
         match self.permission_mode {
+            PermissionMode::BypassPermissions => PermissionDryRunResult::AutoApproved,
             PermissionMode::Locked => {
                 if is_read_only_tool(&call.name) {
                     PermissionDryRunResult::Allowed
@@ -837,6 +912,128 @@ fn apply_team_policy_override(mut base: PolicyConfig, team: &TeamPolicyFile) -> 
         base.permission_mode = PermissionMode::from_str_lossy(mode);
     }
     base
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Managed Settings (enterprise/team system-wide controls)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// System-wide managed settings for enterprise/team deployments.
+/// Loaded from platform-specific paths and enforced as immutable overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagedSettings {
+    /// Prevent use of bypassPermissions mode entirely.
+    pub disable_bypass_permissions_mode: bool,
+    /// Only allow permission rules defined in managed settings.
+    pub allow_managed_permission_rules_only: bool,
+    /// Only allow hooks defined in managed settings.
+    pub allow_managed_hooks_only: bool,
+    /// Allowlist of MCP server IDs (empty = all allowed).
+    pub allowed_mcp_servers: Vec<String>,
+    /// Denylist of MCP server IDs (checked after allowlist).
+    pub denied_mcp_servers: Vec<String>,
+    /// Managed permission rules (added to or replace user rules).
+    #[serde(default)]
+    pub permission_rules: Vec<PermissionRule>,
+    /// Force a specific permission mode.
+    pub permission_mode: Option<String>,
+}
+
+/// Platform-specific path for managed settings.
+pub fn managed_settings_path() -> Option<std::path::PathBuf> {
+    // Check environment override first
+    if let Ok(path) = std::env::var("DEEPSEEK_MANAGED_SETTINGS_PATH") {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::path::PathBuf::from(
+            "/Library/Application Support/DeepSeekCLI/managed-settings.json",
+        );
+        return Some(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::path::PathBuf::from("/etc/deepseek-cli/managed-settings.json");
+        return Some(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(program_data) = std::env::var("ProgramData") {
+            return Some(
+                std::path::PathBuf::from(program_data)
+                    .join("DeepSeekCLI")
+                    .join("managed-settings.json"),
+            );
+        }
+        return Some(std::path::PathBuf::from(
+            "C:\\ProgramData\\DeepSeekCLI\\managed-settings.json",
+        ));
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Load managed settings from the platform-specific path.
+pub fn load_managed_settings() -> Option<ManagedSettings> {
+    let path = managed_settings_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Check if an MCP server is allowed by managed settings.
+pub fn is_mcp_server_allowed(server_id: &str, managed: &ManagedSettings) -> bool {
+    // If denied list contains this server, block it.
+    if managed
+        .denied_mcp_servers
+        .iter()
+        .any(|s| s == server_id || s == "*")
+    {
+        return false;
+    }
+    // If allowed list is non-empty, server must be in it.
+    if !managed.allowed_mcp_servers.is_empty() {
+        return managed
+            .allowed_mcp_servers
+            .iter()
+            .any(|s| s == server_id || s == "*");
+    }
+    true // default: allow
+}
+
+/// Apply managed settings enforcement to a PolicyEngine.
+/// This is called after normal construction to apply enterprise overrides.
+pub fn apply_managed_settings(engine: &mut PolicyEngine, managed: &ManagedSettings) {
+    // Force permission mode if set.
+    if let Some(ref mode) = managed.permission_mode {
+        engine.permission_mode = PermissionMode::from_str_lossy(mode);
+    }
+    // Prevent bypass mode if disabled by managed settings.
+    if managed.disable_bypass_permissions_mode
+        && engine.permission_mode == PermissionMode::BypassPermissions
+    {
+        engine.permission_mode = PermissionMode::Ask;
+    }
+    // Apply managed permission rules.
+    if managed.allow_managed_permission_rules_only {
+        engine.cfg.permission_rules = managed.permission_rules.clone();
+    } else {
+        // Merge: managed rules take priority (prepended).
+        let mut merged = managed.permission_rules.clone();
+        merged.append(&mut engine.cfg.permission_rules);
+        engine.cfg.permission_rules = merged;
+    }
 }
 
 #[cfg(test)]
@@ -1489,5 +1686,271 @@ mod tests {
         unsafe {
             std::env::remove_var("DEEPSEEK_TEAM_POLICY_PATH");
         }
+    }
+
+    #[test]
+    fn bypass_permissions_mode_never_requires_approval() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::BypassPermissions,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let bash_call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "rm -rf /"}),
+            requires_approval: true,
+        };
+        let write_call = ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: true,
+        };
+        let read_call = ToolCall {
+            name: "fs.read".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        assert!(!policy.requires_approval(&bash_call));
+        assert!(!policy.requires_approval(&write_call));
+        assert!(!policy.requires_approval(&read_call));
+        assert_eq!(
+            policy.dry_run(&bash_call),
+            PermissionDryRunResult::AutoApproved
+        );
+        assert_eq!(
+            policy.dry_run(&write_call),
+            PermissionDryRunResult::AutoApproved
+        );
+    }
+
+    #[test]
+    fn bypass_permissions_from_str_lossy() {
+        assert_eq!(
+            PermissionMode::from_str_lossy("bypassPermissions"),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("bypass"),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("bypass-permissions"),
+            PermissionMode::BypassPermissions
+        );
+    }
+
+    #[test]
+    fn bypass_permissions_not_in_cycle() {
+        // BypassPermissions cycles back to Ask (it's excluded from normal rotation)
+        assert_eq!(
+            PermissionMode::BypassPermissions.cycle(),
+            PermissionMode::Ask
+        );
+    }
+
+    #[test]
+    fn mcp_permission_rule_matches_server_wildcard() {
+        let rule = PermissionRule {
+            rule: "Mcp(myserver)".to_string(),
+            decision: "allow".to_string(),
+        };
+        let matching = ToolCall {
+            name: "mcp__myserver__read_file".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        let non_matching = ToolCall {
+            name: "mcp__otherserver__read_file".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        assert_eq!(rule.matches(&matching), Some("allow"));
+        assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn mcp_permission_rule_matches_specific_tool() {
+        let rule = PermissionRule {
+            rule: "Mcp(myserver__read_file)".to_string(),
+            decision: "deny".to_string(),
+        };
+        let matching = ToolCall {
+            name: "mcp__myserver__read_file".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        let non_matching = ToolCall {
+            name: "mcp__myserver__write_file".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        assert_eq!(rule.matches(&matching), Some("deny"));
+        assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn mcp_permission_rule_wildcard_all() {
+        let rule = PermissionRule {
+            rule: "Mcp(*)".to_string(),
+            decision: "allow".to_string(),
+        };
+        let call = ToolCall {
+            name: "mcp__anyserver__anytool".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        assert_eq!(rule.matches(&call), Some("allow"));
+    }
+
+    #[test]
+    fn mcp_permission_rule_ignores_non_mcp_tools() {
+        let rule = PermissionRule {
+            rule: "Mcp(myserver)".to_string(),
+            decision: "allow".to_string(),
+        };
+        let call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "ls"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&call), None);
+    }
+
+    #[test]
+    fn mcp_tools_require_approval_in_ask_mode() {
+        let policy = PolicyEngine::default();
+        let mcp_call = ToolCall {
+            name: "mcp__server__tool".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        assert!(policy.requires_approval(&mcp_call));
+    }
+
+    #[test]
+    fn mcp_tools_allowed_by_permission_rules() {
+        let cfg = PolicyConfig {
+            permission_rules: vec![PermissionRule {
+                rule: "Mcp(myserver)".to_string(),
+                decision: "allow".to_string(),
+            }],
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let allowed = ToolCall {
+            name: "mcp__myserver__read_file".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        let not_allowed = ToolCall {
+            name: "mcp__otherserver__read_file".to_string(),
+            args: json!({}),
+            requires_approval: true,
+        };
+        assert!(!policy.requires_approval(&allowed));
+        assert!(policy.requires_approval(&not_allowed));
+    }
+
+    #[test]
+    fn sandbox_auto_allow_bash_skips_approval() {
+        let mut policy = PolicyEngine::new(PolicyConfig {
+            permission_mode: PermissionMode::Ask,
+            approve_bash: true, // normally requires approval
+            ..PolicyConfig::default()
+        });
+        let bash_call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "unknown_command"}),
+            requires_approval: false,
+        };
+        // Without sandbox auto-allow, approval is required
+        assert!(policy.requires_approval(&bash_call));
+        // With sandbox auto-allow, bash is auto-approved
+        policy.sandbox_auto_allow_bash = true;
+        assert!(!policy.requires_approval(&bash_call));
+    }
+
+    #[test]
+    fn managed_settings_disable_bypass_mode() {
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            permission_mode: PermissionMode::BypassPermissions,
+            ..PolicyConfig::default()
+        });
+        assert_eq!(engine.permission_mode(), PermissionMode::BypassPermissions);
+
+        let managed = ManagedSettings {
+            disable_bypass_permissions_mode: true,
+            ..Default::default()
+        };
+        apply_managed_settings(&mut engine, &managed);
+        // Bypass should have been downgraded to Ask
+        assert_eq!(engine.permission_mode(), PermissionMode::Ask);
+    }
+
+    #[test]
+    fn managed_settings_force_permission_mode() {
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            permission_mode: PermissionMode::Auto,
+            ..PolicyConfig::default()
+        });
+        let managed = ManagedSettings {
+            permission_mode: Some("locked".to_string()),
+            ..Default::default()
+        };
+        apply_managed_settings(&mut engine, &managed);
+        assert_eq!(engine.permission_mode(), PermissionMode::Locked);
+    }
+
+    #[test]
+    fn managed_settings_replace_permission_rules() {
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            permission_rules: vec![PermissionRule {
+                rule: "Bash(npm *)".to_string(),
+                decision: "allow".to_string(),
+            }],
+            ..PolicyConfig::default()
+        });
+        let managed = ManagedSettings {
+            allow_managed_permission_rules_only: true,
+            permission_rules: vec![PermissionRule {
+                rule: "Bash(cargo *)".to_string(),
+                decision: "allow".to_string(),
+            }],
+            ..Default::default()
+        };
+        apply_managed_settings(&mut engine, &managed);
+        // User rules replaced by managed rules
+        assert_eq!(engine.cfg.permission_rules.len(), 1);
+        assert!(engine.cfg.permission_rules[0].rule.contains("cargo"));
+    }
+
+    #[test]
+    fn mcp_server_allowed_by_managed_settings() {
+        let managed = ManagedSettings {
+            allowed_mcp_servers: vec!["server_a".to_string(), "server_b".to_string()],
+            denied_mcp_servers: vec![],
+            ..Default::default()
+        };
+        assert!(is_mcp_server_allowed("server_a", &managed));
+        assert!(is_mcp_server_allowed("server_b", &managed));
+        assert!(!is_mcp_server_allowed("server_c", &managed));
+    }
+
+    #[test]
+    fn mcp_server_denied_by_managed_settings() {
+        let managed = ManagedSettings {
+            allowed_mcp_servers: vec![],
+            denied_mcp_servers: vec!["evil_server".to_string()],
+            ..Default::default()
+        };
+        assert!(is_mcp_server_allowed("good_server", &managed));
+        assert!(!is_mcp_server_allowed("evil_server", &managed));
+    }
+
+    #[test]
+    fn managed_settings_path_returns_some() {
+        // On any platform, this should return a path.
+        let path = managed_settings_path();
+        assert!(path.is_some());
     }
 }
