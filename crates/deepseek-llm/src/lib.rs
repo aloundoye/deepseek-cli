@@ -9,9 +9,13 @@ use reqwest::blocking::Client;
 use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::io::BufRead;
 use std::thread;
 use std::time::Duration;
+
+/// Base delay for network/transport error retries (1s, 2s, 4s exponential backoff).
+const NETWORK_RETRY_BASE_MS: u64 = 1000;
 
 pub trait LlmClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse>;
@@ -96,7 +100,7 @@ impl DeepSeekClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -266,7 +270,7 @@ impl DeepSeekClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -417,7 +421,7 @@ impl DeepSeekClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -628,7 +632,7 @@ impl DeepSeekClient {
                 Err(e) => {
                     last_err = Some(format_transport_error(&e));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
-                        thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, None));
+                        thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -754,7 +758,9 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
 
     match status {
         StatusCode::UNAUTHORIZED => anyhow!(
-            "Authentication failed (HTTP 401). Check your API key: ensure DEEPSEEK_API_KEY is set correctly, or run `deepseek config edit`."
+            "Invalid or missing API key (HTTP 401).\n\
+             Set DEEPSEEK_API_KEY environment variable or configure llm.api_key in settings.\n\
+             Get an API key at https://platform.deepseek.com"
         ),
         StatusCode::TOO_MANY_REQUESTS => anyhow!(
             "Rate limited (HTTP 429). Exhausted {}/{} retries. Try again shortly or reduce request frequency. Detail: {}",
@@ -778,16 +784,37 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
 
 /// Produce a user-friendly error from a transport/network failure.
 fn format_transport_error(err: &reqwest::Error) -> anyhow::Error {
+    let inner_msg = err
+        .source()
+        .map(|e| e.to_string())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_dns = inner_msg.contains("dns")
+        || inner_msg.contains("resolve")
+        || inner_msg.contains("name or service not known")
+        || inner_msg.contains("no such host")
+        || inner_msg.contains("getaddrinfo");
+
     if err.is_timeout() {
         anyhow!(
-            "Request timed out. The DeepSeek API did not respond in time. Try increasing llm.timeout_seconds in your config."
+            "Request timed out. The DeepSeek API did not respond in time.\n\
+             Retrying with exponential backoff. If this persists, try increasing \
+             llm.timeout_seconds in your config."
+        )
+    } else if is_dns {
+        anyhow!(
+            "DNS resolution failed. Could not resolve the DeepSeek API hostname.\n\
+             Check your internet connection and DNS settings. \
+             Retrying with exponential backoff."
         )
     } else if err.is_connect() {
         anyhow!(
-            "Connection failed. Could not reach the DeepSeek API. Check your network connection and llm.endpoint setting."
+            "Connection refused. Could not reach the DeepSeek API at the configured endpoint.\n\
+             Check your network connection and firewall settings. \
+             Retrying with exponential backoff."
         )
     } else {
-        anyhow!("Network error: {err}")
+        anyhow!("Network error: {err}. Retrying with exponential backoff if retries remain.")
     }
 }
 
@@ -1418,6 +1445,51 @@ mod tests {
     }
 
     #[test]
+    fn format_api_error_401_includes_setup_instructions() {
+        let err = format_api_error(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid_api_key"}"#,
+            0,
+            3,
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid or missing API key"),
+            "should mention invalid/missing key: {msg}"
+        );
+        assert!(
+            msg.contains("DEEPSEEK_API_KEY"),
+            "should mention env var: {msg}"
+        );
+        assert!(
+            msg.contains("llm.api_key"),
+            "should mention config field: {msg}"
+        );
+        assert!(
+            msg.contains("https://platform.deepseek.com"),
+            "should include signup URL: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_api_error_401_does_not_retry() {
+        // 401 should not be retryable
+        assert!(!should_retry_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn network_retry_base_uses_one_second_delays() {
+        // Verify the constant matches the spec: 1s, 2s, 4s
+        assert_eq!(NETWORK_RETRY_BASE_MS, 1000);
+        let d0 = retry_delay_ms(NETWORK_RETRY_BASE_MS, 0, None);
+        let d1 = retry_delay_ms(NETWORK_RETRY_BASE_MS, 1, None);
+        let d2 = retry_delay_ms(NETWORK_RETRY_BASE_MS, 2, None);
+        assert_eq!(d0, Duration::from_millis(1000));
+        assert_eq!(d1, Duration::from_millis(2000));
+        assert_eq!(d2, Duration::from_millis(4000));
+    }
+
+    #[test]
     fn retry_after_parses_seconds_and_http_date() {
         let seconds_header = reqwest::header::HeaderValue::from_static("7");
         assert_eq!(parse_retry_after_seconds(Some(&seconds_header)), Some(7));
@@ -1515,6 +1587,61 @@ mod tests {
         // SAFETY: test-only process-level env mutation.
         unsafe {
             std::env::remove_var("DEEPSEEK_API_KEY_RETRY_LIMIT_TEST");
+        }
+    }
+
+    #[test]
+    fn complete_returns_clear_instructions_on_401() {
+        let server = start_mock_retry_server(vec![MockHttpResponse {
+            status: 401,
+            body: r#"{"error":{"message":"invalid_api_key"}}"#.to_string(),
+            retry_after: None,
+        }]);
+
+        let cfg = LlmConfig {
+            endpoint: server.endpoint.clone(),
+            stream: false,
+            api_key_env: "DEEPSEEK_API_KEY_401_TEST".to_string(),
+            max_retries: 2,
+            retry_base_ms: 1,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY_401_TEST", "bad-key");
+        }
+
+        let err = client
+            .complete(&LlmRequest {
+                unit: deepseek_core::LlmUnit::Planner,
+                prompt: "hello".to_string(),
+                model: "deepseek-chat".to_string(),
+                max_tokens: 64,
+                non_urgent: false,
+                images: vec![],
+            })
+            .expect_err("401 should fail without retrying");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid or missing API key"),
+            "401 error should include clear message: {msg}"
+        );
+        assert!(
+            msg.contains("DEEPSEEK_API_KEY"),
+            "401 error should mention env var: {msg}"
+        );
+        assert!(
+            msg.contains("https://platform.deepseek.com"),
+            "401 error should include platform URL: {msg}"
+        );
+        // 401 is non-retryable, so only 1 request
+        assert_eq!(server.request_count(), 1);
+
+        // SAFETY: test-only process-level env mutation.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_API_KEY_401_TEST");
         }
     }
 

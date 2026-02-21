@@ -1,10 +1,9 @@
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{Timelike, Utc};
 use deepseek_core::{
-    AppConfig, ApprovedToolCall, ChatMessage, ChatRequest, EventEnvelope, EventKind, ExecContext,
-    Executor, Failure, LlmRequest, LlmUnit, ModelRouter, Plan, PlanContext, PlanStep, Planner,
-    RouterSignals, Session, SessionBudgets, SessionState, StepOutcome, StreamChunk, ToolCall,
-    ToolChoice, ToolHost, is_valid_session_state_transition,
+    AppConfig, ApprovedToolCall, ChatMessage, ChatRequest, EventEnvelope, EventKind, LlmRequest,
+    LlmUnit, ModelRouter, Plan, PlanStep, RouterSignals, Session, SessionBudgets, SessionState,
+    StreamChunk, ToolCall, ToolChoice, ToolHost, is_valid_session_state_transition,
 };
 use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
 use deepseek_llm::{DeepSeekClient, LlmClient};
@@ -33,177 +32,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 use uuid::Uuid;
-
-pub struct SchemaPlanner;
-
-impl Planner for SchemaPlanner {
-    fn create_plan(&self, ctx: PlanContext) -> Result<Plan> {
-        let prompt_lower = ctx.user_prompt.to_ascii_lowercase();
-        let mut steps = vec![PlanStep {
-            step_id: Uuid::now_v7(),
-            title: "Analyze scope and locate relevant modules".to_string(),
-            intent: "search".to_string(),
-            tools: vec![
-                "index.query".to_string(),
-                "fs.grep".to_string(),
-                "fs.read".to_string(),
-            ],
-            files: vec![],
-            done: false,
-        }];
-
-        if prompt_lower.contains("git")
-            || prompt_lower.contains("branch")
-            || prompt_lower.contains("commit")
-            || prompt_lower.contains("pr")
-        {
-            steps.push(PlanStep {
-                step_id: Uuid::now_v7(),
-                title: "Assess repository status and history".to_string(),
-                intent: "git".to_string(),
-                tools: vec!["git.status".to_string(), "git.diff".to_string()],
-                files: vec![],
-                done: false,
-            });
-        }
-
-        if prompt_lower.contains("refactor")
-            || prompt_lower.contains("implement")
-            || prompt_lower.contains("fix")
-            || prompt_lower.contains("change")
-            || prompt_lower.contains("update")
-            || prompt_lower.contains("patch")
-        {
-            steps.push(PlanStep {
-                step_id: Uuid::now_v7(),
-                title: "Implement code and config updates".to_string(),
-                intent: "edit".to_string(),
-                tools: vec![
-                    "fs.edit".to_string(),
-                    "patch.stage".to_string(),
-                    "patch.apply".to_string(),
-                ],
-                files: vec![],
-                done: false,
-            });
-        }
-
-        if prompt_lower.contains("docs")
-            || prompt_lower.contains("readme")
-            || prompt_lower.contains("guide")
-        {
-            steps.push(PlanStep {
-                step_id: Uuid::now_v7(),
-                title: "Update docs".to_string(),
-                intent: "docs".to_string(),
-                tools: vec!["fs.edit".to_string(), "patch.stage".to_string()],
-                files: vec!["README.md".to_string()],
-                done: false,
-            });
-        }
-
-        steps.push(PlanStep {
-            step_id: Uuid::now_v7(),
-            title: "Run verification and collect outcomes".to_string(),
-            intent: "verify".to_string(),
-            tools: vec!["bash.run".to_string()],
-            files: vec![],
-            done: false,
-        });
-
-        Ok(Plan {
-            plan_id: Uuid::now_v7(),
-            version: 1,
-            goal: ctx.user_prompt,
-            assumptions: vec![
-                "Workspace is writable".to_string(),
-                "DeepSeek API key is configured".to_string(),
-            ],
-            steps,
-            verification: vec![
-                "cargo fmt --all -- --check".to_string(),
-                "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
-                "cargo test --workspace".to_string(),
-            ],
-            risk_notes: vec!["May require approval for patch apply and bash.run".to_string()],
-        })
-    }
-
-    fn revise_plan(&self, _ctx: PlanContext, last_plan: &Plan, failure: Failure) -> Result<Plan> {
-        let mut revised = last_plan.clone();
-        revised.version += 1;
-        revised.steps.retain(|step| !step.done);
-        revised.steps.push(PlanStep {
-            step_id: Uuid::now_v7(),
-            title: "Recovery: inspect failure and apply targeted fix".to_string(),
-            intent: "recover".to_string(),
-            tools: vec![
-                "fs.grep".to_string(),
-                "fs.read".to_string(),
-                "fs.edit".to_string(),
-            ],
-            files: vec![],
-            done: false,
-        });
-        revised.risk_notes.push(format!(
-            "revision due to failure: {} ({})",
-            failure.summary, failure.detail
-        ));
-        Ok(revised)
-    }
-}
-
-pub struct SimpleExecutor {
-    tool_host: Arc<LocalToolHost>,
-}
-
-impl SimpleExecutor {
-    pub fn new(tool_host: Arc<LocalToolHost>) -> Self {
-        Self { tool_host }
-    }
-}
-
-impl Executor for SimpleExecutor {
-    fn run_step(&self, ctx: ExecContext, step: &PlanStep) -> Result<StepOutcome> {
-        let call = match step.intent.as_str() {
-            "search" => ToolCall {
-                name: "fs.search_rg".to_string(),
-                args: json!({"query": ctx.plan.goal, "limit": 10}),
-                requires_approval: false,
-            },
-            "verify" => ToolCall {
-                name: "bash.run".to_string(),
-                args: json!({"cmd": "cargo test --workspace"}),
-                requires_approval: true,
-            },
-            _ => ToolCall {
-                name: "fs.list".to_string(),
-                args: json!({"dir": "."}),
-                requires_approval: false,
-            },
-        };
-
-        let proposal = self.tool_host.propose(call);
-        if !proposal.approved && !ctx.approved {
-            return Ok(StepOutcome {
-                step_id: step.step_id,
-                success: false,
-                notes: "approval required".to_string(),
-            });
-        }
-
-        let result = self.tool_host.execute(ApprovedToolCall {
-            invocation_id: proposal.invocation_id,
-            call: proposal.call,
-        });
-
-        Ok(StepOutcome {
-            step_id: step.step_id,
-            success: result.success,
-            notes: result.output.to_string(),
-        })
-    }
-}
 
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
@@ -251,7 +79,6 @@ struct BackgroundShell {
 pub struct AgentEngine {
     workspace: PathBuf,
     store: Store,
-    planner: SchemaPlanner,
     router: WeightedRouter,
     llm: Box<dyn LlmClient + Send + Sync>,
     observer: Observer,
@@ -281,6 +108,10 @@ pub struct AgentEngine {
     mcp: Option<McpManager>,
     /// Cached MCP tools (discovered at chat startup).
     mcp_tools: Mutex<Vec<McpTool>>,
+    /// Pre-built static portion of the system prompt (tool guidelines, safety rules,
+    /// project markers, platform info, etc.). Computed once at construction time;
+    /// dynamic parts (date, git branch, memory, verification feedback) are appended per turn.
+    cached_system_prompt_base: String,
 }
 
 impl AgentEngine {
@@ -303,10 +134,14 @@ impl AgentEngine {
 
         let mcp = McpManager::new(workspace).ok();
 
+        // Pre-build the static portion of the system prompt so we don't
+        // recompute it on every turn.
+        let cached_system_prompt_base =
+            Self::build_static_system_prompt_base(workspace, &cfg, &policy);
+
         Ok(Self {
             workspace: workspace.to_path_buf(),
             store,
-            planner: SchemaPlanner,
             router,
             llm,
             observer,
@@ -325,6 +160,7 @@ impl AgentEngine {
             hooks,
             mcp,
             mcp_tools: Mutex::new(Vec::new()),
+            cached_system_prompt_base,
         })
     }
 
@@ -800,11 +636,22 @@ impl AgentEngine {
         let mut plan = if let Some(plan) = plan {
             plan
         } else {
-            self.planner.create_plan(PlanContext {
-                session: session.clone(),
-                user_prompt: prompt.to_string(),
-                prior_failures: vec![],
-            })?
+            Plan {
+                plan_id: Uuid::now_v7(),
+                version: 1,
+                goal: prompt.to_string(),
+                assumptions: vec!["Workspace is writable".to_string()],
+                steps: vec![PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Analyze scope".to_string(),
+                    intent: "search".to_string(),
+                    tools: vec!["index.query".to_string(), "fs.grep".to_string()],
+                    files: vec![],
+                    done: false,
+                }],
+                verification: vec!["cargo test --workspace".to_string()],
+                risk_notes: vec![],
+            }
         };
         if !quality_repairs.is_empty() {
             plan.risk_notes.push(format!(
@@ -1030,30 +877,26 @@ impl AgentEngine {
                 }
             }
 
-            let outcome = StepOutcome {
-                step_id: step.step_id,
-                success: step_success,
-                notes: notes.join("\n"),
-            };
+            let step_notes = notes.join("\n");
 
-            plan.steps[step_cursor].done = outcome.success;
+            plan.steps[step_cursor].done = step_success;
             self.emit(
                 session.session_id,
                 EventKind::StepMarkedV1 {
                     step_id: step.step_id,
-                    done: outcome.success,
-                    note: outcome.notes.clone(),
+                    done: step_success,
+                    note: step_notes.clone(),
                 },
             )?;
 
-            if !outcome.success {
+            if !step_success {
                 failure_streak += 1;
                 if revision_budget == 0 {
                     execution_failed = true;
                     break;
                 }
                 revision_budget = revision_budget.saturating_sub(1);
-                let failure_detail = outcome.notes.clone();
+                let failure_detail = step_notes.clone();
                 let revised = self
                     .revise_plan_with_llm(
                         session.session_id,
@@ -1063,19 +906,14 @@ impl AgentEngine {
                         &failure_detail,
                         non_urgent,
                     )
-                    .or_else(|_| {
-                        self.planner.revise_plan(
-                            PlanContext {
-                                session: session.clone(),
-                                user_prompt: prompt.to_string(),
-                                prior_failures: vec![],
-                            },
-                            &plan,
-                            Failure {
-                                summary: "step failed".to_string(),
-                                detail: failure_detail.clone(),
-                            },
-                        )
+                    .or_else(|_: anyhow::Error| -> Result<Plan> {
+                        let mut fallback = plan.clone();
+                        fallback.version += 1;
+                        fallback.steps.retain(|s| !s.done);
+                        fallback
+                            .risk_notes
+                            .push(format!("revision due to failure: {}", failure_detail));
+                        Ok(fallback)
                     })?;
                 self.emit(
                     session.session_id,
@@ -1655,12 +1493,26 @@ impl AgentEngine {
 
             // If the model returned text content with no tool calls, we're done
             if response.tool_calls.is_empty() {
+                // The answer shown to the user may include reasoning_content as
+                // fallback, but the message persisted for API history must NOT
+                // include reasoning_content (it wastes context tokens on resume).
                 let answer = if !response.text.is_empty() {
                     response.text.clone()
                 } else if !response.reasoning_content.is_empty() {
                     response.reasoning_content.clone()
                 } else {
                     "(No response generated)".to_string()
+                };
+
+                // For chat history / session resume, only store the actual text
+                // content — strip reasoning_content. The reasoning was already
+                // displayed to the user via streaming.
+                let history_content = if !response.text.is_empty() {
+                    Some(response.text.clone())
+                } else {
+                    // reasoning_content was used as the answer for display but
+                    // we store a compact placeholder in the API message history.
+                    Some("[reasoning-only response]".to_string())
                 };
 
                 self.emit(
@@ -1674,7 +1526,7 @@ impl AgentEngine {
                     session.session_id,
                     EventKind::ChatTurnV1 {
                         message: ChatMessage::Assistant {
-                            content: Some(answer.clone()),
+                            content: history_content,
                             tool_calls: vec![],
                         },
                     },
@@ -1833,6 +1685,7 @@ impl AgentEngine {
                             elapsed.as_secs_f64()
                         )));
                     }
+                    let result_text = truncate_tool_output(&tc.name, &result_text, 30000);
                     messages.push(ChatMessage::Tool {
                         tool_call_id: tc.id.clone(),
                         content: result_text,
@@ -1919,6 +1772,7 @@ impl AgentEngine {
                     }
 
                     let tool_result = self.execute_agent_tool(internal_name, &args, &session)?;
+                    let tool_result = truncate_tool_output(internal_name, &tool_result, 30000);
                     messages.push(ChatMessage::Tool {
                         tool_call_id: tc.id.clone(),
                         content: tool_result.clone(),
@@ -2174,13 +2028,25 @@ impl AgentEngine {
                     EventKind::ChatTurnV1 { message: tool_msg },
                 )?;
             }
+
+            // ── Compress repeated tool call patterns ──
+            // If the same tool was called 3+ times in a row (across the most
+            // recent assistant+tool message pairs), replace the older results
+            // with a compact summary to save context tokens.
+            compress_repeated_tool_results(&mut messages);
         }
     }
 
     /// Build a system prompt for chat-with-tools mode.
-    fn build_chat_system_prompt(&self, _user_prompt: &str) -> Result<String> {
-        let workspace = self.workspace.to_string_lossy();
-        let now = Utc::now();
+    /// Build the static portion of the system prompt at construction time.
+    /// This includes project markers, platform info, tool guidelines, safety rules, etc.
+    /// Dynamic parts (date, git branch, memory, verification feedback) are appended per turn.
+    fn build_static_system_prompt_base(
+        workspace: &Path,
+        cfg: &AppConfig,
+        policy: &PolicyEngine,
+    ) -> String {
+        let ws = workspace.to_string_lossy();
 
         // Detect project type
         let mut project_markers = Vec::new();
@@ -2196,7 +2062,7 @@ impl AgentEngine {
             ("CMakeLists.txt", "C/C++"),
             ("Makefile", "Make"),
         ] {
-            if self.workspace.join(file).exists() {
+            if workspace.join(file).exists() {
                 project_markers.push(*lang);
             }
         }
@@ -2207,37 +2073,19 @@ impl AgentEngine {
         };
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
-        let permission_mode = self.policy.permission_mode();
-        let base_model = &self.cfg.llm.base_model;
-        let max_model = &self.cfg.llm.max_think_model;
+        let permission_mode = policy.permission_mode();
+        let base_model = &cfg.llm.base_model;
+        let max_model = &cfg.llm.max_think_model;
 
-        // Try to get git branch and short status
-        let git_info = std::process::Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(&self.workspace)
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .map(|branch| format!("Git branch: {branch}\n"))
-            .unwrap_or_default();
-
-        let mut parts = vec![format!(
+        let mut base = format!(
             "You are DeepSeek, an AI coding assistant powering the `deepseek` CLI. \
              You help users with software engineering tasks including writing code, \
              debugging, refactoring, testing, and explaining codebases.\n\n\
              # Environment\n\
-             Working directory: {workspace}\n\
+             Working directory: {ws}\n\
              Platform: {} ({})\n\
              Shell: {shell}\n\
-             Date: {}\n\
              {project_info}\
-             {git_info}\
              Models: {base_model} (fast) / {max_model} (reasoning)\n\
              Permission mode: {permission_mode:?}\n\n\
              # Permission Mode\n\
@@ -2286,33 +2134,55 @@ impl AgentEngine {
              - When done, briefly explain what you changed and why",
             std::env::consts::OS,
             std::env::consts::ARCH,
-            now.format("%Y-%m-%d"),
-        )];
+        );
 
         // Add language preference if set.
-        if !self.cfg.language.is_empty() {
-            parts.push(format!(
-                "\n\n# Language\nRespond in **{}**.",
-                self.cfg.language
-            ));
+        if !cfg.language.is_empty() {
+            base.push_str(&format!("\n\n# Language\nRespond in **{}**.", cfg.language));
         }
 
         // Add output style directive.
-        match self.cfg.output_style.as_str() {
+        match cfg.output_style.as_str() {
             "concise" => {
-                parts.push(
-                    "\n\n# Output Style\nBe extremely concise. Minimize explanation. Code only when possible."
-                        .to_string(),
+                base.push_str(
+                    "\n\n# Output Style\nBe extremely concise. Minimize explanation. Code only when possible.",
                 );
             }
             "verbose" => {
-                parts.push(
-                    "\n\n# Output Style\nBe thorough and detailed. Explain reasoning, trade-offs, and alternatives."
-                        .to_string(),
+                base.push_str(
+                    "\n\n# Output Style\nBe thorough and detailed. Explain reasoning, trade-offs, and alternatives.",
                 );
             }
             _ => {} // "normal" or unrecognized — no override
         }
+
+        base
+    }
+
+    fn build_chat_system_prompt(&self, _user_prompt: &str) -> Result<String> {
+        let now = Utc::now();
+
+        // Try to get git branch
+        let git_info = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&self.workspace)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .map(|branch| format!("Git branch: {branch}\n"))
+            .unwrap_or_default();
+
+        let mut parts = vec![format!(
+            "{}\nDate: {}\n{git_info}",
+            self.cached_system_prompt_base,
+            now.format("%Y-%m-%d"),
+        )];
 
         // Add DEEPSEEK.md / memory if available
         if let Ok(manager) = MemoryManager::new(&self.workspace)
@@ -5933,6 +5803,113 @@ fn truncate_generic(lines: &[&str], max_bytes: usize, total_bytes: usize) -> Str
         let joined = lines.join("\n");
         let truncated = &joined[..joined.floor_char_boundary(max_bytes)];
         format!("{}... (truncated, {} bytes total)", truncated, total_bytes)
+    }
+}
+
+/// Compress repeated tool call patterns in the message history.
+///
+/// When the same tool is called 3+ times consecutively (looking at the tail of
+/// the messages list), the older tool results are replaced with a compact
+/// summary to reduce context token usage. The most recent result is always kept
+/// in full so the model has the latest data.
+fn compress_repeated_tool_results(messages: &mut [ChatMessage]) {
+    // Walk backwards from the end to find consecutive Tool messages that share
+    // the same tool_call_id prefix pattern (same tool name).  We look for runs
+    // of (Assistant{tool_calls} + Tool*) pairs where the assistant called the
+    // same single tool each time.
+
+    // Collect the tail sequence of Tool messages and extract tool names from
+    // the preceding Assistant message's tool_calls.
+    let len = messages.len();
+    if len < 6 {
+        return; // Need at least 3 rounds of (assistant + tool) = 6 messages
+    }
+
+    // Walk backward to find consecutive (Assistant with single tool_call, Tool) pairs
+    // that all call the same tool name.
+    let mut run_end = len; // exclusive end index
+    let mut tool_name: Option<String> = None;
+    let mut count = 0_usize;
+
+    let mut idx = len;
+    while idx >= 2 {
+        idx -= 1;
+        // Check if this is a Tool message
+        if !matches!(&messages[idx], ChatMessage::Tool { .. }) {
+            break;
+        }
+        // The message before should be an Assistant with tool_calls
+        if idx == 0 {
+            break;
+        }
+        if let ChatMessage::Assistant {
+            tool_calls: tcs, ..
+        } = &messages[idx - 1]
+        {
+            if tcs.len() != 1 {
+                break; // Only compress single-tool-call rounds
+            }
+            let name = map_tool_name(&tcs[0].name);
+            match &tool_name {
+                None => {
+                    tool_name = Some(name.to_string());
+                    count = 1;
+                    run_end = idx + 1; // include this Tool message
+                }
+                Some(prev) if prev.as_str() == name => {
+                    count += 1;
+                }
+                _ => break, // Different tool, stop
+            }
+            idx -= 1; // skip the Assistant message
+        } else {
+            break;
+        }
+    }
+
+    if count < 3 {
+        return; // Not enough repetitions to compress
+    }
+
+    // The run covers messages from idx+1 to run_end (exclusive).
+    // Keep the last (assistant + tool) pair intact, compress the rest.
+    let run_start = idx + 1;
+    let pairs_to_compress = count - 1; // keep last pair
+    let msgs_to_compress = pairs_to_compress * 2; // each pair is 2 messages
+
+    if msgs_to_compress == 0 {
+        return;
+    }
+
+    let tn = tool_name.unwrap_or_default();
+    let summary = format!(
+        "[{} prior calls to {} compressed — showing latest result only]",
+        pairs_to_compress, tn
+    );
+
+    // Replace the compressed region with a single User note.
+    // We must keep the message structure valid: the API expects each
+    // tool_call_id in an Assistant message to have a matching Tool response.
+    // So instead of removing them outright, replace each compressed Tool
+    // message content with a one-line summary, and clear the assistant text.
+    for i in 0..msgs_to_compress {
+        let msg_idx = run_start + i;
+        if msg_idx >= run_end {
+            break;
+        }
+        match &mut messages[msg_idx] {
+            ChatMessage::Tool { content, .. } => {
+                if i == 0 {
+                    *content = summary.clone();
+                } else {
+                    *content = format!("[compressed — call {} of {}]", (i / 2) + 1, count);
+                }
+            }
+            ChatMessage::Assistant { content, .. } => {
+                *content = None; // strip any intermediate text
+            }
+            _ => {}
+        }
     }
 }
 

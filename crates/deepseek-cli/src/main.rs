@@ -556,8 +556,9 @@ struct ContextArgs {}
 
 #[derive(Args)]
 struct CompletionsArgs {
-    /// Shell to generate completions for (bash, zsh, fish, powershell).
-    shell: String,
+    /// Shell to generate completions for (bash, zsh, fish, powershell, elvish).
+    #[arg(long)]
+    shell: Shell,
 }
 
 #[derive(Args)]
@@ -10170,21 +10171,8 @@ fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
 }
 
 fn run_completions(args: CompletionsArgs) -> Result<()> {
-    let shell = match args.shell.to_ascii_lowercase().as_str() {
-        "bash" => Shell::Bash,
-        "zsh" => Shell::Zsh,
-        "fish" => Shell::Fish,
-        "powershell" | "pwsh" => Shell::PowerShell,
-        "elvish" => Shell::Elvish,
-        other => {
-            return Err(anyhow!(
-                "unsupported shell '{}' (supported: bash, zsh, fish, powershell)",
-                other
-            ));
-        }
-    };
     let mut cmd = Cli::command();
-    generate(shell, &mut cmd, "deepseek", &mut std::io::stdout());
+    generate(args.shell, &mut cmd, "deepseek", &mut std::io::stdout());
     Ok(())
 }
 
