@@ -3170,12 +3170,12 @@ impl LocalToolHost {
             tool_args_json: call.map(|call| call.args.to_string()),
             tool_result_json: result.map(ToString::to_string),
         };
-        match HookRuntime::run(&hooks, &context, Duration::from_secs(30)) {
+        match HookRuntime::run_legacy(&hooks, &context, Duration::from_secs(30)) {
             Ok(runs) => {
                 for run in runs {
                     self.emit_hook_event(
                         phase,
-                        &run.path,
+                        Path::new(&run.handler_description),
                         run.success,
                         run.timed_out,
                         run.exit_code,
