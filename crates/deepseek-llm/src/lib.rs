@@ -1175,7 +1175,7 @@ fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
 
 /// Marker substrings that indicate DSML markup is present in content.
 const DSML_MARKERS: &[&str] = &[
-    "\u{ff5c}DSML\u{ff5c}",            // ｜DSML｜
+    "\u{ff5c}DSML\u{ff5c}",                           // ｜DSML｜
     "\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}", // ｜tool▁calls▁begin｜
 ];
 
@@ -2256,7 +2256,9 @@ mod tests {
 
     #[test]
     fn dsml_contains_detects_markers() {
-        assert!(contains_dsml_markup("some <\u{ff5c}DSML\u{ff5c}invoke> text"));
+        assert!(contains_dsml_markup(
+            "some <\u{ff5c}DSML\u{ff5c}invoke> text"
+        ));
         assert!(contains_dsml_markup(
             "some <\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}> text"
         ));

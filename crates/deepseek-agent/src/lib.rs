@@ -3,8 +3,7 @@ use chrono::{Timelike, Utc};
 use deepseek_core::{
     AppConfig, ApprovedToolCall, ChatMessage, ChatRequest, EventEnvelope, EventKind, LlmRequest,
     LlmUnit, ModelRouter, Plan, PlanStep, RouterSignals, Session, SessionBudgets, SessionState,
-    StreamChunk, ThinkingConfig, ToolCall, ToolChoice, ToolHost,
-    is_valid_session_state_transition,
+    StreamChunk, ThinkingConfig, ToolCall, ToolChoice, ToolHost, is_valid_session_state_transition,
 };
 use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
 use deepseek_llm::{DeepSeekClient, LlmClient};
@@ -1529,6 +1528,72 @@ impl AgentEngine {
                 }
             }
 
+            // Two-phase reasoning: when thinking is warranted but tools prevent it,
+            // make a separate thinking-only call first to reason about strategy.
+            // Only on the first turn — subsequent tool-result turns don't need
+            // full re-reasoning.
+            let mut reasoning_context: Option<String> = None;
+            if decision.thinking_enabled
+                && options.tools
+                && turn_count == 1
+                && self.cfg.router.two_phase_thinking
+            {
+                self.emit(
+                    session.session_id,
+                    EventKind::RouterEscalationV1 {
+                        reason_codes: vec!["two_phase_reasoning".to_string()],
+                    },
+                )?;
+
+                let think_request = ChatRequest {
+                    model: request_model.clone(),
+                    messages: messages.clone(),
+                    tools: vec![],
+                    tool_choice: ToolChoice::none(),
+                    max_tokens: session.budgets.max_think_tokens.max(4096),
+                    temperature: None,
+                    thinking: Some(ThinkingConfig::enabled(
+                        session.budgets.max_think_tokens.max(4096),
+                    )),
+                };
+
+                self.observer.verbose_log(&format!(
+                    "turn {turn_count}: two-phase reasoning call model={} messages={}",
+                    think_request.model,
+                    think_request.messages.len()
+                ));
+
+                let think_response = {
+                    let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                    if let Some(cb) = cb {
+                        self.llm.complete_chat_streaming(&think_request, cb)?
+                    } else {
+                        self.llm.complete_chat(&think_request)?
+                    }
+                };
+
+                let reasoning = if !think_response.reasoning_content.is_empty() {
+                    think_response.reasoning_content
+                } else {
+                    think_response.text
+                };
+
+                if !reasoning.trim().is_empty() {
+                    reasoning_context = Some(reasoning);
+                }
+            }
+
+            // Inject reasoning as an assistant message so the tool-use call has context
+            if let Some(ref reasoning) = reasoning_context {
+                messages.push(ChatMessage::Assistant {
+                    content: Some(format!(
+                        "[Reasoning phase]\n{reasoning}\n\n[Now executing with tools]"
+                    )),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                });
+            }
+
             let request = ChatRequest {
                 model: request_model.clone(),
                 messages: messages.clone(),
@@ -1540,11 +1605,7 @@ impl AgentEngine {
                 },
                 max_tokens: session.budgets.max_think_tokens.max(4096),
                 // DeepSeek API requires temperature to be omitted when thinking is enabled.
-                temperature: if thinking.is_some() {
-                    None
-                } else {
-                    Some(0.0)
-                },
+                temperature: if thinking.is_some() { None } else { Some(0.0) },
                 thinking: thinking.clone(),
             };
 
@@ -1556,7 +1617,7 @@ impl AgentEngine {
             ));
 
             // Call the LLM with streaming (clone the Arc so it persists across turns)
-            let response_model = request_model;
+            let response_model = request_model.clone();
             let response = {
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
                 if let Some(cb) = cb {
@@ -1581,8 +1642,9 @@ impl AgentEngine {
                     },
                 )?;
                 // Only escalate with thinking if tools are not active — thinking
-                // + tools causes DSML markup leaks. When tools are active, just retry
-                // the same request without thinking mode.
+                // + tools causes DSML markup leaks. When tools are active and
+                // two_phase_thinking is enabled, use two-phase: think first, then
+                // retry with reasoning context. Otherwise just retry as-is.
                 let escalated_request = if tools.is_empty() {
                     ChatRequest {
                         thinking: Some(ThinkingConfig::enabled(
@@ -1590,6 +1652,45 @@ impl AgentEngine {
                         )),
                         temperature: None,
                         ..request
+                    }
+                } else if self.cfg.router.two_phase_thinking {
+                    // Two-phase escalation: think first, then retry with reasoning
+                    let think_request = ChatRequest {
+                        model: request_model.clone(),
+                        messages: request.messages.clone(),
+                        tools: vec![],
+                        tool_choice: ToolChoice::none(),
+                        max_tokens: session.budgets.max_think_tokens.max(4096),
+                        temperature: None,
+                        thinking: Some(ThinkingConfig::enabled(
+                            session.budgets.max_think_tokens.max(4096),
+                        )),
+                    };
+                    let think_resp = {
+                        let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                        if let Some(cb) = cb {
+                            self.llm.complete_chat_streaming(&think_request, cb)?
+                        } else {
+                            self.llm.complete_chat(&think_request)?
+                        }
+                    };
+                    let reasoning = if !think_resp.reasoning_content.is_empty() {
+                        &think_resp.reasoning_content
+                    } else {
+                        &think_resp.text
+                    };
+                    if !reasoning.trim().is_empty() {
+                        let mut escalated = request.clone();
+                        escalated.messages.push(ChatMessage::Assistant {
+                            content: Some(format!(
+                                "[Reasoning phase]\n{reasoning}\n\n[Now executing with tools]"
+                            )),
+                            reasoning_content: None,
+                            tool_calls: vec![],
+                        });
+                        escalated
+                    } else {
+                        request.clone()
                     }
                 } else {
                     request.clone()
@@ -8866,6 +8967,99 @@ mod tests {
         assert!(
             invoked.load(std::sync::atomic::Ordering::Relaxed),
             "subagent worker should have been invoked"
+        );
+    }
+
+    #[test]
+    fn chat_two_phase_injects_reasoning_on_first_turn() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Create a file the tool call will read
+        fs::write(dir.path().join("data.txt"), "important data").expect("write test file");
+        // Phase 1: thinking-only call returns reasoning text
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "I should read data.txt to understand the task.".into(),
+        ));
+        // Phase 2: tool-use call returns a tool call
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("data.txt")}).to_string(),
+        });
+        // Final turn: model returns text answer after tool result
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "The file contains important data.".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read the data file and summarize it",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        // Verify two-phase reasoning event was emitted
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            contents.contains("two_phase_reasoning"),
+            "events should contain two_phase_reasoning escalation, got:\n{contents}"
+        );
+    }
+
+    #[test]
+    fn chat_two_phase_skips_when_disabled() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Disable two_phase_thinking via settings
+        let settings_path = dir.path().join(".deepseek/settings.local.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("parse settings");
+        let mut settings = settings.as_object().unwrap().clone();
+        settings.insert(
+            "router".to_string(),
+            serde_json::json!({"two_phase_thinking": false}),
+        );
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).expect("serialize"),
+        )
+        .expect("write settings");
+
+        // Create a file the tool call will read
+        fs::write(dir.path().join("info.txt"), "some info").expect("write test file");
+        // No phase 1 thinking call — just direct tool call + final answer
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("info.txt")}).to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "The file has some info.".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read the info file",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        // Verify no two-phase reasoning event was emitted
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            !contents.contains("two_phase_reasoning"),
+            "events should NOT contain two_phase_reasoning when disabled, got:\n{contents}"
         );
     }
 }
