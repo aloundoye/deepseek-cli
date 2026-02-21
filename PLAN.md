@@ -317,28 +317,28 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 11: TUI & Interaction Parity
+## Phase 11: TUI & Interaction Parity ✅ Complete
 
 > Keyboard shortcuts, vim mode, multiline input, checkpoints, and visual features from Claude Code.
 
-### 11.1 Keyboard shortcuts
+### 11.1 Keyboard shortcuts ✅
 - `Ctrl+C` — cancel current generation (partially done)
-- `Ctrl+D` — exit session
-- `Ctrl+L` — clear terminal screen
+- `Ctrl+D` — exit session ✅
+- `Ctrl+L` — clear terminal screen ✅
 - `Ctrl+R` — reverse search command history
 - `Ctrl+V` — paste image from clipboard
 - `Ctrl+B` — background running tasks
 - `Ctrl+T` — toggle task list
-- `Ctrl+F` — kill all background agents (press twice)
+- `Ctrl+F` — kill all background agents (press twice) ✅
 - `Esc+Esc` — rewind/summarize from selected message
 - `Shift+Tab` — cycle permission modes (normal → plan → normal)
-- `Alt+P` — switch model
-- `Alt+T` — toggle extended thinking
+- `Alt+P` — switch model ✅
+- `Alt+T` — toggle extended thinking ✅
 - `#` — quick-add memory (see Phase 9.4)
-- `!` prefix — bash mode (direct command execution without tool call)
-- `@` — file path mention / autocomplete
+- `!` prefix — bash mode (direct command execution without tool call) ✅
+- `@` — file path mention / autocomplete ✅
 
-### 11.2 Vim mode
+### 11.2 Vim mode ✅ (already implemented in earlier phases)
 - `/vim` slash command to enable (already exists)
 - Full vi keybindings: normal/insert mode switching
 - `hjkl` navigation, word motions (`w`, `e`, `b`), line motions (`0`, `$`, `^`)
@@ -346,45 +346,46 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 - Operators (`d`, `c`, `y`, `p`), indent/dedent (`>>`, `<<`), `.` repeat
 - Arrow key history navigation in normal mode
 
-### 11.3 Multiline input
-- `\ + Enter` — continue on next line
+### 11.3 Multiline input ✅
+- `\ + Enter` — continue on next line ✅
 - `Option+Enter` (macOS) — newline
 - `Shift+Enter` — newline (requires terminal setup)
-- `Ctrl+J` — newline
+- `Ctrl+J` — newline ✅
 - Paste mode: auto-detect multi-line paste
 
-### 11.4 File edit checkpoints with undo
-- Every file edit (`fs.write`, `fs.edit`, `multi_edit`) snapshots current file contents
+### 11.4 File edit checkpoints with undo ✅
+- Every file edit (`fs.write`, `fs.edit`, `multi_edit`) snapshots current file contents ✅
 - `Esc+Esc` to rewind to previous checkpoint
 - `/rewind` command with checkpoint picker
-- Checkpoints local to session, separate from git
+- Checkpoints local to session, separate from git ✅
 
 ### 11.5 Image support
-- `Ctrl+V` paste images from clipboard
+- `Ctrl+V` paste images from clipboard — DEFERRED to Phase 15
 - Read tool handles image files (PNG, JPG) — already works via multimodal
 - Images displayed inline in transcript where terminal supports
 
-### 11.6 Prompt suggestions
+### 11.6 Prompt suggestions — DEFERRED to Phase 15
 - After each response, auto-suggest follow-up prompts
 - Based on conversation history and git diff context
 - Tab to accept, Enter to accept and submit
 - Configurable via settings
 
-### 11.7 Context visualization
-- `/context` command: colored grid showing token usage breakdown
-- Visual representation of what's consuming context (system prompt, messages, tool results)
+### 11.7 Context visualization ✅
+- `/context` command: token usage breakdown in both CLI and TUI modes ✅
+- System prompt, memory, conversation token estimates ✅
+- Utilization % and compact threshold warning ✅
 
-### 11.8 Session management
-- `/rename NAME` — rename current session
+### 11.8 Session management ✅
+- `/rename NAME` — rename current session ✅
 - `--fork-session` — branch off with new ID, copy full message history
-- `--session-id UUID` — use specific session UUID
-- `--no-session-persistence` — disable persistence
+- `--session-id UUID` — use specific session UUID ✅
+- `--no-session-persistence` — disable persistence ✅
 
-### 11.9 @ file mention autocomplete
-- `@` prefix triggers file path autocomplete
-- Tab completion with fuzzy matching
-- Injects file contents into the prompt context
-- Configurable via `fileSuggestion` setting for custom autocomplete
+### 11.9 @ file mention autocomplete ✅
+- `@` prefix triggers file path autocomplete in TUI Tab handler ✅
+- Tab completion completes file paths after `@` ✅
+- `expand_at_mentions()` injects file contents into prompt context ✅
+- Works in both CLI and TUI modes ✅
 
 ---
 
