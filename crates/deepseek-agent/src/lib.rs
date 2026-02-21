@@ -1337,6 +1337,15 @@ impl AgentEngine {
                 }
             }
 
+            // Ensure chat history respects assistant(tool_calls)->tool pairing rules.
+            let repair_stats = sanitize_chat_history_for_tool_calls(&mut messages);
+            if repair_stats.changed() {
+                self.observer.verbose_log(&format!(
+                    "normalized chat history: dropped {} orphan tool msgs, stripped {} unresolved tool calls",
+                    repair_stats.dropped_tool_messages, repair_stats.stripped_tool_calls
+                ));
+            }
+
             // Context window compaction
             let token_count = estimate_messages_tokens(&messages);
             let threshold = (self.cfg.llm.context_window_tokens as f64
@@ -1348,33 +1357,47 @@ impl AgentEngine {
                 let hr = self.fire_hook(HookEvent::PreCompact, &pre_compact_input);
                 Self::inject_hook_context(&mut messages, &hr);
 
-                // Keep system prompt (index 0) + last 6 messages
-                let keep_tail = 6.min(messages.len() - 1);
-                let compacted_range = &messages[1..messages.len() - keep_tail];
-                let summary = summarize_chat_messages(compacted_range);
-                let from_turn = 1u64;
-                let to_turn = compacted_range.len() as u64;
-                let summary_id = Uuid::now_v7();
+                // Keep system prompt (index 0) plus a tail window, but never
+                // start the tail on a Tool message (that would orphan it).
+                let desired_tail = 6.min(messages.len() - 1);
+                let tail_start = compaction_tail_start(&messages, desired_tail);
+                let compacted_range = &messages[1..tail_start];
+                if !compacted_range.is_empty() {
+                    let summary = summarize_chat_messages(compacted_range);
+                    let from_turn = 1u64;
+                    let to_turn = compacted_range.len() as u64;
+                    let summary_id = Uuid::now_v7();
 
-                let mut new_messages = vec![messages[0].clone()];
-                new_messages.push(ChatMessage::User {
-                    content: format!("[Context compacted — prior conversation summary]\n{summary}"),
-                });
-                new_messages.extend_from_slice(&messages[messages.len() - keep_tail..]);
-                let new_token_count = estimate_messages_tokens(&new_messages);
+                    let mut new_messages = vec![messages[0].clone()];
+                    new_messages.push(ChatMessage::User {
+                        content: format!(
+                            "[Context compacted — prior conversation summary]\n{summary}"
+                        ),
+                    });
+                    new_messages.extend_from_slice(&messages[tail_start..]);
+                    let new_token_count = estimate_messages_tokens(&new_messages);
 
-                self.emit(
-                    session.session_id,
-                    EventKind::ContextCompactedV1 {
-                        summary_id,
-                        from_turn,
-                        to_turn,
-                        token_delta_estimate: token_count as i64 - new_token_count as i64,
-                        replay_pointer: String::new(),
-                    },
-                )?;
+                    self.emit(
+                        session.session_id,
+                        EventKind::ContextCompactedV1 {
+                            summary_id,
+                            from_turn,
+                            to_turn,
+                            token_delta_estimate: token_count as i64 - new_token_count as i64,
+                            replay_pointer: String::new(),
+                        },
+                    )?;
 
-                messages = new_messages;
+                    messages = new_messages;
+                    let post_compact_repairs = sanitize_chat_history_for_tool_calls(&mut messages);
+                    if post_compact_repairs.changed() {
+                        self.observer.verbose_log(&format!(
+                            "post-compact history normalization: dropped {} orphan tool msgs, stripped {} unresolved tool calls",
+                            post_compact_repairs.dropped_tool_messages,
+                            post_compact_repairs.stripped_tool_calls
+                        ));
+                    }
+                }
             }
 
             // Route model selection based on complexity signals
@@ -5812,6 +5835,127 @@ fn truncate_generic(lines: &[&str], max_bytes: usize, total_bytes: usize) -> Str
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ChatHistoryRepairStats {
+    dropped_tool_messages: usize,
+    stripped_tool_calls: usize,
+}
+
+impl ChatHistoryRepairStats {
+    fn changed(self) -> bool {
+        self.dropped_tool_messages > 0 || self.stripped_tool_calls > 0
+    }
+}
+
+fn strip_unresolved_tool_calls(
+    messages: &mut [ChatMessage],
+    assistant_index: Option<usize>,
+    unresolved_ids: &HashSet<String>,
+) -> usize {
+    let Some(idx) = assistant_index else {
+        return 0;
+    };
+    let Some(ChatMessage::Assistant { tool_calls, .. }) = messages.get_mut(idx) else {
+        return 0;
+    };
+    let before = tool_calls.len();
+    tool_calls.retain(|tc| !unresolved_ids.contains(&tc.id));
+    before.saturating_sub(tool_calls.len())
+}
+
+/// Normalize history so each `tool` role message directly corresponds to a
+/// preceding assistant message's `tool_calls` entry.
+fn sanitize_chat_history_for_tool_calls(messages: &mut Vec<ChatMessage>) -> ChatHistoryRepairStats {
+    let mut stats = ChatHistoryRepairStats::default();
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut pending_tool_ids: HashSet<String> = HashSet::new();
+    let mut pending_assistant_index: Option<usize> = None;
+
+    for msg in messages.drain(..) {
+        match msg {
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                if !pending_tool_ids.is_empty() {
+                    stats.stripped_tool_calls += strip_unresolved_tool_calls(
+                        &mut normalized,
+                        pending_assistant_index,
+                        &pending_tool_ids,
+                    );
+                    pending_tool_ids.clear();
+                    pending_assistant_index = None;
+                }
+
+                if tool_calls.is_empty() {
+                    normalized.push(ChatMessage::Assistant {
+                        content,
+                        tool_calls,
+                    });
+                } else {
+                    pending_tool_ids.extend(tool_calls.iter().map(|tc| tc.id.clone()));
+                    pending_assistant_index = Some(normalized.len());
+                    normalized.push(ChatMessage::Assistant {
+                        content,
+                        tool_calls,
+                    });
+                }
+            }
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                if pending_tool_ids.remove(&tool_call_id) {
+                    normalized.push(ChatMessage::Tool {
+                        tool_call_id,
+                        content,
+                    });
+                    if pending_tool_ids.is_empty() {
+                        pending_assistant_index = None;
+                    }
+                } else {
+                    stats.dropped_tool_messages += 1;
+                }
+            }
+            other => {
+                if !pending_tool_ids.is_empty() {
+                    stats.stripped_tool_calls += strip_unresolved_tool_calls(
+                        &mut normalized,
+                        pending_assistant_index,
+                        &pending_tool_ids,
+                    );
+                    pending_tool_ids.clear();
+                    pending_assistant_index = None;
+                }
+                normalized.push(other);
+            }
+        }
+    }
+
+    if !pending_tool_ids.is_empty() {
+        stats.stripped_tool_calls += strip_unresolved_tool_calls(
+            &mut normalized,
+            pending_assistant_index,
+            &pending_tool_ids,
+        );
+    }
+
+    *messages = normalized;
+    stats
+}
+
+/// Compute a compaction tail start index that preserves assistant/tool pairing.
+fn compaction_tail_start(messages: &[ChatMessage], desired_tail: usize) -> usize {
+    if messages.len() <= 1 {
+        return 0;
+    }
+    let mut start = messages.len().saturating_sub(desired_tail).max(1);
+    while start > 1 && matches!(messages.get(start), Some(ChatMessage::Tool { .. })) {
+        start -= 1;
+    }
+    start
+}
+
 /// Compress repeated tool call patterns in the message history.
 ///
 /// When the same tool is called 3+ times consecutively (looking at the tail of
@@ -7060,6 +7204,124 @@ mod tests {
         let summary = summarize_transcript(&transcript, 5);
         assert!(summary.contains("line 45"));
         assert!(!summary.contains("line 1"));
+    }
+
+    fn tool_call(id: &str, name: &str) -> deepseek_core::LlmToolCall {
+        deepseek_core::LlmToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn sanitize_history_drops_orphan_tool_messages() {
+        let mut messages = vec![
+            ChatMessage::System {
+                content: "sys".to_string(),
+            },
+            ChatMessage::User {
+                content: "hello".to_string(),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "orphan".to_string(),
+                content: "stale result".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+
+        let stats = sanitize_chat_history_for_tool_calls(&mut messages);
+
+        assert_eq!(stats.dropped_tool_messages, 1);
+        assert_eq!(stats.stripped_tool_calls, 0);
+        assert!(!messages.iter().any(
+            |m| matches!(m, ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "orphan")
+        ));
+    }
+
+    #[test]
+    fn sanitize_history_strips_unresolved_tool_calls() {
+        let mut messages = vec![
+            ChatMessage::System {
+                content: "sys".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![
+                    tool_call("call_1", "fs.read"),
+                    tool_call("call_2", "fs.read"),
+                ],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "ok".to_string(),
+            },
+            ChatMessage::User {
+                content: "next".to_string(),
+            },
+        ];
+
+        let stats = sanitize_chat_history_for_tool_calls(&mut messages);
+
+        assert_eq!(stats.dropped_tool_messages, 0);
+        assert_eq!(stats.stripped_tool_calls, 1);
+        let assistant = messages
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::Assistant { tool_calls, .. } => Some(tool_calls),
+                _ => None,
+            })
+            .expect("assistant message");
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].id, "call_1");
+    }
+
+    #[test]
+    fn compaction_tail_start_avoids_orphan_tool_boundary() {
+        let messages = vec![
+            ChatMessage::System {
+                content: "sys".to_string(),
+            },
+            ChatMessage::User {
+                content: "u1".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("call_1", "fs.read")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "r1".to_string(),
+            },
+            ChatMessage::User {
+                content: "u2".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("call_2", "bash.run")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_2".to_string(),
+                content: "r2".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+            },
+            ChatMessage::User {
+                content: "u3".to_string(),
+            },
+        ];
+
+        let start = compaction_tail_start(&messages, 3);
+        assert_eq!(start, 5);
+        assert!(matches!(
+            &messages[start],
+            ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+        ));
     }
 
     #[test]

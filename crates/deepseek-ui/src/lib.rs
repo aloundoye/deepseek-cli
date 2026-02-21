@@ -710,7 +710,7 @@ fn render_assistant_markdown(text: &str) -> Line<'static> {
     }
 
     // Table rows: lines starting and ending with `|`
-    if text.starts_with('|') && text.ends_with('|') {
+    if text.len() >= 2 && text.starts_with('|') && text.ends_with('|') {
         let trimmed = &text[1..text.len() - 1];
         // Separator row (e.g. |---|---|)
         if trimmed
@@ -3035,6 +3035,13 @@ mod tests {
         let line = render_assistant_markdown("|---|---|---|");
         let text: String = line.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("---"));
+    }
+
+    #[test]
+    fn render_single_pipe_without_panic() {
+        let line = render_assistant_markdown("|");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "  |");
     }
 
     #[test]
