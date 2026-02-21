@@ -478,7 +478,10 @@ impl AgentEngine {
                 continue; // New file — nothing to snapshot
             }
             // Save using SHA of path as filename to avoid collisions
-            let hash = format!("{:x}", sha2::Sha256::digest(abs_path.to_string_lossy().as_bytes()));
+            let hash = format!(
+                "{:x}",
+                sha2::Sha256::digest(abs_path.to_string_lossy().as_bytes())
+            );
             let dest = snapshot_dir.join(&hash);
             if std::fs::copy(&abs_path, &dest).is_ok() {
                 // Also write a mapping file
@@ -533,12 +536,7 @@ impl AgentEngine {
     }
 
     /// Conditionally create a checkpoint if the tool modifies files.
-    fn maybe_checkpoint(
-        &self,
-        session_id: Uuid,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) {
+    fn maybe_checkpoint(&self, session_id: Uuid, tool_name: &str, args: &serde_json::Value) {
         if Self::is_file_modifying_tool(tool_name) {
             self.create_checkpoint_for_tool(session_id, tool_name, args);
         }
@@ -1315,8 +1313,7 @@ impl AgentEngine {
             if mcp_tool_count > 0 {
                 // If MCP tools exceed threshold, use lazy loading via mcp_search
                 let mcp_token_estimate = mcp_tool_count as u64 * 50; // ~50 tokens per def
-                let context_threshold =
-                    self.cfg.llm.context_window_tokens / 10; // 10% of context
+                let context_threshold = self.cfg.llm.context_window_tokens / 10; // 10% of context
                 if mcp_token_estimate > context_threshold {
                     // Too many MCP tools — add mcp_search instead for on-demand discovery
                     all.push(mcp_search_tool_definition());
@@ -1481,12 +1478,17 @@ impl AgentEngine {
                     {
                         cb(StreamChunk::ContentDelta(format!(
                             "\n⚠ Budget warning: ${:.2}/${:.2} used ({:.0}%). ${:.2} remaining.\n",
-                            cost, max_usd, cost / max_usd * 100.0, remaining
+                            cost,
+                            max_usd,
+                            cost / max_usd * 100.0,
+                            remaining
                         )));
                     }
                     self.observer.verbose_log(&format!(
                         "budget warning: ${:.2}/{:.2} ({:.0}%)",
-                        cost, max_usd, cost / max_usd * 100.0
+                        cost,
+                        max_usd,
+                        cost / max_usd * 100.0
                     ));
                 }
             }
@@ -1799,9 +1801,7 @@ impl AgentEngine {
                         requires_approval: true,
                     };
                     if self.policy.requires_approval(&mcp_tool_call)
-                        && !self
-                            .request_tool_approval(&mcp_tool_call)
-                            .unwrap_or(false)
+                        && !self.request_tool_approval(&mcp_tool_call).unwrap_or(false)
                     {
                         messages.push(ChatMessage::Tool {
                             tool_call_id: tc.id.clone(),
@@ -1816,10 +1816,7 @@ impl AgentEngine {
                     if let Ok(cb) = self.stream_callback.lock()
                         && let Some(ref cb) = *cb
                     {
-                        cb(StreamChunk::ContentDelta(format!(
-                            "\n[mcp: {}]\n",
-                            tc.name
-                        )));
+                        cb(StreamChunk::ContentDelta(format!("\n[mcp: {}]\n", tc.name)));
                     }
                     let tool_start = Instant::now();
                     let result_text = match self.execute_mcp_tool(&tc.name, &args) {
@@ -1845,10 +1842,7 @@ impl AgentEngine {
 
                 // ── mcp_search meta-tool (lazy loading) ──
                 if internal_name == "mcp_search" {
-                    let query = args
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                     let matches = self.search_mcp_tools(query);
                     let result = if matches.is_empty() {
                         format!("No MCP tools found matching '{query}'")
@@ -1856,10 +1850,7 @@ impl AgentEngine {
                         let tool_list: Vec<String> = matches
                             .iter()
                             .map(|t| {
-                                format!(
-                                    "- mcp__{}_{}: {}",
-                                    t.server_id, t.name, t.description
-                                )
+                                format!("- mcp__{}_{}: {}", t.server_id, t.name, t.description)
                             })
                             .collect();
                         format!(
@@ -1882,9 +1873,7 @@ impl AgentEngine {
                         plan_mode_active = true;
                         tools = all_tools
                             .iter()
-                            .filter(|t| {
-                                PLAN_MODE_TOOLS.contains(&t.function.name.as_str())
-                            })
+                            .filter(|t| PLAN_MODE_TOOLS.contains(&t.function.name.as_str()))
                             .cloned()
                             .collect();
                         self.emit(
@@ -1960,10 +1949,7 @@ impl AgentEngine {
                     input.tool_input = Some(args.clone());
                     let hr = self.fire_hook(HookEvent::PreToolUse, &input);
                     if hr.blocked {
-                        let reason = hr
-                            .block_reason
-                            .as_deref()
-                            .unwrap_or("Blocked by hook");
+                        let reason = hr.block_reason.as_deref().unwrap_or("Blocked by hook");
                         messages.push(ChatMessage::Tool {
                             tool_call_id: tc.id.clone(),
                             content: format!("Error: tool blocked by hook — {reason}"),
@@ -2185,9 +2171,7 @@ impl AgentEngine {
                 )?;
                 self.emit(
                     session.session_id,
-                    EventKind::ChatTurnV1 {
-                        message: tool_msg,
-                    },
+                    EventKind::ChatTurnV1 { message: tool_msg },
                 )?;
             }
         }
@@ -3675,11 +3659,7 @@ impl AgentEngine {
     }
 
     /// Execute an MCP tool call by routing to the appropriate server via JSON-RPC.
-    fn execute_mcp_tool(
-        &self,
-        tool_name: &str,
-        args: &serde_json::Value,
-    ) -> Result<String> {
+    fn execute_mcp_tool(&self, tool_name: &str, args: &serde_json::Value) -> Result<String> {
         let (server_id, mcp_tool_name) = parse_mcp_tool_name(tool_name)
             .ok_or_else(|| anyhow!("invalid MCP tool name: {tool_name}"))?;
 
@@ -3807,9 +3787,7 @@ impl AgentEngine {
             "skill" => self.handle_skill(args),
             "kill_shell" => self.handle_kill_shell(args),
             // Plan mode tools are handled inline in chat loop, not here
-            "enter_plan_mode" | "exit_plan_mode" => {
-                Ok("Plan mode transition handled.".to_string())
-            }
+            "enter_plan_mode" | "exit_plan_mode" => Ok("Plan mode transition handled.".to_string()),
             _ => Err(anyhow!("unknown agent tool: {tool_name}")),
         };
         let tool_elapsed = tool_start.elapsed();
@@ -4010,7 +3988,9 @@ impl AgentEngine {
                 })
             })
             .collect();
-        Ok(serde_json::to_string(&serde_json::json!({ "tasks": items }))?)
+        Ok(serde_json::to_string(
+            &serde_json::json!({ "tasks": items }),
+        )?)
     }
 
     /// Handle the spawn_task tool: spawn a subagent to work on a subtask.
@@ -4054,8 +4034,7 @@ impl AgentEngine {
         let custom_agent = match type_str {
             "explore" | "plan" | "bash" | "general-purpose" => None,
             custom_name => {
-                let defs = deepseek_subagent::load_agent_defs(&self.workspace)
-                    .unwrap_or_default();
+                let defs = deepseek_subagent::load_agent_defs(&self.workspace).unwrap_or_default();
                 defs.into_iter().find(|d| d.name == custom_name)
             }
         };
@@ -4126,9 +4105,7 @@ impl AgentEngine {
 
         // Foreground (blocking) execution.
         let output = if let Some(worker) = worker {
-            let results = self
-                .subagents
-                .run_tasks(vec![task], move |t| worker(&t));
+            let results = self.subagents.run_tasks(vec![task], move |t| worker(&t));
             if let Some(result) = results.first() {
                 serde_json::to_string(&json!({
                     "name": result.name,
@@ -4143,14 +4120,12 @@ impl AgentEngine {
         } else {
             // Fallback: run with a simple echo worker.
             let prompt_owned = prompt.to_string();
-            let results = self
-                .subagents
-                .run_tasks(vec![task], move |t| {
-                    Ok(format!(
-                        "Subagent '{}' completed goal: {}",
-                        t.name, prompt_owned
-                    ))
-                });
+            let results = self.subagents.run_tasks(vec![task], move |t| {
+                Ok(format!(
+                    "Subagent '{}' completed goal: {}",
+                    t.name, prompt_owned
+                ))
+            });
             if let Some(result) = results.first() {
                 serde_json::to_string(&json!({
                     "name": result.name,
@@ -4363,17 +4338,14 @@ impl AgentEngine {
                 let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
                 loop {
                     if handle.is_finished() {
-                        let result = handle.join().unwrap_or_else(|_| {
-                            deepseek_core::ToolResult {
-                                invocation_id: Uuid::nil(),
-                                success: false,
-                                output: json!({"error": "shell thread panicked"}),
-                            }
+                        let result = handle.join().unwrap_or_else(|_| deepseek_core::ToolResult {
+                            invocation_id: Uuid::nil(),
+                            success: false,
+                            output: json!({"error": "shell thread panicked"}),
                         });
                         let output = result.output.clone();
                         if let Ok(mut shells) = self.background_shells.lock()
-                            && let Some(entry) =
-                                shells.iter_mut().find(|s| s.shell_id == shell_id)
+                            && let Some(entry) = shells.iter_mut().find(|s| s.shell_id == shell_id)
                         {
                             entry.result = Some(result);
                         }
@@ -4385,8 +4357,7 @@ impl AgentEngine {
                     }
                     if Instant::now() >= deadline {
                         if let Ok(mut shells) = self.background_shells.lock()
-                            && let Some(entry) =
-                                shells.iter_mut().find(|s| s.shell_id == shell_id)
+                            && let Some(entry) = shells.iter_mut().find(|s| s.shell_id == shell_id)
                         {
                             entry.handle = Some(handle);
                         }
@@ -4400,17 +4371,14 @@ impl AgentEngine {
                 }
             } else {
                 if handle.is_finished() {
-                    let result = handle.join().unwrap_or_else(|_| {
-                        deepseek_core::ToolResult {
-                            invocation_id: Uuid::nil(),
-                            success: false,
-                            output: json!({"error": "shell thread panicked"}),
-                        }
+                    let result = handle.join().unwrap_or_else(|_| deepseek_core::ToolResult {
+                        invocation_id: Uuid::nil(),
+                        success: false,
+                        output: json!({"error": "shell thread panicked"}),
                     });
                     let output = result.output.clone();
                     if let Ok(mut shells) = self.background_shells.lock()
-                        && let Some(entry) =
-                            shells.iter_mut().find(|s| s.shell_id == shell_id)
+                        && let Some(entry) = shells.iter_mut().find(|s| s.shell_id == shell_id)
                     {
                         entry.result = Some(result);
                     }
@@ -5771,9 +5739,9 @@ fn estimate_tokens(text: &str) -> u64 {
         let len = word.len();
         tokens += match len {
             0 => 0,
-            1..=3 => 1,   // short words/symbols: 1 token
-            4..=7 => 2,   // common words: ~1.5 tokens
-            8..=15 => 3,  // longer words/identifiers: ~2-3 tokens
+            1..=3 => 1,                    // short words/symbols: 1 token
+            4..=7 => 2,                    // common words: ~1.5 tokens
+            8..=15 => 3,                   // longer words/identifiers: ~2-3 tokens
             _ => (len as u64).div_ceil(4), // very long tokens: ~4 chars/token
         };
     }
@@ -7007,9 +6975,7 @@ pub fn expand_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '$'
-            && chars.peek() == Some(&'{')
-        {
+        if ch == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut var_expr = String::new();
             for c in chars.by_ref() {
@@ -7019,9 +6985,7 @@ pub fn expand_env_vars(input: &str) -> String {
                 var_expr.push(c);
             }
             if let Some((var_name, default)) = var_expr.split_once(":-") {
-                result.push_str(
-                    &std::env::var(var_name).unwrap_or_else(|_| default.to_string()),
-                );
+                result.push_str(&std::env::var(var_name).unwrap_or_else(|_| default.to_string()));
             } else {
                 result.push_str(&std::env::var(&var_expr).unwrap_or_default());
             }

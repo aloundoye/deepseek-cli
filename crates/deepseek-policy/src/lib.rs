@@ -144,19 +144,14 @@ impl PermissionRule {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if let Ok(pattern) = Pattern::new(&specifier)
-                    && (pattern.matches(path)
-                        || pattern.matches_path(Path::new(path)))
+                    && (pattern.matches(path) || pattern.matches_path(Path::new(path)))
                 {
                     return Some(&self.decision);
                 }
                 None
             }
             "web.fetch" => {
-                let url = call
-                    .args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let url = call.args.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 if let Some(domain) = specifier.strip_prefix("domain:") {
                     if url.contains(domain) {
                         return Some(&self.decision);
@@ -667,12 +662,7 @@ pub enum PermissionDryRunResult {
 fn is_edit_tool(name: &str) -> bool {
     matches!(
         name,
-        "fs.write"
-            | "fs.edit"
-            | "multi_edit"
-            | "patch.stage"
-            | "patch.apply"
-            | "notebook.edit"
+        "fs.write" | "fs.edit" | "multi_edit" | "patch.stage" | "patch.apply" | "notebook.edit"
     )
 }
 
@@ -1529,7 +1519,9 @@ mod tests {
         assert!(policy.requires_approval(&random_bash));
         assert_eq!(
             policy.dry_run(&edit_call),
-            PermissionDryRunResult::Denied("dontAsk mode denies non-allowlisted operations".to_string())
+            PermissionDryRunResult::Denied(
+                "dontAsk mode denies non-allowlisted operations".to_string()
+            )
         );
     }
 
@@ -1615,8 +1607,14 @@ mod tests {
             args: json!({"cmd": "npm test"}),
             requires_approval: false,
         };
-        assert_eq!(evaluate_permission_rules(&rules, &deploy), Some("deny".to_string()));
-        assert_eq!(evaluate_permission_rules(&rules, &test), Some("allow".to_string()));
+        assert_eq!(
+            evaluate_permission_rules(&rules, &deploy),
+            Some("deny".to_string())
+        );
+        assert_eq!(
+            evaluate_permission_rules(&rules, &test),
+            Some("allow".to_string())
+        );
     }
 
     #[test]

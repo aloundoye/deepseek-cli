@@ -274,10 +274,7 @@ fn load_commands_from_dir(dir: &Path, out: &mut Vec<CustomCommand>) {
             continue;
         };
         let (frontmatter, body) = parse_command_frontmatter(&raw);
-        let description = frontmatter
-            .get("description")
-            .cloned()
-            .unwrap_or_default();
+        let description = frontmatter.get("description").cloned().unwrap_or_default();
         let disable_model = frontmatter
             .get("disable-model-invocation")
             .is_some_and(|v| v == "true");
@@ -308,10 +305,7 @@ fn parse_command_frontmatter(raw: &str) -> (std::collections::HashMap<String, St
         let yaml_block = &after_first[..end];
         for line in yaml_block.lines() {
             if let Some((key, val)) = line.split_once(':') {
-                map.insert(
-                    key.trim().to_string(),
-                    val.trim().to_string(),
-                );
+                map.insert(key.trim().to_string(), val.trim().to_string());
             }
         }
         let body_start = end + 4; // "\n---"

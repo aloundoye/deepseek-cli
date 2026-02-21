@@ -4,7 +4,8 @@
     <vendor email="support@deepseek.com">DeepSeek</vendor>
 
     <description><![CDATA[
-        Minimal IntelliJ integration for DeepSeek CLI JSON-RPC over stdio.
+        IntelliJ integration for DeepSeek CLI JSON-RPC over stdio.
+        Provides chat, diff viewer, and session management.
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
@@ -14,11 +15,20 @@
     </extensions>
 
     <actions>
-        <action id="DeepSeek.Status"
-                class="com.deepseek.ide.DeepSeekStatusAction"
-                text="DeepSeek Status"
-                description="Check DeepSeek RPC status">
+        <group id="DeepSeek.Menu" text="DeepSeek" popup="true">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
-        </action>
+            <action id="DeepSeek.Status"
+                    class="com.deepseek.ide.DeepSeekStatusAction"
+                    text="Status"
+                    description="Check DeepSeek RPC server status"/>
+            <action id="DeepSeek.Chat"
+                    class="com.deepseek.ide.DeepSeekChatAction"
+                    text="Chat"
+                    description="Send a prompt to DeepSeek"/>
+            <action id="DeepSeek.Diff"
+                    class="com.deepseek.ide.DeepSeekDiffAction"
+                    text="View Patch Diff"
+                    description="Preview a patch diff from DeepSeek"/>
+        </group>
     </actions>
 </idea-plugin>

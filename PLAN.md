@@ -481,25 +481,45 @@ The original codebase was built around a **Plan-and-Execute** architecture:
 
 ---
 
-## Phase 14: IDE Integration
+## Phase 14: IDE Integration ✅ Complete
 
-### 14.1 Expand JSON-RPC server methods
-- Session open/resume/fork, prompt execution, tool event streaming
-- Patch preview/apply, diagnostics forwarding, task updates
-- Fix session fork to copy message history
+### 14.1 Expand JSON-RPC server methods ✅
+- `IdeRpcHandler` — full-featured handler backed by `Store` with session, prompt, tool, patch, diagnostic, and task methods ✅
+- `session/open` — create new session with workspace root ✅
+- `session/resume` — reload session with conversation history from event log ✅
+- `session/fork` — fork session with conversation history copy ✅
+- `session/list` — list all sessions ordered by updated_at ✅
+- `prompt/execute` — queue prompt, record ChatTurnV1 event, return prompt_id ✅
+- `tool/approve` / `tool/deny` — approve or deny pending tool invocations ✅
+- `patch/preview` — check staged/applied patch status ✅
+- `patch/apply` — record PatchAppliedV1 event ✅
+- `diagnostics/list` — extract diagnostic-related entries from session transcript ✅
+- `task/list` / `task/update` — list and update task queue ✅
+- Named error codes: ERR_PARSE, ERR_METHOD_NOT_FOUND, ERR_INVALID_PARAMS, ERR_INTERNAL, ERR_SESSION_NOT_FOUND, ERR_TOOL_DENIED, ERR_PATCH_CONFLICT ✅
+- CLI `run_serve()` upgraded to use `IdeRpcHandler` with workspace-backed Store ✅
+- 10 new tests for all IDE handler methods ✅
 
-### 14.2 VS Code extension
-- `extensions/vscode/` — full chat panel with streaming
-- Checkpoint-based undo: track file edits, rewind to previous state
-- @-mention files with line ranges from selection
-- Parallel conversations in separate tabs
-- Diff viewer for proposed changes
-- Auto-accept or review-before-accept modes
+### 14.2 VS Code extension ✅
+- `DeepSeekChatPanel` — webview-based chat panel with streaming display ✅
+- @-mention files with line ranges from editor selection ✅
+- Parallel conversations via multiple chat panels ✅
+- Diff viewer command (`deepseek.showDiff`) using VS Code built-in diff ✅
+- Auto-accept mode toggle (`deepseek.ide.autoAcceptEdits` setting) ✅
+- Session management: open, resume, fork, list commands ✅
+- Tool approval/denial from chat panel ✅
+- Patch preview and apply from chat panel ✅
+- 6 new commands: openChat, sessionList, forkSession, showDiff + existing startServer, status ✅
+- Package version bumped to 0.0.2 ✅
 
-### 14.3 JetBrains plugin
-- Upgrade from status-only scaffold to full feature flow
-- Chat interface in IDE terminal
-- Opens proposed changes in IDE diff viewer
+### 14.3 JetBrains plugin ✅
+- `DeepSeekRpcClient` — generic `request()` method for any JSON-RPC call ✅
+- Session management: sessionOpen, sessionResume, sessionFork, sessionList ✅
+- `promptExecute()` with proper JSON escaping ✅
+- Tool approve/deny, patch preview/apply methods ✅
+- `DeepSeekChatAction` — chat dialog with session management and notification output ✅
+- `DeepSeekDiffAction` — IDE diff viewer for patch previews using IntelliJ DiffManager ✅
+- Plugin.xml updated with DeepSeek action group in Tools menu ✅
+- All actions grouped under DeepSeek submenu (Status, Chat, View Patch Diff) ✅
 
 ---
 

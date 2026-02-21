@@ -308,9 +308,7 @@ impl McpManager {
                     .url
                     .as_deref()
                     .ok_or_else(|| anyhow!("HTTP MCP server has no URL"))?;
-                let client = Client::builder()
-                    .timeout(Duration::from_secs(10))
-                    .build()?;
+                let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
                 let resp: serde_json::Value = client
                     .post(base_url)
                     .json(&json!({
@@ -377,9 +375,7 @@ pub fn expand_env_vars(input: &str) -> String {
                 var_expr.push(c);
             }
             if let Some((var_name, default)) = var_expr.split_once(":-") {
-                result.push_str(
-                    &std::env::var(var_name).unwrap_or_else(|_| default.to_string()),
-                );
+                result.push_str(&std::env::var(var_name).unwrap_or_else(|_| default.to_string()));
             } else {
                 result.push_str(&std::env::var(&var_expr).unwrap_or_default());
             }
@@ -407,8 +403,8 @@ pub fn expand_server_env_vars(server: &mut McpServer) {
 /// Reads `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 /// or `%APPDATA%/Claude/claude_desktop_config.json` (Windows).
 pub fn import_from_claude_desktop() -> Result<Vec<McpServer>> {
-    let config_path = claude_desktop_config_path()
-        .ok_or_else(|| anyhow!("Claude Desktop config not found"))?;
+    let config_path =
+        claude_desktop_config_path().ok_or_else(|| anyhow!("Claude Desktop config not found"))?;
     if !config_path.exists() {
         return Err(anyhow!(
             "Claude Desktop config not found at {}",
@@ -425,7 +421,10 @@ pub fn import_from_claude_desktop() -> Result<Vec<McpServer>> {
 
     let mut servers = Vec::new();
     for (id, entry) in servers_obj {
-        let command = entry.get("command").and_then(|v| v.as_str()).map(String::from);
+        let command = entry
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let args = entry
             .get("args")
             .and_then(|v| v.as_array())
@@ -449,10 +448,7 @@ pub fn import_from_claude_desktop() -> Result<Vec<McpServer>> {
             args,
             url,
             enabled: true,
-            metadata: entry
-                .get("env")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
+            metadata: entry.get("env").cloned().unwrap_or(serde_json::Value::Null),
         });
     }
     Ok(servers)
@@ -791,10 +787,7 @@ pub fn run_mcp_serve(workspace: &Path) -> Result<()> {
         };
 
         let id = message.get("id").cloned();
-        let method = message
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
         let response = match method {
             "initialize" => json!({
@@ -818,14 +811,8 @@ pub fn run_mcp_serve(workspace: &Path) -> Result<()> {
             }),
             "tools/call" => {
                 let params = message.get("params").cloned().unwrap_or(json!({}));
-                let tool_name = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(json!({}));
+                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 let result_text = execute_serve_tool(workspace, tool_name, &arguments);
                 json!({
                     "jsonrpc": "2.0",
@@ -861,14 +848,46 @@ pub fn run_mcp_serve(workspace: &Path) -> Result<()> {
 /// Build the tool list for MCP serve mode — exposes a subset of DeepSeek tools.
 fn build_serve_tool_list(_workspace: &Path) -> Vec<serde_json::Value> {
     let tools = vec![
-        ("fs_read", "Read a file", json!({"type": "object", "properties": {"path": {"type": "string", "description": "File path to read"}}, "required": ["path"]})),
-        ("fs_write", "Write content to a file", json!({"type": "object", "properties": {"path": {"type": "string", "description": "File path"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]})),
-        ("fs_glob", "Find files by glob pattern", json!({"type": "object", "properties": {"pattern": {"type": "string", "description": "Glob pattern"}}, "required": ["pattern"]})),
-        ("fs_grep", "Search file contents with regex", json!({"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex pattern"}, "path": {"type": "string", "description": "Search path"}}, "required": ["pattern"]})),
-        ("bash_run", "Execute a shell command", json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "Command to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds"}}, "required": ["cmd"]})),
-        ("git_status", "Show git status", json!({"type": "object", "properties": {}})),
-        ("git_diff", "Show git diff", json!({"type": "object", "properties": {"args": {"type": "string", "description": "Additional git diff args"}}})),
-        ("web_fetch", "Fetch URL content", json!({"type": "object", "properties": {"url": {"type": "string", "description": "URL to fetch"}}, "required": ["url"]})),
+        (
+            "fs_read",
+            "Read a file",
+            json!({"type": "object", "properties": {"path": {"type": "string", "description": "File path to read"}}, "required": ["path"]}),
+        ),
+        (
+            "fs_write",
+            "Write content to a file",
+            json!({"type": "object", "properties": {"path": {"type": "string", "description": "File path"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]}),
+        ),
+        (
+            "fs_glob",
+            "Find files by glob pattern",
+            json!({"type": "object", "properties": {"pattern": {"type": "string", "description": "Glob pattern"}}, "required": ["pattern"]}),
+        ),
+        (
+            "fs_grep",
+            "Search file contents with regex",
+            json!({"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex pattern"}, "path": {"type": "string", "description": "Search path"}}, "required": ["pattern"]}),
+        ),
+        (
+            "bash_run",
+            "Execute a shell command",
+            json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "Command to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds"}}, "required": ["cmd"]}),
+        ),
+        (
+            "git_status",
+            "Show git status",
+            json!({"type": "object", "properties": {}}),
+        ),
+        (
+            "git_diff",
+            "Show git diff",
+            json!({"type": "object", "properties": {"args": {"type": "string", "description": "Additional git diff args"}}}),
+        ),
+        (
+            "web_fetch",
+            "Fetch URL content",
+            json!({"type": "object", "properties": {"url": {"type": "string", "description": "URL to fetch"}}, "required": ["url"]}),
+        ),
     ];
     tools
         .into_iter()
@@ -886,10 +905,7 @@ fn build_serve_tool_list(_workspace: &Path) -> Vec<serde_json::Value> {
 fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json::Value) -> String {
     match tool_name {
         "fs_read" => {
-            let path = arguments
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let full_path = if Path::new(path).is_absolute() {
                 PathBuf::from(path)
             } else {
@@ -901,10 +917,7 @@ fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json:
             }
         }
         "fs_write" => {
-            let path = arguments
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = arguments
                 .get("content")
                 .and_then(|v| v.as_str())
@@ -940,10 +953,7 @@ fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json:
             }
         }
         "bash_run" => {
-            let cmd = arguments
-                .get("cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let cmd = arguments.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
             let _timeout_secs = arguments
                 .get("timeout")
                 .and_then(|v| v.as_u64())
@@ -977,10 +987,7 @@ fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json:
             } else {
                 "diff"
             };
-            let extra_args = arguments
-                .get("args")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let extra_args = arguments.get("args").and_then(|v| v.as_str()).unwrap_or("");
             let mut args = vec![git_cmd];
             if !extra_args.is_empty() {
                 args.push(extra_args);
@@ -995,10 +1002,7 @@ fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json:
             }
         }
         "web_fetch" => {
-            let url = arguments
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
             match Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()

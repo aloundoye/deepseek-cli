@@ -12,9 +12,7 @@ use deepseek_diff::PatchStore;
 use deepseek_index::IndexService;
 use deepseek_mcp::{McpManager, McpServer, McpTransport};
 use deepseek_memory::{ExportFormat, MemoryManager};
-use deepseek_policy::{
-    PolicyEngine, TeamPolicyLocks, load_managed_settings, team_policy_locks,
-};
+use deepseek_policy::{PolicyEngine, TeamPolicyLocks, load_managed_settings, team_policy_locks};
 use deepseek_skills::SkillManager;
 use deepseek_store::{AutopilotRunRecord, BackgroundJobRecord, ReplayCassetteRecord, Store};
 use deepseek_tools::PluginManager;
@@ -1042,10 +1040,7 @@ struct PluginRunArgs {
 fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "macos")]
     {
-        let mut child = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .spawn()
-            .ok();
+        let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn().ok();
         if let Some(ref mut c) = child {
             if let Some(ref mut stdin) = c.stdin {
                 let _ = stdin.write_all(text.as_bytes());
@@ -1069,10 +1064,7 @@ fn copy_to_clipboard(text: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        let mut child = Command::new("clip")
-            .stdin(Stdio::piped())
-            .spawn()
-            .ok();
+        let mut child = Command::new("clip").stdin(Stdio::piped()).spawn().ok();
         if let Some(ref mut c) = child {
             if let Some(ref mut stdin) = c.stdin {
                 let _ = stdin.write_all(text.as_bytes());
@@ -1100,9 +1092,7 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
         ));
     }
     if cli.chrome && cli.no_chrome {
-        return Err(anyhow!(
-            "--chrome and --no-chrome are mutually exclusive"
-        ));
+        return Err(anyhow!("--chrome and --no-chrome are mutually exclusive"));
     }
     if cli.dangerously_skip_permissions && !cli.allow_dangerously_skip_permissions {
         return Err(anyhow!(
@@ -1170,17 +1160,18 @@ fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
 
         // Configure tool restrictions based on subagent role
         let opts = match task.role {
-            deepseek_subagent::SubagentRole::Explore
-            | deepseek_subagent::SubagentRole::Plan => ChatOptions {
-                tools: true,
-                allowed_tools: Some(
-                    deepseek_tools::PLAN_MODE_TOOLS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                ),
-                ..Default::default()
-            },
+            deepseek_subagent::SubagentRole::Explore | deepseek_subagent::SubagentRole::Plan => {
+                ChatOptions {
+                    tools: true,
+                    allowed_tools: Some(
+                        deepseek_tools::PLAN_MODE_TOOLS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }
+            }
             _ => ChatOptions {
                 tools: true,
                 ..Default::default()
@@ -1219,8 +1210,16 @@ fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
         }
     } else {
         (
-            if cli.allowed_tools.is_empty() { None } else { Some(cli.allowed_tools.clone()) },
-            if cli.disallowed_tools.is_empty() { None } else { Some(cli.disallowed_tools.clone()) },
+            if cli.allowed_tools.is_empty() {
+                None
+            } else {
+                Some(cli.allowed_tools.clone())
+            },
+            if cli.disallowed_tools.is_empty() {
+                None
+            } else {
+                Some(cli.disallowed_tools.clone())
+            },
         )
     };
     ChatOptions {
@@ -2898,13 +2897,18 @@ fn run_chat(
                             println!("Theme set to: {t}");
                         }
                     } else {
-                        println!(
-                            "Available themes: default, dark, light\nUsage: /theme <name>"
-                        );
+                        println!("Available themes: default, dark, light\nUsage: /theme <name>");
                     }
                 }
                 SlashCommand::Usage => {
-                    run_usage(cwd, UsageArgs { session: true, day: false }, json_mode)?;
+                    run_usage(
+                        cwd,
+                        UsageArgs {
+                            session: true,
+                            day: false,
+                        },
+                        json_mode,
+                    )?;
                 }
                 SlashCommand::AddDir(args) => {
                     if args.is_empty() {
@@ -2928,9 +2932,7 @@ fn run_chat(
                         println!("Bug report info:");
                         println!("  Logs: {}", log_dir.display());
                         println!("  Config: {}", config_dir.display());
-                        println!(
-                            "  Report: https://github.com/anthropics/deepseek-cli/issues"
-                        );
+                        println!("  Report: https://github.com/anthropics/deepseek-cli/issues");
                     }
                 }
                 SlashCommand::PrComments(args) => {
@@ -2954,7 +2956,10 @@ fn run_chat(
                     }
                 }
                 SlashCommand::ReleaseNotes(args) => {
-                    let range = args.first().cloned().unwrap_or_else(|| "HEAD~10..HEAD".to_string());
+                    let range = args
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "HEAD~10..HEAD".to_string());
                     if json_mode {
                         print_json(&json!({"range": range}))?;
                     } else {
@@ -10194,7 +10199,8 @@ fn run_serve(args: ServeArgs, json_mode: bool) -> Result<()> {
             } else {
                 eprintln!("deepseek: starting JSON-RPC server on stdio...");
             }
-            let handler = deepseek_jsonrpc::DefaultRpcHandler;
+            let workspace = std::env::current_dir()?;
+            let handler = deepseek_jsonrpc::IdeRpcHandler::new(&workspace)?;
             deepseek_jsonrpc::run_stdio_server(&handler)
         }
         other => Err(anyhow!(

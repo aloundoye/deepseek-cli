@@ -750,8 +750,13 @@ name = "deepseek-jsonrpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "deepseek-core",
+ "deepseek-store",
  "serde",
  "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

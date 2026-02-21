@@ -1,8 +1,8 @@
 {
   "name": "deepseek-vscode",
   "displayName": "DeepSeek CLI",
-  "description": "VS Code bridge for DeepSeek CLI JSON-RPC.",
-  "version": "0.0.1",
+  "description": "VS Code bridge for DeepSeek CLI JSON-RPC with chat panel.",
+  "version": "0.0.2",
   "publisher": "deepseek",
   "engines": {
     "vscode": "^1.90.0"
@@ -13,7 +13,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:deepseek.startServer",
-    "onCommand:deepseek.status"
+    "onCommand:deepseek.status",
+    "onCommand:deepseek.openChat"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -24,6 +25,11 @@
           "type": "string",
           "default": "deepseek",
           "description": "Path to the deepseek CLI binary."
+        },
+        "deepseek.ide.autoAcceptEdits": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically accept all file edits without review."
         }
       }
     },
@@ -35,6 +41,22 @@
       {
         "command": "deepseek.status",
         "title": "DeepSeek: Status"
+      },
+      {
+        "command": "deepseek.openChat",
+        "title": "DeepSeek: Open Chat"
+      },
+      {
+        "command": "deepseek.sessionList",
+        "title": "DeepSeek: List Sessions"
+      },
+      {
+        "command": "deepseek.forkSession",
+        "title": "DeepSeek: Fork Session"
+      },
+      {
+        "command": "deepseek.showDiff",
+        "title": "DeepSeek: Show Diff"
       }
     ]
   },
