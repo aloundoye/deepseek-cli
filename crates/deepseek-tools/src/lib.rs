@@ -2176,6 +2176,57 @@ pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
     }
 }
 
+/// Generate ToolDefinitions from installed plugins.
+/// Each plugin command becomes a callable tool with `plugin__<id>__<command>` naming.
+pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
+    let manager = match PluginManager::new(workspace) {
+        Ok(m) => m,
+        Err(_) => return vec![],
+    };
+    let plugins = match manager.list() {
+        Ok(p) => p,
+        Err(_) => return vec![],
+    };
+    let mut defs = Vec::new();
+    for plugin in plugins {
+        if !plugin.enabled {
+            continue;
+        }
+        for cmd_path in &plugin.commands {
+            let cmd_name = cmd_path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            let api_name = format!(
+                "plugin__{}__{}",
+                plugin.manifest.id.replace('-', "_"),
+                cmd_name.replace('-', "_")
+            );
+            defs.push(ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: api_name,
+                    description: format!(
+                        "[Plugin: {}] {} command",
+                        plugin.manifest.name, cmd_name
+                    ),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "arguments": {
+                                "type": "string",
+                                "description": "Arguments to pass to the plugin command"
+                            }
+                        },
+                        "required": []
+                    }),
+                },
+            });
+        }
+    }
+    defs
+}
+
 /// Tools that are handled by AgentEngine directly, not by LocalToolHost.
 pub const AGENT_LEVEL_TOOLS: &[&str] = &[
     "user_question",
