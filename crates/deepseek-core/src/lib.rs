@@ -556,6 +556,9 @@ pub enum EventKind {
     TaskDeletedV1 {
         task_id: String,
     },
+    EnterPlanModeV1 {
+        session_id: Uuid,
+    },
     ExitPlanModeV1 {
         session_id: Uuid,
     },

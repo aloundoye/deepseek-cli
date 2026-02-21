@@ -975,6 +975,57 @@ fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
     engine.set_max_budget_usd(cli.max_budget_usd);
 }
 
+/// Wire the subagent worker so spawn_task creates real child agents.
+fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
+    let workspace = cwd.to_path_buf();
+    engine.set_subagent_worker(std::sync::Arc::new(move |task| {
+        let mut child = AgentEngine::new(&workspace)?;
+
+        // If task carries a custom agent definition, use its config.
+        if let Some(ref agent_def) = task.custom_agent {
+            let opts = ChatOptions {
+                tools: true,
+                allowed_tools: if agent_def.tools.is_empty() {
+                    None
+                } else {
+                    Some(agent_def.tools.clone())
+                },
+                disallowed_tools: if agent_def.disallowed_tools.is_empty() {
+                    None
+                } else {
+                    Some(agent_def.disallowed_tools.clone())
+                },
+                system_prompt_override: Some(agent_def.prompt.clone()),
+                ..Default::default()
+            };
+            child.set_max_turns(agent_def.max_turns.or(Some(50)));
+            return child.chat_with_options(&task.goal, opts);
+        }
+
+        // Configure tool restrictions based on subagent role
+        let opts = match task.role {
+            deepseek_subagent::SubagentRole::Explore
+            | deepseek_subagent::SubagentRole::Plan => ChatOptions {
+                tools: true,
+                allowed_tools: Some(
+                    deepseek_tools::PLAN_MODE_TOOLS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            _ => ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        };
+        // Limit child agent turns to prevent runaway
+        child.set_max_turns(Some(50));
+        child.chat_with_options(&task.goal, opts)
+    }));
+}
+
 /// Build ChatOptions from CLI flags.
 fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
     ChatOptions {
@@ -1035,6 +1086,7 @@ fn main() -> Result<()> {
             ensure_llm_ready(&cwd, cli.json)?;
             let mut engine = AgentEngine::new(&cwd)?;
             apply_cli_flags(&mut engine, &cli);
+            wire_subagent_worker(&engine, &cwd);
             let options = chat_options_from_cli(&cli, args.tools);
             let output = engine.chat_with_options(&args.prompt, options)?;
             if cli.json {
@@ -2569,6 +2621,7 @@ fn run_chat(
 
 fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> Result<()> {
     let engine = Arc::new(AgentEngine::new(cwd)?);
+    wire_subagent_worker(&engine, cwd);
     let force_max_think = Arc::new(AtomicBool::new(false));
 
     // Create the channel for TUI stream events.
@@ -9097,6 +9150,7 @@ fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
     ensure_llm_ready(cwd, json_mode)?;
     let mut engine = AgentEngine::new(cwd)?;
     apply_cli_flags(&mut engine, cli);
+    wire_subagent_worker(&engine, cwd);
 
     // Handle --no-input: auto-deny all approval prompts
     if cli.no_input {

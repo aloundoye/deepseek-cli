@@ -1,346 +1,685 @@
-# PLAN.md — DeepSeek CLI: Exhaustive Task List for Claude Code Parity
+# PLAN.md — DeepSeek CLI: Full Claude Code Feature Parity
 
-Based on deep analysis of all 18 crates (~25k LOC) and comparison with Claude Code architecture.
+Based on deep analysis of all 18 crates (~25k LOC) and exhaustive comparison with Claude Code (Feb 2026).
+
+---
+
+## Architecture Reality: What Changed from the Original Specs
+
+### The Big Shift: Plan-and-Execute → Chat-with-Tools
+
+The original codebase was built around a **Plan-and-Execute** architecture:
+1. `SchemaPlanner` generates a JSON plan (list of steps) from the user prompt
+2. `SimpleExecutor` iterates the plan, calling hardcoded tools in sequence
+3. Each step is a single tool call with fixed arguments
+
+**What we actually built** is a **Chat-with-Tools** loop (like Claude Code):
+1. User prompt + system prompt + `tool_definitions()` → DeepSeek API `/chat/completions`
+2. Model streams response with text and/or `tool_calls`
+3. Agent executes tools, sends results back as `role: "tool"` messages, loops
+4. When model returns text without tool_calls → turn complete
+
+**Why**: The Chat-with-Tools pattern is strictly superior — the LLM decides which tools to call, can self-correct, handles multi-step reasoning natively, and matches how modern coding agents (Claude Code, Cursor, Copilot) actually work.
+
+**Impact**: `AgentEngine::chat_with_options()` is now the single entry point. `SchemaPlanner`/`SimpleExecutor`/`run_once_with_mode()` are deprecated dead code (zero call sites). Will be removed in Phase 15.
+
+### Legacy Planner: Dead Code — Remove
+
+| Aspect | Plan-and-Execute | Chat-with-Tools |
+|--------|-----------------|-----------------|
+| Tool selection | LLM must predict all steps upfront | LLM chooses tools dynamically per turn |
+| Error recovery | None — plan fails, full retry | LLM sees error, adapts strategy |
+| Multi-step reasoning | Limited to plan structure | Native chain-of-thought |
+| Streaming | Not supported | Full streaming with tool call deltas |
+
+**Plan mode** (like Claude Code) will be implemented as a Chat-with-Tools variant with restricted read-only tools — NOT as the old Planner architecture. See Phase 6.
 
 ---
 
 ## Phase 0: Critical Bugs (Blocks Basic Functionality) ✅
 
 ### 0.1 Fix tool definition parameter name mismatches ✅
-- Fixed all parameter names in `tool_definitions()` to match what `run_tool()` actually reads from `call.args`
-
 ### 0.2 Fix stream callback consumed and never re-installed ✅
-- Changed `StreamCallback` to `Arc<dyn Fn(StreamChunk) + Send + Sync>`, clone instead of take
-
 ### 0.3 Fix chat() not using session state transitions ✅
-- Added `transition()` calls: `ExecutingStep` at start, `Completed` or `Failed` at end
-
 ### 0.4 Fix chat() not loading prior turns on --continue/--resume ✅
-- On resume, loads `TurnAddedV1` events from store, reconstructs `Vec<ChatMessage>` with proper role mapping
-
 ### 0.5 Fix chat() not persisting memory observations ✅
-- Added memory persistence at end of chat() loop
 
 ---
 
 ## Phase 1: Make the Chat Loop Production-Ready ✅
 
 ### 1.1 Enrich system prompt ✅
-- Enriched `build_chat_system_prompt()` with tool usage guidelines, safety rules, git protocol, workspace info, DEEPSEEK.md content, current date/OS/shell/cwd, error recovery, and style guidelines
-
 ### 1.2 Add context window management ✅
-- Added approximate token tracking and auto-compaction at 80% of context window
-- Emits `ContextCompactedV1` event, truncates large tool outputs
-
 ### 1.3 Wire all entry points to chat() ✅
-- Replaced all `run_once*` calls with `engine.chat()` / `engine.chat_with_options()`
-
 ### 1.4 Integrate model router in chat() — Hybrid Model Strategy ✅
-- `router.select()` called per turn; below 0.72 → `deepseek-chat`, above → `deepseek-reasoner`
-- Auto-escalation on failure
-
 ### 1.5 Add tool execution feedback to stream ✅
-- Tool calls emit `StreamChunk::ContentDelta` with tool name, key args, completion duration, and truncated result preview
 
 ---
 
-## Phase 2: Tool System Completeness ✅ COMPLETED
+## Phase 2: Tool System Completeness ✅
 
 ### 2.1 Add missing tools to tool_definitions() ✅
-- Added 6 chrome tools (navigate, click, type_text, screenshot, read_console, evaluate) to `tool_definitions()` and `map_tool_name()`
-- Added 4 agent-level tools (user_question, task_create, task_update, spawn_task)
-- All tools now have definitions, mappings, and `AGENT_LEVEL_TOOLS` constant
-
 ### 2.2 Fix fs_edit tool definition to match all edit modes ✅
-- Already uses Claude Code style (search/replace/all) — no changes needed
-
 ### 2.3 Implement AskUserQuestion tool ✅
-- Added `UserQuestion` type and `UserQuestionHandler` callback in deepseek-core
-- Agent intercepts `user_question` tool calls before LocalToolHost
-- External handler (TUI mode) or fallback stdin prompt
-- Returns JSON `{"answer": "..."}` or `{"cancelled": true}`
-
 ### 2.4 Implement task tracking tools (TodoWrite equivalent) ✅
-- Added `task_create` tool: creates tasks in store with subject, description, priority
-- Added `task_update` tool: updates task status (pending/in_progress/completed/failed)
-- Emits `TaskCreatedV1` events, uses store's `insert_task()` and `update_task_status()`
-
 ### 2.5 Implement subagent/Task tool ✅
-- Added `spawn_task` tool: spawns subagents via `SubagentManager`
-- Supports explore/plan/task roles
-- External worker function or fallback echo worker
-- `set_subagent_worker()` setter for full agent capabilities
-
 ### 2.6 Improve tool output truncation ✅
-- `truncate_tool_output()` now accepts tool name for tool-specific strategies
-- `bash.run`: parses JSON output, keeps full stderr, truncates stdout to last 200 lines
-- `fs.read`: uses 80 head + 80 tail lines with total line count
-- Generic: keeps 100 head + 100 tail lines with omission count
-- 4 new tests verify all truncation strategies
 
 ---
 
 ## Phase 3: TUI / User Experience ✅
 
 ### 3.1 Improve markdown rendering ✅
-- Added `*italic*` support to `parse_inline_markdown()` with recursive nesting
-- Added table rendering: pipe-delimited rows with `│` separators, separator rows dimmed
-- Italic, bold, inline code, and combinations all work
-
 ### 3.2 Add tool call display in transcript ✅
-- Added `ChatShell::push_tool_call(name, args_summary)` — creates `MessageKind::ToolCall` entry
-- Added `ChatShell::push_tool_result(name, duration_ms, summary)` — creates `MessageKind::ToolResult` with auto-formatted duration (ms/s)
-- Added `TuiStreamEvent::ToolCallStart` and `TuiStreamEvent::ToolCallEnd` events with full handling in event loop
-
 ### 3.3 Add cost/token tracking in status bar ✅
-- Added session turn count display (`turn N`) to `render_statusline_spans()` — hidden when 0
-- Context usage (K/K with color coding) and cost ($) were already displayed
-- Added `ChatShell::push_cost_summary()` for `/cost` command output
-
 ### 3.4 Fix spinner during tool execution ✅
-- Added `ToolCallStart`/`ToolCallEnd` stream events that properly set/clear `shell.active_tool`
-- `ToolCallStart` both pushes transcript entry and activates spinner
-- `ToolCallEnd` pushes result entry and clears spinner
-
 ### 3.5 Right panel toggle — SKIPPED
-- Removed: right panel split disrupts the clean Claude-style full-width chat UI
-- The existing `RightPane` enum and `Ctrl+O` cycle remain for future use if needed
-
 ### 3.6 Improve slash command output ✅
-- Added `ChatShell::push_cost_summary(status)` — formats cost, tokens, context %, turns
-- Added `ChatShell::push_status_summary(status)` — formats model, mode, approvals, tasks, jobs, autopilot, cost
-- Added `ChatShell::push_model_info(model)` — displays current model
 
 ---
 
 ## Phase 4: CLI Flags for Claude Code Parity ✅
 
-### 4.1 --permission-mode <ask|auto|plan> ✅
-- Added `--permission-mode` flag, passed to `PolicyEngine` as override via `apply_cli_flags()`
-
-### 4.2 --dangerously-skip-permissions ✅
-- Sets permission mode to auto with all tools auto-approved
-
-### 4.3 --allowed-tools / --disallowed-tools ✅
-- Comma-separated tool names, filters `tool_definitions()` via `filter_tool_definitions()`
-- Mutual exclusivity validated in `validate_cli_flags()`
-
-### 4.4 --system-prompt / --append-system-prompt ✅
-- Custom system prompt override or append via `ChatOptions`
-- Mutual exclusivity validated
-
-### 4.5 --add-dir <DIR> ✅
-- Additional directories passed through `ChatOptions.additional_dirs`
-
-### 4.6 --verbose ✅
-- Enables detailed logging to stderr via `observer.set_verbose()`
-
-### 4.7 --init as global flag ✅
-- Added `--init` flag to initialize DEEPSEEK.md
-
-### 4.8 Improve --print mode ✅
-- Added `--no-input` for fully non-interactive mode
+### 4.1–4.8 All done ✅
 
 ---
 
 ## Phase 5: Conversation & Memory ✅
 
 ### 5.1 Multi-turn conversation persistence ✅
-- Added `ChatTurnV1` event kind: stores full structured `ChatMessage` (including `tool_calls` with IDs and `Tool` results with `tool_call_id`)
-- On resume, prefers structured `chat_messages` from `ChatTurnV1`; falls back to legacy string transcript for older sessions
-- `RebuildProjection.chat_messages: Vec<ChatMessage>` added to store
-
 ### 5.2 Improve error messages ✅
-- Added `format_api_error()` in deepseek-llm: user-friendly messages for 401, 402, 429, 5xx with actionable suggestions
-- Added `format_transport_error()`: timeout and connection errors with config hints
-- Added `tool_error_hint()` in deepseek-tools: context-specific hints for fs.edit, fs.read, fs.write, bash.run failures
-- Agent appends hints to failed tool results before sending back to LLM
-- Improved budget/turn limit messages with `--max-budget-usd` / `--max-turns` suggestions
-
 ### 5.3 Implement proper token counting ✅
-- Replaced `chars/4` approximation with word-based BPE heuristic in `estimate_tokens()`
-- Short words (1-3 chars) → 1 token, medium (4-7) → 2, long (8-15) → 3, very long → chars/4
-- Added per-message overhead (4 tokens framing) in `estimate_messages_tokens()`
-
 ### 5.4 Cost tracking per conversation ✅
-- Cost ledger, per-session cost queries, and status bar display were already complete
-- Added 80% budget warning via stream callback (once per session)
-- Warning shows used/max cost, percentage, and remaining budget
 
 ---
 
-## Phase 6: MCP & Extensibility
+## Phase 6: Plan Mode & Subagent System
 
-### 6.1 Implement MCP serve mode (only stub in codebase)
-- File: `crates/deepseek-mcp/src/lib.rs` — `run_mcp_serve()`
-- Currently: `eprintln!("MCP serve mode: listening on stdin/stdout (stub)")`
-- **Implement**: Full JSON-RPC 2.0 server using `deepseek-jsonrpc` crate
-- Expose all DeepSeek tools as MCP tools
+> Claude Code's two most powerful orchestration features: Plan Mode (think-before-act) and Task/Subagents (parallel work delegation).
 
-### 6.2 Dynamic MCP tool integration in chat()
-- When MCP servers are configured, discover their tools at startup
-- Merge MCP tools into `tool_definitions()` dynamically
-- Route tool calls to appropriate MCP server based on tool name prefix
+### 6.1 Implement Plan Mode — EnterPlanMode / ExitPlanMode tools
+- Add `enter_plan_mode` tool definition: LLM can proactively enter plan mode
+- Add `exit_plan_mode` tool definition with `allowedPrompts` parameter (bash permissions needed for execution)
+- When plan mode active: restrict tool set to **read-only** only (fs_read, fs_glob, fs_grep, fs_list, git_status, git_diff, git_show, web_fetch, web_search, index_query)
+- Block all write/execute tools (fs_write, fs_edit, bash_run, multi_edit, patch_stage, patch_apply, notebook_edit)
+- LLM writes plan to a file (configurable via `plansDirectory` setting)
+- User reviews plan → approves → tools unlocked for execution
+- Shift+Tab keyboard shortcut to cycle: normal → plan → normal
+- `/plan` slash command to enter plan mode from prompt
+- `--permission-mode plan` flag already exists (Phase 4.1) — wire to this behavior
 
-### 6.3 Plugin tools in tool_definitions()
-- Plugin system exists and works
-- Plugins aren't exposed as LLM-callable tools
-- **Fix**: Load plugin tools dynamically, add to tool_definitions()
+### 6.2 Wire subagent worker in CLI
+- Call `engine.set_subagent_worker()` in CLI chat setup with a real worker closure
+- Worker creates a child `AgentEngine` with its own context window
+- Child agent gets reduced tool set based on subagent type
+- ~20 LOC of glue — all infrastructure exists in deepseek-subagent
+
+### 6.3 Subagent types matching Claude Code
+- **Explore** agent: Read-only tools (Glob, Grep, Read, read-only Bash), uses fast model, thoroughness levels (quick/medium/thorough)
+- **Plan** agent: Read-only tools, researches codebase and designs implementation
+- **Bash** agent: Only Bash tool, for command execution in separate context
+- **General-purpose** agent: All tools, for complex multi-step tasks
+- Configure tool restrictions per agent type in the worker closure
+- `subagent_type` parameter on `spawn_task` tool already exists
+
+### 6.4 Subagent background execution
+- `run_in_background` parameter: spawn subagent, return immediately with output file path
+- Use existing `BackgroundJobStartedV1` events
+- `task_output` tool: retrieve output from background subagent (like Claude Code's TaskOutput)
+- `task_stop` tool: kill a running background subagent (like Claude Code's TaskStop)
+
+### 6.5 Subagent resume & model selection
+- `resume` parameter on `spawn_task`: continue a previous subagent with preserved context
+- `model` parameter: override model per subagent (e.g., use fast model for Explore)
+- `max_turns` parameter: limit subagent turns
+
+### 6.6 Custom subagents from YAML files
+- Load from `.deepseek/agents/`, `~/.deepseek/agents/`
+- YAML frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `maxTurns`, `permissionMode`, `skills`, `hooks`, `memory`, `background`, `isolation`
+- `isolation: worktree` — run in isolated git worktree
+- Register in `spawn_task` tool's available types
+- `--agents` CLI flag for dynamic subagent definitions (JSON)
 
 ---
 
-## Phase 7: Custom Slash Commands
+## Phase 7: Missing LLM Tools
 
-### 7.1 Custom command discovery
-- Load from `.deepseek/commands/`, `~/.deepseek/commands/`
-- Parse YAML frontmatter + markdown body
-- Register in slash command autocomplete
+> Tools that Claude Code's LLM can call but ours can't yet.
 
-### 7.2 Command execution
-- Variable substitution: `$ARGUMENTS`, `$WORKSPACE`, `$SESSION_ID`
-- Optional shell execution step
-- Policy enforcement for any shell commands
+### 7.1 TaskGet & TaskList tools
+- `task_get` tool: retrieve full task details by ID (subject, description, status, blocks, blockedBy)
+- `task_list` tool: list all tasks with summary (id, subject, status, owner, blockedBy)
+- Task dependencies: `blocks` / `blockedBy` fields on tasks
+- Task `activeForm` field: present continuous form shown in spinner during in_progress
+- These complement existing `task_create` and `task_update`
 
-### 7.3 Missing built-in slash commands
+### 7.2 Skill tool (LLM invokes slash commands)
+- `skill` tool definition: LLM can invoke any registered skill/slash command
+- Parameters: `skill` (name), `args` (optional arguments)
+- Routes to existing slash command handlers in deepseek-ui
+- Only skills listed as user-invocable — not built-in CLI commands
+
+### 7.3 Background task management tools
+- `task_output` tool: retrieve output from running/completed background task (block/non-block modes, timeout)
+- `task_stop` tool: terminate a running background task by ID
+
+### 7.4 KillShell tool (terminate background bash)
+- Kill a background bash process by shell ID
+- Complement to `bash_run` with `run_in_background: true`
+
+---
+
+## Phase 8: Full Hooks System
+
+> Claude Code has 14 hook events with 3 handler types. We have basic pre/post tool hooks with command handler only.
+
+### 8.1 Expand hook events to match Claude Code
+- **SessionStart** — fires on session begin/resume/clear/compact (matcher: startup, resume, clear, compact)
+- **UserPromptSubmit** — fires when user submits prompt (can block)
+- **PreToolUse** — before tool execution (can allow/deny/ask) — we have this partially
+- **PostToolUse** — after tool succeeds (feedback only) — we have this partially
+- **PostToolUseFailure** — after tool fails (feedback only)
+- **PermissionRequest** — when permission dialog shown (can allow/deny)
+- **Notification** — on notification events (permission_prompt, idle_prompt, auth_success)
+- **SubagentStart** — when subagent spawned (context injection)
+- **SubagentStop** — when subagent finishes (can block)
+- **Stop** — when main agent finishes responding (can block)
+- **ConfigChange** — when config files change mid-session
+- **PreCompact** — before context compaction (inject instructions)
+- **SessionEnd** — session terminates (clear, logout, exit)
+- **TaskCompleted** — task marked complete
+
+### 8.2 Hook handler types
+- **command** (existing): shell command, JSON on stdin, exit codes (0=allow, 2=block)
+- **prompt**: single-turn LLM evaluation, returns `{ok: true/false, reason}`, defaults to fast model
+- **agent**: multi-turn subagent with read-only tools (Read, Grep, Glob), up to 50 turns
+
+### 8.3 Hook input modification & decision control
+- `updatedInput`: PreToolUse hooks can modify tool parameters before execution
+- `permissionDecision`: allow/deny/ask for PreToolUse and PermissionRequest
+- `additionalContext`: inject context into many hook events
+- `decision: "block"` at top level to block any hookable event
+
+### 8.4 Async hooks
+- `async: true` flag for non-blocking background hook execution
+- `once` flag: run only once per session (for skills)
+- Environment persistence: SessionStart hooks can write to env file
+
+### 8.5 Hook configuration locations
+- `~/.deepseek/settings.json` (all projects)
+- `.deepseek/settings.json` (project, shareable)
+- `.deepseek/settings.local.json` (project, gitignored)
+- Plugin `hooks/hooks.json`
+- Skill/agent YAML frontmatter (scoped to component lifetime)
+
+---
+
+## Phase 9: Memory & Configuration Parity
+
+> Claude Code has hierarchical memory, modular rules, @imports, and path-specific rules.
+
+### 9.1 Modular rules directory
+- `.deepseek/rules/*.md` — project rules (shareable via git)
+- `~/.deepseek/rules/*.md` — user-level rules
+- Auto-load all `.md` files from rules directories into system prompt
+- Path-specific rules: `paths:` YAML frontmatter with glob patterns for conditional loading
+
+### 9.2 Hierarchical DEEPSEEK.md loading
+- Load DEEPSEEK.md recursively upward from cwd to filesystem root
+- Child directory DEEPSEEK.md files loaded on demand
+- `DEEPSEEK.local.md` — project-local, gitignored
+- Load order: managed policy → user global → project → project local
+
+### 9.3 @import syntax in DEEPSEEK.md
+- `@path/to/file` includes file contents into memory context
+- Recursive import with max depth 5
+- Relative paths resolved from DEEPSEEK.md location
+
+### 9.4 `#` key shortcut for quick memory add
+- Press `#` in TUI to quick-add a memory entry
+- Opens mini-editor for the memory content
+- Appends to appropriate DEEPSEEK.md file
+
+### 9.5 Extended permission modes
+- Current: `ask`, `auto`, `plan`
+- Add: `acceptEdits` — auto-accepts file edits, still prompts for commands
+- Add: `dontAsk` — auto-denies unless pre-approved via allow rules
+
+### 9.6 Permission rule glob patterns
+- Format: `Tool(specifier)` with glob patterns
+- `Bash(npm run *)`, `Bash(git commit *)` — command-specific bash permissions
+- `Read(//absolute/path)`, `Edit(src/**/*.rs)` — path-specific file permissions
+- `WebFetch(domain:example.com)` — domain-specific web permissions
+- `Task(AgentName)` — subagent-specific control
+- Evaluation order: **deny > ask > allow** (first match wins)
+
+### 9.7 Settings parity
+- `plansDirectory` — where plan files are stored
+- `outputStyle` — system prompt style adjustment
+- `language` — preferred response language
+- `attribution` — git commit/PR attribution text
+- `availableModels` — restrict model selection
+- `cleanupPeriodDays` — session cleanup period
+- `statusLine` — custom status line script
+- `fileSuggestion` — custom `@` autocomplete script
+- `spinnerVerbs` — custom spinner action verbs
+- `respectGitignore` — exclude gitignored files from tool results
+
+---
+
+## Phase 10: CLI Flags & Slash Commands Full Parity
+
+### 10.1 Missing CLI flags
+- `--agent NAME` — specify a subagent for the session
+- `--agents JSON` — define custom subagents dynamically
+- `--chrome` / `--no-chrome` — Chrome browser integration toggle
+- `--debug [categories]` — debug mode with category filtering
+- `--disable-slash-commands` — disable all skills
+- `--fallback-model MODEL` — fallback when primary overloaded
+- `--init-only` — run initialization hooks and exit
+- `--input-format [text|stream-json]` — input format
+- `--json-schema SCHEMA` — validated JSON output matching schema (print mode)
+- `--mcp-config PATH` — load MCP servers from JSON file
+- `--no-session-persistence` — disable session persistence
+- `--output-format [text|json|stream-json]` — output format (extend existing `--json`)
+- `--permission-prompt-tool TOOL` — MCP tool for non-interactive permission handling
+- `--plugin-dir PATH` — load plugins from directory (repeatable)
+- `--session-id UUID` — use specific session UUID
+- `--settings PATH` — path to settings JSON or JSON string
+- `--strict-mcp-config` — only use MCP servers from `--mcp-config`
+- `--system-prompt-file PATH` — replace system prompt from file
+- `--append-system-prompt-file PATH` — append file contents to prompt
+- `--tools LIST` — restrict built-in tools (`""` = none, `"default"` = all, or comma-separated)
+- `--worktree` / `-w` — start in isolated git worktree
+
+### 10.2 Missing slash commands
+- `/copy` — copy last assistant response to clipboard
+- `/debug [description]` — troubleshoot session via debug log analysis
+- `/exit` — exit REPL (may already work via Ctrl+D)
+- `/hooks` — interactive hooks manager
+- `/rename NAME` — rename current session
+- `/resume [session]` — resume by ID/name or interactive picker
+- `/stats` — visualize daily usage, session history
+- `/statusline` — configure status line UI
+- `/theme` — change color theme
+- `/usage` — show plan/subscription usage limits and rate limit status
+- `/add-dir PATH` — add directory to context during session
 - `/bug` — bundle logs + config + diagnostics for bug report
 - `/pr_comments` — fetch and process GitHub PR comments
 - `/release-notes` — generate release notes from commits
-- `/add-dir` — add directory to context
 - `/login` / `/logout` — credential management
 
+### 10.3 Custom slash commands
+- Load from `.deepseek/commands/`, `~/.deepseek/commands/`
+- YAML frontmatter + markdown body
+- Variable substitution: `$ARGUMENTS`, `$WORKSPACE`, `$SESSION_ID`
+- Optional shell execution step with policy enforcement
+- `disable-model-invocation: true` — keep out of context until manually invoked
+- `context: fork` — run in a subagent
+- Register in slash command autocomplete
+
+### 10.4 Structured output (print mode)
+- `--json-schema` flag: LLM output validated against provided JSON schema
+- Return structured JSON matching the schema
+- Error if output doesn't validate
+
 ---
 
-## Phase 8: IDE Integration
+## Phase 11: TUI & Interaction Parity
 
-### 8.1 Expand JSON-RPC server methods
-- File: `crates/deepseek-jsonrpc/src/lib.rs`
-- Add: session open/resume/fork, prompt execution, tool event streaming
-- Add: patch preview/apply, diagnostics forwarding, task updates
+> Keyboard shortcuts, vim mode, multiline input, checkpoints, and visual features from Claude Code.
 
-### 8.2 VS Code extension
-- File: `extensions/vscode/` (if exists, or create)
-- Full chat panel with streaming
-- Inline actions: send selection/file/diagnostic to agent
-- Diff preview for edits
+### 11.1 Keyboard shortcuts
+- `Ctrl+C` — cancel current generation (partially done)
+- `Ctrl+D` — exit session
+- `Ctrl+L` — clear terminal screen
+- `Ctrl+R` — reverse search command history
+- `Ctrl+V` — paste image from clipboard
+- `Ctrl+B` — background running tasks
+- `Ctrl+T` — toggle task list
+- `Ctrl+F` — kill all background agents (press twice)
+- `Esc+Esc` — rewind/summarize from selected message
+- `Shift+Tab` — cycle permission modes (normal → plan → normal)
+- `Alt+P` — switch model
+- `Alt+T` — toggle extended thinking
+- `#` — quick-add memory (see Phase 9.4)
+- `!` prefix — bash mode (direct command execution without tool call)
+- `@` — file path mention / autocomplete
 
-### 8.3 JetBrains plugin
+### 11.2 Vim mode
+- `/vim` slash command to enable (already exists)
+- Full vi keybindings: normal/insert mode switching
+- `hjkl` navigation, word motions (`w`, `e`, `b`), line motions (`0`, `$`, `^`)
+- Text objects (`iw`, `aw`, `i"`, etc.)
+- Operators (`d`, `c`, `y`, `p`), indent/dedent (`>>`, `<<`), `.` repeat
+- Arrow key history navigation in normal mode
+
+### 11.3 Multiline input
+- `\ + Enter` — continue on next line
+- `Option+Enter` (macOS) — newline
+- `Shift+Enter` — newline (requires terminal setup)
+- `Ctrl+J` — newline
+- Paste mode: auto-detect multi-line paste
+
+### 11.4 File edit checkpoints with undo
+- Every file edit (`fs.write`, `fs.edit`, `multi_edit`) snapshots current file contents
+- `Esc+Esc` to rewind to previous checkpoint
+- `/rewind` command with checkpoint picker
+- Checkpoints local to session, separate from git
+
+### 11.5 Image support
+- `Ctrl+V` paste images from clipboard
+- Read tool handles image files (PNG, JPG) — already works via multimodal
+- Images displayed inline in transcript where terminal supports
+
+### 11.6 Prompt suggestions
+- After each response, auto-suggest follow-up prompts
+- Based on conversation history and git diff context
+- Tab to accept, Enter to accept and submit
+- Configurable via settings
+
+### 11.7 Context visualization
+- `/context` command: colored grid showing token usage breakdown
+- Visual representation of what's consuming context (system prompt, messages, tool results)
+
+### 11.8 Session management
+- `/rename NAME` — rename current session
+- `--fork-session` — branch off with new ID, copy full message history
+- `--session-id UUID` — use specific session UUID
+- `--no-session-persistence` — disable persistence
+
+### 11.9 @ file mention autocomplete
+- `@` prefix triggers file path autocomplete
+- Tab completion with fuzzy matching
+- Injects file contents into the prompt context
+- Configurable via `fileSuggestion` setting for custom autocomplete
+
+---
+
+## Phase 12: MCP Full Integration
+
+> Connect McpManager to the chat loop, implement serve mode, and add OAuth.
+
+### 12.1 Dynamic MCP tool integration in chat()
+- At chat loop startup: call `McpManager::discover_tools()` for all enabled servers
+- Generate `ToolDefinition` for each MCP tool, add to `tool_definitions()` with `mcp__<server>__<tool>` naming
+- Route tool calls with `mcp__` prefix to appropriate MCP server
+- Handle tool schema translation (MCP → OpenAI function calling format)
+- Error propagation across process boundaries
+
+### 12.2 MCP tool search (MCPSearch)
+- When MCP tools exceed 10% of context window: enable lazy loading
+- `mcp_search` tool: LLM describes what tool it needs, searches MCP tool definitions on-demand
+- Reduces token overhead ~85% for servers with many tools
+
+### 12.3 MCP serve mode
+- `deepseek mcp serve`: expose DeepSeek CLI as an MCP server
+- Full JSON-RPC 2.0 server via stdio transport
+- Expose all DeepSeek tools as MCP tools for other apps
+- Use existing `deepseek-jsonrpc` crate
+
+### 12.4 MCP OAuth 2.0 authentication
+- Support OAuth flows for HTTP MCP servers
+- `--client-id`, `--client-secret` on `mcp add`
+- In-session OAuth via `/mcp` command
+- Token refresh handling
+
+### 12.5 MCP resources and prompts
+- Resources: `@server:protocol://resource/path` mentions in prompts
+- Prompts: `/mcp__<server>__<prompt>` slash commands from MCP servers
+- Dynamic updates: `list_changed` notifications for live tool/prompt/resource refresh
+
+### 12.6 MCP configuration improvements
+- `.mcp.json` in project root (shareable via git)
+- Environment variable expansion: `${VAR}` and `${VAR:-default}` in config
+- Import from other tools: `mcp add-from-claude-desktop`
+- `--strict-mcp-config` — only use servers from `--mcp-config`
+- Per-MCP output token limits (warn at 10K, max 25K configurable)
+
+### 12.7 Plugin tools as LLM-callable
+- Generate `ToolDefinition` from plugin metadata
+- Add plugin tools to `tool_definitions()` dynamically
+- Route plugin tool calls to plugin execution system
+
+---
+
+## Phase 13: Permission & Sandbox Parity
+
+### 13.1 Full permission mode set
+- Current: `ask`, `auto`, `plan`
+- Add: `acceptEdits` — auto-accepts file edits, prompts for bash
+- Add: `dontAsk` — auto-denies all unless pre-approved
+- Add: `bypassPermissions` — skip all prompts (requires `--dangerously-skip-permissions` + `--allow-dangerously-skip-permissions`)
+
+### 13.2 Granular permission rules with glob patterns
+- `Bash(npm run *)` — allow specific bash patterns
+- `Read(src/**/*.rs)` — allow reading specific paths
+- `Edit(//absolute/path)` — allow editing specific files
+- `WebFetch(domain:example.com)` — allow specific domains
+- `mcp__<server>` / `mcp__<server>__<tool>` — MCP tool permissions
+- `Task(AgentName)` — subagent permissions
+- Evaluation: deny > ask > allow (first match wins)
+
+### 13.3 Sandbox improvements
+- OS-level filesystem and network isolation for Bash commands
+- `sandbox.enabled`, `sandbox.autoAllowBashIfSandboxed`
+- Network: `allowedDomains`, `allowLocalBinding`, `allowUnixSockets`
+- `sandbox.excludedCommands` — commands that bypass sandbox
+
+### 13.4 Managed settings (enterprise/team)
+- System-wide paths: macOS `/Library/Application Support/DeepSeekCLI/managed-settings.json`
+- `disableBypassPermissionsMode` — prevent bypass
+- `allowManagedPermissionRulesOnly` — only managed rules apply
+- `allowManagedHooksOnly` — only managed hooks load
+- `allowedMcpServers` / `deniedMcpServers` — MCP server allowlists
+
+---
+
+## Phase 14: IDE Integration
+
+### 14.1 Expand JSON-RPC server methods
+- Session open/resume/fork, prompt execution, tool event streaming
+- Patch preview/apply, diagnostics forwarding, task updates
+- Fix session fork to copy message history
+
+### 14.2 VS Code extension
+- `extensions/vscode/` — full chat panel with streaming
+- Checkpoint-based undo: track file edits, rewind to previous state
+- @-mention files with line ranges from selection
+- Parallel conversations in separate tabs
+- Diff viewer for proposed changes
+- Auto-accept or review-before-accept modes
+
+### 14.3 JetBrains plugin
 - Upgrade from status-only scaffold to full feature flow
+- Chat interface in IDE terminal
+- Opens proposed changes in IDE diff viewer
 
 ---
 
-## Phase 9: Testing & Quality
+## Phase 15: Performance, Polish & Dead Code Removal
 
-### 9.1 Integration tests for chat() loop
-- Test: single-turn text response (no tools)
-- Test: multi-turn with tool calls (mock LLM with `deepseek-testkit`)
-- Test: budget/turn limit enforcement
-- Test: tool approval flow (approve and deny)
-- Test: streaming callback delivery across multiple turns
-- Test: context compaction triggers
-
-### 9.2 Parameter mapping tests
-- For every tool in `tool_definitions()`: verify parameter names match `run_tool()` implementation
-- For every tool in `map_tool_name()`: verify mapping is correct
-- Fuzz test: random LLM-style arguments → verify parsing doesn't panic
-
-### 9.3 End-to-end TUI tests
-- Prompt submission → streaming → tool execution → final output
-- Ctrl+C cancellation during streaming
-- Slash command execution
-- Approval dialog flow
-
-### 9.4 Replay regression tests
-- Record real API sessions as cassettes
-- Replay against fake LLM
-- Verify deterministic output
-
----
-
-## Phase 10: Performance & Polish
-
-### 10.1 Reduce first-response latency
+### 15.1 Reduce first-response latency
 - Pre-build system prompt at startup
 - Cache `tool_definitions()` (static data)
 - Pre-warm HTTP connection pool in `DeepSeekClient`
 
-### 10.2 Optimize context usage
+### 15.2 Optimize context usage
 - Summarize large tool results before adding to messages
-- Drop reasoning_content from message history (it's for display only)
+- Drop reasoning_content from message history (display only)
 - Compress repeated tool call patterns
 
-### 10.3 Graceful degradation
-- Invalid API key: clear setup instructions
-- Network down: retry with backoff, then show error
-- Context exceeded: auto-compact and retry
-- Tool failure: include error in conversation, let LLM adapt
+### 15.3 Graceful degradation
+- Invalid API key: clear setup instructions (partially done via `format_api_error()`)
+- Network down: retry with backoff (partially done via `format_transport_error()`)
+- Context exceeded: auto-compact and retry (done in Phase 1.2)
+- Tool failure: include error in conversation (done in Phase 5.2)
 
-### 10.4 Clean up dead code
-- `SimpleExecutor` — never instantiated, remove or document as example
-- `Planner` trait `revise_plan` — only used in legacy path
-- `RightPane` enum and `right_pane_collapsed` — now unused after UI simplification
-- Unused event types in the journal (audit and remove or keep for future)
+### 15.4 Clean up dead code
+- **Remove** `SchemaPlanner`, `SimpleExecutor`, `run_once_with_mode()` — deprecated, zero call sites
+- **Remove** `Planner`/`Executor` traits and `revise_plan` — replaced by plan mode (Phase 6.1)
+- **Remove** `RightPane` enum and `right_pane_collapsed` — unused after UI simplification
+- Audit unused event types in the journal
 
-### 10.5 Shell completions
+### 15.5 Shell completions
 - Verify `completions` command generates proper completions for bash/zsh/fish
-- Include subcommand and flag completions
+- Include all subcommands and flags
 - Test with common shells
+
+### 15.6 PR review status in footer
+- Clickable PR link in status bar with colored underline
+- Green=approved, yellow=pending, red=changes requested, gray=draft, purple=merged
+- Auto-refresh every 60 seconds via `gh` CLI
 
 ---
 
-## Phase 11: Architectural Debt & Hardening
+## Phase 16: Testing & Quality
 
-### 11.1 Split main.rs into modules
-- File: `crates/deepseek-cli/src/main.rs` — **9,563 lines, 149 functions**
-- Extract into submodules:
+### 16.1 Integration tests for chat() loop
+- Single-turn text response (no tools)
+- Multi-turn with tool calls (mock LLM with `deepseek-testkit`)
+- Budget/turn limit enforcement
+- Tool approval flow (approve and deny)
+- Streaming callback delivery across multiple turns
+- Context compaction triggers
+- `ChatTurnV1` persistence and resume reconstruction
+- Plan mode: enter/exit, tool restriction enforcement
+- Subagent spawning and result collection
+
+### 16.2 Parameter mapping tests
+- For every tool in `tool_definitions()`: verify parameter names match `run_tool()` implementation
+- For every tool in `map_tool_name()`: verify mapping is correct
+- Fuzz test: random LLM-style arguments → verify parsing doesn't panic
+
+### 16.3 End-to-end TUI tests
+- Prompt submission → streaming → tool execution → final output
+- Ctrl+C cancellation during streaming
+- Slash command execution
+- Approval dialog flow
+- Plan mode toggle via Shift+Tab
+- Vim mode key handling
+
+### 16.4 Replay regression tests
+- Record real API sessions as cassettes
+- Replay against fake LLM
+- Verify deterministic output
+
+### 16.5 Hook tests
+- All 14 hook events fire at correct times
+- Command/prompt/agent handler types execute correctly
+- Input modification and decision control
+- Async hooks don't block main thread
+
+### 16.6 MCP integration tests
+- Tool discovery from MCP servers
+- Tool call routing to correct server
+- Error handling for unavailable servers
+- OAuth token refresh
+
+---
+
+## Phase 17: Architectural Debt & Hardening
+
+### 17.1 Split main.rs into modules
+- `crates/deepseek-cli/src/main.rs` — ~9,500 lines, ~150 functions
+- Extract:
   - `src/commands/mod.rs` — Clap structs, Commands enum, dispatch
   - `src/commands/chat.rs` — `run_chat()`, `run_chat_tui()`, TUI setup
   - `src/commands/autopilot.rs` — `run_autopilot()`, status, pause/resume
   - `src/commands/profile.rs` — `run_profile()`, `run_benchmark()`
   - `src/commands/patch.rs` — `run_diff()`, `run_apply()`
   - `src/commands/admin.rs` — config, permissions, plugins, clean, doctor
-  - `src/output.rs` — `OutputFormatter` replacing 106 `if cli.json` blocks
-- Create `CliContext { cwd, json_mode, output }` to replace `json_mode: bool` threaded through 40+ signatures
+  - `src/output.rs` — `OutputFormatter` replacing `if cli.json` blocks
+- Create `CliContext { cwd, json_mode, output }` to replace `json_mode: bool` threaded through signatures
 
-### 11.2 Add type-safe tool names
-- Create `ToolName` enum (~30 variants) in deepseek-core
+### 17.2 Add type-safe tool names
+- Create `ToolName` enum (~35 variants including new tools) in deepseek-core
 - Replace `ToolCall.name: String` → `ToolCall.name: ToolName`
 - Replace `map_tool_name()` with `ToolName::from_api_name()` / `ToolName::as_internal()`
-- Replace `REVIEW_BLOCKED_TOOLS: &[&str]` → `ToolName::is_read_only()`
-- Replace `AGENT_LEVEL_TOOLS: &[&str]` → `ToolName::is_agent_level()`
-- Update deepseek-tools, deepseek-agent, deepseek-policy
+- Replace string constants → `ToolName::is_read_only()`, `ToolName::is_agent_level()`
 
-### 11.3 Restructure EventKind into sub-enums
-- Current: 69-variant flat enum (260+ lines)
-- Refactor into:
-  - `SessionEventV1` — TurnAdded, StateChanged, Started, Resumed
-  - `ToolEventV1` — Proposed, Approved, Denied, Result
-  - `PlanEventV1` — Created, Revised, StepMarked
-  - `TaskEventV1` — Created, Completed, Updated, Deleted
-  - `JobEventV1` — Started, Resumed, Stopped
-  - `PluginEventV1` — Installed, Removed, Enabled, Disabled, etc.
-- Replace string fields with enums: `role: String` → `role: ChatRole`, `stop_reason: String` → `StopReason`, `status: String` → `TaskStatus`
+### 17.3 Restructure EventKind into sub-enums
+- Current: 69+ variant flat enum
+- Refactor into: `SessionEventV1`, `ToolEventV1`, `TaskEventV1`, `JobEventV1`, `PluginEventV1`, `HookEventV1`
+- Replace string fields with enums: `role: ChatRole`, `stop_reason: StopReason`, `status: TaskStatus`
 
-### 11.4 Add missing test coverage
-- **deepseek-store** (2870 LOC, 2 tests): event journal append/rebuild, SQLite projection consistency, concurrent access, event type migrations
-- **deepseek-router** (130 LOC, 1 test): boundary conditions (threshold=0.72 exactly), low scores → base model, weight combinations, all-zero signals
-- **deepseek-hooks** (129 LOC, 1 test): Windows PowerShell execution, hook failure modes, timeout handling
-- **deepseek-skills** (235 LOC, 1 test): glob pattern edge cases, directory traversal, hot reload
-- **deepseek-memory** (530 LOC, 3 tests): DEEPSEEK.md read/write roundtrip, auto-memory observation persistence, cross-project memory
-- **deepseek-diff** (296 LOC, 2 tests): SHA verification, conflict detection, 3-way merge
+### 17.4 Add missing test coverage
+- **deepseek-store** (2870 LOC, 2 tests): event journal, SQLite projections, concurrent access, ChatTurnV1
+- **deepseek-router** (130 LOC, 1 test): boundary conditions, weight combinations
+- **deepseek-hooks**: all handler types, failure modes, timeouts
+- **deepseek-skills**: glob patterns, directory traversal, hot reload
+- **deepseek-memory**: read/write roundtrip, auto-memory, cross-project
+- **deepseek-diff**: SHA verification, conflict detection, 3-way merge
 
-### 11.5 Fix error handling hygiene
-- Replace 26+ `lock().unwrap()` calls with `.lock().expect("context")` or proper error propagation
-- Replace `.ok()` on config loading with logging: distinguish "file not found" from "parse error"
-- Replace silent regex compilation failures in deepseek-policy with startup validation
-- Add `#[must_use]` where `Result` return values are silently dropped
+### 17.5 Fix error handling hygiene
+- Replace `lock().unwrap()` → `.lock().expect("context")` or proper error propagation
+- Replace `.ok()` on config → logging with "file not found" vs "parse error"
+- Replace silent regex failures → startup validation
+- Add `#[must_use]` where `Result` silently dropped
 
-### 11.6 Consolidate config type safety
-- Move `PolicyConfig.permission_mode: String` → `PermissionMode` enum (already exists in deepseek-policy)
-- Move `PolicyConfig.approve_edits: String` → `ApprovalMode { Ask, Allow, Deny }` enum
-- Move `PolicyConfig.sandbox_mode: String` → `SandboxMode` enum (already exists)
-- Validate config at load time instead of at use time
+### 17.6 Consolidate config type safety
+- `PolicyConfig.permission_mode: String` → `PermissionMode` enum
+- `PolicyConfig.approve_edits: String` → `ApprovalMode` enum
+- `PolicyConfig.sandbox_mode: String` → `SandboxMode` enum
+- Validate at load time, not use time
 
-### 11.7 Extract test helpers to deepseek-testkit
-- Move temp workspace creation pattern (repeated in 5+ crates) to `testkit::temp_workspace()`
-- Move `temp_host()` pattern from deepseek-tools tests to shared helper
-- Add `testkit::fake_session()` for agent tests
+### 17.7 Extract test helpers to deepseek-testkit
+- `testkit::temp_workspace()` — shared temp workspace creation
+- `testkit::temp_host()` — shared tool host for tests
+- `testkit::fake_session()` — mock session for agent tests
+
+---
+
+## Git Workflow Protocol (Reference — Not a Phase)
+
+> Matches Claude Code's git safety rules. Already partially implemented in system prompt.
+
+- **NEVER** commit/push unless explicitly asked
+- **NEVER** force push, reset --hard, checkout ., clean -f, branch -D unless explicitly asked
+- **NEVER** skip hooks (--no-verify) unless asked
+- **NEVER** amend commits unless asked — create NEW commits after hook failures
+- **NEVER** use interactive flags (-i)
+- Stage specific files (not `git add -A`)
+- Warn on force push to main/master
+- Don't commit secrets (.env, credentials.json)
+- Co-Authored-By line on commits (configurable via `attribution` setting)
+- PR creation via `gh pr create` with Summary + Test Plan sections
+
+---
+
+## Summary: Completion Status
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| 0 | ✅ Complete | Critical bugs fixed |
+| 1 | ✅ Complete | Chat loop production-ready |
+| 2 | ✅ Complete | Tool system complete |
+| 3 | ✅ Complete | TUI / UX |
+| 4 | ✅ Complete | CLI flags (basic set) |
+| 5 | ✅ Complete | Conversation & memory |
+| 6 | **Next** | Plan mode & subagent system |
+| 7 | Pending | Missing LLM tools (TaskGet/List, Skill, background) |
+| 8 | Pending | Full hooks system (14 events, 3 handler types) |
+| 9 | Pending | Memory & configuration parity |
+| 10 | Pending | CLI flags & slash commands full parity |
+| 11 | Pending | TUI & interaction parity (vim, shortcuts, checkpoints) |
+| 12 | Pending | MCP full integration |
+| 13 | Pending | Permission & sandbox parity |
+| 14 | Pending | IDE integration (VS Code, JetBrains) |
+| 15 | Pending | Performance, polish & dead code removal |
+| 16 | Pending | Testing & quality |
+| 17 | Pending | Architectural debt & hardening |
+
+### Feature Parity Gap Summary
+
+| Category | We Have | Claude Code Has | Gap |
+|----------|---------|----------------|-----|
+| LLM Tools | 31 | ~38 | TaskGet, TaskList, Skill, EnterPlanMode, ExitPlanMode, TaskOutput, TaskStop |
+| Slash Commands | 23 | ~30 | /copy, /debug, /hooks, /rename, /stats, /theme, /usage, /add-dir |
+| Hook Events | 2 (pre/post tool) | 14 | 12 missing events, 2 handler types |
+| Permission Modes | 3 | 5 | acceptEdits, dontAsk |
+| Subagent Types | 3 (explore/plan/task) | 6+ | custom YAML agents, background, resume |
+| Memory Features | 3-tier | Full hierarchy | rules/, @import, #shortcut, path-specific |
+| MCP | Discovery only | Full integration | Chat loop wiring, OAuth, search, serve |
+| Keyboard Shortcuts | ~5 | ~16 | Shift+Tab, Alt+P, Alt+T, @, #, !, Esc+Esc |
+| IDE | JSON-RPC stub | Full VS Code + JetBrains | Extensions needed |

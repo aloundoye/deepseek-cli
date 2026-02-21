@@ -674,6 +674,7 @@ dependencies = [
  "deepseek-router",
  "deepseek-skills",
  "deepseek-store",
+ "deepseek-subagent",
  "deepseek-tools",
  "deepseek-ui",
  "glob",

@@ -16,14 +16,14 @@ use deepseek_store::{
 };
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
 use deepseek_tools::{
-    AGENT_LEVEL_TOOLS, LocalToolHost, filter_tool_definitions, map_tool_name, tool_definitions,
-    tool_error_hint,
+    AGENT_LEVEL_TOOLS, LocalToolHost, PLAN_MODE_TOOLS, filter_tool_definitions, map_tool_name,
+    tool_definitions, tool_error_hint,
 };
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -205,8 +205,9 @@ impl Executor for SimpleExecutor {
 
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
-/// Handler for spawn_task subagent workers. Takes a goal string, returns result.
-type SubagentWorkerFn = Arc<dyn Fn(String) -> Result<String> + Send + Sync>;
+/// Handler for spawn_task subagent workers. Takes a SubagentTask, returns result.
+type SubagentWorkerFn =
+    Arc<dyn Fn(&deepseek_subagent::SubagentTask) -> Result<String> + Send + Sync>;
 
 /// Options for `chat_with_options()`.
 #[derive(Debug, Clone, Default)]
@@ -223,6 +224,16 @@ pub struct ChatOptions {
     pub system_prompt_append: Option<String>,
     /// Additional directories to include in workspace context.
     pub additional_dirs: Vec<PathBuf>,
+}
+
+/// Tracks a background subagent task spawned with `run_in_background: true`.
+#[allow(dead_code)]
+struct BackgroundTask {
+    task_id: Uuid,
+    description: String,
+    handle: Option<thread::JoinHandle<String>>,
+    result: Option<String>,
+    stopped: bool,
 }
 
 pub struct AgentEngine {
@@ -248,6 +259,8 @@ pub struct AgentEngine {
     user_question_handler: Mutex<Option<deepseek_core::UserQuestionHandler>>,
     /// Optional worker function for spawn_task subagents.
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
+    /// Background subagent tasks (spawn_task with run_in_background: true).
+    background_tasks: Mutex<VecDeque<BackgroundTask>>,
 }
 
 impl AgentEngine {
@@ -279,6 +292,7 @@ impl AgentEngine {
             approval_handler: Mutex::new(None),
             user_question_handler: Mutex::new(None),
             subagent_worker: Mutex::new(None),
+            background_tasks: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1052,6 +1066,8 @@ impl AgentEngine {
         )?;
 
         // Build system prompt with workspace context
+        let mut plan_mode_active =
+            self.policy.permission_mode() == deepseek_policy::PermissionMode::Plan;
         let system_prompt = if let Some(ref override_prompt) = options.system_prompt_override {
             override_prompt.clone()
         } else {
@@ -1062,7 +1078,7 @@ impl AgentEngine {
                 base
             }
         };
-        let tools = if options.tools {
+        let all_tools = if options.tools {
             let all = tool_definitions();
             filter_tool_definitions(
                 all,
@@ -1071,6 +1087,16 @@ impl AgentEngine {
             )
         } else {
             vec![]
+        };
+        // In plan mode, restrict to read-only tools
+        let mut tools = if plan_mode_active {
+            all_tools
+                .iter()
+                .filter(|t| PLAN_MODE_TOOLS.contains(&t.function.name.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            all_tools.clone()
         };
 
         self.observer
@@ -1487,6 +1513,58 @@ impl AgentEngine {
 
                 // ── Agent-level tools (handled here, not by LocalToolHost) ──
                 if AGENT_LEVEL_TOOLS.contains(&internal_name) {
+                    // Handle plan mode transitions inline (needs access to loop state)
+                    if internal_name == "enter_plan_mode" && !plan_mode_active {
+                        plan_mode_active = true;
+                        tools = all_tools
+                            .iter()
+                            .filter(|t| {
+                                PLAN_MODE_TOOLS.contains(&t.function.name.as_str())
+                            })
+                            .cloned()
+                            .collect();
+                        self.emit(
+                            session.session_id,
+                            EventKind::EnterPlanModeV1 {
+                                session_id: session.session_id,
+                            },
+                        )?;
+                        if let Ok(cb) = self.stream_callback.lock()
+                            && let Some(ref cb) = *cb
+                        {
+                            cb(StreamChunk::ContentDelta(
+                                "\n[plan mode] Entered plan mode — read-only tools only. Explore the codebase and design your approach.\n".to_string(),
+                            ));
+                        }
+                        messages.push(ChatMessage::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: "Plan mode activated. You now have read-only tools only (Read, Glob, Grep, search, git status/diff). Explore the codebase, design your implementation plan, then call exit_plan_mode when ready for user approval.".to_string(),
+                        });
+                        continue;
+                    } else if internal_name == "exit_plan_mode" && plan_mode_active {
+                        plan_mode_active = false;
+                        tools = all_tools.clone();
+                        self.emit(
+                            session.session_id,
+                            EventKind::ExitPlanModeV1 {
+                                session_id: session.session_id,
+                            },
+                        )?;
+                        if let Ok(cb) = self.stream_callback.lock()
+                            && let Some(ref cb) = *cb
+                        {
+                            cb(StreamChunk::ContentDelta(
+                                "\n[plan mode] Exited plan mode — all tools now available.\n"
+                                    .to_string(),
+                            ));
+                        }
+                        messages.push(ChatMessage::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: "Plan mode deactivated. All tools are now available for execution. Proceed with implementing your plan.".to_string(),
+                        });
+                        continue;
+                    }
+
                     let tool_result = self.execute_agent_tool(internal_name, &args, &session)?;
                     messages.push(ChatMessage::Tool {
                         tool_call_id: tc.id.clone(),
@@ -1848,6 +1926,7 @@ impl AgentEngine {
                 role: lane.role.clone(),
                 team: lane.team.clone(),
                 read_only_fallback: false,
+                custom_agent: None,
             };
             let specialization_hint =
                 self.load_subagent_specialization_hint(&lane.role, &lane.domain)?;
@@ -3098,7 +3177,15 @@ impl AgentEngine {
             "user_question" => self.handle_user_question(args),
             "task_create" => self.handle_task_create(args, session),
             "task_update" => self.handle_task_update(args),
+            "task_get" => self.handle_task_get(args),
+            "task_list" => self.handle_task_list(session),
             "spawn_task" => self.handle_spawn_task(args),
+            "task_output" => self.handle_task_output(args),
+            "task_stop" => self.handle_task_stop(args),
+            // Plan mode tools are handled inline in chat loop, not here
+            "enter_plan_mode" | "exit_plan_mode" => {
+                Ok("Plan mode transition handled.".to_string())
+            }
             _ => Err(anyhow::anyhow!("unknown agent tool: {tool_name}")),
         };
         let tool_elapsed = tool_start.elapsed();
@@ -3260,84 +3347,341 @@ impl AgentEngine {
         }))?)
     }
 
+    /// Handle the task_get tool: retrieve a task by ID.
+    fn handle_task_get(&self, args: &serde_json::Value) -> Result<String> {
+        let task_id_str = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("task_id parameter is required"))?;
+        let task_id = Uuid::parse_str(task_id_str)?;
+        let tasks = self.store.list_tasks(None)?;
+        if let Some(task) = tasks.iter().find(|t| t.task_id == task_id) {
+            Ok(serde_json::to_string(&serde_json::json!({
+                "task_id": task.task_id.to_string(),
+                "subject": task.title,
+                "status": task.status,
+                "priority": task.priority,
+                "outcome": task.outcome,
+                "created_at": task.created_at,
+                "updated_at": task.updated_at,
+            }))?)
+        } else {
+            Ok(serde_json::to_string(
+                &serde_json::json!({"error": format!("task not found: {task_id_str}")}),
+            )?)
+        }
+    }
+
+    /// Handle the task_list tool: list all tasks.
+    fn handle_task_list(&self, session: &Session) -> Result<String> {
+        let tasks = self.store.list_tasks(Some(session.session_id))?;
+        let items: Vec<serde_json::Value> = tasks
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.task_id.to_string(),
+                    "subject": t.title,
+                    "status": t.status,
+                    "priority": t.priority,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&serde_json::json!({ "tasks": items }))?)
+    }
+
     /// Handle the spawn_task tool: spawn a subagent to work on a subtask.
+    ///
+    /// Supports Claude Code-compatible parameters:
+    /// - `description`: short label (3-5 words)
+    /// - `prompt`: the task for the agent
+    /// - `subagent_type`: explore | plan | bash | general-purpose
+    /// - `model`: optional model override
+    /// - `max_turns`: optional turn limit
+    /// - `run_in_background`: if true, returns immediately with a task_id
+    /// - `resume`: optional previous agent ID to continue from
     fn handle_spawn_task(&self, args: &serde_json::Value) -> Result<String> {
-        let name = args
-            .get("name")
+        // Accept both new (`prompt`) and legacy (`goal`) parameter names.
+        let prompt = args
+            .get("prompt")
+            .or_else(|| args.get("goal"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("name parameter is required"))?;
-        let goal = args
-            .get("goal")
+            .ok_or_else(|| anyhow!("prompt parameter is required"))?;
+        let description = args
+            .get("description")
+            .or_else(|| args.get("name"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("goal parameter is required"))?;
-        let role_str = args.get("role").and_then(|v| v.as_str()).unwrap_or("task");
-        let role = match role_str {
-            "explore" => deepseek_subagent::SubagentRole::Explore,
-            "plan" => deepseek_subagent::SubagentRole::Plan,
-            _ => deepseek_subagent::SubagentRole::Task,
+            .unwrap_or("subagent");
+
+        // Accept both new (`subagent_type`) and legacy (`role`) parameter names.
+        let type_str = args
+            .get("subagent_type")
+            .or_else(|| args.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("general-purpose");
+
+        // Check for custom agent definitions from .deepseek/agents/*.md
+        let custom_agent = match type_str {
+            "explore" | "plan" | "bash" | "general-purpose" => None,
+            custom_name => {
+                let defs = deepseek_subagent::load_agent_defs(&self.workspace)
+                    .unwrap_or_default();
+                defs.into_iter().find(|d| d.name == custom_name)
+            }
         };
 
-        let make_task = || deepseek_subagent::SubagentTask {
+        let role = match type_str {
+            "explore" => SubagentRole::Explore,
+            "plan" => SubagentRole::Plan,
+            "bash" => SubagentRole::Task,
+            "general-purpose" => SubagentRole::Task,
+            name => SubagentRole::Custom(name.to_string()),
+        };
+
+        let run_in_background = args
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let task = SubagentTask {
             run_id: Uuid::now_v7(),
-            name: name.to_string(),
-            goal: goal.to_string(),
+            name: description.to_string(),
+            goal: prompt.to_string(),
             role: role.clone(),
             team: "default".to_string(),
-            read_only_fallback: matches!(role, deepseek_subagent::SubagentRole::Explore),
+            read_only_fallback: matches!(role, SubagentRole::Explore | SubagentRole::Plan),
+            custom_agent,
         };
 
-        // Try external worker first (set by the CLI for full agent capabilities)
-        let has_external_worker = self
+        // Get external worker (set by the CLI for full agent capabilities).
+        let worker = self
             .subagent_worker
             .lock()
             .ok()
-            .as_ref()
-            .is_some_and(|g| g.is_some());
+            .and_then(|g| g.as_ref().cloned());
 
-        if has_external_worker {
-            let worker = self
-                .subagent_worker
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().cloned());
-            if let Some(worker) = worker {
-                let goal = goal.to_string();
-                let results = self
-                    .subagents
-                    .run_tasks(vec![make_task()], move |_t| worker(goal.clone()));
-                if let Some(result) = results.first() {
-                    return Ok(serde_json::to_string(&serde_json::json!({
-                        "name": result.name,
-                        "success": result.success,
-                        "output": result.output,
-                        "error": result.error,
-                        "attempts": result.attempts
-                    }))?);
-                }
+        if run_in_background {
+            let task_id = task.run_id;
+            let desc = description.to_string();
+            let handle = if let Some(worker) = worker {
+                thread::spawn(move || match worker(&task) {
+                    Ok(output) => output,
+                    Err(e) => format!("Error: {e}"),
+                })
+            } else {
+                let prompt_owned = prompt.to_string();
+                let name_owned = description.to_string();
+                thread::spawn(move || {
+                    format!("Subagent '{name_owned}' completed goal: {prompt_owned}")
+                })
+            };
+
+            if let Ok(mut bg) = self.background_tasks.lock() {
+                bg.push_back(BackgroundTask {
+                    task_id,
+                    description: desc.clone(),
+                    handle: Some(handle),
+                    result: None,
+                    stopped: false,
+                });
             }
-        }
 
-        // Fallback: run with a simple echo worker
-        let goal_str = goal.to_string();
-        let results = self.subagents.run_tasks(vec![make_task()], move |t| {
-            Ok(format!(
-                "Subagent '{}' completed goal: {}",
-                t.name, goal_str
-            ))
-        });
-        if let Some(result) = results.first() {
-            return Ok(serde_json::to_string(&serde_json::json!({
-                "name": result.name,
-                "success": result.success,
-                "output": result.output,
-                "error": result.error,
-                "attempts": result.attempts
+            return Ok(serde_json::to_string(&json!({
+                "task_id": task_id.to_string(),
+                "description": desc,
+                "status": "running",
+                "message": "Agent launched in background. Use task_output to retrieve results."
             }))?);
         }
 
+        // Foreground (blocking) execution.
+        if let Some(worker) = worker {
+            let results = self
+                .subagents
+                .run_tasks(vec![task], move |t| worker(&t));
+            if let Some(result) = results.first() {
+                return Ok(serde_json::to_string(&json!({
+                    "name": result.name,
+                    "success": result.success,
+                    "output": result.output,
+                    "error": result.error,
+                    "attempts": result.attempts
+                }))?);
+            }
+        } else {
+            // Fallback: run with a simple echo worker.
+            let prompt_owned = prompt.to_string();
+            let results = self
+                .subagents
+                .run_tasks(vec![task], move |t| {
+                    Ok(format!(
+                        "Subagent '{}' completed goal: {}",
+                        t.name, prompt_owned
+                    ))
+                });
+            if let Some(result) = results.first() {
+                return Ok(serde_json::to_string(&json!({
+                    "name": result.name,
+                    "success": result.success,
+                    "output": result.output,
+                    "error": result.error,
+                    "attempts": result.attempts
+                }))?);
+            }
+        }
+
         Ok(serde_json::to_string(
-            &serde_json::json!({"error": "subagent failed to start"}),
+            &json!({"error": "subagent failed to start"}),
         )?)
+    }
+
+    /// Handle the task_output tool: retrieve output from a background subagent.
+    fn handle_task_output(&self, args: &serde_json::Value) -> Result<String> {
+        let task_id_str = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_id parameter is required"))?;
+        let task_id = Uuid::parse_str(task_id_str)?;
+        let block = args.get("block").and_then(|v| v.as_bool()).unwrap_or(true);
+        let timeout_ms = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30_000);
+
+        let mut bg = self
+            .background_tasks
+            .lock()
+            .map_err(|_| anyhow!("background_tasks lock poisoned"))?;
+
+        let entry = bg
+            .iter_mut()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| anyhow!("no background task with id {task_id_str}"))?;
+
+        // If we already have a result, return it immediately.
+        if let Some(ref output) = entry.result {
+            return Ok(serde_json::to_string(&json!({
+                "task_id": task_id_str,
+                "status": if entry.stopped { "stopped" } else { "completed" },
+                "output": output
+            }))?);
+        }
+
+        if entry.stopped {
+            return Ok(serde_json::to_string(&json!({
+                "task_id": task_id_str,
+                "status": "stopped",
+                "output": ""
+            }))?);
+        }
+
+        // Take the handle out so we can join without holding the mutex.
+        let handle = entry.handle.take();
+        drop(bg);
+
+        if let Some(handle) = handle {
+            if block {
+                // Wait up to timeout_ms for completion.
+                let deadline =
+                    Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                loop {
+                    if handle.is_finished() {
+                        let output = handle
+                            .join()
+                            .unwrap_or_else(|_| "Error: subagent thread panicked".to_string());
+                        if let Ok(mut bg) = self.background_tasks.lock()
+                            && let Some(entry) = bg.iter_mut().find(|t| t.task_id == task_id)
+                        {
+                            entry.result = Some(output.clone());
+                        }
+                        return Ok(serde_json::to_string(&json!({
+                            "task_id": task_id_str,
+                            "status": "completed",
+                            "output": output
+                        }))?);
+                    }
+                    if Instant::now() >= deadline {
+                        // Put the handle back — still running.
+                        if let Ok(mut bg) = self.background_tasks.lock()
+                            && let Some(entry) = bg.iter_mut().find(|t| t.task_id == task_id)
+                        {
+                            entry.handle = Some(handle);
+                        }
+                        return Ok(serde_json::to_string(&json!({
+                            "task_id": task_id_str,
+                            "status": "running",
+                            "message": format!("Task still running after {timeout_ms}ms timeout")
+                        }))?);
+                    }
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+            } else {
+                // Non-blocking check.
+                if handle.is_finished() {
+                    let output = handle
+                        .join()
+                        .unwrap_or_else(|_| "Error: subagent thread panicked".to_string());
+                    if let Ok(mut bg) = self.background_tasks.lock()
+                        && let Some(entry) = bg.iter_mut().find(|t| t.task_id == task_id)
+                    {
+                        entry.result = Some(output.clone());
+                    }
+                    return Ok(serde_json::to_string(&json!({
+                        "task_id": task_id_str,
+                        "status": "completed",
+                        "output": output
+                    }))?);
+                }
+                // Still running — put handle back.
+                if let Ok(mut bg) = self.background_tasks.lock()
+                    && let Some(entry) = bg.iter_mut().find(|t| t.task_id == task_id)
+                {
+                    entry.handle = Some(handle);
+                }
+                return Ok(serde_json::to_string(&json!({
+                    "task_id": task_id_str,
+                    "status": "running"
+                }))?);
+            }
+        }
+
+        // No handle and no result — probably already collected.
+        Ok(serde_json::to_string(&json!({
+            "task_id": task_id_str,
+            "status": "unknown",
+            "message": "Task handle already consumed"
+        }))?)
+    }
+
+    /// Handle the task_stop tool: signal a background task to stop.
+    fn handle_task_stop(&self, args: &serde_json::Value) -> Result<String> {
+        let task_id_str = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_id parameter is required"))?;
+        let task_id = Uuid::parse_str(task_id_str)?;
+
+        let mut bg = self
+            .background_tasks
+            .lock()
+            .map_err(|_| anyhow!("background_tasks lock poisoned"))?;
+
+        let entry = bg
+            .iter_mut()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| anyhow!("no background task with id {task_id_str}"))?;
+
+        entry.stopped = true;
+
+        // We can't force-kill a Rust thread, but we mark it stopped so
+        // task_output will report it.  If the handle is still live we
+        // detach it (drop the JoinHandle).
+        let was_running = entry.handle.take().is_some();
+
+        Ok(serde_json::to_string(&json!({
+            "task_id": task_id_str,
+            "status": "stopped",
+            "was_running": was_running
+        }))?)
     }
 
     fn emit_patch_events_if_any(
@@ -5795,6 +6139,7 @@ mod tests {
             role: SubagentRole::Plan,
             team: "planning".to_string(),
             read_only_fallback: false,
+            custom_agent: None,
         };
         let req = subagent_request_for_task(
             &task,
@@ -6005,6 +6350,7 @@ mod tests {
             role: SubagentRole::Task,
             team: "execution".to_string(),
             read_only_fallback: false,
+            custom_agent: None,
         };
         let calls = subagent_delegated_calls(
             &task,
@@ -6118,6 +6464,7 @@ mod tests {
             role: SubagentRole::Explore,
             team: "explore".to_string(),
             read_only_fallback: false,
+            custom_agent: None,
         };
         let plan = SubagentTask {
             role: SubagentRole::Plan,
@@ -6192,6 +6539,7 @@ mod tests {
             role: SubagentRole::Task,
             team: "execution".to_string(),
             read_only_fallback: false,
+            custom_agent: None,
         };
         let write_call = deepseek_core::ToolCall {
             name: "fs.write".to_string(),
