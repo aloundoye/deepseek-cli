@@ -513,8 +513,36 @@ struct CompactArgs {
     yes: bool,
 }
 
-#[derive(Args, Default)]
-struct DoctorArgs {}
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum DoctorModeArg {
+    Auto,
+    Runtime,
+    Test,
+    Performance,
+}
+
+#[derive(Args, Clone)]
+struct DoctorArgs {
+    /// Analyze debug input from a file path.
+    #[arg(long)]
+    analyze_file: Option<String>,
+    /// Analyze debug input provided inline.
+    #[arg(long)]
+    analyze_text: Option<String>,
+    /// Debug analysis mode (auto infers from input content).
+    #[arg(long, value_enum, default_value_t = DoctorModeArg::Auto)]
+    mode: DoctorModeArg,
+}
+
+impl Default for DoctorArgs {
+    fn default() -> Self {
+        Self {
+            analyze_file: None,
+            analyze_text: None,
+            mode: DoctorModeArg::Auto,
+        }
+    }
+}
 
 #[derive(Args)]
 struct ExecArgs {

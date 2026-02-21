@@ -23,12 +23,13 @@ use crate::util::*;
 
 // CLI types
 use crate::{
-    Cli, CompactArgs, ConfigCmd, DoctorArgs, ExportArgs, McpCmd, McpGetArgs, McpRemoveArgs,
-    MemoryCmd, MemoryEditArgs, MemoryShowArgs, MemorySyncArgs, RewindArgs, RunArgs, SearchArgs,
-    SkillRunArgs, SkillsCmd, TasksCmd, UsageArgs,
+    Cli, CompactArgs, ConfigCmd, DoctorArgs, DoctorModeArg, ExportArgs, McpCmd, McpGetArgs,
+    McpRemoveArgs, MemoryCmd, MemoryEditArgs, MemoryShowArgs, MemorySyncArgs, RewindArgs, RunArgs,
+    SearchArgs, SkillRunArgs, SkillsCmd, TasksCmd, UsageArgs,
 };
 
 // Commands that chat dispatches to
+use crate::commands::admin::doctor_payload;
 use crate::commands::admin::run_config;
 use crate::commands::admin::run_doctor;
 use crate::commands::admin::{parse_permissions_cmd, permissions_payload, run_permissions};
@@ -510,7 +511,7 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Doctor => {
-                    run_doctor(cwd, DoctorArgs {}, json_mode)?;
+                    run_doctor(cwd, DoctorArgs::default(), json_mode)?;
                 }
                 SlashCommand::Copy => {
                     // Copy last assistant response to clipboard
@@ -523,20 +524,27 @@ pub(crate) fn run_chat(
                         println!("No assistant response to copy.");
                     }
                 }
-                SlashCommand::Debug(args) => {
-                    let desc = if args.is_empty() {
-                        "general".to_string()
-                    } else {
-                        args.join(" ")
-                    };
-                    let log_dir = deepseek_core::runtime_dir(cwd).join("logs");
-                    if json_mode {
-                        print_json(&json!({"debug": desc, "log_dir": log_dir.to_string_lossy()}))?;
-                    } else {
-                        println!("Debug: {desc}");
-                        println!("Logs: {}", log_dir.display());
+                SlashCommand::Debug(args) => match parse_debug_analysis_args(&args)? {
+                    Some(doctor_args) => {
+                        run_doctor(cwd, doctor_args, json_mode)?;
                     }
-                }
+                    None => {
+                        let desc = if args.is_empty() {
+                            "general".to_string()
+                        } else {
+                            args.join(" ")
+                        };
+                        let log_dir = deepseek_core::runtime_dir(cwd).join("logs");
+                        if json_mode {
+                            print_json(
+                                &json!({"debug": desc, "log_dir": log_dir.to_string_lossy()}),
+                            )?;
+                        } else {
+                            println!("Debug: {desc}");
+                            println!("Logs: {}", log_dir.display());
+                        }
+                    }
+                },
                 SlashCommand::Exit => {
                     break;
                 }
@@ -1074,9 +1082,21 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
                     let path = AppConfig::keybindings_path().unwrap_or_default();
                     format!("Keybindings: {}", path.display())
                 }
-                SlashCommand::Doctor => "Use 'deepseek doctor' for diagnostics.".to_string(),
+                SlashCommand::Doctor => serde_json::to_string_pretty(&doctor_payload(cwd, &DoctorArgs::default())?)?,
                 SlashCommand::Copy => "Copied last response to clipboard.".to_string(),
-                SlashCommand::Debug(args) => format!("Debug: {}", if args.is_empty() { "general".to_string() } else { args.join(" ") }),
+                SlashCommand::Debug(args) => match parse_debug_analysis_args(&args)? {
+                    Some(doctor_args) => {
+                        serde_json::to_string_pretty(&doctor_payload(cwd, &doctor_args)?)?
+                    }
+                    None => format!(
+                        "Debug: {}",
+                        if args.is_empty() {
+                            "general".to_string()
+                        } else {
+                            args.join(" ")
+                        }
+                    ),
+                },
                 SlashCommand::Exit => "Exiting...".to_string(),
                 SlashCommand::Hooks(_) => {
                     let hooks = &cfg.hooks;
@@ -1173,6 +1193,58 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
         },
         move || current_ui_status(cwd, cfg, fmt_refresh.load(Ordering::Relaxed)).ok(),
     )
+}
+
+fn parse_debug_analysis_args(args: &[String]) -> Result<Option<DoctorArgs>> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+
+    let mut idx = 0usize;
+    if args[0].eq_ignore_ascii_case("analyze") {
+        idx = 1;
+        if idx >= args.len() {
+            return Err(anyhow!(
+                "usage: /debug analyze <auto|runtime|test|performance> <file-or-text>"
+            ));
+        }
+    }
+
+    let Some(mode) = parse_debug_mode_token(&args[idx]) else {
+        if idx == 0 {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "usage: /debug analyze <auto|runtime|test|performance> <file-or-text>"
+        ));
+    };
+    idx += 1;
+
+    let remaining = &args[idx..];
+    if remaining.is_empty() {
+        return Err(anyhow!(
+            "missing debug input. provide a file path or inline text after the mode"
+        ));
+    }
+
+    let mut doctor_args = DoctorArgs::default();
+    doctor_args.mode = mode;
+    if remaining.len() == 1 && Path::new(&remaining[0]).exists() {
+        doctor_args.analyze_file = Some(remaining[0].clone());
+    } else {
+        doctor_args.analyze_text = Some(remaining.join(" "));
+    }
+    Ok(Some(doctor_args))
+}
+
+fn parse_debug_mode_token(token: &str) -> Option<DoctorModeArg> {
+    match token.to_ascii_lowercase().as_str() {
+        "auto" => Some(DoctorModeArg::Auto),
+        "runtime" => Some(DoctorModeArg::Runtime),
+        "test" | "tests" => Some(DoctorModeArg::Test),
+        "performance" | "perf" => Some(DoctorModeArg::Performance),
+        _ => None,
+    }
 }
 
 pub(crate) fn load_tui_keybindings(cwd: &Path, cfg: &AppConfig) -> KeyBindings {
