@@ -1,5 +1,8 @@
 use anyhow::{Result, anyhow};
+use base64::Engine;
+use chrono::Utc;
 use deepseek_agent::{AgentEngine, ChatOptions};
+use deepseek_chrome::{ChromeSession, ScreenshotFormat};
 use deepseek_core::{AppConfig, EventKind, StreamChunk, runtime_dir};
 use deepseek_mcp::McpManager;
 use deepseek_memory::{ExportFormat, MemoryManager};
@@ -10,7 +13,7 @@ use deepseek_ui::{
     run_tui_shell_with_bindings,
 };
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -46,6 +49,11 @@ use crate::commands::tasks::run_tasks;
 use crate::commands::teleport::{parse_teleport_args, run_teleport, teleport_now};
 use crate::commands::visual::{parse_visual_cmd, run_visual, visual_payload};
 
+fn is_max_think_selection(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("reasoner") || lower.contains("max") || lower.contains("high")
+}
+
 pub(crate) fn run_chat(
     cwd: &Path,
     json_mode: bool,
@@ -61,15 +69,19 @@ pub(crate) fn run_chat(
     if let Some(cli) = cli {
         apply_cli_flags(&mut engine, cli);
     }
+    let mut force_max_think = cli
+        .and_then(|v| v.model.as_deref())
+        .map(is_max_think_selection)
+        .unwrap_or(false);
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
-        return run_chat_tui(cwd, allow_tools, &cfg);
+        return run_chat_tui(cwd, allow_tools, &cfg, force_max_think);
     }
     if force_tui && !interactive_tty {
         return Err(anyhow!("--tui requires an interactive terminal"));
     }
-    let mut force_max_think = false;
     let mut last_assistant_response: Option<String> = None;
+    let mut additional_dirs = cli.map(|value| value.add_dir.clone()).unwrap_or_default();
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -132,6 +144,9 @@ pub(crate) fn run_chat(
                             "/vim",
                             "/copy",
                             "/debug",
+                            "/desktop",
+                            "/todos",
+                            "/chrome",
                             "/exit",
                             "/hooks",
                             "/rename",
@@ -217,10 +232,7 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::Model(model) => {
                     if let Some(model) = model {
-                        let lower = model.to_ascii_lowercase();
-                        force_max_think = lower.contains("reasoner")
-                            || lower.contains("max")
-                            || lower.contains("high");
+                        force_max_think = is_max_think_selection(&model);
                     }
                     if json_mode {
                         print_json(&json!({
@@ -231,7 +243,10 @@ pub(crate) fn run_chat(
                     } else if force_max_think {
                         println!("model mode: max-think ({})", cfg.llm.max_think_model);
                     } else {
-                        println!("model mode: base ({})", cfg.llm.base_model);
+                        println!(
+                            "model mode: hybrid auto (base={} max_think={})",
+                            cfg.llm.base_model, cfg.llm.max_think_model
+                        );
                     }
                 }
                 SlashCommand::Cost => {
@@ -291,10 +306,13 @@ pub(crate) fn run_chat(
                     )?;
                 }
                 SlashCommand::Plan => {
+                    force_max_think = true;
                     if json_mode {
-                        print_json(&json!({"plan_mode": true}))?;
+                        print_json(&json!({"plan_mode": true, "force_max_think": true}))?;
                     } else {
-                        println!("plan mode active; prompts will prefer structured planning.");
+                        println!(
+                            "plan mode active; prompts will prefer structured planning and max-think routing."
+                        );
                     }
                 }
                 SlashCommand::Teleport(args) => match parse_teleport_args(args) {
@@ -337,7 +355,11 @@ pub(crate) fn run_chat(
                         println!(
                             "effort={} model_mode={}",
                             normalized,
-                            if force_max_think { "max-think" } else { "base" }
+                            if force_max_think {
+                                "max-think"
+                            } else {
+                                "hybrid-auto"
+                            }
                         );
                     }
                 }
@@ -630,10 +652,41 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::AddDir(args) => {
                     if args.is_empty() {
-                        println!("Usage: /add-dir <path>");
+                        if json_mode {
+                            print_json(&json!({"error":"usage: /add-dir <path>"}))?;
+                        } else {
+                            println!("Usage: /add-dir <path>");
+                        }
                     } else {
-                        for dir in &args {
-                            println!("Added directory: {dir}");
+                        let mut added = Vec::new();
+                        for raw in &args {
+                            let path = resolve_additional_dir(cwd, raw);
+                            if !path.exists() || !path.is_dir() {
+                                if json_mode {
+                                    print_json(&json!({
+                                        "error": format!("directory does not exist: {}", path.display())
+                                    }))?;
+                                } else {
+                                    println!("Directory does not exist: {}", path.display());
+                                }
+                                continue;
+                            }
+                            if !additional_dirs.contains(&path) {
+                                additional_dirs.push(path.clone());
+                                added.push(path);
+                            }
+                        }
+                        if json_mode {
+                            print_json(&json!({
+                                "added": added.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+                                "active": additional_dirs.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+                            }))?;
+                        } else if added.is_empty() {
+                            println!("No new directories added.");
+                        } else {
+                            for dir in &added {
+                                println!("Added directory: {}", dir.display());
+                            }
                         }
                     }
                 }
@@ -654,22 +707,27 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::PrComments(args) => {
-                    let pr_num = args.first().unwrap_or(&String::new()).clone();
+                    let pr_num = args.first().cloned().unwrap_or_default();
+                    let output_path = args.get(1).cloned();
                     if pr_num.is_empty() {
-                        println!("Usage: /pr_comments <PR_NUMBER>");
-                    } else if json_mode {
-                        print_json(&json!({"pr": pr_num, "status": "fetching"}))?;
+                        if json_mode {
+                            print_json(
+                                &json!({"error":"usage: /pr_comments <PR_NUMBER> [OUTPUT_JSON]"}),
+                            )?;
+                        } else {
+                            println!("Usage: /pr_comments <PR_NUMBER> [OUTPUT_JSON]");
+                        }
                     } else {
-                        println!("Fetching PR #{pr_num} comments...");
-                        // Use gh CLI to fetch PR comments
-                        match std::process::Command::new("gh")
-                            .args(["pr", "view", &pr_num, "--comments"])
-                            .output()
-                        {
-                            Ok(output) => {
-                                println!("{}", String::from_utf8_lossy(&output.stdout));
+                        let payload = pr_comments_payload(cwd, &pr_num, output_path.as_deref())?;
+                        if json_mode {
+                            print_json(&payload)?;
+                        } else {
+                            if let Some(path) = payload["saved_to"].as_str() {
+                                println!("PR comments saved to {path}");
                             }
-                            Err(e) => println!("Failed to fetch PR comments: {e}"),
+                            if let Some(summary) = payload["summary"].as_str() {
+                                println!("{summary}");
+                            }
                         }
                     }
                 }
@@ -678,27 +736,80 @@ pub(crate) fn run_chat(
                         .first()
                         .cloned()
                         .unwrap_or_else(|| "HEAD~10..HEAD".to_string());
+                    let output_path = args.get(1).cloned();
+                    let payload = release_notes_payload(cwd, &range, output_path.as_deref())?;
                     if json_mode {
-                        print_json(&json!({"range": range}))?;
+                        print_json(&payload)?;
                     } else {
                         println!("Release notes for {range}:");
-                        match std::process::Command::new("git")
-                            .args(["log", "--oneline", &range])
-                            .output()
-                        {
-                            Ok(output) => {
-                                println!("{}", String::from_utf8_lossy(&output.stdout));
+                        if let Some(lines) = payload["lines"].as_array() {
+                            for line in lines.iter().filter_map(|value| value.as_str()) {
+                                println!("{line}");
                             }
-                            Err(e) => println!("Failed: {e}"),
+                        }
+                        if let Some(path) = payload["saved_to"].as_str() {
+                            println!("Saved to {path}");
                         }
                     }
                 }
                 SlashCommand::Login => {
-                    println!("Set your API key via DEEPSEEK_API_KEY environment variable");
-                    println!("or add `llm.api_key` to .deepseek/settings.json");
+                    let payload = login_payload(cwd)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!(
+                            "{}",
+                            payload["message"].as_str().unwrap_or("login complete")
+                        );
+                    }
                 }
                 SlashCommand::Logout => {
-                    println!("Remove your API key from the environment or settings file.");
+                    let payload = logout_payload(cwd)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!(
+                            "{}",
+                            payload["message"].as_str().unwrap_or("logout complete")
+                        );
+                    }
+                }
+                SlashCommand::Desktop(args) => {
+                    let payload = desktop_payload(cwd, &args)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    }
+                }
+                SlashCommand::Todos(args) => {
+                    let payload = todos_payload(cwd, &args)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!(
+                            "TODO scan: {} result(s)",
+                            payload["count"].as_u64().unwrap_or(0)
+                        );
+                        if let Some(rows) = payload["items"].as_array() {
+                            for row in rows.iter().take(20) {
+                                println!(
+                                    "- {}:{} {}",
+                                    row["path"].as_str().unwrap_or_default(),
+                                    row["line"].as_u64().unwrap_or(0),
+                                    row["text"].as_str().unwrap_or_default()
+                                );
+                            }
+                        }
+                    }
+                }
+                SlashCommand::Chrome(args) => {
+                    let payload = chrome_payload(cwd, &args)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    }
                 }
                 SlashCommand::Unknown { name, args } => {
                     // Try custom commands from .deepseek/commands/
@@ -718,6 +829,8 @@ pub(crate) fn run_chat(
                                 &rendered,
                                 ChatOptions {
                                     tools: allow_tools,
+                                    force_max_think,
+                                    additional_dirs: additional_dirs.clone(),
                                     ..Default::default()
                                 },
                             )?;
@@ -757,6 +870,8 @@ pub(crate) fn run_chat(
             prompt,
             ChatOptions {
                 tools: allow_tools,
+                force_max_think,
+                additional_dirs: additional_dirs.clone(),
                 ..Default::default()
             },
         )?;
@@ -771,10 +886,16 @@ pub(crate) fn run_chat(
     Ok(())
 }
 
-pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> Result<()> {
+pub(crate) fn run_chat_tui(
+    cwd: &Path,
+    allow_tools: bool,
+    cfg: &AppConfig,
+    initial_force_max_think: bool,
+) -> Result<()> {
     let engine = Arc::new(AgentEngine::new(cwd)?);
     wire_subagent_worker(&engine, cwd);
-    let force_max_think = Arc::new(AtomicBool::new(false));
+    let force_max_think = Arc::new(AtomicBool::new(initial_force_max_think));
+    let additional_dirs = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
 
     // Create the channel for TUI stream events.
     let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
@@ -802,6 +923,7 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
     let bindings = load_tui_keybindings(cwd, cfg);
     let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
     let fmt_refresh = Arc::clone(&force_max_think);
+    let additional_dirs_for_closure = Arc::clone(&additional_dirs);
     run_tui_shell_with_bindings(
         status,
         bindings,
@@ -812,7 +934,7 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual /vim".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual /desktop /todos /chrome /vim".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -887,16 +1009,16 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
                 ),
                 SlashCommand::Model(model) => {
                     if let Some(model) = model {
-                        let lower = model.to_ascii_lowercase();
-                        force_max_think.store(
-                            lower.contains("reasoner") || lower.contains("max") || lower.contains("high"),
-                            Ordering::Relaxed,
-                        );
+                        force_max_think.store(is_max_think_selection(&model), Ordering::Relaxed);
                     }
-                    format!(
-                        "model mode: {}",
-                        if force_max_think.load(Ordering::Relaxed) { &cfg.llm.max_think_model } else { &cfg.llm.base_model }
-                    )
+                    if force_max_think.load(Ordering::Relaxed) {
+                        format!("model mode: max-think ({})", cfg.llm.max_think_model)
+                    } else {
+                        format!(
+                            "model mode: hybrid auto (base={} max_think={})",
+                            cfg.llm.base_model, cfg.llm.max_think_model
+                        )
+                    }
                 }
                 SlashCommand::Cost => {
                     let store = Store::new(cwd)?;
@@ -939,7 +1061,10 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
                     )?;
                     format!("exported transcript {}", record.output_path)
                 }
-                SlashCommand::Plan => "plan mode enabled".to_string(),
+                SlashCommand::Plan => {
+                    force_max_think.store(true, Ordering::Relaxed);
+                    "plan mode enabled (max-think routing preferred)".to_string()
+                }
                 SlashCommand::Teleport(args) => {
                     match parse_teleport_args(args) {
                         Ok(teleport_args) => {
@@ -977,7 +1102,15 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
                         matches!(normalized.as_str(), "high" | "max"),
                         Ordering::Relaxed,
                     );
-                    format!("effort={} force_max_think={}", normalized, force_max_think.load(Ordering::Relaxed))
+                    format!(
+                        "effort={} model_mode={}",
+                        normalized,
+                        if force_max_think.load(Ordering::Relaxed) {
+                            "max-think"
+                        } else {
+                            "hybrid-auto"
+                        }
+                    )
                 }
                 SlashCommand::Skills(args) => {
                     let manager = SkillManager::new(cwd)?;
@@ -1123,15 +1256,72 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
                     format!("Usage: input={} output={}", usage.input_tokens, usage.output_tokens)
                 }
                 SlashCommand::AddDir(args) => {
-                    if args.is_empty() { "Usage: /add-dir <path>".to_string() } else { format!("Added: {}", args.join(", ")) }
+                    if args.is_empty() {
+                        "Usage: /add-dir <path>".to_string()
+                    } else {
+                        let mut added = Vec::new();
+                        let mut guard = additional_dirs_for_closure
+                            .lock()
+                            .map_err(|_| anyhow!("failed to access additional dir state"))?;
+                        for raw in &args {
+                            let path = resolve_additional_dir(cwd, raw);
+                            if path.exists() && path.is_dir() && !guard.contains(&path) {
+                                guard.push(path.clone());
+                                added.push(path);
+                            }
+                        }
+                        if added.is_empty() {
+                            "No new directories added.".to_string()
+                        } else {
+                            format!(
+                                "Added: {}",
+                                added
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    }
                 }
                 SlashCommand::Bug => format!("Report bugs at https://github.com/anthropics/deepseek-cli/issues\nLogs: {}", deepseek_core::runtime_dir(cwd).join("logs").display()),
                 SlashCommand::PrComments(args) => {
-                    if let Some(pr) = args.first() { format!("Fetch PR #{pr} comments via 'gh pr view {pr} --comments'") } else { "Usage: /pr_comments <number>".to_string() }
+                    if let Some(pr) = args.first() {
+                        let payload = pr_comments_payload(cwd, pr, args.get(1).map(|s| s.as_str()))?;
+                        serde_json::to_string_pretty(&payload)?
+                    } else {
+                        "Usage: /pr_comments <number> [output.json]".to_string()
+                    }
                 }
-                SlashCommand::ReleaseNotes(_) => "Use 'git log --oneline' for release notes.".to_string(),
-                SlashCommand::Login => "Set DEEPSEEK_API_KEY or add llm.api_key to settings.json".to_string(),
-                SlashCommand::Logout => "Remove API key from env or settings.".to_string(),
+                SlashCommand::ReleaseNotes(args) => {
+                    let range = args
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("HEAD~10..HEAD");
+                    let payload =
+                        release_notes_payload(cwd, range, args.get(1).map(|s| s.as_str()))?;
+                    serde_json::to_string_pretty(&payload)?
+                }
+                SlashCommand::Login => {
+                    let payload = login_payload(cwd)?;
+                    serde_json::to_string_pretty(&payload)?
+                }
+                SlashCommand::Logout => {
+                    let payload = logout_payload(cwd)?;
+                    serde_json::to_string_pretty(&payload)?
+                }
+                SlashCommand::Desktop(args) => {
+                    let payload = desktop_payload(cwd, &args)?;
+                    serde_json::to_string_pretty(&payload)?
+                }
+                SlashCommand::Todos(args) => {
+                    let payload = todos_payload(cwd, &args)?;
+                    serde_json::to_string_pretty(&payload)?
+                }
+                SlashCommand::Chrome(args) => {
+                    let payload = chrome_payload(cwd, &args)?;
+                    serde_json::to_string_pretty(&payload)?
+                }
                 SlashCommand::Unknown { name, args } => {
                     let custom_cmds = deepseek_skills::load_custom_commands(cwd);
                     if let Some(cmd) = custom_cmds.iter().find(|c| c.name == name) {
@@ -1159,9 +1349,13 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
             // Agent prompt — expand @file mentions and set stream callback.
             let engine_clone = Arc::clone(&engine);
             let prompt = deepseek_ui::expand_at_mentions(prompt);
-            let _max_think = force_max_think.load(Ordering::Relaxed);
+            let max_think = force_max_think.load(Ordering::Relaxed);
             let tx_stream = tx.clone();
             let tx_done = tx.clone();
+            let prompt_additional_dirs = additional_dirs_for_closure
+                .lock()
+                .map(|dirs| dirs.clone())
+                .unwrap_or_default();
 
             engine.set_stream_callback(std::sync::Arc::new(move |chunk| match chunk {
                 StreamChunk::ContentDelta(s) => {
@@ -1175,7 +1369,15 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
 
             thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    engine_clone.chat(&prompt)
+                    engine_clone.chat_with_options(
+                        &prompt,
+                        ChatOptions {
+                            tools: allow_tools,
+                            force_max_think: max_think,
+                            additional_dirs: prompt_additional_dirs,
+                            ..Default::default()
+                        },
+                    )
                 }));
                 match result {
                     Ok(Ok(output)) => {
@@ -1193,6 +1395,621 @@ pub(crate) fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> R
         },
         move || current_ui_status(cwd, cfg, fmt_refresh.load(Ordering::Relaxed)).ok(),
     )
+}
+
+fn resolve_additional_dir(cwd: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn pr_comments_payload(
+    cwd: &Path,
+    pr_number: &str,
+    output_path: Option<&str>,
+) -> Result<serde_json::Value> {
+    let gh_available = std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !gh_available {
+        return Err(anyhow!(
+            "GitHub CLI ('gh') is required for /pr_comments. Install gh and authenticate first."
+        ));
+    }
+
+    let output = std::process::Command::new("gh")
+        .current_dir(cwd)
+        .args([
+            "pr",
+            "view",
+            pr_number,
+            "--json",
+            "number,title,url,author,comments",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to fetch PR comments: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let comments_count = parsed["comments"]
+        .as_array()
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+
+    let mut saved_to = None;
+    if let Some(path) = output_path {
+        let destination = resolve_additional_dir(cwd, path);
+        if let Some(parent) = destination.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&destination, serde_json::to_vec_pretty(&parsed)?)?;
+        saved_to = Some(destination.to_string_lossy().to_string());
+    }
+
+    Ok(json!({
+        "schema": "deepseek.pr_comments.v1",
+        "ok": true,
+        "pr": pr_number,
+        "summary": format!("Fetched {} comment(s) for PR #{}", comments_count, pr_number),
+        "saved_to": saved_to,
+        "data": parsed,
+    }))
+}
+
+fn release_notes_payload(
+    cwd: &Path,
+    range: &str,
+    output_path: Option<&str>,
+) -> Result<serde_json::Value> {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["log", "--no-merges", "--pretty=format:%h %s", range])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to generate release notes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    let mut saved_to = None;
+    if let Some(path) = output_path {
+        let destination = resolve_additional_dir(cwd, path);
+        if let Some(parent) = destination.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut rendered = format!("# Release Notes ({range})\n\n");
+        for line in &lines {
+            rendered.push_str("- ");
+            rendered.push_str(line);
+            rendered.push('\n');
+        }
+        std::fs::write(&destination, rendered)?;
+        saved_to = Some(destination.to_string_lossy().to_string());
+    }
+
+    Ok(json!({
+        "schema": "deepseek.release_notes.v1",
+        "ok": true,
+        "range": range,
+        "count": lines.len(),
+        "lines": lines,
+        "saved_to": saved_to,
+    }))
+}
+
+fn login_payload(cwd: &Path) -> Result<serde_json::Value> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let env_key = if cfg.llm.api_key_env.trim().is_empty() {
+        "DEEPSEEK_API_KEY".to_string()
+    } else {
+        cfg.llm.api_key_env.clone()
+    };
+    let token = std::env::var(&env_key).unwrap_or_default();
+    if token.trim().is_empty() {
+        return Err(anyhow!(
+            "missing {}. export the key first, then run /login",
+            env_key
+        ));
+    }
+
+    let runtime_auth = runtime_dir(cwd).join("auth").join("session.json");
+    if let Some(parent) = runtime_auth.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mask = format!(
+        "***{}",
+        token
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+    let session_payload = json!({
+        "provider": "deepseek",
+        "api_key_env": env_key,
+        "masked": mask,
+        "created_at": Utc::now().to_rfc3339(),
+    });
+    std::fs::write(&runtime_auth, serde_json::to_vec_pretty(&session_payload)?)?;
+
+    let local_path = AppConfig::project_local_settings_path(cwd);
+    if let Some(parent) = local_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut root = if local_path.exists() {
+        let raw = std::fs::read_to_string(&local_path)?;
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let map = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("settings.local.json root must be an object"))?;
+    let llm_value = map.entry("llm".to_string()).or_insert_with(|| json!({}));
+    if !llm_value.is_object() {
+        *llm_value = json!({});
+    }
+    if let Some(llm) = llm_value.as_object_mut() {
+        llm.insert("api_key".to_string(), json!(token));
+        llm.insert("api_key_env".to_string(), json!(env_key));
+    }
+    std::fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
+
+    Ok(json!({
+        "schema": "deepseek.auth.v1",
+        "logged_in": true,
+        "session_path": runtime_auth.to_string_lossy().to_string(),
+        "settings_path": local_path.to_string_lossy().to_string(),
+        "message": "Login successful. Workspace auth session and settings.local.json updated.",
+    }))
+}
+
+fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
+    let cfg = AppConfig::ensure(cwd)?;
+    let env_key = if cfg.llm.api_key_env.trim().is_empty() {
+        "DEEPSEEK_API_KEY".to_string()
+    } else {
+        cfg.llm.api_key_env.clone()
+    };
+    let runtime_auth = runtime_dir(cwd).join("auth").join("session.json");
+    let session_removed = if runtime_auth.exists() {
+        std::fs::remove_file(&runtime_auth)?;
+        true
+    } else {
+        false
+    };
+
+    let local_path = AppConfig::project_local_settings_path(cwd);
+    let mut settings_updated = false;
+    if local_path.exists() {
+        let raw = std::fs::read_to_string(&local_path)?;
+        let mut root =
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}));
+        if let Some(llm) = root.get_mut("llm").and_then(|entry| entry.as_object_mut()) {
+            if llm.remove("api_key").is_some() {
+                settings_updated = true;
+            }
+        }
+        std::fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
+    }
+
+    // SAFETY: called on explicit user command from main thread.
+    unsafe { std::env::remove_var(env_key) };
+
+    Ok(json!({
+        "schema": "deepseek.auth.v1",
+        "logged_in": false,
+        "session_removed": session_removed,
+        "settings_updated": settings_updated,
+        "message": "Logged out. Session file removed and workspace API key unset.",
+    }))
+}
+
+fn desktop_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
+    let teleport_args = parse_teleport_args(args.to_vec()).unwrap_or_default();
+    let execution = teleport_now(cwd, teleport_args)?;
+    let session_id = Store::new(cwd)?
+        .load_latest_session()?
+        .map(|session| session.session_id.to_string());
+    Ok(json!({
+        "schema": "deepseek.desktop_handoff.v1",
+        "mode": if execution.imported.is_some() { "import" } else { "export" },
+        "bundle_id": execution.bundle_id,
+        "path": execution.path.or(execution.imported),
+        "session_id": session_id,
+        "resume_command": session_id.map(|id| format!("deepseek --resume {id}")),
+    }))
+}
+
+fn todos_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
+    let mut max_results = 100usize;
+    let mut query = None;
+    if let Some(first) = args.first() {
+        if let Ok(parsed) = first.parse::<usize>() {
+            max_results = parsed.clamp(1, 2000);
+            query = args.get(1).cloned();
+        } else {
+            query = Some(first.clone());
+        }
+    }
+    let query_lower = query.as_deref().map(|value| value.to_ascii_lowercase());
+
+    let output = std::process::Command::new("rg")
+        .current_dir(cwd)
+        .args([
+            "--line-number",
+            "--no-heading",
+            "--hidden",
+            "--glob",
+            "!.git/*",
+            "--glob",
+            "!target/*",
+            "--glob",
+            "!node_modules/*",
+            "TODO|FIXME",
+            ".",
+        ])
+        .output();
+
+    let mut items = Vec::new();
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let mut parts = line.splitn(3, ':');
+            let path = parts.next().unwrap_or_default();
+            let line_no = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let text = parts.next().unwrap_or_default().trim().to_string();
+            if let Some(filter) = query_lower.as_deref()
+                && !text.to_ascii_lowercase().contains(filter)
+            {
+                continue;
+            }
+            items.push(json!({
+                "path": path,
+                "line": line_no,
+                "text": text,
+            }));
+            if items.len() >= max_results {
+                break;
+            }
+        }
+    }
+
+    Ok(json!({
+        "schema": "deepseek.todos.v1",
+        "count": items.len(),
+        "query": query,
+        "items": items,
+    }))
+}
+
+fn chrome_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
+    let mut idx = 0usize;
+    let subcommand = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "status".to_string())
+        .to_ascii_lowercase();
+    if !args.is_empty() {
+        idx = 1;
+    }
+
+    let port = std::env::var("DEEPSEEK_CHROME_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(9222);
+    let mut session = ChromeSession::new(port)?;
+    // Slash-command UX should surface real browser connectivity, not silent stubs.
+    session.set_allow_stub_fallback(false);
+    let debug_url = session.debug_url().to_string();
+
+    match subcommand.as_str() {
+        "status" => {
+            let status = session.connection_status()?;
+            Ok(json!({
+                "schema": "deepseek.chrome.v1",
+                "action": "status",
+                "port": port,
+                "connected": status.connected,
+                "debug_url": debug_url,
+                "status": status,
+            }))
+        }
+        "reconnect" => {
+            let status = session.reconnect(true)?;
+            Ok(json!({
+                "schema": "deepseek.chrome.v1",
+                "action": "reconnect",
+                "port": port,
+                "connected": status.connected,
+                "debug_url": debug_url,
+                "status": status,
+            }))
+        }
+        "tabs" => match session.list_tabs() {
+            Ok(tabs) => Ok(json!({
+                "schema": "deepseek.chrome.v1",
+                "action": "tabs",
+                "port": port,
+                "count": tabs.len(),
+                "tabs": tabs,
+            })),
+            Err(err) => Ok(chrome_error_payload("tabs", port, &debug_url, &err)),
+        },
+        "tab" => {
+            let Some(tab_action) = args.get(idx).map(|v| v.to_ascii_lowercase()) else {
+                return Err(anyhow!("usage: /chrome tab [new <url>|focus <target_id>]"));
+            };
+            idx += 1;
+            match tab_action.as_str() {
+                "new" => {
+                    let url = args.get(idx).map(String::as_str).unwrap_or("about:blank");
+                    match session.create_tab(url) {
+                        Ok(tab) => Ok(json!({
+                            "schema": "deepseek.chrome.v1",
+                            "action": "tab.new",
+                            "port": port,
+                            "ok": true,
+                            "tab": tab,
+                        })),
+                        Err(err) => Ok(chrome_error_payload("tab.new", port, &debug_url, &err)),
+                    }
+                }
+                "focus" | "activate" => {
+                    let Some(target_id) = args.get(idx) else {
+                        return Err(anyhow!("usage: /chrome tab focus <target_id>"));
+                    };
+                    match session.activate_tab(target_id) {
+                        Ok(_) => Ok(json!({
+                            "schema": "deepseek.chrome.v1",
+                            "action": "tab.focus",
+                            "port": port,
+                            "ok": true,
+                            "target_id": target_id,
+                        })),
+                        Err(err) => Ok(chrome_error_payload("tab.focus", port, &debug_url, &err)),
+                    }
+                }
+                _ => Err(anyhow!("usage: /chrome tab [new <url>|focus <target_id>]")),
+            }
+        }
+        "navigate" => {
+            let Some(url) = args.get(idx) else {
+                return Err(anyhow!("usage: /chrome navigate <url>"));
+            };
+            if let Err(err) = session.ensure_live_connection() {
+                return Ok(chrome_error_payload("navigate", port, &debug_url, &err));
+            }
+            match session.navigate(url) {
+                Ok(result) => Ok(json!({
+                    "schema": "deepseek.chrome.v1",
+                    "action": "navigate",
+                    "port": port,
+                    "url": url,
+                    "ok": result.error.is_none(),
+                    "error": result.error.map(|e| e.message),
+                })),
+                Err(err) => Ok(chrome_error_payload("navigate", port, &debug_url, &err)),
+            }
+        }
+        "click" => {
+            let Some(selector) = args.get(idx) else {
+                return Err(anyhow!("usage: /chrome click <css-selector>"));
+            };
+            if let Err(err) = session.ensure_live_connection() {
+                return Ok(chrome_error_payload("click", port, &debug_url, &err));
+            }
+            match session.click(selector) {
+                Ok(result) => Ok(json!({
+                    "schema": "deepseek.chrome.v1",
+                    "action": "click",
+                    "port": port,
+                    "selector": selector,
+                    "ok": result.error.is_none(),
+                    "error": result.error.map(|e| e.message),
+                })),
+                Err(err) => Ok(chrome_error_payload("click", port, &debug_url, &err)),
+            }
+        }
+        "type" => {
+            let Some(selector) = args.get(idx) else {
+                return Err(anyhow!("usage: /chrome type <css-selector> <text>"));
+            };
+            let Some(text) = args.get(idx + 1) else {
+                return Err(anyhow!("usage: /chrome type <css-selector> <text>"));
+            };
+            if let Err(err) = session.ensure_live_connection() {
+                return Ok(chrome_error_payload("type", port, &debug_url, &err));
+            }
+            match session.type_text(selector, text) {
+                Ok(result) => Ok(json!({
+                    "schema": "deepseek.chrome.v1",
+                    "action": "type",
+                    "port": port,
+                    "selector": selector,
+                    "text": text,
+                    "ok": result.error.is_none(),
+                    "error": result.error.map(|e| e.message),
+                })),
+                Err(err) => Ok(chrome_error_payload("type", port, &debug_url, &err)),
+            }
+        }
+        "evaluate" => {
+            let expression = args[idx..].join(" ");
+            if expression.trim().is_empty() {
+                return Err(anyhow!("usage: /chrome evaluate <javascript-expression>"));
+            }
+            if let Err(err) = session.ensure_live_connection() {
+                return Ok(chrome_error_payload("evaluate", port, &debug_url, &err));
+            }
+            match session.evaluate(&expression) {
+                Ok(value) => Ok(json!({
+                    "schema": "deepseek.chrome.v1",
+                    "action": "evaluate",
+                    "port": port,
+                    "expression": expression,
+                    "ok": true,
+                    "value": value,
+                })),
+                Err(err) => Ok(chrome_error_payload("evaluate", port, &debug_url, &err)),
+            }
+        }
+        "screenshot" => {
+            let format = match args.get(idx).map(|v| v.to_ascii_lowercase()) {
+                Some(value) if value == "jpeg" || value == "jpg" => ScreenshotFormat::Jpeg,
+                Some(value) if value == "webp" => ScreenshotFormat::Webp,
+                _ => ScreenshotFormat::Png,
+            };
+            let output_path = args
+                .get(idx + 1)
+                .cloned()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let ext = match format {
+                        ScreenshotFormat::Png => "png",
+                        ScreenshotFormat::Jpeg => "jpg",
+                        ScreenshotFormat::Webp => "webp",
+                    };
+                    runtime_dir(cwd).join("chrome").join(format!(
+                        "screenshot-{}.{}",
+                        Utc::now().timestamp(),
+                        ext
+                    ))
+                });
+            if let Some(parent) = output_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            if let Err(err) = session.ensure_live_connection() {
+                return Ok(chrome_error_payload("screenshot", port, &debug_url, &err));
+            }
+            match session.screenshot(format) {
+                Ok(data) => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+                    std::fs::write(&output_path, bytes)?;
+                    Ok(json!({
+                        "schema": "deepseek.chrome.v1",
+                        "action": "screenshot",
+                        "port": port,
+                        "path": output_path.to_string_lossy().to_string(),
+                        "ok": true,
+                    }))
+                }
+                Err(err) => Ok(chrome_error_payload("screenshot", port, &debug_url, &err)),
+            }
+        }
+        "console" => match session
+            .ensure_live_connection()
+            .and_then(|_| session.read_console())
+        {
+            Ok(entries) => Ok(json!({
+                "schema": "deepseek.chrome.v1",
+                "action": "console",
+                "port": port,
+                "count": entries.len(),
+                "entries": entries,
+            })),
+            Err(err) => Ok(chrome_error_payload("console", port, &debug_url, &err)),
+        },
+        _ => Err(anyhow!(
+            "usage: /chrome [status|reconnect|tabs|tab new <url>|tab focus <target_id>|navigate <url>|click <selector>|type <selector> <text>|evaluate <js>|screenshot [png|jpeg|webp] [output]|console]"
+        )),
+    }
+}
+
+fn chrome_error_payload(
+    action: &str,
+    port: u16,
+    debug_url: &str,
+    err: &anyhow::Error,
+) -> serde_json::Value {
+    let message = err.to_string();
+    let lower = message.to_ascii_lowercase();
+    let (kind, hints): (&str, Vec<&str>) =
+        if lower.contains("endpoint_unreachable") || lower.contains("connection refused") {
+            (
+                "endpoint_unreachable",
+                vec![
+                    "Start Chrome with --remote-debugging-port=9222",
+                    "Verify DEEPSEEK_CHROME_PORT points to the active debugging port",
+                ],
+            )
+        } else if lower.contains("no_page_targets") || lower.contains("no debuggable page target") {
+            (
+                "no_page_targets",
+                vec![
+                    "Run /chrome reconnect to create a recovery tab",
+                    "Open at least one browser tab in the target Chrome profile",
+                ],
+            )
+        } else if lower.contains("timed out") {
+            (
+                "endpoint_timeout",
+                vec![
+                    "Confirm local firewall/proxy rules are not blocking localhost debug traffic",
+                    "Retry /chrome reconnect once the browser is responsive",
+                ],
+            )
+        } else if lower.contains("cdp error") {
+            (
+                "cdp_command_failed",
+                vec![
+                    "Retry the command after /chrome reconnect",
+                    "Use /chrome tabs to confirm the active page target",
+                ],
+            )
+        } else {
+            (
+                "chrome_error",
+                vec![
+                    "Run /chrome status for live connection diagnostics",
+                    "Run /chrome reconnect to recover stale sessions",
+                ],
+            )
+        };
+
+    json!({
+        "schema": "deepseek.chrome.v1",
+        "action": action,
+        "port": port,
+        "ok": false,
+        "debug_url": debug_url,
+        "error": {
+            "kind": kind,
+            "message": message,
+            "hints": hints,
+        }
+    })
 }
 
 fn parse_debug_analysis_args(args: &[String]) -> Result<Option<DoctorArgs>> {
@@ -1460,4 +2277,31 @@ pub(crate) fn run_resume_specific(
         );
     }
     run_chat(cwd, json_mode, true, false, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_error_payload_classifies_endpoint_unreachable() {
+        let payload = chrome_error_payload(
+            "status",
+            9222,
+            "http://127.0.0.1:9222",
+            &anyhow::anyhow!("Connection refused (os error 61)"),
+        );
+        assert_eq!(payload["error"]["kind"], "endpoint_unreachable");
+    }
+
+    #[test]
+    fn chrome_error_payload_classifies_no_page_targets() {
+        let payload = chrome_error_payload(
+            "status",
+            9222,
+            "http://127.0.0.1:9222",
+            &anyhow::anyhow!("no_page_targets: no debuggable page target available"),
+        );
+        assert_eq!(payload["error"]["kind"], "no_page_targets");
+    }
 }

@@ -360,6 +360,163 @@ fn status_usage_compact_and_doctor_emit_json() {
     let doctor = run_json(workspace.path(), &["--json", "doctor"]);
     assert!(doctor["os"].as_str().is_some());
     assert!(doctor["checks"]["cargo"].as_bool().is_some());
+    assert!(
+        doctor["leadership"]["readiness"]["score"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        doctor["leadership"]["enterprise"]["audit"]["events_total"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        doctor["leadership"]["ecosystem"]["coverage"]["scm"]
+            .as_bool()
+            .is_some()
+    );
+    assert!(
+        doctor["leadership"]["deployment"]["coverage"]["ci"]
+            .as_bool()
+            .is_some()
+    );
+}
+
+#[test]
+fn parity_flags_update_and_teleport_emit_json() {
+    let workspace = TempDir::new().expect("workspace");
+
+    let sources = run_json(workspace.path(), &["--json", "--setting-sources"]);
+    assert_eq!(sources["schema"], "deepseek.settings_sources.v1");
+    assert!(sources["user"].as_str().is_some());
+    assert!(sources["project"].as_str().is_some());
+    assert!(sources["project_local"].as_str().is_some());
+    assert!(sources["legacy_toml"].as_str().is_some());
+
+    let status = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "--ide",
+            "--remote",
+            "--teammate-mode",
+            "pair",
+            "--betas",
+            "ui,tools",
+            "--maintenance",
+            "--include-partial-messages",
+            "--allowedTools",
+            "fs_read",
+            "status",
+        ],
+    );
+    assert!(status["state"].as_str().is_some());
+
+    let status2 = run_json(
+        workspace.path(),
+        &["--json", "--disallowedTools", "bash_run", "status"],
+    );
+    assert!(status2["state"].as_str().is_some());
+
+    let update = run_json(
+        workspace.path(),
+        &["--json", "update", "--check", "--channel", "stable"],
+    );
+    assert_eq!(update["schema"], "deepseek.update.v1");
+    assert_eq!(update["check_only"], true);
+    assert_eq!(update["channel"], "stable");
+
+    let teleport = run_json(workspace.path(), &["--json", "--teleport"]);
+    assert!(teleport["bundle_id"].as_str().is_some());
+}
+
+#[test]
+fn remote_env_check_performs_real_health_probe() {
+    let workspace = TempDir::new().expect("workspace");
+    let mock = start_mock_llm_server();
+
+    let added = run_json(
+        workspace.path(),
+        &[
+            "--json",
+            "remote-env",
+            "add",
+            "local",
+            mock.endpoint.as_str(),
+        ],
+    );
+    let profile_id = added["profile_id"]
+        .as_str()
+        .expect("profile id")
+        .to_string();
+
+    let checked = run_json(
+        workspace.path(),
+        &["--json", "remote-env", "check", profile_id.as_str()],
+    );
+    assert_eq!(checked["profile_id"].as_str(), Some(profile_id.as_str()));
+    assert_eq!(checked["reachable"], true);
+    assert!(checked["latency_ms"].as_u64().is_some());
+    assert!(checked["status_code"].as_u64().is_some());
+    assert!(checked["checked_url"].as_str().is_some());
+}
+
+#[test]
+fn leadership_report_detects_phase3_signals() {
+    let workspace = TempDir::new().expect("workspace");
+
+    fs::create_dir_all(workspace.path().join(".github/workflows")).expect("workflows dir");
+    fs::write(
+        workspace.path().join(".github/workflows/ci.yml"),
+        "name: ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n",
+    )
+    .expect("ci workflow");
+
+    fs::write(
+        workspace.path().join("Dockerfile"),
+        "FROM rust:latest\nWORKDIR /app\nCOPY . .\nRUN cargo build --release\n",
+    )
+    .expect("dockerfile");
+
+    fs::create_dir_all(workspace.path().join("k8s")).expect("k8s dir");
+    fs::write(
+        workspace.path().join("k8s/deployment.yaml"),
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n      containers:\n      - name: app\n        image: example/app:1\n",
+    )
+    .expect("k8s manifest");
+
+    fs::write(
+        workspace.path().join("main.tf"),
+        "terraform { required_version = \">= 1.5.0\" }\n",
+    )
+    .expect("terraform");
+
+    fs::create_dir_all(workspace.path().join(".deepseek")).expect("runtime dir");
+    fs::write(
+        workspace.path().join(".deepseek/sso.json"),
+        "{\"provider\":\"okta\",\"oauth2\":true}\n",
+    )
+    .expect("sso config");
+
+    let _ = run_json(
+        workspace.path(),
+        &["--json", "ask", "seed enterprise audit events"],
+    );
+
+    let payload = run_json_with_env(
+        workspace.path(),
+        &["--json", "leadership", "--audit-window-hours", "72"],
+        &[("JIRA_API_TOKEN", "token"), ("SLACK_BOT_TOKEN", "token")],
+    );
+    assert_eq!(payload["enterprise"]["sso"]["configured"], true);
+    assert_eq!(payload["ecosystem"]["coverage"]["scm"], true);
+    assert_eq!(payload["ecosystem"]["coverage"]["work_tracking"], true);
+    assert_eq!(payload["ecosystem"]["coverage"]["collaboration"], true);
+    assert_eq!(payload["deployment"]["coverage"]["ci"], true);
+    assert_eq!(payload["deployment"]["coverage"]["container"], true);
+    assert_eq!(payload["deployment"]["coverage"]["kubernetes"], true);
+    assert_eq!(payload["deployment"]["coverage"]["cloud"], true);
+    assert!(payload["readiness"]["score"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[test]

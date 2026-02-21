@@ -2,8 +2,11 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use deepseek_core::EventKind;
 use deepseek_store::{RemoteEnvProfileRecord, Store};
+use reqwest::Url;
+use reqwest::blocking::Client;
 use serde_json::json;
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::RemoteEnvCmd;
@@ -85,12 +88,17 @@ pub(crate) fn remote_env_now(cwd: &Path, cmd: RemoteEnvCmd) -> Result<serde_json
             let profile = store
                 .load_remote_env_profile(profile_id)?
                 .ok_or_else(|| anyhow!("remote profile not found: {}", profile_id))?;
+            let health = check_remote_endpoint(&profile.endpoint);
             Ok(json!({
                 "profile_id": profile.profile_id,
                 "name": profile.name,
                 "endpoint": profile.endpoint,
                 "auth_mode": profile.auth_mode,
-                "reachable": true,
+                "reachable": health.reachable,
+                "latency_ms": health.latency_ms,
+                "status_code": health.status_code,
+                "checked_url": health.checked_url,
+                "error": health.error,
             }))
         }
     }
@@ -124,4 +132,93 @@ pub(crate) fn run_remote_env(cwd: &Path, cmd: RemoteEnvCmd, json_mode: bool) -> 
         println!("{}", serde_json::to_string_pretty(&payload)?);
     }
     Ok(())
+}
+
+struct HealthCheckResult {
+    reachable: bool,
+    latency_ms: Option<u128>,
+    status_code: Option<u16>,
+    checked_url: String,
+    error: Option<String>,
+}
+
+fn check_remote_endpoint(endpoint: &str) -> HealthCheckResult {
+    let parsed = match Url::parse(endpoint) {
+        Ok(url) => url,
+        Err(err) => {
+            return HealthCheckResult {
+                reachable: false,
+                latency_ms: None,
+                status_code: None,
+                checked_url: endpoint.to_string(),
+                error: Some(format!("invalid endpoint URL: {err}")),
+            };
+        }
+    };
+
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::limited(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return HealthCheckResult {
+                reachable: false,
+                latency_ms: None,
+                status_code: None,
+                checked_url: endpoint.to_string(),
+                error: Some(format!("failed to initialize HTTP client: {err}")),
+            };
+        }
+    };
+
+    let mut candidates = vec![parsed.to_string()];
+    if parsed.path() == "/" {
+        for suffix in ["/health", "/status", "/ping"] {
+            if let Ok(candidate) = parsed.join(suffix) {
+                candidates.push(candidate.to_string());
+            }
+        }
+    }
+
+    for candidate in candidates {
+        let started = std::time::Instant::now();
+        let response = client
+            .head(&candidate)
+            .send()
+            .or_else(|_| client.get(&candidate).send());
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                return HealthCheckResult {
+                    reachable: status.is_success() || status.is_redirection(),
+                    latency_ms: Some(started.elapsed().as_millis()),
+                    status_code: Some(status.as_u16()),
+                    checked_url: candidate,
+                    error: None,
+                };
+            }
+            Err(err) => {
+                if candidate == endpoint {
+                    continue;
+                }
+                return HealthCheckResult {
+                    reachable: false,
+                    latency_ms: Some(started.elapsed().as_millis()),
+                    status_code: None,
+                    checked_url: candidate,
+                    error: Some(err.to_string()),
+                };
+            }
+        }
+    }
+
+    HealthCheckResult {
+        reachable: false,
+        latency_ms: None,
+        status_code: None,
+        checked_url: endpoint.to_string(),
+        error: Some("all endpoint probes failed".to_string()),
+    }
 }

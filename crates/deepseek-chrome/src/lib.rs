@@ -25,6 +25,10 @@ pub struct ChromeSession {
     connected: bool,
     /// WebSocket debugger URL for the active target, when discoverable
     ws_debug_url: Option<String>,
+    /// Keep deterministic stub fallbacks for offline callers/tests.
+    allow_stub_fallback: bool,
+    /// Last connection probe error for diagnostics.
+    last_connection_error: Option<String>,
     /// HTTP client used for discovery endpoints
     http_client: Client,
 }
@@ -70,6 +74,32 @@ pub struct ConsoleEntry {
     pub timestamp: Option<f64>,
 }
 
+/// Browser target returned by Chrome's `/json/list` and `/json/new` endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChromeTarget {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    #[serde(rename = "type")]
+    pub target_type: String,
+    pub ws_debug_url: Option<String>,
+}
+
+/// Connection probe result with recovery metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChromeConnectionStatus {
+    pub connected: bool,
+    pub debug_url: String,
+    pub ws_debug_url: Option<String>,
+    pub target_count: usize,
+    pub page_target_count: usize,
+    pub stub_fallback_active: bool,
+    pub recovered: bool,
+    pub created_tab: bool,
+    pub failure_kind: Option<String>,
+    pub failure_message: Option<String>,
+}
+
 impl ChromeSession {
     /// Create a new Chrome session connecting to the given debugging port.
     pub fn new(port: u16) -> Result<Self> {
@@ -80,14 +110,140 @@ impl ChromeSession {
             next_id: AtomicU64::new(1),
             connected: false,
             ws_debug_url: None,
+            allow_stub_fallback: true,
+            last_connection_error: None,
             http_client,
         })
     }
 
+    /// Enable/disable deterministic stub fallbacks when no live target is available.
+    pub fn set_allow_stub_fallback(&mut self, allow: bool) {
+        self.allow_stub_fallback = allow;
+    }
+
+    /// Whether this session currently allows deterministic offline fallbacks.
+    pub fn allow_stub_fallback(&self) -> bool {
+        self.allow_stub_fallback
+    }
+
     /// Check if Chrome is accessible on the debugging port.
     pub fn check_connection(&mut self) -> Result<bool> {
-        self.ws_debug_url = self.discover_websocket_debug_url().ok().flatten();
-        self.connected = true;
+        self.last_connection_error = None;
+        match self.discover_websocket_debug_url() {
+            Ok(ws_url) => {
+                self.ws_debug_url = ws_url;
+                if self.ws_debug_url.is_none() {
+                    self.last_connection_error =
+                        Some("no debuggable page target available".to_string());
+                }
+            }
+            Err(err) => {
+                self.ws_debug_url = None;
+                self.last_connection_error = Some(err.to_string());
+            }
+        }
+        self.connected = self.ws_debug_url.is_some() || self.allow_stub_fallback;
+        Ok(self.connected)
+    }
+
+    /// Return live connection diagnostics for status UIs.
+    pub fn connection_status(&mut self) -> Result<ChromeConnectionStatus> {
+        self.check_connection()?;
+        let targets = self.list_tabs().unwrap_or_default();
+        let page_target_count = targets
+            .iter()
+            .filter(|target| target.target_type == "page")
+            .count();
+        Ok(self.build_connection_status(targets.len(), page_target_count, false, false))
+    }
+
+    /// Reconnect and optionally create a recovery tab when none are available.
+    pub fn reconnect(&mut self, create_tab_if_missing: bool) -> Result<ChromeConnectionStatus> {
+        let connected_before = self.check_connection()?;
+        let mut created_tab = false;
+        if create_tab_if_missing && self.ws_debug_url.is_none() {
+            if self.create_tab("about:blank").is_ok() {
+                created_tab = true;
+            }
+        }
+        self.check_connection()?;
+        let targets = self.list_tabs().unwrap_or_default();
+        let page_target_count = targets
+            .iter()
+            .filter(|target| target.target_type == "page")
+            .count();
+        let connected_after = self.connected && self.ws_debug_url.is_some();
+        Ok(self.build_connection_status(
+            targets.len(),
+            page_target_count,
+            !connected_before && connected_after,
+            created_tab,
+        ))
+    }
+
+    /// Ensure a live websocket target is available, attempting lightweight recovery once.
+    pub fn ensure_live_connection(&mut self) -> Result<()> {
+        let status = self.reconnect(true)?;
+        if status.connected && status.ws_debug_url.is_some() {
+            return Ok(());
+        }
+        let kind = status
+            .failure_kind
+            .unwrap_or_else(|| "connection_failed".to_string());
+        let message = status
+            .failure_message
+            .unwrap_or_else(|| "chrome remote debugging endpoint is unavailable".to_string());
+        Err(anyhow!("{kind}: {message}"))
+    }
+
+    /// List current browser targets from `/json/list`.
+    pub fn list_tabs(&self) -> Result<Vec<ChromeTarget>> {
+        let list_url = format!("{}/json/list", self.debug_url);
+        let response = self.http_client.get(&list_url).send()?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "chrome target list request failed: HTTP {}",
+                response.status()
+            ));
+        }
+        let body: Value = response.json()?;
+        let targets = body
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid /json/list response"))?
+            .iter()
+            .map(Self::target_from_value)
+            .collect::<Vec<_>>();
+        Ok(targets)
+    }
+
+    /// Create a new browser tab.
+    pub fn create_tab(&self, url: &str) -> Result<ChromeTarget> {
+        let encoded_url = url.replace(' ', "%20");
+        let endpoint = format!("{}/json/new?{}", self.debug_url, encoded_url);
+        let response = match self.http_client.put(&endpoint).send() {
+            Ok(response) => response,
+            Err(_) => self.http_client.get(&endpoint).send()?,
+        };
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "chrome tab creation failed: HTTP {}",
+                response.status()
+            ));
+        }
+        let body: Value = response.json()?;
+        Ok(Self::target_from_value(&body))
+    }
+
+    /// Focus an existing tab target.
+    pub fn activate_tab(&self, target_id: &str) -> Result<bool> {
+        let endpoint = format!("{}/json/activate/{target_id}", self.debug_url);
+        let response = self.http_client.get(&endpoint).send()?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "chrome tab activation failed: HTTP {}",
+                response.status()
+            ));
+        }
         Ok(true)
     }
 
@@ -107,25 +263,97 @@ impl ChromeSession {
             }
         }
 
-        let list_url = format!("{}/json/list", self.debug_url);
-        let resp = self.http_client.get(&list_url).send()?;
-        if !resp.status().is_success() {
-            return Ok(None);
-        }
-        let body: Value = resp.json()?;
-        for target in body.as_array().into_iter().flatten() {
-            let is_page = target
-                .get("type")
-                .and_then(|v| v.as_str())
-                .is_none_or(|kind| kind == "page");
+        let targets = self.list_tabs()?;
+        for target in targets {
+            let is_page = target.target_type.is_empty() || target.target_type == "page";
             if !is_page {
                 continue;
             }
-            if let Some(ws) = target.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
-                return Ok(Some(ws.to_string()));
+            if let Some(ws) = target.ws_debug_url {
+                return Ok(Some(ws));
             }
         }
         Ok(None)
+    }
+
+    fn target_from_value(value: &Value) -> ChromeTarget {
+        ChromeTarget {
+            id: value
+                .get("id")
+                .or_else(|| value.get("targetId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            title: value
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            url: value
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            target_type: value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("page")
+                .to_string(),
+            ws_debug_url: value
+                .get("webSocketDebuggerUrl")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+        }
+    }
+
+    fn build_connection_status(
+        &self,
+        target_count: usize,
+        page_target_count: usize,
+        recovered: bool,
+        created_tab: bool,
+    ) -> ChromeConnectionStatus {
+        let failure_kind = if self.ws_debug_url.is_some() {
+            None
+        } else if self
+            .last_connection_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("Connection refused"))
+        {
+            Some("endpoint_unreachable".to_string())
+        } else if self
+            .last_connection_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("timed out"))
+        {
+            Some("endpoint_timeout".to_string())
+        } else if page_target_count == 0 {
+            Some("no_page_targets".to_string())
+        } else {
+            Some("connection_error".to_string())
+        };
+
+        ChromeConnectionStatus {
+            connected: self.ws_debug_url.is_some(),
+            debug_url: self.debug_url.clone(),
+            ws_debug_url: self.ws_debug_url.clone(),
+            target_count,
+            page_target_count,
+            stub_fallback_active: self.allow_stub_fallback && self.ws_debug_url.is_none(),
+            recovered,
+            created_tab,
+            failure_kind,
+            failure_message: self.last_connection_error.clone(),
+        }
+    }
+
+    fn require_live_or_stub(&self, action: &str) -> Result<()> {
+        if self.ws_debug_url.is_some() || self.allow_stub_fallback {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "live chrome websocket endpoint unavailable for {action}"
+        ))
     }
 
     fn send_cdp_command(&self, method: &str, params: Value) -> Result<CdpResult> {
@@ -211,6 +439,7 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        self.require_live_or_stub("navigate")?;
         if self.ws_debug_url.is_some() {
             let _ = self.send_cdp_command("Page.enable", json!({}));
             return self.send_cdp_command("Page.navigate", json!({ "url": url }));
@@ -232,6 +461,7 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        self.require_live_or_stub("click")?;
         if self.ws_debug_url.is_some() {
             let selector_json = serde_json::to_string(selector)?;
             let expression = format!(
@@ -270,6 +500,7 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        self.require_live_or_stub("type_text")?;
         if self.ws_debug_url.is_some() {
             let selector_json = serde_json::to_string(selector)?;
             let text_json = serde_json::to_string(text)?;
@@ -311,6 +542,7 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        self.require_live_or_stub("screenshot")?;
         if self.ws_debug_url.is_some() {
             let _ = self.send_cdp_command("Page.enable", json!({}));
             let result = self.send_cdp_command(
@@ -341,6 +573,7 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        self.require_live_or_stub("read_console")?;
         if self.ws_debug_url.is_some() {
             let script = r#"(() => {
   if (!globalThis.__deepseekConsoleBuffer) {
@@ -395,6 +628,7 @@ impl ChromeSession {
         if !self.connected {
             return Err(anyhow!("not connected to Chrome"));
         }
+        self.require_live_or_stub("evaluate")?;
         if self.ws_debug_url.is_some() {
             let result = self.evaluate_runtime(expression)?;
             if let Some(error) = result.error {
@@ -509,5 +743,45 @@ mod tests {
         assert!(json.contains("42"));
         let parsed: CdpResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, 42);
+    }
+
+    #[test]
+    fn strict_mode_requires_live_websocket() {
+        let mut session = ChromeSession::new(9).unwrap();
+        session.set_allow_stub_fallback(false);
+        let connected = session.check_connection().unwrap();
+        assert!(!connected);
+        let err = session
+            .navigate("https://example.com")
+            .expect_err("strict mode should reject stub navigation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("live chrome websocket endpoint unavailable")
+                || msg.contains("not connected to Chrome")
+        );
+    }
+
+    #[test]
+    fn connection_status_exposes_failure_taxonomy() {
+        let mut session = ChromeSession::new(9).unwrap();
+        session.set_allow_stub_fallback(false);
+        let status = session.connection_status().unwrap();
+        assert!(!status.connected);
+        assert!(status.failure_kind.is_some());
+        assert!(status.failure_message.is_some());
+    }
+
+    #[test]
+    fn target_from_value_maps_expected_fields() {
+        let target = ChromeSession::target_from_value(&json!({
+            "id": "abc123",
+            "title": "Example",
+            "url": "https://example.com",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/abc123"
+        }));
+        assert_eq!(target.id, "abc123");
+        assert_eq!(target.target_type, "page");
+        assert!(target.ws_debug_url.is_some());
     }
 }

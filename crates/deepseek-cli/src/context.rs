@@ -118,8 +118,17 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
             },
         )
     };
+    let force_max_think = cli
+        .model
+        .as_deref()
+        .map(|model| {
+            let lower = model.to_ascii_lowercase();
+            lower.contains("reasoner") || lower.contains("max") || lower.contains("high")
+        })
+        .unwrap_or(false);
     ChatOptions {
         tools,
+        force_max_think,
         allowed_tools: effective_allowed,
         disallowed_tools: effective_disallowed,
         system_prompt_override: sys_override,

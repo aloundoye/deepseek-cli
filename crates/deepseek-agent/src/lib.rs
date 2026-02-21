@@ -44,6 +44,8 @@ type SubagentWorkerFn =
 pub struct ChatOptions {
     /// Whether to include tool definitions and allow tool execution.
     pub tools: bool,
+    /// Force max-think routing for this chat turn sequence.
+    pub force_max_think: bool,
     /// If set, only these tool function names are sent to the LLM.
     pub allowed_tools: Option<Vec<String>>,
     /// If set, these tool function names are removed before sending to the LLM.
@@ -447,6 +449,26 @@ impl AgentEngine {
             decision.escalated = true;
             decision.confidence = decision.confidence.max(0.95);
             decision.score = decision.score.max(self.cfg.router.threshold_high);
+        } else if self.cfg.router.auto_max_think
+            && !decision
+                .selected_model
+                .eq_ignore_ascii_case(&self.cfg.llm.max_think_model)
+        {
+            // Planner is the orchestrator in the hybrid strategy, so default it to reasoner
+            // unless explicitly disabled.
+            if !decision
+                .reason_codes
+                .iter()
+                .any(|r| r == "planner_default_reasoner")
+            {
+                decision
+                    .reason_codes
+                    .push("planner_default_reasoner".to_string());
+            }
+            decision.selected_model = self.cfg.llm.max_think_model.clone();
+            decision.escalated = true;
+            decision.confidence = decision.confidence.max(0.9);
+            decision.score = decision.score.max(self.cfg.router.threshold_high);
         }
         self.emit(
             session.session_id,
@@ -482,11 +504,17 @@ impl AgentEngine {
             estimate_tokens(&llm_response.text),
         )?;
         let mut plan = parse_plan_from_llm(&llm_response.text, prompt);
+        let mut planner_escalations: u8 = u8::from(
+            decision
+                .selected_model
+                .eq_ignore_ascii_case(&self.cfg.llm.max_think_model),
+        );
         if plan.is_none()
             && self.cfg.router.auto_max_think
+            && self.cfg.router.escalate_on_invalid_plan
             && self
                 .router
-                .should_escalate_retry(&LlmUnit::Planner, true, 0)
+                .should_escalate_retry(&LlmUnit::Planner, true, planner_escalations)
         {
             self.emit(
                 session.session_id,
@@ -519,12 +547,13 @@ impl AgentEngine {
                 estimate_tokens(prompt),
                 estimate_tokens(&retry.text),
             )?;
+            planner_escalations = planner_escalations.saturating_add(1);
             plan = parse_plan_from_llm(&retry.text, prompt);
         }
         let objective_outcomes = self
             .load_matching_objective_outcomes(prompt, 6)
             .unwrap_or_default();
-        let quality_retry_budget = self.cfg.router.max_escalations_per_unit.max(1) as usize;
+        let quality_retry_budget = self.cfg.router.max_escalations_per_unit as usize;
         let mut quality_attempt = 0usize;
         let mut quality_repairs = Vec::new();
         while let Some(candidate) = plan.clone() {
@@ -541,22 +570,34 @@ impl AgentEngine {
                 break;
             }
             quality_attempt += 1;
-            self.emit(
-                session.session_id,
-                EventKind::RouterEscalationV1 {
-                    reason_codes: vec![
-                        "plan_quality_retry".to_string(),
-                        format!("quality_score_{:.2}", report.score),
-                    ],
-                },
-            )?;
+            let use_max_think = self.cfg.router.auto_max_think
+                && self
+                    .router
+                    .should_escalate_retry(&LlmUnit::Planner, true, planner_escalations);
+            if use_max_think {
+                self.emit(
+                    session.session_id,
+                    EventKind::RouterEscalationV1 {
+                        reason_codes: vec![
+                            "plan_quality_retry".to_string(),
+                            format!("quality_score_{:.2}", report.score),
+                        ],
+                    },
+                )?;
+            }
+            let repair_model = if use_max_think {
+                planner_escalations = planner_escalations.saturating_add(1);
+                self.cfg.llm.max_think_model.clone()
+            } else {
+                decision.selected_model.clone()
+            };
             let repair_prompt = build_plan_quality_repair_prompt(prompt, &candidate, &report);
             let repaired = self.complete_with_cache(
                 session.session_id,
                 &LlmRequest {
                     unit: LlmUnit::Planner,
                     prompt: repair_prompt.clone(),
-                    model: self.cfg.llm.max_think_model.clone(),
+                    model: repair_model.clone(),
                     max_tokens: session.budgets.max_think_tokens,
                     non_urgent,
                     images: vec![],
@@ -566,7 +607,7 @@ impl AgentEngine {
                 session.session_id,
                 EventKind::UsageUpdatedV1 {
                     unit: LlmUnit::Planner,
-                    model: self.cfg.llm.max_think_model.clone(),
+                    model: repair_model.clone(),
                     input_tokens: estimate_tokens(&repair_prompt),
                     output_tokens: estimate_tokens(&repaired.text),
                 },
@@ -597,15 +638,27 @@ impl AgentEngine {
                 break;
             }
             feedback_attempt += 1;
-            self.emit(
-                session.session_id,
-                EventKind::RouterEscalationV1 {
-                    reason_codes: vec![
-                        "plan_feedback_retry".to_string(),
-                        format!("feedback_score_{:.2}", report.score),
-                    ],
-                },
-            )?;
+            let use_max_think = self.cfg.router.auto_max_think
+                && self
+                    .router
+                    .should_escalate_retry(&LlmUnit::Planner, true, planner_escalations);
+            if use_max_think {
+                self.emit(
+                    session.session_id,
+                    EventKind::RouterEscalationV1 {
+                        reason_codes: vec![
+                            "plan_feedback_retry".to_string(),
+                            format!("feedback_score_{:.2}", report.score),
+                        ],
+                    },
+                )?;
+            }
+            let repair_model = if use_max_think {
+                planner_escalations = planner_escalations.saturating_add(1);
+                self.cfg.llm.max_think_model.clone()
+            } else {
+                decision.selected_model.clone()
+            };
             let repair_prompt = build_verification_feedback_repair_prompt(
                 prompt,
                 &candidate,
@@ -617,7 +670,7 @@ impl AgentEngine {
                 &LlmRequest {
                     unit: LlmUnit::Planner,
                     prompt: repair_prompt.clone(),
-                    model: self.cfg.llm.max_think_model.clone(),
+                    model: repair_model.clone(),
                     max_tokens: session.budgets.max_think_tokens,
                     non_urgent,
                     images: vec![],
@@ -627,7 +680,7 @@ impl AgentEngine {
                 session.session_id,
                 EventKind::UsageUpdatedV1 {
                     unit: LlmUnit::Planner,
-                    model: self.cfg.llm.max_think_model.clone(),
+                    model: repair_model.clone(),
                     input_tokens: estimate_tokens(&repair_prompt),
                     output_tokens: estimate_tokens(&repaired.text),
                 },
@@ -1426,7 +1479,26 @@ impl AgentEngine {
                 low_confidence: if empty_response_count > 0 { 0.6 } else { 0.2 },
                 ambiguity_flags: ambiguity,
             };
-            let decision = self.router.select(LlmUnit::Executor, signals);
+            let mut decision = self.router.select(LlmUnit::Executor, signals);
+            if options.force_max_think
+                && !decision
+                    .selected_model
+                    .eq_ignore_ascii_case(&self.cfg.llm.max_think_model)
+            {
+                if !decision
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "user_force_max_think")
+                {
+                    decision
+                        .reason_codes
+                        .push("user_force_max_think".to_string());
+                }
+                decision.selected_model = self.cfg.llm.max_think_model.clone();
+                decision.escalated = true;
+                decision.confidence = decision.confidence.max(0.95);
+                decision.score = decision.score.max(self.cfg.router.threshold_high);
+            }
             self.emit(
                 session.session_id,
                 EventKind::RouterDecisionV1 {
@@ -1455,6 +1527,7 @@ impl AgentEngine {
             ));
 
             // Call the LLM with streaming (clone the Arc so it persists across turns)
+            let mut response_model = decision.selected_model.clone();
             let response = {
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
                 if let Some(cb) = cb {
@@ -1466,32 +1539,36 @@ impl AgentEngine {
 
             // Escalation retry: if base model returned empty response and we weren't
             // already using the reasoner, retry with the max_think model once.
-            let response =
-                if response.text.is_empty() && response.tool_calls.is_empty() && turn_count <= 1 {
-                    let max_model = &self.cfg.llm.max_think_model;
-                    if decision.selected_model != *max_model {
-                        self.emit(
-                            session.session_id,
-                            EventKind::RouterEscalationV1 {
-                                reason_codes: vec!["empty_response_escalation".to_string()],
-                            },
-                        )?;
-                        let escalated_request = ChatRequest {
-                            model: max_model.clone(),
-                            ..request
-                        };
-                        let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
-                        if let Some(cb) = cb {
-                            self.llm.complete_chat_streaming(&escalated_request, cb)?
-                        } else {
-                            self.llm.complete_chat(&escalated_request)?
-                        }
+            let response = if response.text.is_empty()
+                && response.tool_calls.is_empty()
+                && turn_count <= 1
+                && self.cfg.router.auto_max_think
+            {
+                let max_model = &self.cfg.llm.max_think_model;
+                if decision.selected_model != *max_model {
+                    self.emit(
+                        session.session_id,
+                        EventKind::RouterEscalationV1 {
+                            reason_codes: vec!["empty_response_escalation".to_string()],
+                        },
+                    )?;
+                    response_model = max_model.clone();
+                    let escalated_request = ChatRequest {
+                        model: max_model.clone(),
+                        ..request
+                    };
+                    let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                    if let Some(cb) = cb {
+                        self.llm.complete_chat_streaming(&escalated_request, cb)?
                     } else {
-                        response
+                        self.llm.complete_chat(&escalated_request)?
                     }
                 } else {
                     response
-                };
+                }
+            } else {
+                response
+            };
 
             // Record usage metrics
             let input_tok = estimate_tokens(
@@ -1513,7 +1590,7 @@ impl AgentEngine {
                 session.session_id,
                 EventKind::UsageUpdatedV1 {
                     unit: LlmUnit::Executor,
-                    model: decision.selected_model.clone(),
+                    model: response_model,
                     input_tokens: input_tok,
                     output_tokens: output_tok,
                 },
@@ -2586,7 +2663,11 @@ impl AgentEngine {
                 ambiguity_flags: 0.4,
             },
         );
+        let revision_retry_index = failure_streak.saturating_sub(1).min(u32::from(u8::MAX)) as u8;
         if self.cfg.router.auto_max_think
+            && self
+                .router
+                .should_escalate_retry(&LlmUnit::Planner, true, revision_retry_index)
             && !decision
                 .selected_model
                 .eq_ignore_ascii_case(&self.cfg.llm.max_think_model)
@@ -8383,6 +8464,82 @@ mod tests {
         assert!(
             answer.contains("Hello from mock") || answer.contains("Mock response"),
             "unexpected answer: {answer}"
+        );
+    }
+
+    #[test]
+    fn chat_force_max_think_uses_reasoner_model() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "Forced max-think response".into(),
+        ));
+        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let result = engine.chat_with_options(
+            "explain this deeply",
+            ChatOptions {
+                tools: false,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let store = Store::new(dir.path()).expect("store");
+        let session = store
+            .load_latest_session()
+            .expect("load session")
+            .expect("session");
+        let projection = store
+            .rebuild_from_events(session.session_id)
+            .expect("projection");
+        assert!(
+            projection
+                .router_models
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case("deepseek-reasoner")),
+            "expected reasoner routing decision, got {:?}",
+            projection.router_models
+        );
+    }
+
+    #[test]
+    fn plan_only_defaults_to_reasoner_in_hybrid_mode() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            r#"{
+              "goal": "test goal",
+              "assumptions": [],
+              "steps": [
+                {
+                  "title": "Inspect workspace",
+                  "intent": "search",
+                  "tools": ["fs.grep"],
+                  "files": []
+                }
+              ],
+              "verification": [],
+              "risk_notes": []
+            }"#
+            .to_string(),
+        ));
+        let engine = AgentEngine::new(dir.path()).expect("engine");
+        let _plan = engine.plan_only("build a plan").expect("plan");
+
+        let store = Store::new(dir.path()).expect("store");
+        let session = store
+            .load_latest_session()
+            .expect("load session")
+            .expect("session");
+        let projection = store
+            .rebuild_from_events(session.session_id)
+            .expect("projection");
+        assert!(
+            projection
+                .router_models
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case("deepseek-reasoner")),
+            "expected planner to default to reasoner, got {:?}",
+            projection.router_models
         );
     }
 

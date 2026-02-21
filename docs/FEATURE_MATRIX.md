@@ -2,7 +2,7 @@
 
 **Audit Date:** 2026-02-19
 **Spec Reference:** `specs.md` (RFC: DeepSeek CLI Agent in Rust)
-**Status:** All spec items implemented. Zero open gaps.
+**Status:** High implementation coverage with active parity work. See `missing.md` section 10 for concrete open gaps.
 
 ---
 
@@ -426,6 +426,9 @@
 | -- | JSON-RPC 2.0 server crate | DONE | `crates/deepseek-jsonrpc/src/lib.rs` -- `JsonRpcRequest`, `JsonRpcResponse`, `JsonRpcError`, `RpcHandler` trait, `run_stdio_server()` | `jsonrpc_request_round_trip`, `parse_error_returns_code_32700` | `cargo test -p deepseek-jsonrpc` | Newline-delimited JSON over stdio |
 | -- | `deepseek serve` command | DONE | `crates/deepseek-cli/src/main.rs` -- `Serve(ServeArgs)` with `--transport` flag | `serve_command_exists` | `cargo run --bin deepseek -- serve --help` | Foundation for VS Code/JetBrains extensions |
 | -- | Default RPC handler | DONE | `crates/deepseek-jsonrpc/src/lib.rs` -- `DefaultRpcHandler` supports `initialize`, `status`, `cancel`, `shutdown` | `default_handler_*` tests | `cargo test -p deepseek-jsonrpc` | Extensible via `RpcHandler` trait |
+| -- | Remote resume + handoff methods | DONE | `crates/deepseek-jsonrpc/src/lib.rs` -- `session/remote_resume`, `session/handoff_export`, `session/handoff_import` | `ide_handler_handoff_export_import_remote_resume` | `cargo test -p deepseek-jsonrpc` | Enables IDE/cloud handoff + resume workflow |
+| -- | JSON-RPC event polling | DONE | `crates/deepseek-jsonrpc/src/lib.rs` -- `events/poll` for incremental event fetch by `after_seq` cursor | `ide_handler_events_poll_returns_rows` | `cargo test -p deepseek-jsonrpc` | Session event transport for IDE timeline sync |
+| -- | Optional partial-message streaming path | DONE | `crates/deepseek-jsonrpc/src/lib.rs` -- `prompt/stream_next` + `prompt/execute include_partial_messages`; respects `DEEPSEEK_INCLUDE_PARTIAL_MESSAGES` default | `ide_handler_prompt_partial_stream` | `cargo test -p deepseek-jsonrpc` | Cursor-based partial chunk polling for IDE UIs |
 | -- | `IdeSessionStartedV1` event | DONE | `crates/deepseek-core/src/lib.rs` -- `EventKind::IdeSessionStartedV1 { transport, client_info }` | Event serialization tests | `cargo test -p deepseek-core` | Logged when IDE connects |
 
 ### 28. Supply-Chain Security
@@ -525,13 +528,16 @@
 
 | Spec Section | Feature | Status | Implementation | Tests | Verification Command | Notes |
 |---|---|---|---|---|---|---|
-| -- | `deepseek-chrome` crate | DONE | `crates/deepseek-chrome/src/lib.rs` -- `ChromeSession` with CDP WebSocket protocol | `chrome_*` tests (10) | `cargo test -p deepseek-chrome` | **New crate**; deps: anyhow, serde, serde_json, base64 |
+| -- | `deepseek-chrome` crate | DONE | `crates/deepseek-chrome/src/lib.rs` -- `ChromeSession` with CDP WebSocket protocol | `chrome_*` tests (13) | `cargo test -p deepseek-chrome` | **New crate**; deps: anyhow, serde, serde_json, base64 |
 | -- | `ChromeSession::navigate()` | DONE | `crates/deepseek-chrome/src/lib.rs` -- CDP `Page.navigate` | `chrome_navigate_*` tests | `cargo test -p deepseek-chrome` | URL navigation |
 | -- | `ChromeSession::click()` | DONE | `crates/deepseek-chrome/src/lib.rs` -- CDP DOM + Input dispatch | `chrome_click_*` tests | `cargo test -p deepseek-chrome` | CSS selector-based clicking |
 | -- | `ChromeSession::type_text()` | DONE | `crates/deepseek-chrome/src/lib.rs` -- CDP Input.dispatchKeyEvent | `chrome_type_*` tests | `cargo test -p deepseek-chrome` | Text input to elements |
 | -- | `ChromeSession::screenshot()` | DONE | `crates/deepseek-chrome/src/lib.rs` -- CDP `Page.captureScreenshot` | `chrome_screenshot_*` tests | `cargo test -p deepseek-chrome` | Returns base64 PNG; supports JPEG/WebP formats |
 | -- | `ChromeSession::read_console()` | DONE | `crates/deepseek-chrome/src/lib.rs` -- CDP Runtime console events | `chrome_console_*` tests | `cargo test -p deepseek-chrome` | Console log/warn/error capture |
 | -- | `ChromeSession::evaluate()` | DONE | `crates/deepseek-chrome/src/lib.rs` -- CDP `Runtime.evaluate` | `chrome_eval_*` tests | `cargo test -p deepseek-chrome` | JavaScript expression evaluation |
+| -- | Live connection diagnostics + recovery | DONE | `crates/deepseek-chrome/src/lib.rs` -- `connection_status()`, `reconnect()`, `ensure_live_connection()`, `ChromeConnectionStatus` | `strict_mode_requires_live_websocket`, `connection_status_exposes_failure_taxonomy` | `cargo test -p deepseek-chrome` | Reports endpoint/page-target failures and recovery metadata |
+| -- | Tab lifecycle APIs | DONE | `crates/deepseek-chrome/src/lib.rs` -- `list_tabs()`, `create_tab()`, `activate_tab()` | `target_from_value_maps_expected_fields` | `cargo test -p deepseek-chrome` | Supports tab list/create/focus flows for resilient sessions |
+| -- | Strict `/chrome` command path | DONE | `crates/deepseek-cli/src/commands/chat.rs` -- `/chrome` now runs with `set_allow_stub_fallback(false)` and structured `error.kind` taxonomy | CLI integration suite (build/runtime coverage) | `cargo test -p deepseek-cli --test cli_json` | Adds `tabs`, `tab new`, `tab focus`, `click`, `type`, `evaluate`, richer reconnect/status |
 
 ### 37. Agent Teams
 
@@ -546,7 +552,7 @@
 
 | Spec Section | Feature | Status | Implementation | Tests | Verification Command | Notes |
 |---|---|---|---|---|---|---|
-| 7.1 | Unit tests per crate | DONE | All 20 crates have `#[cfg(test)] mod tests` | 214 test functions across 21 test suites | `cargo test --workspace --all-targets` | Isolated crate testing |
+| 7.1 | Unit tests per crate | DONE | All 20 crates have `#[cfg(test)] mod tests` | 200+ test functions across 21 test suites | `cargo test --workspace --all-targets` | Isolated crate testing |
 | 7.2 | Deterministic replay harness | DONE | `crates/deepseek-testkit/src/lib.rs` -- replay from cassettes, fake LLM, golden tests | `replay_*` tests | `cargo test -p deepseek-testkit` | `ReplayExecutedV1` event; `replay.strict_mode` config |
 | 7.3 | Property-based tests (proptest) | DONE | `crates/deepseek-core/src/lib.rs` -- proptest for state machine invariants and config merging | Proptest tests | `cargo test -p deepseek-core` | Generates random state transition sequences |
 | 7.4 | Performance benchmarks | DONE | `.github/workflows/performance-gates.yml` -- CI performance gates | CI workflow | Automated in CI | p95 targets for index query and first token |
@@ -582,7 +588,7 @@
 | deepseek-policy | 22 | `cargo test -p deepseek-policy` |
 | deepseek-llm | 20 | `cargo test -p deepseek-llm` |
 | deepseek-ui | 11 | `cargo test -p deepseek-ui` |
-| deepseek-chrome | 10 | `cargo test -p deepseek-chrome` |
+| deepseek-chrome | 13 | `cargo test -p deepseek-chrome` |
 | deepseek-subagent | 9 | `cargo test -p deepseek-subagent` |
 | deepseek-mcp | 7 | `cargo test -p deepseek-mcp` |
 | deepseek-jsonrpc | 6 | `cargo test -p deepseek-jsonrpc` |
@@ -596,7 +602,7 @@
 | deepseek-skills | 1 | `cargo test -p deepseek-skills` |
 | deepseek-router | 1 | `cargo test -p deepseek-router` |
 | deepseek-testkit | 1 | `cargo test -p deepseek-testkit` |
-| **Total** | **214** | `cargo test --workspace --all-targets` |
+| **Total** | **See per-crate rows** | `cargo test --workspace --all-targets` |
 
 ---
 

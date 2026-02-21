@@ -262,9 +262,9 @@
 
 ### Phase 3: Feature Leadership (Months 5-6)
 **Goal:** Surpass Claude Code in key areas
-1. Enterprise features
-2. Ecosystem integration
-3. Production deployment features
+1. ✅ Enterprise features (`leadership` + `doctor` now report SSO/team-policy/managed-settings posture and audit/admin metrics)
+2. ✅ Ecosystem integration (`leadership` detects GitHub/GitLab + Jira/Linear/Asana + Slack/Teams integration signals)
+3. ✅ Production deployment features (`leadership` analyzes CI/CD, container, Kubernetes, and IaC/cloud configuration with risk scoring)
 4. **Deliverable:** Preferred choice for teams/enterprises
 
 ### Phase 4: Innovation (Months 7-12)
@@ -380,6 +380,16 @@ By following this implementation plan, DeepSeek CLI can achieve feature parity w
 
 This section adds concrete, implementation-level parity gaps that were not explicitly tracked above.
 
+### 10.0 Implementation Snapshot (2026-02-21)
+- ✅ 10.1 CLI parity flags, aliases, `update` command, `--setting-sources`, and JSON tests.
+- ✅ 10.2 slash command parity for `/desktop`, `/todos`, `/chrome`; `/add-dir` mutates active context; `/login` + `/logout` perform real local session/settings updates; `remote-env check` performs real HTTP health verification.
+- ✅ 10.3 TUI parity improvements: reverse history search (`Ctrl+R`), `Esc Esc` rewind behavior, ghost-text suggestion + Tab accept, wired mission/artifacts/plan-collapse toggles, PR review status footer badge.
+- ✅ 10.4 Vim depth parity: `iw/aw` and quote/bracket text objects, `ciw/diw/yiw`, `gg`/`G` motions, expanded Vim tests.
+- 🚧 10.5 Chrome parity increment: strict live `/chrome` mode (no silent stubs), reconnect recovery, tab lifecycle commands (`tabs`, `tab new`, `tab focus`), and structured browser failure taxonomy. Native messaging host and recording/export remain.
+- ✅ 10.7 JSON-RPC parity: added `session/remote_resume`, `session/handoff_export`, `session/handoff_import`, `events/poll`, and optional `prompt/stream_next` partial chunk polling path.
+- 🚧 10.6 deeper IDE workflow parity remains multi-iteration work.
+- ✅ 10.8 parity regression checklist added via `scripts/parity_regression_check.sh` and CI integration.
+
 ### 10.1 CLI Flags & Commands Parity
 **Priority:** Critical ⚠️
 
@@ -444,15 +454,15 @@ This section adds concrete, implementation-level parity gaps that were not expli
 **Priority:** High 🔥
 
 #### Tasks:
-1. Add browser extension + native messaging host architecture (not only direct CDP port mode).
-2. Add `/chrome` control flow including reconnect command.
-3. Implement resilient browser session lifecycle:
+1. 🚧 Add browser extension + native messaging host architecture (not only direct CDP port mode).
+2. ✅ Add `/chrome` control flow including reconnect command.
+3. ✅ Implement resilient browser session lifecycle:
    - tab creation/switch/recovery flows
    - stale/idle connection recovery
-4. Remove/replace stub fallback behaviors when live connection is unavailable.
+4. ✅ Remove/replace stub fallback behaviors when live connection is unavailable (slash-command path now requires live endpoint).
 5. Add browser automation extras parity:
-   - recording/export flow (GIF/demo)
-   - clearer failure taxonomy for common browser errors.
+   - 🚧 recording/export flow (GIF/demo)
+   - ✅ clearer failure taxonomy for common browser errors.
 
 ### 10.6 IDE Extension Depth Parity
 **Priority:** High 🔥
@@ -472,9 +482,9 @@ This section adds concrete, implementation-level parity gaps that were not expli
 **Priority:** Medium ⚡
 
 #### Tasks:
-1. Extend JSON-RPC capabilities for remote/cloud session workflows used by IDEs.
-2. Add methods/events needed for desktop handoff and remote resume.
-3. Add optional partial-message streaming support path aligned with `--include-partial-messages`.
+1. ✅ Extend JSON-RPC capabilities for remote/cloud session workflows used by IDEs.
+2. ✅ Add methods/events needed for desktop handoff and remote resume.
+3. ✅ Add optional partial-message streaming support path aligned with `--include-partial-messages`.
 
 ### 10.8 Tracking & Spec Hygiene
 **Priority:** Medium ⚡

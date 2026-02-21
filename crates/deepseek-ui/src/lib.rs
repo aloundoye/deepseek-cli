@@ -92,6 +92,9 @@ pub enum SlashCommand {
     Doctor,
     Copy,
     Debug(Vec<String>),
+    Desktop(Vec<String>),
+    Todos(Vec<String>),
+    Chrome(Vec<String>),
     Exit,
     Hooks(Vec<String>),
     Rename(Option<String>),
@@ -152,6 +155,9 @@ impl SlashCommand {
             "doctor" => Self::Doctor,
             "copy" => Self::Copy,
             "debug" => Self::Debug(args),
+            "desktop" => Self::Desktop(args),
+            "todos" => Self::Todos(args),
+            "chrome" => Self::Chrome(args),
             "exit" | "quit" => Self::Exit,
             "hooks" => Self::Hooks(args),
             "rename" => Self::Rename(args.first().cloned()),
@@ -192,6 +198,8 @@ pub struct UiStatus {
     pub session_turns: usize,
     #[serde(default)]
     pub working_directory: String,
+    #[serde(default)]
+    pub pr_review_status: Option<String>,
 }
 
 fn default_context_max() -> u64 {
@@ -225,8 +233,13 @@ pub fn render_statusline(status: &UiStatus) -> String {
     } else {
         String::new()
     };
+    let review_part = status
+        .pr_review_status
+        .as_deref()
+        .map(|value| format!(" review={value}"))
+        .unwrap_or_default();
     format!(
-        "model={} {} approvals={} jobs={}{} autopilot={}{} cost=${:.4}",
+        "model={} {} approvals={} jobs={}{} autopilot={}{}{} cost=${:.4}",
         status.model,
         mode_indicator,
         status.pending_approvals,
@@ -238,8 +251,19 @@ pub fn render_statusline(status: &UiStatus) -> String {
             "idle"
         },
         ctx_part,
+        review_part,
         status.estimated_cost_usd,
     )
+}
+
+fn review_badge(status: &str) -> (&'static str, Color) {
+    match status {
+        "approved" => (" REVIEW APPROVED ", Color::Green),
+        "changes_requested" => (" REVIEW CHANGES ", Color::Red),
+        "draft" => (" REVIEW DRAFT ", Color::Blue),
+        "merged" => (" REVIEW MERGED ", Color::Cyan),
+        _ => (" REVIEW PENDING ", Color::Yellow),
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +376,18 @@ fn render_statusline_spans(
         spans.push(Span::styled(
             format!(" turn {} ", status.session_turns),
             Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if let Some(review) = status.pr_review_status.as_deref() {
+        let (label, bg) = review_badge(review);
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -1087,11 +1123,31 @@ fn style_continuation_line(
     Line::from(vec![Span::styled(format!("  {text}"), body_style)])
 }
 
+fn is_plan_list_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return true;
+    }
+    let mut saw_digit = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        if saw_digit && ch == '.' {
+            return true;
+        }
+        break;
+    }
+    false
+}
+
 /// Flush new transcript entries above the inline viewport into native terminal scrollback.
 fn flush_transcript_above(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     shell: &ChatShell,
     last_printed_idx: &mut usize,
+    collapse_plan: bool,
 ) -> Result<()> {
     if *last_printed_idx >= shell.transcript.len() {
         return Ok(());
@@ -1102,6 +1158,7 @@ fn flush_transcript_above(
     let mut in_code_block = false;
     let mut in_diff_block = false;
     let mut diff_context_run: Vec<String> = Vec::new();
+    let mut collapsed_plan_lines = 0usize;
     // Scan earlier entries to figure out if we're inside a code block
     for entry in &shell.transcript[..*last_printed_idx] {
         for sub in entry.text.split('\n') {
@@ -1122,6 +1179,14 @@ fn flush_transcript_above(
                 kind: entry.kind,
                 text: sub_text.to_string(),
             };
+            if collapse_plan
+                && sub_entry.kind == MessageKind::Assistant
+                && !in_code_block
+                && is_plan_list_line(&sub_entry.text)
+            {
+                collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
+                continue;
+            }
             let is_fence =
                 sub_entry.kind == MessageKind::Assistant && sub_entry.text.starts_with("```");
             if is_fence
@@ -1177,6 +1242,17 @@ fn flush_transcript_above(
         DIFF_CONTEXT_KEEP_HEAD,
         DIFF_CONTEXT_KEEP_TAIL,
     );
+    if collapsed_plan_lines > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "… {} plan lines hidden (Ctrl+P to expand)",
+                collapsed_plan_lines
+            ),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+    }
     *last_printed_idx = shell.transcript.len();
     if lines.is_empty() {
         return Ok(());
@@ -1202,6 +1278,7 @@ fn flush_streaming_lines(
     buffer: &mut String,
     in_code_block: &mut bool,
     in_diff_block: &mut bool,
+    collapse_plan: bool,
 ) -> Result<()> {
     // Find the last newline — everything before it consists of complete lines.
     let Some(last_nl) = buffer.rfind('\n') else {
@@ -1214,7 +1291,12 @@ fn flush_streaming_lines(
     let lines_text: Vec<&str> = complete.split('\n').collect();
     let mut styled_lines: Vec<Line<'static>> = Vec::with_capacity(lines_text.len());
     let mut diff_context_run: Vec<String> = Vec::new();
+    let mut collapsed_plan_lines = 0usize;
     for line_text in &lines_text {
+        if collapse_plan && !*in_code_block && is_plan_list_line(line_text) {
+            collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
+            continue;
+        }
         let is_fence = line_text.starts_with("```");
         if is_fence || !*in_code_block || !*in_diff_block {
             flush_diff_context_run(
@@ -1266,6 +1348,17 @@ fn flush_streaming_lines(
         DIFF_CONTEXT_KEEP_HEAD,
         DIFF_CONTEXT_KEEP_TAIL,
     );
+    if collapsed_plan_lines > 0 {
+        styled_lines.push(Line::from(vec![Span::styled(
+            format!(
+                "… {} streaming plan lines hidden (Ctrl+P to expand)",
+                collapsed_plan_lines
+            ),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+    }
     if styled_lines.is_empty() {
         return Ok(());
     }
@@ -1453,6 +1546,9 @@ impl ChatShell {
     pub fn push_status_summary(&mut self, status: &UiStatus) {
         self.push_system(format!("Model: {}", status.model));
         self.push_system(format!("Permission mode: {}", status.permission_mode));
+        if let Some(review) = status.pr_review_status.as_deref() {
+            self.push_system(format!("PR review: {}", review));
+        }
         self.push_system(format!("Pending approvals: {}", status.pending_approvals));
         self.push_system(format!("Active tasks: {}", status.active_tasks));
         self.push_system(format!("Background jobs: {}", status.background_jobs));
@@ -1489,6 +1585,7 @@ pub struct KeyBindings {
     pub background: KeyEvent,
     pub toggle_raw: KeyEvent,
     pub history_prev: KeyEvent,
+    pub history_search: KeyEvent,
     pub paste_hint: KeyEvent,
     pub toggle_mission_control: KeyEvent,
     pub toggle_artifacts: KeyEvent,
@@ -1514,6 +1611,7 @@ struct KeyBindingsFile {
     background: Option<String>,
     toggle_raw: Option<String>,
     history_prev: Option<String>,
+    history_search: Option<String>,
     paste_hint: Option<String>,
     toggle_mission_control: Option<String>,
     toggle_artifacts: Option<String>,
@@ -1539,6 +1637,7 @@ impl Default for KeyBindings {
             background: KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             toggle_raw: KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             history_prev: KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            history_search: KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
             paste_hint: KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
             toggle_mission_control: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
             toggle_artifacts: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
@@ -1582,6 +1681,9 @@ impl KeyBindings {
         }
         if let Some(value) = raw.history_prev {
             self.history_prev = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.history_search {
+            self.history_search = parse_key_event(&value)?;
         }
         if let Some(value) = raw.paste_hint {
             self.paste_hint = parse_key_event(&value)?;
@@ -1843,6 +1945,8 @@ where
     let mut vim_visual_anchor: Option<usize> = None;
     let mut vim_yank_buffer = String::new();
     let mut vim_pending_operator: Option<char> = None;
+    let mut vim_pending_text_object: Option<(char, char)> = None;
+    let mut vim_pending_g = false;
     let mut is_processing = false;
     let mut pending_approval: Option<(String, String, mpsc::Sender<bool>)> = None;
     let mut cancelled = false;
@@ -1853,6 +1957,13 @@ where
     let mut streaming_buffer = String::new();
     let mut streaming_in_code_block = false;
     let mut streaming_in_diff_block = false;
+    let mut mission_control_visible = false;
+    let mut artifacts_visible = false;
+    let mut plan_collapsed = false;
+    let mut reverse_search_active = false;
+    let mut reverse_search_query = String::new();
+    let mut reverse_search_index: Option<usize> = None;
+    let workspace_path = PathBuf::from(status.working_directory.clone());
 
     loop {
         tick_count = tick_count.wrapping_add(1);
@@ -1863,13 +1974,14 @@ where
 
         // Print any new transcript entries above the inline viewport
         // so they go into native terminal scrollback.
-        flush_transcript_above(&mut terminal, &shell, &mut last_printed_idx)?;
+        flush_transcript_above(&mut terminal, &shell, &mut last_printed_idx, plan_collapsed)?;
         // Flush complete lines from the streaming buffer into scrollback.
         flush_streaming_lines(
             &mut terminal,
             &mut streaming_buffer,
             &mut streaming_in_code_block,
             &mut streaming_in_diff_block,
+            plan_collapsed,
         )?;
 
         terminal.draw(|frame| {
@@ -1971,57 +2083,93 @@ where
                     input_area,
                 );
             } else {
-                let (prompt_str, prompt_style) = if vim_enabled {
-                    match vim_mode {
-                        VimMode::Normal => (
-                            ": ",
+                if reverse_search_active {
+                    let match_preview = reverse_search_index
+                        .and_then(|idx| history.get(idx))
+                        .cloned()
+                        .unwrap_or_else(|| "<no match>".to_string());
+                    let text = format!(
+                        "(reverse-i-search)`{}': {}",
+                        reverse_search_query,
+                        truncate_inline(&match_preview, width.saturating_sub(28) as usize)
+                    );
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![Span::styled(
+                            truncate_inline(&text, width.saturating_sub(1) as usize),
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(Color::LightYellow)
                                 .add_modifier(Modifier::BOLD),
-                        ),
-                        VimMode::Visual => (
-                            ": ",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        VimMode::Command => (
-                            ": ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        VimMode::Insert => (
+                        )])),
+                        input_area,
+                    );
+                } else {
+                    let (prompt_str, prompt_style) = if vim_enabled {
+                        match vim_mode {
+                            VimMode::Normal => (
+                                ": ",
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            VimMode::Visual => (
+                                ": ",
+                                Style::default()
+                                    .fg(Color::Magenta)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            VimMode::Command => (
+                                ": ",
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            VimMode::Insert => (
+                                "> ",
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        }
+                    } else {
+                        (
                             "> ",
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
-                        ),
+                        )
+                    };
+
+                    if vim_enabled && vim_mode == VimMode::Command {
+                        let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
+                        let input_text = format!(":{}{}", vim_command_buffer, cursor_ch);
+                        frame.render_widget(
+                            Paragraph::new(Line::from(vec![
+                                Span::styled(prompt_str.to_string(), prompt_style),
+                                Span::raw(input_text),
+                            ])),
+                            input_area,
+                        );
+                    } else {
+                        let before = &input[..cursor_pos.min(input.len())];
+                        let after = &input[cursor_pos.min(input.len())..];
+                        let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
+                        let mut spans = vec![
+                            Span::styled(prompt_str.to_string(), prompt_style),
+                            Span::raw(format!("{}{}{}", before, cursor_ch, after)),
+                        ];
+                        if cursor_pos >= input.len()
+                            && let Some(ghost) = history_ghost_suffix(&history, &input)
+                        {
+                            spans.push(Span::styled(
+                                ghost,
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
+                            ));
+                        }
+                        frame.render_widget(Paragraph::new(Line::from(spans)), input_area);
                     }
-                } else {
-                    (
-                        "> ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                };
-                let input_text = if vim_enabled && vim_mode == VimMode::Command {
-                    let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-                    format!(":{}{}", vim_command_buffer, cursor_ch)
-                } else {
-                    let before = &input[..cursor_pos.min(input.len())];
-                    let after = &input[cursor_pos.min(input.len())..];
-                    let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-                    format!("{}{}{}", before, cursor_ch, after)
-                };
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(prompt_str.to_string(), prompt_style),
-                        Span::raw(input_text),
-                    ])),
-                    input_area,
-                );
+                }
             }
 
             // Row 3: thin separator line below input
@@ -2056,11 +2204,13 @@ where
             ));
             let mode_color = match status.permission_mode.as_str() {
                 "auto" => Color::Green,
+                "plan" => Color::Blue,
                 "locked" => Color::Red,
                 _ => Color::Yellow,
             };
             let mode_label = match status.permission_mode.as_str() {
                 "auto" => " AUTO ",
+                "plan" => " PLAN ",
                 "locked" => " LOCKED ",
                 _ => " ASK ",
             };
@@ -2071,12 +2221,53 @@ where
                     .bg(mode_color)
                     .add_modifier(Modifier::BOLD),
             ));
+            if let Some(review) = status.pr_review_status.as_deref() {
+                let (label, bg) = review_badge(review);
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    label.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             if vim_enabled {
                 status_spans.push(Span::styled(
                     format!(" {} ", vim_mode.label()),
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if mission_control_visible {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    " MISSION ".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if artifacts_visible {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    " ARTIFACTS ".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if plan_collapsed {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    " PLAN COLLAPSED ".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightMagenta)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -2278,6 +2469,98 @@ where
             continue;
         }
 
+        if reverse_search_active {
+            match key.code {
+                KeyCode::Esc => {
+                    reverse_search_active = false;
+                    reverse_search_query.clear();
+                    reverse_search_index = None;
+                    input = saved_input.clone();
+                    cursor_pos = input.len();
+                    info_line = "reverse search canceled".to_string();
+                    continue;
+                }
+                KeyCode::Enter => {
+                    reverse_search_active = false;
+                    reverse_search_query.clear();
+                    reverse_search_index = None;
+                    info_line = "reverse search accepted".to_string();
+                }
+                KeyCode::Backspace => {
+                    reverse_search_query.pop();
+                    reverse_search_index =
+                        history_reverse_search_index(&history, &reverse_search_query, None);
+                    apply_reverse_search_result(
+                        &history,
+                        reverse_search_index,
+                        &mut input,
+                        &mut cursor_pos,
+                    );
+                    info_line = if reverse_search_index.is_some() {
+                        format!("reverse search: `{}`", reverse_search_query)
+                    } else {
+                        format!("reverse search: no match for `{}`", reverse_search_query)
+                    };
+                    continue;
+                }
+                KeyCode::Char(ch) if key.modifiers == KeyModifiers::NONE => {
+                    reverse_search_query.push(ch);
+                    reverse_search_index =
+                        history_reverse_search_index(&history, &reverse_search_query, None);
+                    apply_reverse_search_result(
+                        &history,
+                        reverse_search_index,
+                        &mut input,
+                        &mut cursor_pos,
+                    );
+                    info_line = if reverse_search_index.is_some() {
+                        format!("reverse search: `{}`", reverse_search_query)
+                    } else {
+                        format!("reverse search: no match for `{}`", reverse_search_query)
+                    };
+                    continue;
+                }
+                _ => {
+                    reverse_search_active = false;
+                    reverse_search_query.clear();
+                    reverse_search_index = None;
+                }
+            }
+        }
+
+        if key == bindings.history_search {
+            if history.is_empty() {
+                info_line = "reverse search: history is empty".to_string();
+                continue;
+            }
+            if !reverse_search_active {
+                saved_input = input.clone();
+                reverse_search_active = true;
+                reverse_search_query.clear();
+                reverse_search_index = history_reverse_search_index(&history, "", None);
+            } else {
+                let before = reverse_search_index;
+                reverse_search_index =
+                    history_reverse_search_index(&history, &reverse_search_query, before);
+            }
+            apply_reverse_search_result(
+                &history,
+                reverse_search_index,
+                &mut input,
+                &mut cursor_pos,
+            );
+            info_line = if reverse_search_index.is_some() {
+                if reverse_search_query.is_empty() {
+                    "reverse search: latest entry".to_string()
+                } else {
+                    format!("reverse search: `{}`", reverse_search_query)
+                }
+            } else {
+                format!("reverse search: no match for `{}`", reverse_search_query)
+            };
+            continue;
+        }
+
         let mut vim_quit_after_submit = false;
         if vim_enabled {
             let mut vim_consumed = false;
@@ -2286,124 +2569,255 @@ where
                     if key.code == KeyCode::Esc {
                         vim_mode = VimMode::Normal;
                         vim_pending_operator = None;
+                        vim_pending_text_object = None;
+                        vim_pending_g = false;
                         info_line = "-- NORMAL --".to_string();
                         vim_consumed = true;
                     }
                 }
                 VimMode::Normal => {
-                    match key.code {
-                        KeyCode::Char('i') => {
-                            vim_mode = VimMode::Insert;
-                            vim_pending_operator = None;
-                            info_line = "-- INSERT --".to_string();
-                        }
-                        KeyCode::Char('a') => {
-                            cursor_pos = (cursor_pos + 1).min(input.len());
-                            vim_mode = VimMode::Insert;
-                            vim_pending_operator = None;
-                            info_line = "-- INSERT --".to_string();
-                        }
-                        KeyCode::Char('v') => {
-                            vim_mode = VimMode::Visual;
-                            vim_visual_anchor = Some(cursor_pos);
-                            vim_pending_operator = None;
-                            info_line = "-- VISUAL --".to_string();
-                        }
-                        KeyCode::Char(':') => {
-                            vim_mode = VimMode::Command;
-                            vim_command_buffer.clear();
-                            vim_pending_operator = None;
-                            info_line = ":".to_string();
-                        }
-                        KeyCode::Char('h') | KeyCode::Left => {
-                            cursor_pos = cursor_pos.saturating_sub(1);
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('l') | KeyCode::Right => {
-                            cursor_pos = (cursor_pos + 1).min(input.len());
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('0') => {
-                            cursor_pos = 0;
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('$') => {
-                            cursor_pos = input.len();
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('w') => {
-                            cursor_pos = move_to_next_word_start(&input, cursor_pos);
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('b') => {
-                            cursor_pos = move_to_prev_word_start(&input, cursor_pos);
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('e') => {
-                            cursor_pos = move_to_word_end(&input, cursor_pos);
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('x') => {
-                            if cursor_pos < input.len() {
-                                input.remove(cursor_pos);
+                    if let Some((operator, scope)) = vim_pending_text_object.take() {
+                        if let Some((start, end)) =
+                            resolve_vim_text_object_bounds(&input, cursor_pos, scope, key.code)
+                        {
+                            if apply_vim_operator_range(
+                                operator,
+                                &mut input,
+                                &mut cursor_pos,
+                                &mut vim_yank_buffer,
+                                &mut vim_mode,
+                                start,
+                                end,
+                            ) {
+                                info_line = match operator {
+                                    'c' => "-- INSERT --".to_string(),
+                                    'y' => format!("yanked {} chars", end.saturating_sub(start)),
+                                    _ => format!(
+                                        "applied {operator}{}{}",
+                                        scope,
+                                        display_key_code(key.code)
+                                    ),
+                                };
                             }
-                            vim_pending_operator = None;
+                        } else {
+                            info_line = format!(
+                                "unknown text object {}{}",
+                                scope,
+                                display_key_code(key.code)
+                            );
                         }
-                        KeyCode::Char('p') => {
-                            if !vim_yank_buffer.is_empty() {
-                                let insert_at = (cursor_pos + 1).min(input.len());
-                                input.insert_str(insert_at, &vim_yank_buffer);
-                                cursor_pos = (insert_at + vim_yank_buffer.len()).min(input.len());
+                        vim_pending_operator = None;
+                        vim_pending_g = false;
+                    } else {
+                        match key.code {
+                            KeyCode::Char('i') => {
+                                if let Some(op) = vim_pending_operator.take() {
+                                    vim_pending_text_object = Some((op, 'i'));
+                                    info_line = format!("{op}i");
+                                } else {
+                                    vim_mode = VimMode::Insert;
+                                    vim_pending_operator = None;
+                                    vim_pending_g = false;
+                                    info_line = "-- INSERT --".to_string();
+                                }
                             }
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Char('d') => {
-                            if vim_pending_operator == Some('d') {
-                                input.clear();
+                            KeyCode::Char('a') => {
+                                if let Some(op) = vim_pending_operator.take() {
+                                    vim_pending_text_object = Some((op, 'a'));
+                                    info_line = format!("{op}a");
+                                } else {
+                                    cursor_pos = (cursor_pos + 1).min(input.len());
+                                    vim_mode = VimMode::Insert;
+                                    vim_pending_operator = None;
+                                    vim_pending_g = false;
+                                    info_line = "-- INSERT --".to_string();
+                                }
+                            }
+                            KeyCode::Char('v') => {
+                                vim_mode = VimMode::Visual;
+                                vim_visual_anchor = Some(cursor_pos);
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                                info_line = "-- VISUAL --".to_string();
+                            }
+                            KeyCode::Char(':') => {
+                                vim_mode = VimMode::Command;
+                                vim_command_buffer.clear();
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                                info_line = ":".to_string();
+                            }
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                cursor_pos = cursor_pos.saturating_sub(1);
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                cursor_pos = (cursor_pos + 1).min(input.len());
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('0') => {
                                 cursor_pos = 0;
                                 vim_pending_operator = None;
-                                info_line = "deleted line".to_string();
-                            } else {
-                                vim_pending_operator = Some('d');
-                                info_line = "d".to_string();
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
                             }
-                        }
-                        KeyCode::Char('c') => {
-                            if vim_pending_operator == Some('c') {
-                                input.clear();
-                                cursor_pos = 0;
-                                vim_mode = VimMode::Insert;
+                            KeyCode::Char('$') => {
+                                cursor_pos = input.len();
                                 vim_pending_operator = None;
-                                info_line = "-- INSERT --".to_string();
-                            } else {
-                                vim_pending_operator = Some('c');
-                                info_line = "c".to_string();
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
                             }
-                        }
-                        KeyCode::Char('y') => {
-                            if vim_pending_operator == Some('y') {
-                                vim_yank_buffer = input.clone();
+                            KeyCode::Char('g') => {
+                                if vim_pending_g {
+                                    cursor_pos = 0;
+                                    vim_pending_g = false;
+                                    vim_pending_operator = None;
+                                    vim_pending_text_object = None;
+                                    info_line = "gg".to_string();
+                                } else {
+                                    vim_pending_g = true;
+                                    info_line = "g".to_string();
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                cursor_pos = input.len();
                                 vim_pending_operator = None;
-                                info_line = "yanked line".to_string();
-                            } else {
-                                vim_pending_operator = Some('y');
-                                info_line = "y".to_string();
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                                info_line = "G".to_string();
                             }
-                        }
-                        KeyCode::Enter => {
-                            key = bindings.submit;
-                            vim_pending_operator = None;
-                        }
-                        KeyCode::Esc => {
-                            vim_pending_operator = None;
-                        }
-                        _ => {
-                            vim_pending_operator = None;
+                            KeyCode::Char('w') => {
+                                if let Some(op) = vim_pending_operator.take() {
+                                    if let Some((start, end)) =
+                                        word_text_object_bounds(&input, cursor_pos, false)
+                                    {
+                                        let _ = apply_vim_operator_range(
+                                            op,
+                                            &mut input,
+                                            &mut cursor_pos,
+                                            &mut vim_yank_buffer,
+                                            &mut vim_mode,
+                                            start,
+                                            end,
+                                        );
+                                        info_line = if op == 'c' {
+                                            "-- INSERT --".to_string()
+                                        } else {
+                                            format!("applied {op}w")
+                                        };
+                                    }
+                                } else {
+                                    cursor_pos = move_to_next_word_start(&input, cursor_pos);
+                                }
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('b') => {
+                                cursor_pos = move_to_prev_word_start(&input, cursor_pos);
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('e') => {
+                                cursor_pos = move_to_word_end(&input, cursor_pos);
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('x') => {
+                                if cursor_pos < input.len() {
+                                    input.remove(cursor_pos);
+                                }
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('p') => {
+                                if !vim_yank_buffer.is_empty() {
+                                    let insert_at = (cursor_pos + 1).min(input.len());
+                                    input.insert_str(insert_at, &vim_yank_buffer);
+                                    cursor_pos =
+                                        (insert_at + vim_yank_buffer.len()).min(input.len());
+                                }
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Char('d') => {
+                                if vim_pending_operator == Some('d') {
+                                    input.clear();
+                                    cursor_pos = 0;
+                                    vim_pending_operator = None;
+                                    vim_pending_text_object = None;
+                                    vim_pending_g = false;
+                                    info_line = "deleted line".to_string();
+                                } else {
+                                    vim_pending_operator = Some('d');
+                                    vim_pending_text_object = None;
+                                    vim_pending_g = false;
+                                    info_line = "d".to_string();
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                if vim_pending_operator == Some('c') {
+                                    input.clear();
+                                    cursor_pos = 0;
+                                    vim_mode = VimMode::Insert;
+                                    vim_pending_operator = None;
+                                    vim_pending_text_object = None;
+                                    vim_pending_g = false;
+                                    info_line = "-- INSERT --".to_string();
+                                } else {
+                                    vim_pending_operator = Some('c');
+                                    vim_pending_text_object = None;
+                                    vim_pending_g = false;
+                                    info_line = "c".to_string();
+                                }
+                            }
+                            KeyCode::Char('y') => {
+                                if vim_pending_operator == Some('y') {
+                                    vim_yank_buffer = input.clone();
+                                    vim_pending_operator = None;
+                                    vim_pending_text_object = None;
+                                    vim_pending_g = false;
+                                    info_line = "yanked line".to_string();
+                                } else {
+                                    vim_pending_operator = Some('y');
+                                    vim_pending_text_object = None;
+                                    vim_pending_g = false;
+                                    info_line = "y".to_string();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                key = bindings.submit;
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            KeyCode::Esc => {
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
+                            _ => {
+                                vim_pending_operator = None;
+                                vim_pending_text_object = None;
+                                vim_pending_g = false;
+                            }
                         }
                     }
                     vim_consumed = true;
                 }
                 VimMode::Visual => {
+                    vim_pending_operator = None;
+                    vim_pending_text_object = None;
+                    vim_pending_g = false;
                     if vim_visual_anchor.is_none() {
                         vim_visual_anchor = Some(cursor_pos);
                     }
@@ -2467,6 +2881,9 @@ where
                             vim_mode = VimMode::Command;
                             vim_command_buffer.clear();
                             vim_visual_anchor = None;
+                            vim_pending_operator = None;
+                            vim_pending_text_object = None;
+                            vim_pending_g = false;
                             info_line = ":".to_string();
                         }
                         _ => {}
@@ -2474,6 +2891,9 @@ where
                     vim_consumed = true;
                 }
                 VimMode::Command => {
+                    vim_pending_operator = None;
+                    vim_pending_text_object = None;
+                    vim_pending_g = false;
                     match key.code {
                         KeyCode::Esc => {
                             vim_mode = VimMode::Normal;
@@ -2538,6 +2958,48 @@ where
             };
             status.permission_mode = next.to_string();
             info_line = format!("permission mode: {} -> {}", current, next);
+            continue;
+        }
+        if key == bindings.toggle_mission_control {
+            mission_control_visible = !mission_control_visible;
+            info_line = if mission_control_visible {
+                let lines = if shell.mission_control_lines.is_empty() {
+                    vec![
+                        "Mission control enabled.".to_string(),
+                        "No mission-control events in this session yet.".to_string(),
+                    ]
+                } else {
+                    shell.mission_control_lines.clone()
+                };
+                for line in lines.into_iter().take(12) {
+                    shell.push_system(format!("[mission] {line}"));
+                }
+                "mission control enabled".to_string()
+            } else {
+                "mission control hidden".to_string()
+            };
+            continue;
+        }
+        if key == bindings.toggle_artifacts {
+            artifacts_visible = !artifacts_visible;
+            info_line = if artifacts_visible {
+                let lines = load_artifact_lines(&workspace_path);
+                for line in lines.into_iter().take(16) {
+                    shell.push_system(format!("[artifact] {line}"));
+                }
+                "artifacts panel enabled".to_string()
+            } else {
+                "artifacts panel hidden".to_string()
+            };
+            continue;
+        }
+        if key == bindings.toggle_plan_collapse {
+            plan_collapsed = !plan_collapsed;
+            info_line = if plan_collapsed {
+                "plan collapse enabled".to_string()
+            } else {
+                "plan collapse disabled".to_string()
+            };
             continue;
         }
         if key == bindings.background {
@@ -2633,6 +3095,15 @@ where
             continue;
         }
         if key == bindings.autocomplete {
+            if cursor_pos >= input.len()
+                && !input.starts_with('/')
+                && let Some(ghost) = history_ghost_suffix(&history, &input)
+            {
+                input.push_str(&ghost);
+                cursor_pos = input.len();
+                info_line = "accepted suggestion".to_string();
+                continue;
+            }
             if input.starts_with('/') {
                 let prefix = input.trim_start_matches('/').to_ascii_lowercase();
                 let commands = [
@@ -2682,6 +3153,9 @@ where
                     "release-notes",
                     "login",
                     "logout",
+                    "desktop",
+                    "todos",
+                    "chrome",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
@@ -2762,6 +3236,8 @@ where
                             &mut vim_command_buffer,
                             &mut vim_visual_anchor,
                             &mut vim_pending_operator,
+                            &mut vim_pending_text_object,
+                            &mut vim_pending_g,
                         );
                         info_line = if vim_enabled {
                             format!("vim mode on ({})", vim_mode.label())
@@ -3008,6 +3484,66 @@ fn autocomplete_path_token(token: &str) -> Option<String> {
     Some(format!("{base}{replacement}"))
 }
 
+fn history_ghost_suffix(history: &VecDeque<String>, input: &str) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    for entry in history.iter().rev() {
+        if entry.starts_with(input) && entry.len() > input.len() {
+            return Some(entry[input.len()..].to_string());
+        }
+    }
+    None
+}
+
+fn history_reverse_search_index(
+    history: &VecDeque<String>,
+    query: &str,
+    before: Option<usize>,
+) -> Option<usize> {
+    if history.is_empty() {
+        return None;
+    }
+    let matches = |value: &String| query.is_empty() || value.contains(query);
+
+    if let Some(current) = before {
+        if current > 0 {
+            for idx in (0..current).rev() {
+                if matches(&history[idx]) {
+                    return Some(idx);
+                }
+            }
+        }
+        for idx in ((current + 1).min(history.len())..history.len()).rev() {
+            if matches(&history[idx]) {
+                return Some(idx);
+            }
+        }
+        return None;
+    }
+
+    for idx in (0..history.len()).rev() {
+        if matches(&history[idx]) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn apply_reverse_search_result(
+    history: &VecDeque<String>,
+    index: Option<usize>,
+    input: &mut String,
+    cursor_pos: &mut usize,
+) {
+    if let Some(idx) = index
+        && let Some(entry) = history.get(idx)
+    {
+        *input = entry.clone();
+        *cursor_pos = input.len();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VimSlashCommand {
     Toggle,
@@ -3051,6 +3587,8 @@ fn apply_vim_command(
     vim_command_buffer: &mut String,
     vim_visual_anchor: &mut Option<usize>,
     vim_pending_operator: &mut Option<char>,
+    vim_pending_text_object: &mut Option<(char, char)>,
+    vim_pending_g: &mut bool,
 ) {
     match command {
         VimSlashCommand::Toggle => {
@@ -3077,6 +3615,8 @@ fn apply_vim_command(
     vim_command_buffer.clear();
     *vim_visual_anchor = None;
     *vim_pending_operator = None;
+    *vim_pending_text_object = None;
+    *vim_pending_g = false;
 }
 
 fn is_word_byte(byte: u8) -> bool {
@@ -3132,6 +3672,138 @@ fn move_to_word_end(input: &str, cursor_pos: usize) -> usize {
         pos += 1;
     }
     pos
+}
+
+fn display_key_code(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+fn apply_vim_operator_range(
+    operator: char,
+    input: &mut String,
+    cursor_pos: &mut usize,
+    vim_yank_buffer: &mut String,
+    vim_mode: &mut VimMode,
+    start: usize,
+    end: usize,
+) -> bool {
+    if end <= start || start >= input.len() || end > input.len() {
+        return false;
+    }
+    let selected = input[start..end].to_string();
+    match operator {
+        'y' => {
+            *vim_yank_buffer = selected;
+        }
+        'd' => {
+            input.replace_range(start..end, "");
+            *cursor_pos = start.min(input.len());
+        }
+        'c' => {
+            input.replace_range(start..end, "");
+            *cursor_pos = start.min(input.len());
+            *vim_mode = VimMode::Insert;
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn word_text_object_bounds(input: &str, cursor_pos: usize, around: bool) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut cursor = cursor_pos.min(bytes.len().saturating_sub(1));
+    if !is_word_byte(bytes[cursor]) {
+        if let Some(next) = (cursor..bytes.len()).find(|idx| is_word_byte(bytes[*idx])) {
+            cursor = next;
+        } else if let Some(prev) = (0..=cursor).rev().find(|idx| is_word_byte(bytes[*idx])) {
+            cursor = prev;
+        } else {
+            return None;
+        }
+    }
+
+    let mut start = cursor;
+    while start > 0 && is_word_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cursor + 1;
+    while end < bytes.len() && is_word_byte(bytes[end]) {
+        end += 1;
+    }
+
+    if around {
+        if end < bytes.len() && bytes[end].is_ascii_whitespace() {
+            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+        } else {
+            while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+                start -= 1;
+            }
+        }
+    }
+    Some((start, end))
+}
+
+fn delimiter_text_object_bounds(
+    input: &str,
+    cursor_pos: usize,
+    open: u8,
+    close: u8,
+    around: bool,
+) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let cursor = cursor_pos.min(bytes.len().saturating_sub(1));
+    let left = (0..=cursor).rev().find(|idx| bytes[*idx] == open)?;
+    let right = ((left + 1)..bytes.len()).find(|idx| bytes[*idx] == close)?;
+    if around {
+        Some((left, right + 1))
+    } else if right > left + 1 {
+        Some((left + 1, right))
+    } else {
+        None
+    }
+}
+
+fn resolve_vim_text_object_bounds(
+    input: &str,
+    cursor_pos: usize,
+    scope: char,
+    key: KeyCode,
+) -> Option<(usize, usize)> {
+    let around = scope == 'a';
+    match key {
+        KeyCode::Char('w') => word_text_object_bounds(input, cursor_pos, around),
+        KeyCode::Char('"') => delimiter_text_object_bounds(input, cursor_pos, b'"', b'"', around),
+        KeyCode::Char('\'') => {
+            delimiter_text_object_bounds(input, cursor_pos, b'\'', b'\'', around)
+        }
+        KeyCode::Char('(') | KeyCode::Char(')') => {
+            delimiter_text_object_bounds(input, cursor_pos, b'(', b')', around)
+        }
+        KeyCode::Char('[') | KeyCode::Char(']') => {
+            delimiter_text_object_bounds(input, cursor_pos, b'[', b']', around)
+        }
+        KeyCode::Char('{') | KeyCode::Char('}') => {
+            delimiter_text_object_bounds(input, cursor_pos, b'{', b'}', around)
+        }
+        _ => None,
+    }
 }
 
 fn visual_bounds(len: usize, anchor: usize, cursor_pos: usize) -> (usize, usize) {
@@ -3211,6 +3883,7 @@ mod tests {
             context_max_tokens: 128_000,
             session_turns: 5,
             working_directory: "/tmp".to_string(),
+            pr_review_status: None,
         });
         assert!(line.contains("model=deepseek-chat"));
         assert!(line.contains("autopilot=running"));
@@ -3290,6 +3963,18 @@ mod tests {
             SlashCommand::parse("/debug connection"),
             Some(SlashCommand::Debug(vec!["connection".to_string()]))
         );
+        assert_eq!(
+            SlashCommand::parse("/desktop open"),
+            Some(SlashCommand::Desktop(vec!["open".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/todos fix"),
+            Some(SlashCommand::Todos(vec!["fix".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/chrome reconnect"),
+            Some(SlashCommand::Chrome(vec!["reconnect".to_string()]))
+        );
         assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit));
         assert_eq!(
@@ -3345,6 +4030,7 @@ mod tests {
             context_max_tokens: 128_000,
             session_turns: 10,
             working_directory: "/workspace".to_string(),
+            pr_review_status: None,
         });
         assert!(line.contains("[AUTO]"));
         assert!(line.contains("ctx=96K/128K(75%)"));
@@ -3471,6 +4157,95 @@ mod tests {
         assert_eq!(move_to_prev_word_start(text, 6), 0);
         assert_eq!(move_to_word_end(text, 0), 4);
         assert_eq!(move_to_word_end(text, 6), 9);
+    }
+
+    #[test]
+    fn vim_text_object_bounds_support_word_and_quotes() {
+        let text = "let value = \"hello world\";";
+        assert_eq!(word_text_object_bounds(text, 4, false), Some((4, 9)));
+        assert_eq!(word_text_object_bounds(text, 4, true), Some((4, 10)));
+        assert_eq!(
+            resolve_vim_text_object_bounds(text, 14, 'i', KeyCode::Char('"')),
+            Some((13, 24))
+        );
+        assert_eq!(
+            resolve_vim_text_object_bounds(text, 14, 'a', KeyCode::Char('"')),
+            Some((12, 25))
+        );
+    }
+
+    #[test]
+    fn vim_operator_range_handles_change_delete_yank() {
+        let mut input = "alpha beta".to_string();
+        let mut cursor = 0usize;
+        let mut yank = String::new();
+        let mut mode = VimMode::Normal;
+        assert!(apply_vim_operator_range(
+            'y',
+            &mut input,
+            &mut cursor,
+            &mut yank,
+            &mut mode,
+            0,
+            5
+        ));
+        assert_eq!(yank, "alpha");
+        assert_eq!(mode, VimMode::Normal);
+
+        assert!(apply_vim_operator_range(
+            'd',
+            &mut input,
+            &mut cursor,
+            &mut yank,
+            &mut mode,
+            0,
+            6
+        ));
+        assert_eq!(input, "beta");
+
+        assert!(apply_vim_operator_range(
+            'c',
+            &mut input,
+            &mut cursor,
+            &mut yank,
+            &mut mode,
+            0,
+            4
+        ));
+        assert_eq!(input, "");
+        assert_eq!(mode, VimMode::Insert);
+    }
+
+    #[test]
+    fn reverse_search_and_ghost_helpers_work() {
+        let history = VecDeque::from(vec![
+            "cargo test".to_string(),
+            "cargo check".to_string(),
+            "git status".to_string(),
+        ]);
+        assert_eq!(
+            history_ghost_suffix(&history, "car"),
+            Some("go check".to_string())
+        );
+        assert_eq!(
+            history_reverse_search_index(&history, "cargo", None),
+            Some(1)
+        );
+        assert_eq!(
+            history_reverse_search_index(&history, "cargo", Some(1)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn statusline_includes_review_badge_value() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            pr_review_status: Some("changes_requested".to_string()),
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(line.contains("review=changes_requested"));
     }
 
     #[test]
@@ -3669,6 +4444,7 @@ mod tests {
             context_max_tokens: 128_000,
             session_turns: 5,
             working_directory: "/tmp".to_string(),
+            pr_review_status: None,
         };
         shell.push_status_summary(&status);
         let all_text: String = shell
@@ -3735,6 +4511,18 @@ mod tests {
         assert_eq!(SlashCommand::parse("/logout"), Some(SlashCommand::Logout));
         assert_eq!(SlashCommand::parse("/bug"), Some(SlashCommand::Bug));
         assert_eq!(SlashCommand::parse("/usage"), Some(SlashCommand::Usage));
+        assert_eq!(
+            SlashCommand::parse("/desktop"),
+            Some(SlashCommand::Desktop(vec![]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/todos"),
+            Some(SlashCommand::Todos(vec![]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/chrome"),
+            Some(SlashCommand::Chrome(vec![]))
+        );
         assert_eq!(
             SlashCommand::parse("/rename foo"),
             Some(SlashCommand::Rename(Some("foo".to_string())))
@@ -3831,6 +4619,14 @@ mod tests {
             crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Tab,
                 crossterm::event::KeyModifiers::NONE
+            )
+        );
+        // Ctrl+R should trigger reverse history search
+        assert_eq!(
+            bindings.history_search,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('r'),
+                crossterm::event::KeyModifiers::CONTROL
             )
         );
     }
