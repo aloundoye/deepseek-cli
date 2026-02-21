@@ -36,6 +36,8 @@ deepseek-mcp = { path = "../deepseek-mcp" }
 deepseek-skills = { path = "../deepseek-skills" }
 deepseek-subagent = { path = "../deepseek-subagent" }
 deepseek-jsonrpc = { path = "../deepseek-jsonrpc" }
+deepseek-context = { path = "../deepseek-context" }
+deepseek-errors = { path = "../deepseek-errors" }
 
 [dev-dependencies]
 assert_cmd = "2"

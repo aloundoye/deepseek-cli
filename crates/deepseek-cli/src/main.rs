@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use deepseek_agent::AgentEngine;
@@ -7,6 +7,11 @@ use deepseek_memory::MemoryManager;
 use deepseek_policy::load_managed_settings;
 use serde_json::json;
 use std::path::PathBuf;
+
+// Enhanced context and error handling
+use deepseek_errors::ErrorHandler;
+mod context_enhanced;
+use context_enhanced::errors as enhanced_errors;
 
 mod commands;
 mod context;
@@ -1042,35 +1047,62 @@ struct PluginRunArgs {
     max_think: bool,
 }
 
+/// Handle error with enhanced formatting
+fn handle_error(error: anyhow::Error, json_mode: bool) -> ! {
+    let handler = ErrorHandler::new().verbose(false).show_suggestions(true);
+    let error_message = handler.handle(&error);
+
+    if json_mode {
+        // JSON output for machine consumption
+        let json_error = json!({
+            "error": error.to_string(),
+            "message": error_message,
+            "success": false
+        });
+        eprintln!("{}", serde_json::to_string_pretty(&json_error).unwrap());
+    } else {
+        // Human-readable output
+        eprintln!("{}", error_message);
+    }
+
+    std::process::exit(1);
+}
+
 /// Validate mutually exclusive CLI flags.
 fn validate_cli_flags(cli: &Cli) -> Result<()> {
     if !cli.allowed_tools.is_empty() && !cli.disallowed_tools.is_empty() {
-        return Err(anyhow!(
-            "--allowed-tools and --disallowed-tools are mutually exclusive"
-        ));
+        return Err(enhanced_errors::config_error(
+            "--allowed-tools and --disallowed-tools are mutually exclusive",
+        )
+        .into_error());
     }
     if cli.system_prompt.is_some() && cli.append_system_prompt.is_some() {
-        return Err(anyhow!(
-            "--system-prompt and --append-system-prompt are mutually exclusive"
-        ));
+        return Err(enhanced_errors::config_error(
+            "--system-prompt and --append-system-prompt are mutually exclusive",
+        )
+        .into_error());
     }
     if cli.system_prompt.is_some() && cli.system_prompt_file.is_some() {
-        return Err(anyhow!(
-            "--system-prompt and --system-prompt-file are mutually exclusive"
-        ));
+        return Err(enhanced_errors::config_error(
+            "--system-prompt and --system-prompt-file are mutually exclusive",
+        )
+        .into_error());
     }
     if cli.chrome && cli.no_chrome {
-        return Err(anyhow!("--chrome and --no-chrome are mutually exclusive"));
+        return Err(enhanced_errors::config_error(
+            "--chrome and --no-chrome are mutually exclusive",
+        )
+        .into_error());
     }
     if cli.dangerously_skip_permissions && !cli.allow_dangerously_skip_permissions {
-        return Err(anyhow!(
+        return Err(enhanced_errors::config_error(
             "--dangerously-skip-permissions requires --allow-dangerously-skip-permissions to confirm intent"
-        ));
+        ).into_error());
     }
     if cli.allow_dangerously_skip_permissions && !cli.dangerously_skip_permissions {
-        return Err(anyhow!(
+        return Err(enhanced_errors::config_error(
             "--allow-dangerously-skip-permissions has no effect without --dangerously-skip-permissions"
-        ));
+        ).into_error());
     }
     // Check managed settings: enterprise may disable bypass mode.
     if cli.dangerously_skip_permissions
@@ -1078,14 +1110,26 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
         && let Some(managed) = load_managed_settings()
         && managed.disable_bypass_permissions_mode
     {
-        return Err(anyhow!(
-            "bypass permissions mode is disabled by managed settings"
-        ));
+        return Err(enhanced_errors::permission_error(
+            "bypass permissions mode is disabled by managed settings",
+        )
+        .into_error());
     }
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
+    match run() {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            // Get json mode from args
+            let cli = Cli::parse();
+            handle_error(e, cli.json);
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let mut cli = Cli::parse();
     validate_cli_flags(&cli)?;
     let cwd = std::env::current_dir()?;

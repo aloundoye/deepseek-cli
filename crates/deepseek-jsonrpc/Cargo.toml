@@ -13,6 +13,8 @@ serde_json.workspace = true
 uuid.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 deepseek-store = { path = "../deepseek-store" }
+deepseek-context = { path = "../deepseek-context" }
+deepseek-errors = { path = "../deepseek-errors" }
 
 [dev-dependencies]
 tempfile = "3"
