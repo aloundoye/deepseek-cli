@@ -23,11 +23,33 @@ auto_max_think = true
 threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1
-# Reasoner-directed execution: deepseek-reasoner analyzes on every tool-enabled
-# turn, deepseek-chat executes tool calls guided by that reasoning.
+# Unified thinking + tools (DeepSeek V3.2): use deepseek-chat with thinking
+# mode enabled alongside tools in a single API call. Simpler and lower-latency
+# than the two-model reasoner-directed loop. Set to false to fall back to
+# reasoner_directed mode.
+unified_thinking_tools = true
+# Reasoner-directed execution (fallback): deepseek-reasoner analyzes on every
+# tool-enabled turn, deepseek-chat executes tool calls guided by that reasoning.
+# Only active when unified_thinking_tools = false.
 reasoner_directed = true
 # Maximum reasoner calls per session to limit token cost.
 reasoner_directed_max_turns = 20
+# Mode router: selects among V3_AUTOPILOT, R1_SUPERVISE, R1_DRIVE_TOOLS.
+# V3_AUTOPILOT is the default (deepseek-chat with unified thinking + tools).
+# R1_DRIVE_TOOLS escalates to deepseek-reasoner driving tools via JSON intents.
+mode_router_enabled = true
+# Max consecutive step failures before escalating from V3 to R1.
+v3_max_step_failures = 2
+# Max files changed without verification before escalating.
+blast_radius_threshold = 5
+# Allow V3 one recovery attempt for compile/lint/dependency errors.
+v3_mechanical_recovery = true
+# Max R1 drive-tools steps per task.
+r1_max_steps = 30
+# Max retries when R1 output fails JSON schema validation.
+r1_max_parse_retries = 2
+# Max context requests from V3 patch writer.
+v3_patch_max_context_requests = 3
 w1 = 0.2
 w2 = 0.15
 w3 = 0.2

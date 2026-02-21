@@ -1,3 +1,9 @@
+pub mod mode_router;
+pub mod observation;
+pub mod protocol;
+pub mod r1_drive;
+pub mod v3_patch;
+
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{Timelike, Utc};
 use deepseek_core::{
@@ -1507,10 +1513,12 @@ impl AgentEngine {
             let request_model = decision.selected_model.clone();
 
             // Build thinking config when the router (or user) requests thinking mode.
-            // IMPORTANT: Never enable thinking when tools are active — DeepSeek API
-            // outputs raw DSML markup instead of structured tool_calls when thinking
-            // is combined with the tools parameter.
-            let thinking = if decision.thinking_enabled && !options.tools {
+            // DeepSeek V3.2 supports thinking + tools in a single call (unified mode).
+            // When unified mode is disabled, thinking is only used without tools
+            // (the old DSML leak workaround).
+            let thinking = if decision.thinking_enabled
+                && (!options.tools || self.cfg.router.unified_thinking_tools)
+            {
                 Some(ThinkingConfig::enabled(
                     session.budgets.max_think_tokens.max(4096),
                 ))
@@ -1518,9 +1526,19 @@ impl AgentEngine {
                 None
             };
 
-            // Strip reasoning_content from prior assistant messages before sending
-            // a new request — DeepSeek API requirement for multi-turn thinking + tools.
-            for msg in &mut messages {
+            // Strip reasoning_content from assistant messages that belong to
+            // *prior* conversation turns (before the current user question).
+            // Per DeepSeek V3.2 docs: keep reasoning_content within the current
+            // tool loop so the model retains its logical thread, but clear it
+            // from earlier turns to save bandwidth.
+            //
+            // Find the index of the last User message — everything before it
+            // belongs to prior turns and should have reasoning_content stripped.
+            let last_user_idx = messages
+                .iter()
+                .rposition(|m| matches!(m, ChatMessage::User { .. }))
+                .unwrap_or(0);
+            for msg in &mut messages[..last_user_idx] {
                 if let ChatMessage::Assistant {
                     reasoning_content, ..
                 } = msg
@@ -1532,14 +1550,15 @@ impl AgentEngine {
             // Two-phase reasoning (legacy): when thinking is warranted but tools prevent it,
             // make a separate thinking-only call first to reason about strategy.
             // Only on the first turn — subsequent tool-result turns don't need
-            // full re-reasoning. Disabled when reasoner_directed is active (it
-            // supersedes this approach with per-turn reasoner calls).
+            // full re-reasoning. Disabled when reasoner_directed or unified_thinking_tools
+            // is active (both supersede this approach).
             let mut reasoning_context: Option<String> = None;
             if decision.thinking_enabled
                 && options.tools
                 && turn_count == 1
                 && self.cfg.router.two_phase_thinking
                 && !self.cfg.router.reasoner_directed
+                && !self.cfg.router.unified_thinking_tools
             {
                 self.emit(
                     session.session_id,
@@ -1602,11 +1621,14 @@ impl AgentEngine {
             // `deepseek-reasoner` to analyze the situation and produce a
             // directive. The executor call below will include that directive
             // in its message history as guiding context.
+            // Skipped when unified_thinking_tools is active — thinking + tools
+            // work together in a single call, no need for the two-model loop.
             let mut reasoner_directed_active = false;
             if (decision.thinking_enabled || decision.reasoner_directed)
                 && options.tools
                 && self.cfg.router.reasoner_directed
                 && self.cfg.router.two_phase_thinking
+                && !self.cfg.router.unified_thinking_tools
                 && reasoner_turn_count < self.cfg.router.reasoner_directed_max_turns as u64
             {
                 reasoner_directed_active = true;
@@ -1619,10 +1641,8 @@ impl AgentEngine {
                     },
                 )?;
 
-                let tool_names: Vec<String> = tools
-                    .iter()
-                    .map(|t| t.function.name.clone())
-                    .collect();
+                let tool_names: Vec<String> =
+                    tools.iter().map(|t| t.function.name.clone()).collect();
                 let directive_prompt =
                     self.build_reasoner_directive_prompt(&tool_names, reasoner_turn_count);
 
@@ -1690,9 +1710,7 @@ impl AgentEngine {
 
                         if !directive.trim().is_empty() {
                             // Check for TASK_COMPLETE signal
-                            if let Some(complete_pos) =
-                                directive.find("TASK_COMPLETE")
-                            {
+                            if let Some(complete_pos) = directive.find("TASK_COMPLETE") {
                                 let final_answer = directive
                                     [complete_pos + "TASK_COMPLETE".len()..]
                                     .trim()
@@ -1712,8 +1730,7 @@ impl AgentEngine {
                                         content: answer.clone(),
                                     },
                                 )?;
-                                let _ =
-                                    self.transition(&mut session, SessionState::Completed);
+                                let _ = self.transition(&mut session, SessionState::Completed);
                                 return Ok(answer);
                             }
 
@@ -1790,60 +1807,60 @@ impl AgentEngine {
                         reason_codes: vec!["empty_response_escalation".to_string()],
                     },
                 )?;
-                // Only escalate with thinking if tools are not active — thinking
-                // + tools causes DSML markup leaks. When tools are active and
-                // two_phase_thinking is enabled, use two-phase: think first, then
-                // retry with reasoning context. Otherwise just retry as-is.
-                let escalated_request = if tools.is_empty() {
-                    ChatRequest {
-                        thinking: Some(ThinkingConfig::enabled(
-                            session.budgets.max_think_tokens.max(4096),
-                        )),
-                        temperature: None,
-                        ..request
-                    }
-                } else if self.cfg.router.two_phase_thinking {
-                    // Two-phase escalation: think first, then retry with reasoning
-                    let think_request = ChatRequest {
-                        model: request_model.clone(),
-                        messages: request.messages.clone(),
-                        tools: vec![],
-                        tool_choice: ToolChoice::none(),
-                        max_tokens: session.budgets.max_think_tokens.max(4096),
-                        temperature: None,
-                        thinking: Some(ThinkingConfig::enabled(
-                            session.budgets.max_think_tokens.max(4096),
-                        )),
-                    };
-                    let think_resp = {
-                        let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
-                        if let Some(cb) = cb {
-                            self.llm.complete_chat_streaming(&think_request, cb)?
-                        } else {
-                            self.llm.complete_chat(&think_request)?
-                        }
-                    };
-                    let reasoning = if !think_resp.reasoning_content.is_empty() {
-                        &think_resp.reasoning_content
-                    } else {
-                        &think_resp.text
-                    };
-                    if !reasoning.trim().is_empty() {
-                        let mut escalated = request.clone();
-                        escalated.messages.push(ChatMessage::Assistant {
-                            content: Some(format!(
-                                "[Reasoning phase]\n{reasoning}\n\n[Now executing with tools]"
+                // With unified_thinking_tools, thinking + tools work together
+                // directly. Otherwise, fall back to two-phase escalation when
+                // tools are active (thinking-only call first, then tools).
+                let escalated_request =
+                    if tools.is_empty() || self.cfg.router.unified_thinking_tools {
+                        ChatRequest {
+                            thinking: Some(ThinkingConfig::enabled(
+                                session.budgets.max_think_tokens.max(4096),
                             )),
-                            reasoning_content: None,
-                            tool_calls: vec![],
-                        });
-                        escalated
+                            temperature: None,
+                            ..request
+                        }
+                    } else if self.cfg.router.two_phase_thinking {
+                        // Two-phase escalation: think first, then retry with reasoning
+                        let think_request = ChatRequest {
+                            model: request_model.clone(),
+                            messages: request.messages.clone(),
+                            tools: vec![],
+                            tool_choice: ToolChoice::none(),
+                            max_tokens: session.budgets.max_think_tokens.max(4096),
+                            temperature: None,
+                            thinking: Some(ThinkingConfig::enabled(
+                                session.budgets.max_think_tokens.max(4096),
+                            )),
+                        };
+                        let think_resp = {
+                            let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                            if let Some(cb) = cb {
+                                self.llm.complete_chat_streaming(&think_request, cb)?
+                            } else {
+                                self.llm.complete_chat(&think_request)?
+                            }
+                        };
+                        let reasoning = if !think_resp.reasoning_content.is_empty() {
+                            &think_resp.reasoning_content
+                        } else {
+                            &think_resp.text
+                        };
+                        if !reasoning.trim().is_empty() {
+                            let mut escalated = request.clone();
+                            escalated.messages.push(ChatMessage::Assistant {
+                                content: Some(format!(
+                                    "[Reasoning phase]\n{reasoning}\n\n[Now executing with tools]"
+                                )),
+                                reasoning_content: None,
+                                tool_calls: vec![],
+                            });
+                            escalated
+                        } else {
+                            request.clone()
+                        }
                     } else {
                         request.clone()
-                    }
-                } else {
-                    request.clone()
-                };
+                    };
                 let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
                 if let Some(cb) = cb {
                     self.llm.complete_chat_streaming(&escalated_request, cb)?
@@ -9254,7 +9271,9 @@ mod tests {
             serde_json::json!({
                 "two_phase_thinking": true,
                 "reasoner_directed": enabled,
-                "reasoner_directed_max_turns": max_turns
+                "reasoner_directed_max_turns": max_turns,
+                // Disable unified mode so these tests exercise the reasoner-directed path
+                "unified_thinking_tools": false
             }),
         );
         fs::write(
@@ -9333,7 +9352,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(result.is_ok(), "chat should succeed on fallback: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "chat should succeed on fallback: {:?}",
+            result.err()
+        );
         let answer = result.unwrap();
         assert!(
             answer.contains("Unguided response"),
@@ -9423,6 +9446,201 @@ mod tests {
         assert_eq!(
             rd_count, 1,
             "should have exactly 1 reasoner_directed escalation event (budget=1), got {rd_count}"
+        );
+    }
+
+    // ── Unified thinking + tools tests ──────────────────────────────────
+
+    fn write_unified_thinking_settings(dir: &Path, unified: bool, reasoner_directed: bool) {
+        let settings_path = dir.join(".deepseek/settings.local.json");
+        let existing: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("parse settings");
+        let mut settings = existing.as_object().unwrap().clone();
+        settings.insert(
+            "router".to_string(),
+            serde_json::json!({
+                "two_phase_thinking": true,
+                "reasoner_directed": reasoner_directed,
+                "reasoner_directed_max_turns": 20,
+                "unified_thinking_tools": unified
+            }),
+        );
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).expect("serialize"),
+        )
+        .expect("write settings");
+    }
+
+    #[test]
+    fn chat_unified_thinking_tools_enables_thinking_with_tools() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        write_unified_thinking_settings(dir.path(), true, false);
+        fs::write(dir.path().join("data.txt"), "unified test data").expect("write test file");
+
+        // With unified mode, a single model call handles thinking + tool_calls.
+        // No separate reasoner call needed.
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_u1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("data.txt")}).to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "File contains: unified test data".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read data.txt",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        let answer = result.unwrap();
+        assert!(
+            answer.contains("unified test data"),
+            "answer should contain file contents, got: {answer}"
+        );
+
+        // Verify NO reasoner_directed escalation events — unified mode bypasses it
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            !contents.contains(r#""reason_codes":["reasoner_directed"]"#),
+            "events should NOT contain reasoner_directed when unified mode is active"
+        );
+        // Verify no two_phase_reasoning either
+        assert!(
+            !contents.contains(r#""reason_codes":["two_phase_reasoning"]"#),
+            "events should NOT contain two_phase_reasoning when unified mode is active"
+        );
+    }
+
+    #[test]
+    fn chat_unified_thinking_tools_keeps_reasoning_in_tool_loop() {
+        // Verify that reasoning_content from assistant messages within the
+        // current tool loop is preserved (not stripped) per V3.2 docs.
+        let messages = vec![
+            ChatMessage::System {
+                content: "You are a coding assistant.".to_string(),
+            },
+            // Prior turn (old user question) — reasoning should be stripped
+            ChatMessage::User {
+                content: "old question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("old answer".to_string()),
+                reasoning_content: Some("old reasoning that should be stripped".to_string()),
+                tool_calls: vec![],
+            },
+            // Current turn (new user question)
+            ChatMessage::User {
+                content: "new question".to_string(),
+            },
+            // Tool loop — reasoning from current turn should be kept
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: Some("current reasoning to keep".to_string()),
+                tool_calls: vec![tool_call("call_1", "fs.read")],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "file contents".to_string(),
+            },
+        ];
+
+        // Find last User message index
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| matches!(m, ChatMessage::User { .. }))
+            .unwrap_or(0);
+
+        // Apply the same stripping logic as the production code
+        let mut test_messages = messages.clone();
+        for msg in &mut test_messages[..last_user_idx] {
+            if let ChatMessage::Assistant {
+                reasoning_content, ..
+            } = msg
+            {
+                *reasoning_content = None;
+            }
+        }
+
+        // Old turn reasoning should be stripped
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &test_messages[2]
+        {
+            assert_eq!(
+                *reasoning_content, None,
+                "reasoning from prior turn should be stripped"
+            );
+        }
+
+        // Current tool loop reasoning should be preserved
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &test_messages[4]
+        {
+            assert_eq!(
+                reasoning_content.as_deref(),
+                Some("current reasoning to keep"),
+                "reasoning from current tool loop should be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_unified_thinking_tools_falls_back_to_reasoner_directed() {
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        // Disable unified, enable reasoner_directed
+        write_unified_thinking_settings(dir.path(), false, true);
+        fs::write(dir.path().join("fallback.txt"), "fallback data").expect("write test file");
+
+        // With unified=false, reasoner_directed kicks in: reasoner first, then executor
+        mock.push(deepseek_testkit::Scenario::ReasonerResponse {
+            reasoning_content: "Need to read the file".into(),
+            text: "Next: read fallback.txt with fs_read".into(),
+        });
+        mock.push(deepseek_testkit::Scenario::ToolCall {
+            id: "call_fb1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"file_path": dir.path().join("fallback.txt")})
+                .to_string(),
+        });
+        mock.push(deepseek_testkit::Scenario::ReasonerResponse {
+            reasoning_content: "File read successfully".into(),
+            text: "TASK_COMPLETE — The file contains: fallback data".into(),
+        });
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        let result = engine.chat_with_options(
+            "read fallback.txt and tell me what it contains",
+            ChatOptions {
+                tools: true,
+                force_max_think: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+        let answer = result.unwrap();
+        assert!(
+            answer.contains("fallback data"),
+            "answer should contain file contents, got: {answer}"
+        );
+
+        // Verify reasoner_directed WAS used (since unified is off)
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        let contents = fs::read_to_string(&events_path).expect("read events");
+        assert!(
+            contents.contains(r#""reason_codes":["reasoner_directed"]"#),
+            "events should contain reasoner_directed when unified mode is disabled"
         );
     }
 }

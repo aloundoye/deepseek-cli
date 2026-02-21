@@ -1166,10 +1166,12 @@ pub enum ChatMessage {
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
-        /// Chain-of-thought reasoning from thinking mode. Present when the model
-        /// uses thinking and returns reasoning alongside tool calls or content.
-        /// Must be stripped from prior turns before sending new API requests
-        /// (DeepSeek API requirement for multi-turn thinking + tools).
+        /// Chain-of-thought reasoning from thinking mode (DeepSeek V3.2).
+        /// Present when the model uses thinking and returns reasoning alongside
+        /// tool calls or content. Per V3.2 docs: **keep** reasoning_content
+        /// within a tool loop (same user question) so the model retains its
+        /// logical thread, but **strip** it from prior conversation turns
+        /// (previous user questions) to save bandwidth.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -1309,6 +1311,24 @@ fn default_cleanup_period_days() -> u32 {
 }
 fn default_respect_gitignore() -> bool {
     true
+}
+fn default_true_bool() -> bool {
+    true
+}
+fn default_v3_max_step_failures() -> u32 {
+    2
+}
+fn default_blast_radius_threshold() -> u32 {
+    5
+}
+fn default_r1_max_steps() -> u32 {
+    30
+}
+fn default_r1_max_parse_retries() -> u32 {
+    2
+}
+fn default_v3_patch_max_context_requests() -> u32 {
+    3
 }
 
 impl AppConfig {
@@ -1474,10 +1494,36 @@ pub struct RouterConfig {
     pub two_phase_thinking: bool,
     /// When true, use `deepseek-reasoner` to analyze and direct strategy on every
     /// tool-enabled turn, then `deepseek-chat` executes tool calls guided by that
-    /// reasoning. This is the primary workaround for the thinking+tools DSML leak.
+    /// reasoning. Fallback for when `unified_thinking_tools` is disabled.
     pub reasoner_directed: bool,
+    /// When true (default), use `deepseek-chat` with thinking mode enabled
+    /// alongside tools in a single API call (DeepSeek V3.2 unified mode).
+    /// When false, fall back to the two-model `reasoner_directed` loop.
+    pub unified_thinking_tools: bool,
     /// Maximum number of reasoner calls per session to limit token cost.
     pub reasoner_directed_max_turns: u32,
+    /// Enable the mode router (V3Autopilot / R1Supervise / R1DriveTools).
+    /// When false, always uses V3Autopilot.
+    #[serde(default = "default_true_bool")]
+    pub mode_router_enabled: bool,
+    /// Max consecutive failures on the same step before escalating from V3 to R1.
+    #[serde(default = "default_v3_max_step_failures")]
+    pub v3_max_step_failures: u32,
+    /// Max files changed since last green verify before escalating to R1.
+    #[serde(default = "default_blast_radius_threshold")]
+    pub blast_radius_threshold: u32,
+    /// Allow V3 one bounded recovery attempt for mechanical errors.
+    #[serde(default = "default_true_bool")]
+    pub v3_mechanical_recovery: bool,
+    /// Max total R1 drive-tools steps per task.
+    #[serde(default = "default_r1_max_steps")]
+    pub r1_max_steps: u32,
+    /// Max retries when R1 output fails schema validation.
+    #[serde(default = "default_r1_max_parse_retries")]
+    pub r1_max_parse_retries: u32,
+    /// Max context requests from V3 patch writer before giving up.
+    #[serde(default = "default_v3_patch_max_context_requests")]
+    pub v3_patch_max_context_requests: u32,
     pub w1: f32,
     pub w2: f32,
     pub w3: f32,
@@ -1496,6 +1542,14 @@ impl Default for RouterConfig {
             two_phase_thinking: true,
             reasoner_directed: true,
             reasoner_directed_max_turns: 20,
+            unified_thinking_tools: true,
+            mode_router_enabled: true,
+            v3_max_step_failures: 2,
+            blast_radius_threshold: 5,
+            v3_mechanical_recovery: true,
+            r1_max_steps: 30,
+            r1_max_parse_retries: 2,
+            v3_patch_max_context_requests: 3,
             w1: 0.2,
             w2: 0.15,
             w3: 0.2,
