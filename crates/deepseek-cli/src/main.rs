@@ -2355,13 +2355,17 @@ fn run_chat(
         }
         let mut line = String::new();
         stdin().read_line(&mut line)?;
-        let prompt = line.trim();
-        if prompt == "exit" {
+        let raw_prompt = line.trim();
+        if raw_prompt == "exit" {
             break;
         }
-        if prompt.is_empty() {
+        if raw_prompt.is_empty() {
             continue;
         }
+
+        // Expand @file mentions into inline file content
+        let prompt_owned = deepseek_ui::expand_at_mentions(raw_prompt);
+        let prompt = prompt_owned.as_str();
 
         if let Some(cmd) = SlashCommand::parse(prompt) {
             match cmd {
@@ -3270,7 +3274,39 @@ fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                     Ok(cmd) => serde_json::to_string_pretty(&visual_payload(cwd, cmd)?)?,
                     Err(err) => format!("visual parse error: {err}"),
                 },
-                SlashCommand::Context => "Use 'deepseek context' for token breakdown.".to_string(),
+                SlashCommand::Context => {
+                    let ctx_cfg = AppConfig::load(cwd).unwrap_or_default();
+                    let ctx_store = Store::new(cwd)?;
+                    let context_window = ctx_cfg.llm.context_window_tokens;
+                    let compact_threshold = ctx_cfg.context.auto_compact_threshold;
+                    let session = ctx_store.load_latest_session()?;
+                    let (session_tokens, compactions) = if let Some(ref s) = session {
+                        let usage = ctx_store.usage_summary(Some(s.session_id), None)?;
+                        let compactions = ctx_store.list_context_compactions(Some(s.session_id))?;
+                        (usage.input_tokens + usage.output_tokens, compactions.len())
+                    } else {
+                        (0, 0)
+                    };
+                    let memory_tokens = {
+                        let mem = deepseek_memory::MemoryManager::new(cwd).ok();
+                        let text = mem.and_then(|m| m.read_combined_memory().ok()).unwrap_or_default();
+                        (text.len() as u64) / 4
+                    };
+                    let system_prompt_tokens: u64 = 800 + ctx_cfg.policy.allowlist.len() as u64 * 40 + 400;
+                    let conversation_tokens = session_tokens.saturating_sub(system_prompt_tokens + memory_tokens);
+                    let utilization = if context_window > 0 {
+                        (session_tokens as f64 / context_window as f64) * 100.0
+                    } else { 0.0 };
+                    let mut out = format!(
+                        "Context Window Inspector\n========================\nWindow size:       {} tokens\nCompact threshold: {:.0}%\nSession tokens:    {}\nUtilization:       {:.1}%\nCompactions:       {}\n\nBreakdown:\n  System prompt:        ~{} tokens\n  Memory (DEEPSEEK.md): ~{} tokens\n  Conversation:         ~{} tokens",
+                        context_window, compact_threshold * 100.0, session_tokens,
+                        utilization, compactions, system_prompt_tokens, memory_tokens, conversation_tokens,
+                    );
+                    if utilization > (compact_threshold as f64 * 100.0) {
+                        out.push_str("\n\nContext is above compact threshold. Use /compact to free space.");
+                    }
+                    out
+                }
                 SlashCommand::Sandbox(_) => format!("Sandbox mode: {}", AppConfig::load(cwd).unwrap_or_default().policy.sandbox_mode),
                 SlashCommand::Agents => "Use 'deepseek background list' for subagent status.".to_string(),
                 SlashCommand::Tasks(_) => "Use 'deepseek tasks list' for task queue.".to_string(),
@@ -3357,9 +3393,9 @@ fn run_chat_tui(cwd: &Path, _allow_tools: bool, cfg: &AppConfig) -> Result<()> {
                 return;
             }
 
-            // Agent prompt — set stream callback and spawn background thread.
+            // Agent prompt — expand @file mentions and set stream callback.
             let engine_clone = Arc::clone(&engine);
-            let prompt = prompt.to_string();
+            let prompt = deepseek_ui::expand_at_mentions(prompt);
             let _max_think = force_max_think.load(Ordering::Relaxed);
             let tx_stream = tx.clone();
             let tx_done = tx.clone();

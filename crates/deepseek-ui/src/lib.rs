@@ -1156,6 +1156,12 @@ pub struct KeyBindings {
     pub toggle_artifacts: KeyEvent,
     pub toggle_plan_collapse: KeyEvent,
     pub cycle_permission_mode: KeyEvent,
+    pub exit_session: KeyEvent,
+    pub clear_screen: KeyEvent,
+    pub newline_alt: KeyEvent,
+    pub switch_model: KeyEvent,
+    pub toggle_thinking: KeyEvent,
+    pub kill_background: KeyEvent,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1175,6 +1181,12 @@ struct KeyBindingsFile {
     toggle_artifacts: Option<String>,
     toggle_plan_collapse: Option<String>,
     cycle_permission_mode: Option<String>,
+    exit_session: Option<String>,
+    clear_screen: Option<String>,
+    newline_alt: Option<String>,
+    switch_model: Option<String>,
+    toggle_thinking: Option<String>,
+    kill_background: Option<String>,
 }
 
 impl Default for KeyBindings {
@@ -1194,6 +1206,12 @@ impl Default for KeyBindings {
             toggle_artifacts: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
             toggle_plan_collapse: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             cycle_permission_mode: KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            exit_session: KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            clear_screen: KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            newline_alt: KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            switch_model: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+            toggle_thinking: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+            kill_background: KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
         }
     }
 }
@@ -1241,6 +1259,24 @@ impl KeyBindings {
         }
         if let Some(value) = raw.cycle_permission_mode {
             self.cycle_permission_mode = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.exit_session {
+            self.exit_session = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.clear_screen {
+            self.clear_screen = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.newline_alt {
+            self.newline_alt = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.switch_model {
+            self.switch_model = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.toggle_thinking {
+            self.toggle_thinking = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.kill_background {
+            self.kill_background = parse_key_event(&value)?;
         }
         Ok(self)
     }
@@ -2075,6 +2111,43 @@ where
             info_line = "paste is supported via terminal bracketed paste".to_string();
             continue;
         }
+        // Ctrl+D — exit session
+        if key == bindings.exit_session {
+            break;
+        }
+        // Ctrl+L — clear terminal screen
+        if key == bindings.clear_screen {
+            shell.transcript.clear();
+            info_line = "screen cleared".to_string();
+            continue;
+        }
+        // Ctrl+J — alternative newline (like Shift+Enter)
+        if key == bindings.newline_alt {
+            input.insert(cursor_pos.min(input.len()), '\n');
+            cursor_pos = (cursor_pos + 1).min(input.len());
+            continue;
+        }
+        // Alt+P — switch model
+        if key == bindings.switch_model {
+            info_line = "model switch: use /model <name>".to_string();
+            input = "/model ".to_string();
+            cursor_pos = input.len();
+            continue;
+        }
+        // Alt+T — toggle extended thinking
+        if key == bindings.toggle_thinking {
+            info_line = "thinking toggle: use /effort <low|medium|high>".to_string();
+            input = "/effort ".to_string();
+            cursor_pos = input.len();
+            continue;
+        }
+        // Ctrl+F — kill all background agents
+        if key == bindings.kill_background {
+            info_line = "kill background agents: send /background kill-all".to_string();
+            input = "/background kill-all".to_string();
+            cursor_pos = input.len();
+            continue;
+        }
         if key == bindings.stop {
             if let Some(last) = last_escape_at
                 && last.elapsed() <= Duration::from_millis(600)
@@ -2129,11 +2202,30 @@ where
                     "terminal-setup",
                     "keybindings",
                     "doctor",
+                    "copy",
+                    "debug",
+                    "exit",
+                    "hooks",
+                    "rename",
+                    "resume",
+                    "stats",
+                    "statusline",
+                    "theme",
+                    "usage",
+                    "add-dir",
+                    "bug",
+                    "pr_comments",
+                    "release-notes",
+                    "login",
+                    "logout",
                 ];
                 if let Some(next) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
                     input = format!("/{next}");
                     cursor_pos = input.len();
                 }
+            } else if let Some(completed) = autocomplete_at_mention(&input) {
+                input = completed;
+                cursor_pos = input.len();
             } else if let Some(completed) = autocomplete_path_input(&input) {
                 input = completed;
                 cursor_pos = input.len();
@@ -2185,6 +2277,13 @@ where
                 info_line = "already processing, please wait...".to_string();
                 continue;
             }
+            // Backslash at end of line = continuation (multiline)
+            if input.ends_with('\\') {
+                input.pop(); // Remove trailing backslash
+                input.push('\n');
+                cursor_pos = input.len();
+                continue;
+            }
             let prompt = input.trim().to_string();
             if prompt.is_empty() {
                 continue;
@@ -2215,6 +2314,13 @@ where
                 history_cursor = None;
                 continue;
             }
+            // ! prefix — bash mode: wrap in direct bash command
+            let effective_prompt = if let Some(cmd) = prompt.strip_prefix('!') {
+                let cmd = cmd.trim();
+                format!("Run this exact bash command and show the output: `{cmd}`")
+            } else {
+                prompt.clone()
+            };
             history.push_back(prompt.clone());
             if history.len() > 100 {
                 let _ = history.pop_front();
@@ -2226,7 +2332,7 @@ where
             is_processing = true;
             cancelled = false;
             shell.active_tool = Some("processing...".to_string());
-            on_submit(&prompt);
+            on_submit(&effective_prompt);
             if vim_quit_after_submit {
                 break;
             }
@@ -2312,6 +2418,67 @@ fn parse_key_code(value: &str) -> Option<KeyCode> {
         value if value.chars().count() == 1 => value.chars().next().map(KeyCode::Char),
         _ => None,
     }
+}
+
+/// Autocomplete `@path` file mentions. Finds the last `@` token in the input and
+/// completes the path after it using the same logic as path autocomplete.
+fn autocomplete_at_mention(input: &str) -> Option<String> {
+    // Find the last token starting with '@'
+    let split_at = input
+        .char_indices()
+        .rfind(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx + 1)
+        .unwrap_or(0);
+    let token = &input[split_at..];
+    if !token.starts_with('@') || token.len() < 2 {
+        return None;
+    }
+    let path_part = &token[1..]; // strip the '@'
+    let completed = autocomplete_path_token(path_part)?;
+    let mut out = String::with_capacity(input.len() + completed.len() + 2);
+    out.push_str(&input[..split_at]);
+    out.push('@');
+    out.push_str(&completed);
+    Some(out)
+}
+
+/// Expand `@file` mentions in a prompt into inline file content references.
+/// Returns the prompt with `@path` replaced by `[file: path]\n<content>\n[/file]`.
+pub fn expand_at_mentions(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for token in input.split_whitespace() {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        if token.starts_with('@') && token.len() > 1 {
+            let raw_path = &token[1..];
+            let path = if let Some(stripped) = raw_path.strip_prefix("~/") {
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default();
+                PathBuf::from(home).join(stripped)
+            } else {
+                let p = PathBuf::from(raw_path);
+                if p.is_absolute() {
+                    p
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(p)
+                }
+            };
+            if path.is_file()
+                && let Ok(content) = fs::read_to_string(&path)
+            {
+                result.push_str(&format!(
+                    "[file: {}]\n{}\n[/file]",
+                    path.display(),
+                    content.trim()
+                ));
+                continue;
+            }
+        }
+        result.push_str(token);
+    }
+    result
 }
 
 fn autocomplete_path_input(input: &str) -> Option<String> {
@@ -2981,5 +3148,47 @@ mod tests {
         assert!(all_text.contains("deepseek-reasoner"));
         assert!(all_text.contains("auto"));
         assert!(all_text.contains("running"));
+    }
+
+    #[test]
+    fn at_mention_autocomplete_detects_prefix() {
+        // Without @, should return None
+        assert!(autocomplete_at_mention("hello world").is_none());
+        // Single @ without path should return None
+        assert!(autocomplete_at_mention("@").is_none());
+    }
+
+    #[test]
+    fn expand_at_mentions_passes_through_without_at() {
+        let input = "hello world no mentions";
+        assert_eq!(expand_at_mentions(input), input);
+    }
+
+    #[test]
+    fn expand_at_mentions_expands_real_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "deepseek-at-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        fs::write(&file, "file content here").unwrap();
+
+        let input = format!("check @{} please", file.display());
+        let expanded = expand_at_mentions(&input);
+        assert!(expanded.contains("file content here"));
+        assert!(expanded.contains("[file:"));
+        assert!(expanded.contains("[/file]"));
+        assert!(expanded.contains("please"));
+    }
+
+    #[test]
+    fn expand_at_mentions_preserves_missing_files() {
+        let input = "look at @/nonexistent/path/file.rs here";
+        let expanded = expand_at_mentions(input);
+        assert!(expanded.contains("@/nonexistent/path/file.rs"));
     }
 }
