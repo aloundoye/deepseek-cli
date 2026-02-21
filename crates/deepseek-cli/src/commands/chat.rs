@@ -240,10 +240,7 @@ pub(crate) fn run_chat(
                             "thinking_enabled": force_max_think,
                         }))?;
                     } else if force_max_think {
-                        println!(
-                            "model mode: thinking-enabled ({})",
-                            cfg.llm.base_model
-                        );
+                        println!("model mode: thinking-enabled ({})", cfg.llm.base_model);
                     } else {
                         println!(
                             "model mode: auto ({} thinking=on-demand)",
@@ -357,11 +354,7 @@ pub(crate) fn run_chat(
                         println!(
                             "effort={} thinking={}",
                             normalized,
-                            if force_max_think {
-                                "enabled"
-                            } else {
-                                "auto"
-                            }
+                            if force_max_think { "enabled" } else { "auto" }
                         );
                     }
                 }

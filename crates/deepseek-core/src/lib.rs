@@ -1463,6 +1463,10 @@ pub struct RouterConfig {
     pub threshold_high: f32,
     pub escalate_on_invalid_plan: bool,
     pub max_escalations_per_unit: u8,
+    /// When true and the router requests thinking mode but tools are active,
+    /// use a two-phase approach: first a thinking-only call (no tools) to reason
+    /// about strategy, then a tools call (no thinking) with the reasoning as context.
+    pub two_phase_thinking: bool,
     pub w1: f32,
     pub w2: f32,
     pub w3: f32,
@@ -1478,6 +1482,7 @@ impl Default for RouterConfig {
             threshold_high: 0.72,
             escalate_on_invalid_plan: true,
             max_escalations_per_unit: 1,
+            two_phase_thinking: true,
             w1: 0.2,
             w2: 0.15,
             w3: 0.2,
