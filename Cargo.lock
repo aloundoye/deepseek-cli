@@ -786,6 +786,7 @@ dependencies = [
  "chrono",
  "deepseek-core",
  "deepseek-store",
+ "glob",
  "serde",
  "serde_json",
  "sha2",

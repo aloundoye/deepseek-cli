@@ -2050,6 +2050,31 @@ impl AgentEngine {
             now.format("%Y-%m-%d"),
         )];
 
+        // Add language preference if set.
+        if !self.cfg.language.is_empty() {
+            parts.push(format!(
+                "\n\n# Language\nRespond in **{}**.",
+                self.cfg.language
+            ));
+        }
+
+        // Add output style directive.
+        match self.cfg.output_style.as_str() {
+            "concise" => {
+                parts.push(
+                    "\n\n# Output Style\nBe extremely concise. Minimize explanation. Code only when possible."
+                        .to_string(),
+                );
+            }
+            "verbose" => {
+                parts.push(
+                    "\n\n# Output Style\nBe thorough and detailed. Explain reasoning, trade-offs, and alternatives."
+                        .to_string(),
+                );
+            }
+            _ => {} // "normal" or unrecognized — no override
+        }
+
         // Add DEEPSEEK.md / memory if available
         if let Ok(manager) = MemoryManager::new(&self.workspace)
             && let Ok(memory) = manager.read_combined_memory()

@@ -86,17 +86,44 @@ impl MemoryManager {
 
     pub fn read_combined_memory(&self) -> Result<String> {
         let mut chunks = Vec::new();
+
+        // 1. Global memory: ~/.deepseek/DEEPSEEK.md
         if let Some(global) = Self::global_memory_path()
             && global.exists()
             && let Ok(text) = fs::read_to_string(&global)
         {
-            let trimmed = text.trim();
+            let base_dir = global.parent().unwrap_or(Path::new("/"));
+            let processed = process_imports(text.trim(), base_dir, 5);
+            let trimmed = processed.trim();
             if !trimmed.is_empty() {
                 chunks.push(format!("[global:{}]\n{}", global.display(), trimmed));
             }
         }
+
+        // 2. Hierarchical DEEPSEEK.md files (root → cwd).
+        let hierarchical = load_hierarchical_memory(&self.workspace);
+        for (path, content) in &hierarchical {
+            // Skip the workspace-level DEEPSEEK.md — we already load it below.
+            if path == &self.memory_path() {
+                continue;
+            }
+            let base_dir = path.parent().unwrap_or(Path::new("/"));
+            let processed = process_imports(content, base_dir, 5);
+            let trimmed = processed.trim();
+            if !trimmed.is_empty() {
+                chunks.push(format!("[memory:{}]\n{}", path.display(), trimmed));
+            }
+        }
+
+        // 3. Project-level DEEPSEEK.md (workspace root).
         let project = self.read_memory()?;
-        let project_trimmed = project.trim();
+        let base_dir = self
+            .memory_path()
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_path_buf();
+        let processed = process_imports(project.trim(), &base_dir, 5);
+        let project_trimmed = processed.trim();
         if !project_trimmed.is_empty() {
             chunks.push(format!(
                 "[project:{}]\n{}",
@@ -104,6 +131,32 @@ impl MemoryManager {
                 project_trimmed
             ));
         }
+
+        // 4. Project-local DEEPSEEK.local.md (gitignored).
+        let local_path = self.workspace.join("DEEPSEEK.local.md");
+        if local_path.exists()
+            && let Ok(text) = fs::read_to_string(&local_path)
+        {
+            let processed = process_imports(text.trim(), &self.workspace, 5);
+            let trimmed = processed.trim();
+            if !trimmed.is_empty() {
+                chunks.push(format!("[local:{}]\n{}", local_path.display(), trimmed));
+            }
+        }
+
+        // 5. Rules directories.
+        let rules = load_rules(&self.workspace);
+        for rule in &rules {
+            let level = if rule.user_level { "user-rule" } else { "rule" };
+            chunks.push(format!(
+                "[{}:{}]\n{}",
+                level,
+                rule.path.display(),
+                rule.content
+            ));
+        }
+
+        // 6. Auto-memory observations.
         if let Some(auto_path) = self.auto_memory_path()
             && auto_path.exists()
             && let Ok(text) = fs::read_to_string(&auto_path)
@@ -364,6 +417,278 @@ impl MemoryManager {
     }
 }
 
+// ── Rules Directory Loading ──────────────────────────────────────────────────
+
+/// A loaded rule file from `.deepseek/rules/` or `~/.deepseek/rules/`.
+#[derive(Debug, Clone)]
+pub struct RuleFile {
+    /// Source path of the rule file.
+    pub path: PathBuf,
+    /// Whether this is a user-level rule (from ~/.deepseek/rules/).
+    pub user_level: bool,
+    /// Glob patterns for path-specific activation. Empty = always active.
+    pub path_patterns: Vec<String>,
+    /// The rule content (markdown body after frontmatter).
+    pub content: String,
+}
+
+/// Load all rule files from both project and user-level rules directories.
+/// Returns rules in load order: user-level first, then project-level.
+pub fn load_rules(workspace: &Path) -> Vec<RuleFile> {
+    let mut rules = Vec::new();
+
+    // User-level rules: ~/.deepseek/rules/*.md
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+    {
+        let user_rules_dir = PathBuf::from(&home).join(".deepseek/rules");
+        if user_rules_dir.is_dir() {
+            load_rules_from_dir(&user_rules_dir, true, &mut rules);
+        }
+    }
+
+    // Project-level rules: .deepseek/rules/*.md
+    let project_rules_dir = workspace.join(".deepseek/rules");
+    if project_rules_dir.is_dir() {
+        load_rules_from_dir(&project_rules_dir, false, &mut rules);
+    }
+
+    rules
+}
+
+/// Filter rules to only those that are active for the given file paths being edited.
+/// Rules with no path patterns are always active.
+pub fn filter_active_rules<'a>(rules: &'a [RuleFile], active_paths: &[&str]) -> Vec<&'a RuleFile> {
+    rules
+        .iter()
+        .filter(|rule| {
+            if rule.path_patterns.is_empty() {
+                return true; // No patterns = always active.
+            }
+            // At least one pattern must match at least one active path.
+            rule.path_patterns.iter().any(|pattern| {
+                if let Ok(pat) = glob::Pattern::new(pattern) {
+                    active_paths
+                        .iter()
+                        .any(|p| pat.matches(p) || pat.matches_path(Path::new(p)))
+                } else {
+                    false
+                }
+            })
+        })
+        .collect()
+}
+
+fn load_rules_from_dir(dir: &Path, user_level: bool, out: &mut Vec<RuleFile>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        })
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            let (frontmatter, body) = parse_rule_frontmatter(&raw);
+            let path_patterns = frontmatter
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let content = body.trim().to_string();
+            if !content.is_empty() {
+                out.push(RuleFile {
+                    path,
+                    user_level,
+                    path_patterns,
+                    content,
+                });
+            }
+        }
+    }
+}
+
+/// Parse optional YAML frontmatter from a rule file.
+/// Returns (frontmatter as JSON value, body after frontmatter).
+fn parse_rule_frontmatter(raw: &str) -> (serde_json::Value, &str) {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with("---") {
+        return (serde_json::Value::Null, raw);
+    }
+    // Find closing ---
+    if let Some(end) = trimmed[3..].find("\n---") {
+        let yaml_str = &trimmed[3..3 + end].trim();
+        let body = &trimmed[3 + end + 4..]; // skip past closing ---
+        // Parse YAML as JSON (simple key: value pairs).
+        let frontmatter = parse_simple_yaml(yaml_str);
+        (frontmatter, body)
+    } else {
+        (serde_json::Value::Null, raw)
+    }
+}
+
+/// Minimal YAML-like parser for frontmatter (supports key: value and key: [list]).
+fn parse_simple_yaml(yaml: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let mut current_key: Option<String> = None;
+    let mut current_list: Vec<serde_json::Value> = Vec::new();
+    let mut in_list = false;
+
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // List item under current key.
+        if in_list && trimmed.starts_with("- ") {
+            current_list.push(serde_json::Value::String(
+                trimmed[2..].trim().to_string(),
+            ));
+            continue;
+        }
+
+        // Save any pending list.
+        if in_list {
+            if let Some(ref key) = current_key {
+                map.insert(
+                    key.clone(),
+                    serde_json::Value::Array(current_list.clone()),
+                );
+            }
+            in_list = false;
+            current_list.clear();
+        }
+
+        if let Some(colon_pos) = trimmed.find(':') {
+            let key = trimmed[..colon_pos].trim().to_string();
+            let value_part = trimmed[colon_pos + 1..].trim();
+            if value_part.is_empty() {
+                // Could be start of a list.
+                current_key = Some(key);
+                in_list = true;
+                current_list.clear();
+            } else {
+                map.insert(
+                    key,
+                    serde_json::Value::String(value_part.to_string()),
+                );
+            }
+        }
+    }
+
+    // Save final pending list.
+    if in_list
+        && let Some(ref key) = current_key
+    {
+        map.insert(
+            key.clone(),
+            serde_json::Value::Array(current_list),
+        );
+    }
+
+    serde_json::Value::Object(map)
+}
+
+// ── Hierarchical DEEPSEEK.md Loading ────────────────────────────────────────
+
+/// Load DEEPSEEK.md files hierarchically from cwd up to filesystem root.
+/// Returns content chunks in order: root → ... → cwd (higher-level first).
+pub fn load_hierarchical_memory(workspace: &Path) -> Vec<(PathBuf, String)> {
+    let mut paths = Vec::new();
+    let mut dir = workspace.to_path_buf();
+
+    loop {
+        let deepseek_md = dir.join("DEEPSEEK.md");
+        if deepseek_md.exists()
+            && let Ok(content) = fs::read_to_string(&deepseek_md)
+        {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                paths.push((deepseek_md, trimmed.to_string()));
+            }
+        }
+        // Also check DEEPSEEK.local.md (gitignored, machine-local).
+        let local_md = dir.join("DEEPSEEK.local.md");
+        if local_md.exists()
+            && let Ok(content) = fs::read_to_string(&local_md)
+        {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                paths.push((local_md, trimmed.to_string()));
+            }
+        }
+
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    // Reverse so root-level appears first (higher precedence loads first).
+    paths.reverse();
+    paths
+}
+
+/// Process @import directives in memory content.
+/// `@path/to/file` includes that file's contents inline.
+/// Relative paths are resolved from the directory containing the source file.
+/// Max recursion depth is 5 to prevent infinite loops.
+pub fn process_imports(content: &str, base_dir: &Path, max_depth: u8) -> String {
+    if max_depth == 0 {
+        return content.to_string();
+    }
+
+    let mut result = String::with_capacity(content.len());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(import_path) = trimmed.strip_prefix('@') {
+            let import_path = import_path.trim();
+            if import_path.is_empty() {
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+            let resolved = base_dir.join(import_path);
+            if resolved.exists() && resolved.is_file() {
+                if let Ok(imported) = fs::read_to_string(&resolved) {
+                    let import_dir = resolved.parent().unwrap_or(base_dir);
+                    let processed = process_imports(&imported, import_dir, max_depth - 1);
+                    result.push_str(&format!(
+                        "<!-- imported from {} -->\n",
+                        resolved.display()
+                    ));
+                    result.push_str(processed.trim());
+                    result.push('\n');
+                } else {
+                    result.push_str(&format!("<!-- import failed: {} -->\n", resolved.display()));
+                }
+            } else {
+                result.push_str(&format!(
+                    "<!-- import not found: {} -->\n",
+                    resolved.display()
+                ));
+            }
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn has_ignored_component(path: &Path) -> bool {
     path.components().any(|component| {
         let value = component.as_os_str();
@@ -526,5 +851,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn loads_rules_from_project_directory() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-rules-test-{}", Uuid::now_v7()));
+        let rules_dir = workspace.join(".deepseek/rules");
+        fs::create_dir_all(&rules_dir).expect("rules dir");
+        fs::write(
+            rules_dir.join("coding.md"),
+            "Always use snake_case for variables.\n",
+        )
+        .expect("rule");
+        fs::write(
+            rules_dir.join("rust.md"),
+            "---\npaths:\n  - src/**/*.rs\n---\nUse anyhow for errors.\n",
+        )
+        .expect("rule with frontmatter");
+
+        let rules = load_rules(&workspace);
+        assert_eq!(rules.len(), 2);
+        // Sorted alphabetically: coding.md, rust.md
+        assert!(rules[0].content.contains("snake_case"));
+        assert!(rules[0].path_patterns.is_empty());
+        assert!(rules[1].content.contains("anyhow"));
+        assert_eq!(rules[1].path_patterns, vec!["src/**/*.rs"]);
+    }
+
+    #[test]
+    fn filter_active_rules_matches_patterns() {
+        let always = RuleFile {
+            path: PathBuf::from("always.md"),
+            user_level: false,
+            path_patterns: vec![],
+            content: "Always active".to_string(),
+        };
+        let rust_only = RuleFile {
+            path: PathBuf::from("rust.md"),
+            user_level: false,
+            path_patterns: vec!["src/**/*.rs".to_string()],
+            content: "Rust only".to_string(),
+        };
+        let js_only = RuleFile {
+            path: PathBuf::from("js.md"),
+            user_level: false,
+            path_patterns: vec!["**/*.js".to_string()],
+            content: "JS only".to_string(),
+        };
+
+        let rules = vec![always, rust_only, js_only];
+        let active = filter_active_rules(&rules, &["src/main.rs"]);
+        assert_eq!(active.len(), 2); // always + rust_only
+        assert!(active.iter().any(|r| r.content == "Always active"));
+        assert!(active.iter().any(|r| r.content == "Rust only"));
+    }
+
+    #[test]
+    fn process_imports_resolves_files() {
+        let dir =
+            std::env::temp_dir().join(format!("deepseek-import-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("extra.md"), "Extra content here").expect("extra");
+
+        let input = "# Main\n@extra.md\nDone.";
+        let output = process_imports(input, &dir, 5);
+        assert!(output.contains("Extra content here"));
+        assert!(output.contains("# Main"));
+        assert!(output.contains("Done."));
+    }
+
+    #[test]
+    fn process_imports_handles_missing_file() {
+        let dir = std::env::temp_dir().join(format!("deepseek-import-missing-{}", Uuid::now_v7()));
+        fs::create_dir_all(&dir).expect("dir");
+
+        let input = "# Main\n@nonexistent.md\nDone.";
+        let output = process_imports(input, &dir, 5);
+        assert!(output.contains("import not found"));
+        assert!(output.contains("Done."));
+    }
+
+    #[test]
+    fn process_imports_respects_max_depth() {
+        let dir =
+            std::env::temp_dir().join(format!("deepseek-import-depth-{}", Uuid::now_v7()));
+        fs::create_dir_all(&dir).expect("dir");
+        // a.md imports b.md which imports a.md (circular).
+        fs::write(dir.join("a.md"), "@b.md").expect("a");
+        fs::write(dir.join("b.md"), "@a.md").expect("b");
+
+        // Should terminate without infinite loop.
+        let output = process_imports("@a.md", &dir, 3);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn hierarchical_memory_loads_upward() {
+        let base =
+            std::env::temp_dir().join(format!("deepseek-hier-{}", Uuid::now_v7()));
+        let child = base.join("project/sub");
+        fs::create_dir_all(&child).expect("dirs");
+
+        fs::write(base.join("DEEPSEEK.md"), "Root memory").expect("root");
+        fs::write(base.join("project/DEEPSEEK.md"), "Project memory").expect("project");
+        fs::write(child.join("DEEPSEEK.md"), "Sub memory").expect("sub");
+
+        let loaded = load_hierarchical_memory(&child);
+        assert!(loaded.len() >= 3);
+        // First entry should be the highest-level one.
+        assert!(loaded.first().unwrap().1.contains("Root memory"));
+        assert!(loaded.last().unwrap().1.contains("Sub memory"));
+    }
+
+    #[test]
+    fn parse_rule_frontmatter_extracts_paths() {
+        let raw = "---\npaths:\n  - src/**/*.rs\n  - tests/**/*.rs\n---\nRule body here.\n";
+        let (fm, body) = parse_rule_frontmatter(raw);
+        let paths = fm["paths"].as_array().expect("array");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].as_str().unwrap(), "src/**/*.rs");
+        assert!(body.contains("Rule body here"));
+    }
+
+    #[test]
+    fn parse_rule_frontmatter_handles_no_frontmatter() {
+        let raw = "Just plain content.";
+        let (fm, body) = parse_rule_frontmatter(raw);
+        assert!(fm.is_null());
+        assert_eq!(body, raw);
     }
 }

@@ -10,6 +10,10 @@ pub enum PermissionMode {
     Ask,
     Auto,
     Plan,
+    /// Auto-accepts file edits; still prompts for bash commands.
+    AcceptEdits,
+    /// Auto-denies everything unless pre-approved via allow rules.
+    DontAsk,
     Locked,
 }
 
@@ -18,6 +22,8 @@ impl PermissionMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => PermissionMode::Auto,
             "plan" => PermissionMode::Plan,
+            "acceptedits" | "accept-edits" | "accept_edits" => PermissionMode::AcceptEdits,
+            "dontask" | "dont-ask" | "dont_ask" => PermissionMode::DontAsk,
             "locked" => PermissionMode::Locked,
             _ => PermissionMode::Ask,
         }
@@ -28,16 +34,20 @@ impl PermissionMode {
             PermissionMode::Ask => "ask",
             PermissionMode::Auto => "auto",
             PermissionMode::Plan => "plan",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::DontAsk => "dontAsk",
             PermissionMode::Locked => "locked",
         }
     }
 
-    /// Cycle to the next mode: ask → auto → locked → ask.
+    /// Cycle to the next mode: ask → auto → acceptEdits → plan → dontAsk → locked → ask.
     pub fn cycle(&self) -> Self {
         match self {
             PermissionMode::Ask => PermissionMode::Auto,
-            PermissionMode::Auto => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::Locked,
+            PermissionMode::Auto => PermissionMode::AcceptEdits,
+            PermissionMode::AcceptEdits => PermissionMode::Plan,
+            PermissionMode::Plan => PermissionMode::DontAsk,
+            PermissionMode::DontAsk => PermissionMode::Locked,
             PermissionMode::Locked => PermissionMode::Ask,
         }
     }
@@ -47,6 +57,162 @@ impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// A permission rule in `Tool(specifier)` format.
+/// Evaluation order: deny > ask > allow (first match wins).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRule {
+    /// The rule string, e.g. "Bash(npm run *)", "Edit(src/**/*.rs)", "WebFetch(domain:example.com)"
+    pub rule: String,
+    /// The decision: "allow", "deny", or "ask".
+    pub decision: String,
+}
+
+impl PermissionRule {
+    /// Parse a rule and check if it matches a tool call.
+    /// Returns `Some(decision)` if matched, `None` otherwise.
+    pub fn matches(&self, call: &ToolCall) -> Option<&str> {
+        let (tool_prefix, specifier) = parse_rule_syntax(&self.rule)?;
+        let tool_name = match tool_prefix.as_str() {
+            "Bash" | "bash" => "bash.run",
+            "Read" | "read" => "fs.read",
+            "Edit" | "edit" => "fs.edit",
+            "Write" | "write" => "fs.write",
+            "WebFetch" | "webfetch" | "web_fetch" => "web.fetch",
+            "Task" | "task" => "spawn_task",
+            "Glob" | "glob" => "fs.glob",
+            "Grep" | "grep" => "fs.grep",
+            _ => return None,
+        };
+
+        if call.name != tool_name {
+            return None;
+        }
+
+        // Check specifier match.
+        match tool_name {
+            "bash.run" => {
+                let cmd = call.args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                if glob_command_matches(&specifier, cmd) {
+                    Some(&self.decision)
+                } else {
+                    None
+                }
+            }
+            "fs.read" | "fs.edit" | "fs.write" | "fs.glob" | "fs.grep" => {
+                let path = call
+                    .args
+                    .get("path")
+                    .or_else(|| call.args.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Ok(pattern) = Pattern::new(&specifier)
+                    && (pattern.matches(path)
+                        || pattern.matches_path(Path::new(path)))
+                {
+                    return Some(&self.decision);
+                }
+                None
+            }
+            "web.fetch" => {
+                let url = call
+                    .args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(domain) = specifier.strip_prefix("domain:") {
+                    if url.contains(domain) {
+                        return Some(&self.decision);
+                    }
+                } else if url.contains(&specifier) {
+                    return Some(&self.decision);
+                }
+                None
+            }
+            "spawn_task" => {
+                let agent = call
+                    .args
+                    .get("subagent_type")
+                    .or_else(|| call.args.get("role"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if agent == specifier || specifier == "*" {
+                    Some(&self.decision)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parse "Tool(specifier)" syntax. Returns (tool, specifier).
+fn parse_rule_syntax(rule: &str) -> Option<(String, String)> {
+    let rule = rule.trim();
+    let paren_pos = rule.find('(')?;
+    if !rule.ends_with(')') {
+        return None;
+    }
+    let tool = rule[..paren_pos].trim().to_string();
+    let specifier = rule[paren_pos + 1..rule.len() - 1].trim().to_string();
+    if tool.is_empty() || specifier.is_empty() {
+        return None;
+    }
+    Some((tool, specifier))
+}
+
+/// Check if a glob-like command pattern matches a command string.
+fn glob_command_matches(pattern: &str, cmd: &str) -> bool {
+    // Simple glob: "npm run *" matches "npm run test", "npm run build", etc.
+    let pattern_tokens: Vec<&str> = pattern.split_whitespace().collect();
+    let cmd_tokens: Vec<&str> = cmd.split_whitespace().collect();
+    if pattern_tokens.is_empty() {
+        return false;
+    }
+    for (i, pt) in pattern_tokens.iter().enumerate() {
+        if *pt == "*" {
+            return true; // wildcard matches rest
+        }
+        if i >= cmd_tokens.len() {
+            return false;
+        }
+        if let Some(prefix) = pt.strip_suffix('*') {
+            if !cmd_tokens[i].starts_with(prefix) {
+                return false;
+            }
+        } else if !pt.eq_ignore_ascii_case(cmd_tokens[i]) {
+            return false;
+        }
+    }
+    cmd_tokens.len() >= pattern_tokens.len()
+}
+
+/// Evaluate permission rules against a tool call.
+/// Returns: "allow", "deny", "ask", or None if no rule matched.
+/// Evaluation order: deny > ask > allow (strongest match wins).
+pub fn evaluate_permission_rules(rules: &[PermissionRule], call: &ToolCall) -> Option<String> {
+    let mut result: Option<&str> = None;
+    for rule in rules {
+        if let Some(decision) = rule.matches(call) {
+            match decision {
+                "deny" => return Some("deny".to_string()), // deny wins immediately
+                "ask" => {
+                    if result.is_none() || result == Some("allow") {
+                        result = Some("ask");
+                    }
+                }
+                "allow" => {
+                    if result.is_none() {
+                        result = Some("allow");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    result.map(|s| s.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +226,9 @@ pub struct PolicyConfig {
     pub sandbox_mode: String,
     pub sandbox_wrapper: Option<String>,
     pub permission_mode: PermissionMode,
+    /// Granular permission rules in Tool(specifier) format.
+    #[serde(default)]
+    pub permission_rules: Vec<PermissionRule>,
 }
 
 impl Default for PolicyConfig {
@@ -106,6 +275,7 @@ impl Default for PolicyConfig {
             sandbox_mode: "allowlist".to_string(),
             sandbox_wrapper: None,
             permission_mode: PermissionMode::Ask,
+            permission_rules: vec![],
         }
     }
 }
@@ -190,6 +360,7 @@ impl PolicyEngine {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             permission_mode: PermissionMode::from_str_lossy(&cfg.permission_mode),
+            permission_rules: vec![],
         };
         if let Some(team_policy) = load_team_policy_override() {
             mapped = apply_team_policy_override(mapped, &team_policy);
@@ -254,9 +425,38 @@ impl PolicyEngine {
                 // In locked mode, all non-read tools require approval (and will be denied).
                 !is_read_only_tool(&call.name)
             }
+            PermissionMode::DontAsk => {
+                // DontAsk: auto-denies all non-read tools unless allowlisted.
+                if is_read_only_tool(&call.name) {
+                    return false;
+                }
+                if call.name == "bash.run"
+                    && let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+                    && self.check_command(cmd).is_ok()
+                {
+                    return false; // allowlisted command passes
+                }
+                true // everything else is denied
+            }
             PermissionMode::Plan => {
                 // In plan mode, reads are allowed; writes need approval.
                 !is_read_only_tool(&call.name)
+            }
+            PermissionMode::AcceptEdits => {
+                // AcceptEdits: file edits auto-approve; bash still needs approval.
+                if is_read_only_tool(&call.name) || is_edit_tool(&call.name) {
+                    false
+                } else if call.name == "bash.run" {
+                    // Bash still requires approval (unless allowlisted).
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+                        && self.check_command(cmd).is_ok()
+                    {
+                        return false;
+                    }
+                    true
+                } else {
+                    false
+                }
             }
             PermissionMode::Auto => {
                 // In auto mode, allowlisted tools auto-approve; others still need approval.
@@ -299,11 +499,43 @@ impl PolicyEngine {
                     )
                 }
             }
+            PermissionMode::DontAsk => {
+                if is_read_only_tool(&call.name) {
+                    PermissionDryRunResult::Allowed
+                } else if call.name == "bash.run" {
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+                        && self.check_command(cmd).is_ok()
+                    {
+                        return PermissionDryRunResult::AutoApproved;
+                    }
+                    PermissionDryRunResult::Denied(
+                        "dontAsk mode denies non-allowlisted operations".to_string(),
+                    )
+                } else {
+                    PermissionDryRunResult::Denied(
+                        "dontAsk mode denies non-allowlisted operations".to_string(),
+                    )
+                }
+            }
             PermissionMode::Plan => {
                 if is_read_only_tool(&call.name) {
                     PermissionDryRunResult::Allowed
                 } else {
                     PermissionDryRunResult::NeedsApproval
+                }
+            }
+            PermissionMode::AcceptEdits => {
+                if is_read_only_tool(&call.name) || is_edit_tool(&call.name) {
+                    PermissionDryRunResult::AutoApproved
+                } else if call.name == "bash.run" {
+                    if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+                        && self.check_command(cmd).is_ok()
+                    {
+                        return PermissionDryRunResult::AutoApproved;
+                    }
+                    PermissionDryRunResult::NeedsApproval
+                } else {
+                    PermissionDryRunResult::AutoApproved
                 }
             }
             PermissionMode::Auto => {
@@ -354,6 +586,19 @@ pub enum PermissionDryRunResult {
     NeedsApproval,
     /// Tool call would be denied.
     Denied(String),
+}
+
+/// Returns true if the tool modifies files (write/edit/patch).
+fn is_edit_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.write"
+            | "fs.edit"
+            | "multi_edit"
+            | "patch.stage"
+            | "patch.apply"
+            | "notebook.edit"
+    )
 }
 
 /// Returns true if the tool is read-only (never modifies state).
@@ -704,6 +949,7 @@ mod tests {
             sandbox_mode: "allowlist".to_string(),
             sandbox_wrapper: None,
             permission_mode: PermissionMode::Ask,
+            permission_rules: vec![],
         };
         let team = TeamPolicyFile {
             approve_edits: Some("ask".to_string()),
@@ -853,8 +1099,10 @@ mod tests {
     #[test]
     fn permission_mode_cycles_correctly() {
         assert_eq!(PermissionMode::Ask.cycle(), PermissionMode::Auto);
-        assert_eq!(PermissionMode::Auto.cycle(), PermissionMode::Plan);
-        assert_eq!(PermissionMode::Plan.cycle(), PermissionMode::Locked);
+        assert_eq!(PermissionMode::Auto.cycle(), PermissionMode::AcceptEdits);
+        assert_eq!(PermissionMode::AcceptEdits.cycle(), PermissionMode::Plan);
+        assert_eq!(PermissionMode::Plan.cycle(), PermissionMode::DontAsk);
+        assert_eq!(PermissionMode::DontAsk.cycle(), PermissionMode::Locked);
         assert_eq!(PermissionMode::Locked.cycle(), PermissionMode::Ask);
     }
 
@@ -1014,6 +1262,184 @@ mod tests {
             };
             prop_assert!(policy.check_command(&cmd).is_ok());
         }
+    }
+
+    #[test]
+    fn accept_edits_mode_auto_approves_edits_but_prompts_bash() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::AcceptEdits,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let edit_call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let write_call = ToolCall {
+            name: "fs.write".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let bash_call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "unknown_command"}),
+            requires_approval: false,
+        };
+        assert!(!policy.requires_approval(&edit_call));
+        assert!(!policy.requires_approval(&write_call));
+        assert!(policy.requires_approval(&bash_call));
+        assert_eq!(
+            policy.dry_run(&edit_call),
+            PermissionDryRunResult::AutoApproved
+        );
+        assert_eq!(
+            policy.dry_run(&bash_call),
+            PermissionDryRunResult::NeedsApproval
+        );
+    }
+
+    #[test]
+    fn dont_ask_mode_denies_non_allowlisted() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::DontAsk,
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let edit_call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let read_call = ToolCall {
+            name: "fs.read".to_string(),
+            args: json!({"path": "test.txt"}),
+            requires_approval: false,
+        };
+        let allowlisted_bash = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "cargo test --workspace"}),
+            requires_approval: false,
+        };
+        let random_bash = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "unknown_command"}),
+            requires_approval: false,
+        };
+        assert!(policy.requires_approval(&edit_call));
+        assert!(!policy.requires_approval(&read_call));
+        assert!(!policy.requires_approval(&allowlisted_bash));
+        assert!(policy.requires_approval(&random_bash));
+        assert_eq!(
+            policy.dry_run(&edit_call),
+            PermissionDryRunResult::Denied("dontAsk mode denies non-allowlisted operations".to_string())
+        );
+    }
+
+    #[test]
+    fn permission_rule_matches_bash_pattern() {
+        let rule = PermissionRule {
+            rule: "Bash(npm run *)".to_string(),
+            decision: "allow".to_string(),
+        };
+        let matching = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "npm run test"}),
+            requires_approval: false,
+        };
+        let non_matching = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "cargo test"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&matching), Some("allow"));
+        assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn permission_rule_matches_edit_glob() {
+        let rule = PermissionRule {
+            rule: "Edit(src/**/*.rs)".to_string(),
+            decision: "allow".to_string(),
+        };
+        let matching = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": "src/main.rs"}),
+            requires_approval: false,
+        };
+        let non_matching = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": "tests/test.js"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&matching), Some("allow"));
+        assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn permission_rule_matches_webfetch_domain() {
+        let rule = PermissionRule {
+            rule: "WebFetch(domain:example.com)".to_string(),
+            decision: "allow".to_string(),
+        };
+        let matching = ToolCall {
+            name: "web.fetch".to_string(),
+            args: json!({"url": "https://example.com/api"}),
+            requires_approval: false,
+        };
+        let non_matching = ToolCall {
+            name: "web.fetch".to_string(),
+            args: json!({"url": "https://evil.com/api"}),
+            requires_approval: false,
+        };
+        assert_eq!(rule.matches(&matching), Some("allow"));
+        assert_eq!(rule.matches(&non_matching), None);
+    }
+
+    #[test]
+    fn evaluate_rules_deny_wins_over_allow() {
+        let rules = vec![
+            PermissionRule {
+                rule: "Bash(npm *)".to_string(),
+                decision: "allow".to_string(),
+            },
+            PermissionRule {
+                rule: "Bash(npm run deploy)".to_string(),
+                decision: "deny".to_string(),
+            },
+        ];
+        let deploy = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "npm run deploy"}),
+            requires_approval: false,
+        };
+        let test = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "npm test"}),
+            requires_approval: false,
+        };
+        assert_eq!(evaluate_permission_rules(&rules, &deploy), Some("deny".to_string()));
+        assert_eq!(evaluate_permission_rules(&rules, &test), Some("allow".to_string()));
+    }
+
+    #[test]
+    fn permission_mode_from_str_handles_new_modes() {
+        assert_eq!(
+            PermissionMode::from_str_lossy("acceptEdits"),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("accept-edits"),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("dontAsk"),
+            PermissionMode::DontAsk
+        );
+        assert_eq!(
+            PermissionMode::from_str_lossy("dont-ask"),
+            PermissionMode::DontAsk
+        );
     }
 
     #[test]
