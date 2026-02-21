@@ -2149,25 +2149,40 @@ pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
         }
         "fs.read" => {
             if lower.contains("no such file") || lower.contains("not found") {
-                Some("Hint: file does not exist. Use fs.glob to search for the correct path.".to_string())
+                Some(
+                    "Hint: file does not exist. Use fs.glob to search for the correct path."
+                        .to_string(),
+                )
             } else if lower.contains("permission denied") {
-                Some("Hint: permission denied. The file may be outside the allowed workspace.".to_string())
+                Some(
+                    "Hint: permission denied. The file may be outside the allowed workspace."
+                        .to_string(),
+                )
             } else {
                 None
             }
         }
         "fs.write" => {
             if lower.contains("permission denied") {
-                Some("Hint: permission denied. Check that the directory exists and is writable.".to_string())
+                Some(
+                    "Hint: permission denied. Check that the directory exists and is writable."
+                        .to_string(),
+                )
             } else {
                 None
             }
         }
         "bash.run" => {
             if lower.contains("timed out") || lower.contains("timeout") {
-                Some("Hint: command timed out. Try a shorter operation or increase the timeout.".to_string())
+                Some(
+                    "Hint: command timed out. Try a shorter operation or increase the timeout."
+                        .to_string(),
+                )
             } else if lower.contains("not found") || lower.contains("command not found") {
-                Some("Hint: command not found. Check that the program is installed and in PATH.".to_string())
+                Some(
+                    "Hint: command not found. Check that the program is installed and in PATH."
+                        .to_string(),
+                )
             } else {
                 None
             }
@@ -2206,10 +2221,7 @@ pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
                 tool_type: "function".to_string(),
                 function: FunctionDefinition {
                     name: api_name,
-                    description: format!(
-                        "[Plugin: {}] {} command",
-                        plugin.manifest.name, cmd_name
-                    ),
+                    description: format!("[Plugin: {}] {} command", plugin.manifest.name, cmd_name),
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {

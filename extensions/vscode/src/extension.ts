@@ -59,6 +59,42 @@ class DeepSeekRpcClient {
     return this.request("status", {});
   }
 
+  async sessionOpen(workspaceRoot: string): Promise<JsonRpcResponse> {
+    return this.request("session/open", { workspace_root: workspaceRoot });
+  }
+
+  async sessionResume(sessionId: string): Promise<JsonRpcResponse> {
+    return this.request("session/resume", { session_id: sessionId });
+  }
+
+  async sessionFork(sessionId: string): Promise<JsonRpcResponse> {
+    return this.request("session/fork", { session_id: sessionId });
+  }
+
+  async sessionList(): Promise<JsonRpcResponse> {
+    return this.request("session/list", {});
+  }
+
+  async promptExecute(sessionId: string, prompt: string): Promise<JsonRpcResponse> {
+    return this.request("prompt/execute", { session_id: sessionId, prompt });
+  }
+
+  async toolApprove(sessionId: string, invocationId: string): Promise<JsonRpcResponse> {
+    return this.request("tool/approve", { session_id: sessionId, invocation_id: invocationId });
+  }
+
+  async toolDeny(sessionId: string, invocationId: string): Promise<JsonRpcResponse> {
+    return this.request("tool/deny", { session_id: sessionId, invocation_id: invocationId });
+  }
+
+  async patchPreview(sessionId: string, patchId: string): Promise<JsonRpcResponse> {
+    return this.request("patch/preview", { session_id: sessionId, patch_id: patchId });
+  }
+
+  async patchApply(sessionId: string, patchId: string): Promise<JsonRpcResponse> {
+    return this.request("patch/apply", { session_id: sessionId, patch_id: patchId });
+  }
+
   async request(method: string, params: unknown): Promise<JsonRpcResponse> {
     await this.start();
     if (!this.process) {
@@ -124,9 +160,222 @@ class DeepSeekRpcClient {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Chat Panel (webview-based)
+// ---------------------------------------------------------------------------
+
+interface ChatEntry {
+  role: "user" | "assistant" | "tool";
+  content: string;
+}
+
+class DeepSeekChatPanel {
+  private static panels = new Map<string, DeepSeekChatPanel>();
+  private readonly panel: vscode.WebviewPanel;
+  private readonly client: DeepSeekRpcClient;
+  private sessionId: string | null = null;
+  private history: ChatEntry[] = [];
+  private autoAccept: boolean;
+
+  static create(
+    extensionUri: vscode.Uri,
+    client: DeepSeekRpcClient,
+    title: string,
+    autoAccept: boolean,
+  ): DeepSeekChatPanel {
+    const panel = vscode.window.createWebviewPanel(
+      "deepseekChat",
+      title,
+      vscode.ViewColumn.Beside,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+    const chatPanel = new DeepSeekChatPanel(panel, client, autoAccept);
+    DeepSeekChatPanel.panels.set(title, chatPanel);
+    panel.onDidDispose(() => DeepSeekChatPanel.panels.delete(title));
+    return chatPanel;
+  }
+
+  private constructor(
+    panel: vscode.WebviewPanel,
+    client: DeepSeekRpcClient,
+    autoAccept: boolean,
+  ) {
+    this.panel = panel;
+    this.client = client;
+    this.autoAccept = autoAccept;
+    this.panel.webview.html = this.getHtml();
+    this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
+  }
+
+  private async onMessage(msg: { type: string; text?: string; invocationId?: string; patchId?: string }): Promise<void> {
+    switch (msg.type) {
+      case "send": {
+        if (!msg.text) return;
+        await this.ensureSession();
+        this.addEntry({ role: "user", content: msg.text });
+        try {
+          const resp = await this.client.promptExecute(this.sessionId!, msg.text);
+          if (resp.error) {
+            this.addEntry({ role: "assistant", content: `Error: ${resp.error.message}` });
+          } else {
+            const result = resp.result as { prompt_id: string; status: string };
+            this.addEntry({ role: "assistant", content: `[Prompt queued: ${result.prompt_id}]` });
+          }
+        } catch (e) {
+          this.addEntry({ role: "assistant", content: `Error: ${e instanceof Error ? e.message : String(e)}` });
+        }
+        break;
+      }
+      case "approve":
+        if (msg.invocationId) {
+          await this.client.toolApprove(this.sessionId!, msg.invocationId);
+          this.addEntry({ role: "tool", content: `Approved: ${msg.invocationId}` });
+        }
+        break;
+      case "deny":
+        if (msg.invocationId) {
+          await this.client.toolDeny(this.sessionId!, msg.invocationId);
+          this.addEntry({ role: "tool", content: `Denied: ${msg.invocationId}` });
+        }
+        break;
+      case "applyPatch":
+        if (msg.patchId) {
+          const resp = await this.client.patchApply(this.sessionId!, msg.patchId);
+          if (resp.error) {
+            this.addEntry({ role: "tool", content: `Patch error: ${resp.error.message}` });
+          } else {
+            this.addEntry({ role: "tool", content: `Patch applied: ${msg.patchId}` });
+          }
+        }
+        break;
+      case "previewPatch":
+        if (msg.patchId) {
+          const resp = await this.client.patchPreview(this.sessionId!, msg.patchId);
+          if (resp.error) {
+            this.addEntry({ role: "tool", content: `Preview error: ${resp.error.message}` });
+          } else {
+            this.addEntry({ role: "tool", content: `Patch preview: ${JSON.stringify(resp.result)}` });
+          }
+        }
+        break;
+      case "toggleAutoAccept":
+        this.autoAccept = !this.autoAccept;
+        break;
+      case "atMention": {
+        // Open file picker and insert @path into input.
+        const uris = await vscode.window.showOpenDialog({ canSelectMany: false });
+        if (uris && uris.length > 0) {
+          const relativePath = vscode.workspace.asRelativePath(uris[0]);
+          // Get active editor selection for line range.
+          const editor = vscode.window.activeTextEditor;
+          let mention = `@${relativePath}`;
+          if (editor && editor.document.uri.fsPath === uris[0].fsPath && !editor.selection.isEmpty) {
+            const startLine = editor.selection.start.line + 1;
+            const endLine = editor.selection.end.line + 1;
+            mention = `@${relativePath}:${startLine}-${endLine}`;
+          }
+          this.panel.webview.postMessage({ type: "insertMention", text: mention });
+        }
+        break;
+      }
+    }
+  }
+
+  private async ensureSession(): Promise<void> {
+    if (this.sessionId) return;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ".";
+    const resp = await this.client.sessionOpen(workspaceRoot);
+    if (resp.result) {
+      this.sessionId = (resp.result as { session_id: string }).session_id;
+    }
+  }
+
+  private addEntry(entry: ChatEntry): void {
+    this.history.push(entry);
+    this.panel.webview.postMessage({ type: "addEntry", entry });
+  }
+
+  private getHtml(): string {
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { font-family: var(--vscode-font-family); margin: 0; padding: 8px; display: flex; flex-direction: column; height: 100vh; }
+    #chat { flex: 1; overflow-y: auto; padding-bottom: 8px; }
+    .entry { margin: 4px 0; padding: 6px 10px; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; }
+    .user { background: var(--vscode-input-background); border-left: 3px solid var(--vscode-inputOption-activeBorder); }
+    .assistant { background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-editorInfo-foreground); }
+    .tool { background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-editorWarning-foreground); font-size: 0.9em; }
+    .role-label { font-size: 0.8em; font-weight: bold; opacity: 0.7; margin-bottom: 2px; }
+    #input-area { display: flex; gap: 4px; }
+    #prompt { flex: 1; padding: 6px; font-size: 14px; border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+    button { padding: 6px 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 3px; }
+    button:hover { background: var(--vscode-button-hoverBackground); }
+    .toolbar { display: flex; gap: 4px; margin-bottom: 4px; }
+    .toolbar button { font-size: 0.85em; padding: 3px 8px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="atMention()">@ File</button>
+    <button onclick="toggleAutoAccept()">Auto-Accept: <span id="autoAcceptState">OFF</span></button>
+  </div>
+  <div id="chat"></div>
+  <div id="input-area">
+    <input id="prompt" type="text" placeholder="Ask DeepSeek..." />
+    <button onclick="send()">Send</button>
+  </div>
+  <script>
+    const vscode = acquireVsCodeApi();
+    const chat = document.getElementById("chat");
+    const prompt = document.getElementById("prompt");
+
+    function send() {
+      const text = prompt.value.trim();
+      if (!text) return;
+      vscode.postMessage({ type: "send", text });
+      prompt.value = "";
+    }
+    prompt.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+
+    function atMention() { vscode.postMessage({ type: "atMention" }); }
+    function toggleAutoAccept() { vscode.postMessage({ type: "toggleAutoAccept" }); }
+
+    window.addEventListener("message", (event) => {
+      const msg = event.data;
+      if (msg.type === "addEntry") {
+        const div = document.createElement("div");
+        div.className = "entry " + msg.entry.role;
+        div.innerHTML = '<div class="role-label">' + msg.entry.role + '</div>' + escapeHtml(msg.entry.content);
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+      }
+      if (msg.type === "insertMention") {
+        prompt.value += msg.text + " ";
+        prompt.focus();
+      }
+      if (msg.type === "autoAcceptState") {
+        document.getElementById("autoAcceptState").textContent = msg.enabled ? "ON" : "OFF";
+      }
+    });
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extension activation
+// ---------------------------------------------------------------------------
+
 const rpcClient = new DeepSeekRpcClient();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Start server command.
   context.subscriptions.push(
     vscode.commands.registerCommand("deepseek.startServer", async () => {
       await rpcClient.start();
@@ -134,6 +383,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
+  // Status command.
   context.subscriptions.push(
     vscode.commands.registerCommand("deepseek.status", async () => {
       try {
@@ -146,6 +396,74 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         vscode.window.showErrorMessage(`DeepSeek status failed: ${message}`);
+      }
+    })
+  );
+
+  // Open chat panel command.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("deepseek.openChat", () => {
+      const cfg = vscode.workspace.getConfiguration("deepseek.ide");
+      const autoAccept = cfg.get<boolean>("autoAcceptEdits", false);
+      DeepSeekChatPanel.create(context.extensionUri, rpcClient, "DeepSeek Chat", autoAccept);
+    })
+  );
+
+  // Session list command.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("deepseek.sessionList", async () => {
+      try {
+        const resp = await rpcClient.sessionList();
+        if (resp.error) {
+          vscode.window.showErrorMessage(`DeepSeek error: ${resp.error.message}`);
+          return;
+        }
+        const sessions = (resp.result as { sessions: Array<{ session_id: string; workspace_root: string; status: string }> }).sessions;
+        if (sessions.length === 0) {
+          vscode.window.showInformationMessage("No sessions found.");
+          return;
+        }
+        const items = sessions.map(s => ({
+          label: s.session_id,
+          description: `${s.workspace_root} (${s.status})`
+        }));
+        const selected = await vscode.window.showQuickPick(items, { placeHolder: "Select a session to resume" });
+        if (selected) {
+          await rpcClient.sessionResume(selected.label);
+          vscode.window.showInformationMessage(`Resumed session ${selected.label}`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`DeepSeek session list failed: ${message}`);
+      }
+    })
+  );
+
+  // Fork session command.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("deepseek.forkSession", async () => {
+      const sessionId = await vscode.window.showInputBox({ prompt: "Session ID to fork" });
+      if (!sessionId) return;
+      try {
+        const resp = await rpcClient.sessionFork(sessionId);
+        if (resp.error) {
+          vscode.window.showErrorMessage(`Fork error: ${resp.error.message}`);
+          return;
+        }
+        const result = resp.result as { session_id: string };
+        vscode.window.showInformationMessage(`Forked session: ${result.session_id}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Fork failed: ${message}`);
+      }
+    })
+  );
+
+  // Diff viewer command — opens a diff for a file before/after a patch.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("deepseek.showDiff", async (leftUri: vscode.Uri, rightUri: vscode.Uri, title: string) => {
+      if (leftUri && rightUri) {
+        await vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, title ?? "DeepSeek Diff");
       }
     })
   );

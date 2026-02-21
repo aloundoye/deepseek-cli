@@ -1458,9 +1458,18 @@ where
 
         // Shark logo in blue, info text in white/gray
         writeln!(out)?;
-        writeln!(out, "\x1b[1;34m        ▄       \x1b[0m \x1b[1mDeepSeek CLI\x1b[0m v{version}")?;
-        writeln!(out, "\x1b[1;34m    ▗▄▀ ● ▀▀▀▀▄ \x1b[0m \x1b[36m{model}\x1b[0m")?;
-        writeln!(out, "\x1b[1;34m    ▝▀▄▄▄▄▄▄▀▀▘ \x1b[0m \x1b[90m{cwd}\x1b[0m")?;
+        writeln!(
+            out,
+            "\x1b[1;34m        ▄       \x1b[0m \x1b[1mDeepSeek CLI\x1b[0m v{version}"
+        )?;
+        writeln!(
+            out,
+            "\x1b[1;34m    ▗▄▀ ● ▀▀▀▀▄ \x1b[0m \x1b[36m{model}\x1b[0m"
+        )?;
+        writeln!(
+            out,
+            "\x1b[1;34m    ▝▀▄▄▄▄▄▄▀▀▘ \x1b[0m \x1b[90m{cwd}\x1b[0m"
+        )?;
         writeln!(out, "\x1b[1;34m        ▀        \x1b[0m")?;
         writeln!(out)?;
         out.flush()?;

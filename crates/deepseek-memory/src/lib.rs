@@ -555,19 +555,14 @@ fn parse_simple_yaml(yaml: &str) -> serde_json::Value {
 
         // List item under current key.
         if in_list && trimmed.starts_with("- ") {
-            current_list.push(serde_json::Value::String(
-                trimmed[2..].trim().to_string(),
-            ));
+            current_list.push(serde_json::Value::String(trimmed[2..].trim().to_string()));
             continue;
         }
 
         // Save any pending list.
         if in_list {
             if let Some(ref key) = current_key {
-                map.insert(
-                    key.clone(),
-                    serde_json::Value::Array(current_list.clone()),
-                );
+                map.insert(key.clone(), serde_json::Value::Array(current_list.clone()));
             }
             in_list = false;
             current_list.clear();
@@ -582,22 +577,14 @@ fn parse_simple_yaml(yaml: &str) -> serde_json::Value {
                 in_list = true;
                 current_list.clear();
             } else {
-                map.insert(
-                    key,
-                    serde_json::Value::String(value_part.to_string()),
-                );
+                map.insert(key, serde_json::Value::String(value_part.to_string()));
             }
         }
     }
 
     // Save final pending list.
-    if in_list
-        && let Some(ref key) = current_key
-    {
-        map.insert(
-            key.clone(),
-            serde_json::Value::Array(current_list),
-        );
+    if in_list && let Some(ref key) = current_key {
+        map.insert(key.clone(), serde_json::Value::Array(current_list));
     }
 
     serde_json::Value::Object(map)
@@ -666,10 +653,7 @@ pub fn process_imports(content: &str, base_dir: &Path, max_depth: u8) -> String 
                 if let Ok(imported) = fs::read_to_string(&resolved) {
                     let import_dir = resolved.parent().unwrap_or(base_dir);
                     let processed = process_imports(&imported, import_dir, max_depth - 1);
-                    result.push_str(&format!(
-                        "<!-- imported from {} -->\n",
-                        resolved.display()
-                    ));
+                    result.push_str(&format!("<!-- imported from {} -->\n", resolved.display()));
                     result.push_str(processed.trim());
                     result.push('\n');
                 } else {
@@ -909,8 +893,7 @@ mod tests {
 
     #[test]
     fn process_imports_resolves_files() {
-        let dir =
-            std::env::temp_dir().join(format!("deepseek-import-test-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("deepseek-import-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&dir).expect("dir");
         fs::write(dir.join("extra.md"), "Extra content here").expect("extra");
 
@@ -934,8 +917,7 @@ mod tests {
 
     #[test]
     fn process_imports_respects_max_depth() {
-        let dir =
-            std::env::temp_dir().join(format!("deepseek-import-depth-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("deepseek-import-depth-{}", Uuid::now_v7()));
         fs::create_dir_all(&dir).expect("dir");
         // a.md imports b.md which imports a.md (circular).
         fs::write(dir.join("a.md"), "@b.md").expect("a");
@@ -948,8 +930,7 @@ mod tests {
 
     #[test]
     fn hierarchical_memory_loads_upward() {
-        let base =
-            std::env::temp_dir().join(format!("deepseek-hier-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("deepseek-hier-{}", Uuid::now_v7()));
         let child = base.join("project/sub");
         fs::create_dir_all(&child).expect("dirs");
 
