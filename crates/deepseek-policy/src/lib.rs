@@ -270,6 +270,8 @@ impl Default for PolicyConfig {
             approve_bash: true,
             allowlist: vec![
                 "rg".to_string(),
+                "find .".to_string(),
+                "head".to_string(),
                 "git status".to_string(),
                 "git diff".to_string(),
                 "git show".to_string(),
@@ -429,25 +431,31 @@ impl PolicyEngine {
         if contains_forbidden_shell_tokens(cmd) {
             return Err(PolicyError::CommandInjection);
         }
-        let cmd_tokens: Vec<&str> = cmd.split_whitespace().collect();
-        if cmd_tokens.is_empty() {
-            return Err(PolicyError::CommandNotAllowed);
-        }
-        let command_name = cmd_tokens[0].to_ascii_lowercase();
-        if self
-            .cfg
-            .denied_command_prefixes
-            .iter()
-            .any(|prefix| prefix.eq_ignore_ascii_case(&command_name))
-        {
-            return Err(PolicyError::DangerousCommand);
-        }
-        for allowed in &self.cfg.allowlist {
-            if allow_pattern_matches(allowed, &cmd_tokens) {
-                return Ok(());
+        let segments = split_pipeline_segments(cmd)?;
+        for segment in segments {
+            let cmd_tokens: Vec<&str> = segment.split_whitespace().collect();
+            if cmd_tokens.is_empty() {
+                return Err(PolicyError::CommandNotAllowed);
+            }
+            let command_name = cmd_tokens[0].to_ascii_lowercase();
+            if self
+                .cfg
+                .denied_command_prefixes
+                .iter()
+                .any(|prefix| prefix.eq_ignore_ascii_case(&command_name))
+            {
+                return Err(PolicyError::DangerousCommand);
+            }
+            let allowlisted = self
+                .cfg
+                .allowlist
+                .iter()
+                .any(|allowed| allow_pattern_matches(allowed, &cmd_tokens));
+            if !allowlisted {
+                return Err(PolicyError::CommandNotAllowed);
             }
         }
-        Err(PolicyError::CommandNotAllowed)
+        Ok(())
     }
 
     pub fn redact(&self, text: &str) -> String {
@@ -758,8 +766,17 @@ fn allow_pattern_matches(pattern: &str, cmd_tokens: &[&str]) -> bool {
 }
 
 fn contains_forbidden_shell_tokens(cmd: &str) -> bool {
-    let forbidden = ["\n", "\r", ";", "&&", "||", "|", "`", "$("];
+    // Single-pipe pipelines are allowed; each segment is validated separately.
+    let forbidden = ["\n", "\r", ";", "&&", "||", "`", "$("];
     forbidden.iter().any(|needle| cmd.contains(needle))
+}
+
+fn split_pipeline_segments(cmd: &str) -> Result<Vec<&str>, PolicyError> {
+    let segments = cmd.split('|').map(str::trim).collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(PolicyError::CommandInjection);
+    }
+    Ok(segments)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1084,6 +1101,20 @@ mod tests {
         assert!(matches!(
             policy.check_command("cargo test; echo hacked"),
             Err(PolicyError::CommandInjection)
+        ));
+    }
+
+    #[test]
+    fn pipeline_commands_require_each_segment_to_be_allowlisted() {
+        let policy = PolicyEngine::default();
+        assert!(
+            policy
+                .check_command(r#"find . -type f -name "*.rs" | head -20"#)
+                .is_ok()
+        );
+        assert!(matches!(
+            policy.check_command(r#"find . -type f -name "*.rs" | wc -l"#),
+            Err(PolicyError::CommandNotAllowed)
         ));
     }
 
@@ -1419,7 +1450,7 @@ mod tests {
         fn commands_with_shell_injection_tokens_are_rejected(
             left in "[a-zA-Z0-9 _\\-]{0,24}",
             right in "[a-zA-Z0-9 _\\-]{0,24}",
-            token in prop::sample::select(vec![";", "&&", "||", "|", "`", "$("]),
+            token in prop::sample::select(vec![";", "&&", "||", "`", "$("]),
         ) {
             let policy = PolicyEngine::default();
             let cmd = format!("{left}{token}{right}");

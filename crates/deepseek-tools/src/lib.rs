@@ -2194,7 +2194,8 @@ pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
                 )
             } else if lower.contains("forbidden shell metacharacters") {
                 Some(
-                    "Hint: bash.run does not allow shell metacharacters (pipes |, semicolons ;, &&, ||, backticks, $()). \
+                    "Hint: bash.run blocks shell metacharacters (;, &&, ||, backticks, $()). \
+                     A single pipeline (|) is allowed only when each command segment is allowlisted. \
                      Do NOT retry with similar commands. Instead use the built-in tools: \
                      fs.grep for searching file contents, fs.glob for finding files by pattern, \
                      fs.read for reading files. These tools do not have shell restrictions."
