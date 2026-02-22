@@ -60,6 +60,12 @@ impl AgentEngine {
         let Some(ref mcp) = self.mcp else {
             return prompt.to_string();
         };
+        let session_id = self
+            .store
+            .load_latest_session()
+            .ok()
+            .flatten()
+            .map(|session| session.session_id);
         let mut result = String::with_capacity(prompt.len());
         for token in prompt.split_whitespace() {
             if !result.is_empty() {
@@ -70,13 +76,49 @@ impl AgentEngine {
                 && token.len() > 2
                 && token[1..].contains(':')
                 && !token[1..].starts_with('/')
-                && let Ok(content) = mcp.resolve_resource(token)
             {
-                result.push_str(&format!(
-                    "[resource: {}]\n{}\n[/resource]",
-                    &token[1..],
-                    content.trim()
-                ));
+                match mcp.resolve_resource(token) {
+                    Ok(content) => {
+                        if let Some(session_id) = session_id {
+                            let _ = self.emit(
+                                session_id,
+                                EventKind::TelemetryEventV1 {
+                                    name: "kpi.mcp.resource_resolve".to_string(),
+                                    properties: json!({
+                                        "status": "success",
+                                        "reference": token,
+                                    }),
+                                },
+                            );
+                        }
+                        result.push_str(&format!(
+                            "[resource: {}]\n{}\n[/resource]",
+                            &token[1..],
+                            content.trim()
+                        ));
+                    }
+                    Err(err) => {
+                        if let Some(session_id) = session_id {
+                            let _ = self.emit(
+                                session_id,
+                                EventKind::TelemetryEventV1 {
+                                    name: "kpi.mcp.resource_resolve".to_string(),
+                                    properties: json!({
+                                        "status": "failure",
+                                        "reference": token,
+                                        "error": err.to_string(),
+                                    }),
+                                },
+                            );
+                        }
+                        let mut reason = err.to_string().replace('\n', " ");
+                        if reason.len() > 160 {
+                            reason.truncate(160);
+                            reason.push_str("...");
+                        }
+                        result.push_str(&format!("[resource-unavailable: {} ({})]", token, reason));
+                    }
+                }
                 continue;
             }
             result.push_str(token);

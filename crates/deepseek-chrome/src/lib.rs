@@ -110,7 +110,7 @@ impl ChromeSession {
             next_id: AtomicU64::new(1),
             connected: false,
             ws_debug_url: None,
-            allow_stub_fallback: true,
+            allow_stub_fallback: false,
             last_connection_error: None,
             http_client,
         })
@@ -674,6 +674,7 @@ mod tests {
     #[test]
     fn navigate_after_connect() {
         let mut session = ChromeSession::new(9222).unwrap();
+        session.set_allow_stub_fallback(true);
         session.check_connection().unwrap();
         let result = session.navigate("https://example.com").unwrap();
         assert!(result.error.is_none());
@@ -683,6 +684,7 @@ mod tests {
     #[test]
     fn click_element() {
         let mut session = ChromeSession::new(9222).unwrap();
+        session.set_allow_stub_fallback(true);
         session.check_connection().unwrap();
         let result = session.click("#submit-btn").unwrap();
         assert!(result.result.unwrap()["clicked"].as_bool().unwrap());
@@ -691,6 +693,7 @@ mod tests {
     #[test]
     fn type_text_into_element() {
         let mut session = ChromeSession::new(9222).unwrap();
+        session.set_allow_stub_fallback(true);
         session.check_connection().unwrap();
         let result = session.type_text("input.search", "hello world").unwrap();
         assert!(result.result.unwrap()["typed"].as_bool().unwrap());
@@ -699,6 +702,7 @@ mod tests {
     #[test]
     fn screenshot_returns_base64() {
         let mut session = ChromeSession::new(9222).unwrap();
+        session.set_allow_stub_fallback(true);
         session.check_connection().unwrap();
         let data = session.screenshot(ScreenshotFormat::Png).unwrap();
         assert!(!data.is_empty());
@@ -712,6 +716,7 @@ mod tests {
     #[test]
     fn read_console_empty_initially() {
         let mut session = ChromeSession::new(9222).unwrap();
+        session.set_allow_stub_fallback(true);
         session.check_connection().unwrap();
         let entries = session.read_console().unwrap();
         assert!(entries.is_empty());
@@ -720,9 +725,25 @@ mod tests {
     #[test]
     fn evaluate_returns_value() {
         let mut session = ChromeSession::new(9222).unwrap();
+        session.set_allow_stub_fallback(true);
         session.check_connection().unwrap();
         let result = session.evaluate("1 + 1").unwrap();
         assert!(result.is_object());
+    }
+
+    #[test]
+    fn default_mode_is_strict_live() {
+        let mut session = ChromeSession::new(9).unwrap();
+        let connected = session.check_connection().unwrap();
+        assert!(!connected);
+        let err = session
+            .navigate("https://example.com")
+            .expect_err("default strict mode should reject offline stubs");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("live chrome websocket endpoint unavailable")
+                || msg.contains("not connected to Chrome")
+        );
     }
 
     #[test]

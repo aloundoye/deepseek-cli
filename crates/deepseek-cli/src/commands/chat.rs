@@ -1283,14 +1283,24 @@ pub(crate) fn run_chat_tui(
                     match parse_teleport_args(args) {
                         Ok(teleport_args) => {
                             let teleport = teleport_now(cwd, teleport_args)?;
-                            if let Some(imported) = teleport.imported {
-                                format!("imported teleport bundle {}", imported)
-                            } else {
-                                format!(
+                            match teleport.mode.as_str() {
+                                "import" => format!(
+                                    "imported teleport bundle {}",
+                                    teleport.imported.unwrap_or_default()
+                                ),
+                                "link" => format!(
+                                    "handoff link {}",
+                                    teleport.link_url.unwrap_or_default()
+                                ),
+                                "consume" => format!(
+                                    "consumed handoff {}",
+                                    teleport.handoff_id.unwrap_or_default()
+                                ),
+                                _ => format!(
                                     "teleport bundle {} -> {}",
                                     teleport.bundle_id.unwrap_or_default(),
                                     teleport.path.unwrap_or_default()
-                                )
+                                ),
                             }
                         }
                         Err(err) => format!("teleport parse error: {err}"),
@@ -1908,15 +1918,22 @@ fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
 }
 
 fn desktop_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
-    let teleport_args = parse_teleport_args(args.to_vec()).unwrap_or_default();
+    let teleport_args = if args.is_empty() {
+        parse_teleport_args(vec!["link".to_string()]).unwrap_or_default()
+    } else {
+        parse_teleport_args(args.to_vec()).unwrap_or_default()
+    };
     let execution = teleport_now(cwd, teleport_args)?;
     let session_id = Store::new(cwd)?
         .load_latest_session()?
         .map(|session| session.session_id.to_string());
     Ok(json!({
-        "schema": "deepseek.desktop_handoff.v1",
-        "mode": if execution.imported.is_some() { "import" } else { "export" },
+        "schema": "deepseek.desktop_handoff.v2",
+        "mode": execution.mode,
         "bundle_id": execution.bundle_id,
+        "handoff_id": execution.handoff_id,
+        "link_url": execution.link_url,
+        "token": execution.token,
         "path": execution.path.or(execution.imported),
         "session_id": session_id,
         "resume_command": session_id.map(|id| format!("deepseek --resume {id}")),
@@ -2003,9 +2020,9 @@ fn chrome_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(9222);
+    let cfg = AppConfig::load(cwd).unwrap_or_default();
     let mut session = ChromeSession::new(port)?;
-    // Slash-command UX should surface real browser connectivity, not silent stubs.
-    session.set_allow_stub_fallback(false);
+    session.set_allow_stub_fallback(cfg.tools.chrome.allow_stub_fallback);
     let debug_url = session.debug_url().to_string();
 
     match subcommand.as_str() {

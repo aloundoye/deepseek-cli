@@ -3,6 +3,7 @@ use deepseek_core::{ChatMessage, EventKind, Session, SessionBudgets, SessionStat
 use deepseek_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, Write};
@@ -149,6 +150,18 @@ impl RpcHandler for DefaultRpcHandler {
 struct PendingToolApproval {
     /// Maps invocation_id → tool_name for tools awaiting approval.
     pending: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HandoffDescriptor {
+    schema: String,
+    handoff_id: Uuid,
+    bundle_path: String,
+    token_hash: String,
+    created_at: String,
+    expires_at: String,
+    used_at: Option<String>,
+    session_id: Uuid,
 }
 
 /// Full-featured IDE handler backed by a `Store`.
@@ -569,6 +582,136 @@ impl IdeRpcHandler {
             "turn_count": chat_messages.len(),
             "status": "idle",
             "resumed": resume_import,
+        }))
+    }
+
+    fn handle_session_handoff_link_create(&self, params: Value) -> Result<Value> {
+        let exported = self.handle_session_handoff_export(params.clone())?;
+        let bundle_path = exported
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("handoff export did not return bundle path"))?;
+        let session_id = exported
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("handoff export did not return session id"))?;
+        let session_id = Uuid::parse_str(session_id)?;
+
+        let handoff_id = Uuid::now_v7();
+        let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
+        let token_hash = sha256_hex(&token);
+        let created_at = chrono::Utc::now();
+        let ttl_minutes = params
+            .get("ttl_minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 24 * 60);
+        let expires_at = (created_at + chrono::Duration::minutes(ttl_minutes as i64)).to_rfc3339();
+
+        let descriptor = HandoffDescriptor {
+            schema: "deepseek.handoff_link.v1".to_string(),
+            handoff_id,
+            bundle_path: bundle_path.to_string(),
+            token_hash,
+            created_at: created_at.to_rfc3339(),
+            expires_at: expires_at.clone(),
+            used_at: None,
+            session_id,
+        };
+        write_handoff_descriptor(self.store.root.as_path(), &descriptor)?;
+
+        let seq = self.store.next_seq_no(session_id)?;
+        self.store.append_event(&deepseek_core::EventEnvelope {
+            seq_no: seq,
+            at: chrono::Utc::now(),
+            session_id,
+            kind: EventKind::TeleportHandoffLinkCreatedV1 {
+                handoff_id,
+                session_id,
+                expires_at: expires_at.clone(),
+            },
+        })?;
+
+        let base_url = params
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("https://app.deepseek.com/handoff");
+        let sep = if base_url.contains('?') { '&' } else { '?' };
+        let link_url = format!("{base_url}{sep}handoff_id={handoff_id}&token={token}");
+
+        Ok(serde_json::json!({
+            "schema": "deepseek.handoff_link.v1",
+            "handoff_id": handoff_id.to_string(),
+            "bundle_path": bundle_path,
+            "session_id": session_id.to_string(),
+            "expires_at": expires_at,
+            "token": token,
+            "url": link_url,
+        }))
+    }
+
+    fn handle_session_handoff_link_consume(&self, params: Value) -> Result<Value> {
+        let handoff_id = require_uuid(&params, "handoff_id")?;
+        let token = params
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing 'token' parameter"))?;
+        let mut descriptor = read_handoff_descriptor(self.store.root.as_path(), handoff_id)?;
+        let now = chrono::Utc::now();
+
+        let invalid_reason = if descriptor.used_at.is_some() {
+            Some("already_used")
+        } else if sha256_hex(token) != descriptor.token_hash {
+            Some("token_mismatch")
+        } else {
+            let expires = chrono::DateTime::parse_from_rfc3339(&descriptor.expires_at)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .map_err(|_| anyhow!("invalid descriptor expiry timestamp"))?;
+            if now > expires { Some("expired") } else { None }
+        };
+
+        if let Some(reason) = invalid_reason {
+            let seq = self.store.next_seq_no(descriptor.session_id)?;
+            self.store.append_event(&deepseek_core::EventEnvelope {
+                seq_no: seq,
+                at: chrono::Utc::now(),
+                session_id: descriptor.session_id,
+                kind: EventKind::TeleportHandoffLinkConsumedV1 {
+                    handoff_id,
+                    session_id: descriptor.session_id,
+                    success: false,
+                    reason: reason.to_string(),
+                },
+            })?;
+            return Err(anyhow!("handoff token rejected: {reason}"));
+        }
+
+        let imported = self.handle_session_handoff_import(serde_json::json!({
+            "bundle_path": descriptor.bundle_path,
+            "resume": true,
+        }))?;
+        descriptor.used_at = Some(now.to_rfc3339());
+        write_handoff_descriptor(self.store.root.as_path(), &descriptor)?;
+
+        let seq = self.store.next_seq_no(descriptor.session_id)?;
+        self.store.append_event(&deepseek_core::EventEnvelope {
+            seq_no: seq,
+            at: chrono::Utc::now(),
+            session_id: descriptor.session_id,
+            kind: EventKind::TeleportHandoffLinkConsumedV1 {
+                handoff_id,
+                session_id: descriptor.session_id,
+                success: true,
+                reason: "consumed".to_string(),
+            },
+        })?;
+
+        Ok(serde_json::json!({
+            "schema": "deepseek.handoff_link.v1",
+            "handoff_id": handoff_id.to_string(),
+            "consumed": true,
+            "imported_session_id": imported["session_id"],
+            "turn_count": imported["turn_count"],
         }))
     }
 
@@ -996,6 +1139,7 @@ impl RpcHandler for IdeRpcHandler {
                 "capabilities": [
                     "session/open", "session/resume", "session/fork", "session/list",
                     "session/remote_resume", "session/handoff_export", "session/handoff_import",
+                    "session/handoff_link_create", "session/handoff_link_consume",
                     "prompt/execute", "prompt/stream_next",
                     "tool/approve", "tool/deny",
                     "patch/preview", "patch/apply",
@@ -1020,6 +1164,8 @@ impl RpcHandler for IdeRpcHandler {
             "session/remote_resume" => self.handle_session_remote_resume(params),
             "session/handoff_export" => self.handle_session_handoff_export(params),
             "session/handoff_import" => self.handle_session_handoff_import(params),
+            "session/handoff_link_create" => self.handle_session_handoff_link_create(params),
+            "session/handoff_link_consume" => self.handle_session_handoff_link_consume(params),
 
             // Prompt execution
             "prompt/execute" => self.handle_prompt_execute(params),
@@ -1050,6 +1196,38 @@ impl RpcHandler for IdeRpcHandler {
             _ => Err(anyhow!("method not found: {method}")),
         }
     }
+}
+
+fn handoff_dir(store_root: &Path) -> PathBuf {
+    store_root.join("teleport").join("handoffs")
+}
+
+fn handoff_descriptor_path(store_root: &Path, handoff_id: Uuid) -> PathBuf {
+    handoff_dir(store_root).join(format!("{handoff_id}.json"))
+}
+
+fn write_handoff_descriptor(store_root: &Path, descriptor: &HandoffDescriptor) -> Result<()> {
+    let path = handoff_descriptor_path(store_root, descriptor.handoff_id);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(descriptor)?)?;
+    Ok(())
+}
+
+fn read_handoff_descriptor(store_root: &Path, handoff_id: Uuid) -> Result<HandoffDescriptor> {
+    let path = handoff_descriptor_path(store_root, handoff_id);
+    let raw = fs::read_to_string(&path)?;
+    let descriptor = serde_json::from_str::<HandoffDescriptor>(&raw)?;
+    Ok(descriptor)
+}
+
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Extract a UUID from a JSON params object.
@@ -1177,6 +1355,8 @@ mod tests {
         assert!(caps.iter().any(|c| c == "prompt/stream_next"));
         assert!(caps.iter().any(|c| c == "session/handoff_export"));
         assert!(caps.iter().any(|c| c == "session/handoff_import"));
+        assert!(caps.iter().any(|c| c == "session/handoff_link_create"));
+        assert!(caps.iter().any(|c| c == "session/handoff_link_consume"));
         assert!(caps.iter().any(|c| c == "session/remote_resume"));
         assert!(caps.iter().any(|c| c == "events/poll"));
         assert!(caps.iter().any(|c| c == "tool/approve"));
@@ -1345,6 +1525,47 @@ mod tests {
             .expect("remote_resume");
         assert_eq!(remote["remote"], true);
         assert_eq!(remote["session_id"], imported_id);
+    }
+
+    #[test]
+    fn ide_handler_handoff_link_create_and_consume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
+
+        let opened = handler
+            .handle(
+                "session/open",
+                json!({"workspace_root": "/tmp/handoff-link"}),
+            )
+            .unwrap();
+        let sid = opened["session_id"].as_str().unwrap();
+        let _ = handler
+            .handle(
+                "prompt/execute",
+                json!({"session_id": sid, "prompt": "handoff link seed"}),
+            )
+            .expect("prompt/execute");
+
+        let created = handler
+            .handle(
+                "session/handoff_link_create",
+                json!({"session_id": sid, "ttl_minutes": 10}),
+            )
+            .expect("handoff_link_create");
+        assert_eq!(created["schema"], "deepseek.handoff_link.v1");
+        let handoff_id = created["handoff_id"].as_str().unwrap();
+        let token = created["token"].as_str().unwrap();
+        assert!(!handoff_id.is_empty());
+        assert!(!token.is_empty());
+
+        let consumed = handler
+            .handle(
+                "session/handoff_link_consume",
+                json!({"handoff_id": handoff_id, "token": token}),
+            )
+            .expect("handoff_link_consume");
+        assert_eq!(consumed["consumed"], true);
+        assert!(consumed["imported_session_id"].as_str().is_some());
     }
 
     #[test]

@@ -1378,6 +1378,31 @@
                             result: result.clone(),
                         },
                     )?;
+                    if (internal_name.starts_with("chrome.")
+                        || internal_name.starts_with("chrome_"))
+                        && !result.success
+                    {
+                        let error_kind = result
+                            .output
+                            .get("error_kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let live_connect_failure = matches!(
+                            error_kind,
+                            "chrome_unavailable" | "chrome_session_not_connected"
+                        );
+                        self.emit(
+                            session.session_id,
+                            EventKind::TelemetryEventV1 {
+                                name: "kpi.chrome.tool_failure".to_string(),
+                                properties: json!({
+                                    "tool": internal_name,
+                                    "error_kind": error_kind,
+                                    "live_connect_failure": live_connect_failure,
+                                }),
+                            },
+                        )?;
+                    }
 
                     // Notify TUI of completion with result preview
                     if let Ok(mut cb_guard) = self.stream_callback.lock()

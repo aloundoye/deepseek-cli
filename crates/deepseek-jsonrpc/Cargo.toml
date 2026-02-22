@@ -11,6 +11,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+sha2.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-context = { path = "../deepseek-context" }

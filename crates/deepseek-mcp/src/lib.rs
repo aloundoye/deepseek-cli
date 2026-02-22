@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chrono::Utc;
 use deepseek_store::{McpServerRecord, McpToolCacheRecord, Store};
 use reqwest::blocking::Client;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -320,19 +321,24 @@ impl McpManager {
                     .send()?
                     .error_for_status()?
                     .json()?;
-                let content = resp
-                    .get("result")
-                    .and_then(|r| r.get("contents"))
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|item| item.get("text"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                Ok(content.to_string())
+                extract_resource_text(
+                    resp.get("result")
+                        .ok_or_else(|| anyhow!("MCP resources/read response missing result"))?,
+                )
             }
             McpTransport::Stdio => {
-                // Stdio resource resolution is complex — return a stub for now
-                Ok(format!("[MCP resource: {server_id}:{uri}]"))
+                let response = execute_mcp_stdio_request(
+                    &server,
+                    "resources/read",
+                    json!({ "uri": uri }),
+                    2,
+                    Duration::from_secs(6),
+                )?;
+                extract_resource_text(
+                    response
+                        .get("result")
+                        .ok_or_else(|| anyhow!("MCP resources/read response missing result"))?,
+                )
             }
         }
     }
@@ -645,6 +651,148 @@ fn discover_stdio_tools(server: &McpServer) -> Result<Vec<McpTool>> {
     discovered.sort_by(|a, b| a.name.cmp(&b.name));
     discovered.dedup_by(|a, b| a.name == b.name);
     Ok(discovered)
+}
+
+/// Execute one framed JSON-RPC request against an MCP stdio server.
+///
+/// This function starts a short-lived server process, initializes MCP protocol,
+/// then sends exactly one method request and returns the matching response frame.
+pub fn execute_mcp_stdio_request(
+    server: &McpServer,
+    method: &str,
+    params: serde_json::Value,
+    request_id: u64,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let command = server
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow!("stdio transport requires command"))?;
+    let mut child = Command::new(command)
+        .args(&server.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start MCP stdio command: {command}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open MCP stdio stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open MCP stdio stdout"))?;
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+
+    let reader_handle = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
+            if tx.send(value).is_err() {
+                break;
+            }
+        }
+    });
+
+    let init = json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {
+            "name": "deepseek-cli",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    });
+    write_mcp_request(&mut stdin, 1, "initialize", init)?;
+    write_mcp_request(&mut stdin, request_id, method, params)?;
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let response = wait_for_mcp_response(&rx, request_id, timeout);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.join();
+
+    match response {
+        Some(value) => Ok(value),
+        None => Err(anyhow!(
+            "MCP stdio request timed out: method={method} timeout_ms={}",
+            timeout.as_millis()
+        )),
+    }
+}
+
+fn wait_for_mcp_response(
+    rx: &mpsc::Receiver<serde_json::Value>,
+    request_id: u64,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(1));
+        let wait = remaining.min(Duration::from_millis(150));
+        match rx.recv_timeout(wait) {
+            Ok(message) => {
+                if message.get("id").and_then(|v| v.as_u64()) == Some(request_id) {
+                    return Some(message);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    None
+}
+
+fn extract_resource_text(result: &serde_json::Value) -> Result<String> {
+    let contents = result
+        .get("contents")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("MCP resources/read missing contents array"))?;
+    if contents.is_empty() {
+        return Err(anyhow!("MCP resources/read returned no contents"));
+    }
+
+    let mut merged = Vec::new();
+    for item in contents {
+        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+            merged.push(text.to_string());
+            continue;
+        }
+        if let Some(blob) = item.get("blob").and_then(|v| v.as_str()) {
+            let mime = item
+                .get("mimeType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream");
+            match base64::engine::general_purpose::STANDARD.decode(blob) {
+                Ok(bytes) => match String::from_utf8(bytes.clone()) {
+                    Ok(text) => merged.push(text),
+                    Err(_) => merged.push(format!(
+                        "[binary-resource mime={} size={} bytes]",
+                        mime,
+                        bytes.len()
+                    )),
+                },
+                Err(_) => merged.push(format!(
+                    "[invalid-base64-resource mime={} chars={}]",
+                    mime,
+                    blob.len()
+                )),
+            }
+        }
+    }
+
+    if merged.is_empty() {
+        return Err(anyhow!(
+            "MCP resources/read contents had no text/blob payloads"
+        ));
+    }
+    let joined = merged.join("\n");
+    let (bounded, _truncated) = enforce_mcp_token_limit(&joined, &McpTokenLimits::default());
+    Ok(bounded)
 }
 
 fn write_mcp_request(
@@ -1075,6 +1223,8 @@ fn parse_tools_array(server_id: &str, tools: &[serde_json::Value]) -> Vec<McpToo
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn add_list_remove_server_round_trip() {
@@ -1196,6 +1346,43 @@ mod tests {
         let tools = parse_mcp_tools_message("srv", &parsed);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "ping");
+    }
+
+    #[test]
+    fn extract_resource_text_merges_text_and_blob_entries() {
+        let blob = base64::engine::general_purpose::STANDARD.encode("from blob");
+        let result = extract_resource_text(&serde_json::json!({
+            "contents": [
+                {"text":"line one"},
+                {"blob": blob, "mimeType":"text/plain"}
+            ]
+        }))
+        .expect("resource text");
+        assert!(result.contains("line one"));
+        assert!(result.contains("from blob"));
+    }
+
+    #[test]
+    fn extract_resource_text_handles_binary_blob_marker() {
+        let blob = base64::engine::general_purpose::STANDARD.encode([0_u8, 159, 146, 150]);
+        let result = extract_resource_text(&serde_json::json!({
+            "contents": [
+                {"blob": blob, "mimeType":"application/octet-stream"}
+            ]
+        }))
+        .expect("resource marker");
+        assert!(result.contains("[binary-resource"));
+        assert!(result.contains("application/octet-stream"));
+    }
+
+    #[test]
+    fn wait_for_mcp_response_times_out_without_matching_id() {
+        let (tx, rx) = mpsc::channel::<serde_json::Value>();
+        tx.send(serde_json::json!({"id":1,"result":{}}))
+            .expect("send frame");
+        drop(tx);
+        let value = wait_for_mcp_response(&rx, 2, Duration::from_millis(20));
+        assert!(value.is_none());
     }
 
     #[test]
