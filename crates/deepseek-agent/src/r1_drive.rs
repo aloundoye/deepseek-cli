@@ -61,13 +61,13 @@ const R1_SYSTEM_PROMPT: &str = r#"You are a senior software architect directing 
 - edit_file: {"file_path": "path/to/file", "old_string": "...", "new_string": "..."}
 - glob: {"pattern": "**/*.rs"}
 - ripgrep: {"pattern": "regex", "glob": "*.rs"}
-- run_cmd: {"cmd": "cargo test", "timeout_ms": 30000}
+- run_cmd: {"command": "cargo test", "timeout_ms": 30000}
 - git_status: {}
 - git_diff: {"ref": "HEAD"}
 - list_dir: {"path": "src/"}
 - apply_patch: {"patch": "unified diff text"}
 - multi_edit: {"edits": [{"file_path": "...", "old_string": "...", "new_string": "..."}]}
-- diagnostics_check: {"cmd": "cargo check"}
+- diagnostics_check: {"path": "src/"}
 - index_query: {"query": "search terms"}
 "#;
 

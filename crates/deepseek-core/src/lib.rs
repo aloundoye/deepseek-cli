@@ -1239,6 +1239,10 @@ impl ToolChoice {
     pub fn none() -> Self {
         Self::Mode("none".to_string())
     }
+    /// Force the model to return at least one tool call.
+    pub fn required() -> Self {
+        Self::Mode("required".to_string())
+    }
 }
 
 /// Request for the chat-with-tools API.
