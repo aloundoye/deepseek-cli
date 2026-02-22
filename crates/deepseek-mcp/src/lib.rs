@@ -612,7 +612,7 @@ fn discover_stdio_tools(server: &McpServer) -> Result<Vec<McpTool>> {
         "capabilities": {},
         "clientInfo": {
             "name": "deepseek-cli",
-            "version": "0.1.0"
+            "version": "0.2.0"
         }
     });
     write_mcp_request(&mut stdin, 1, "initialize", init)?;
@@ -871,7 +871,7 @@ fn build_serve_tool_list(_workspace: &Path) -> Vec<serde_json::Value> {
         (
             "bash_run",
             "Execute a shell command",
-            json!({"type": "object", "properties": {"cmd": {"type": "string", "description": "Command to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds"}}, "required": ["cmd"]}),
+            json!({"type": "object", "properties": {"command": {"type": "string", "description": "Command to execute"}, "timeout": {"type": "integer", "description": "Timeout in seconds"}}, "required": ["command"]}),
         ),
         (
             "git_status",
@@ -953,7 +953,11 @@ fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json:
             }
         }
         "bash_run" => {
-            let cmd = arguments.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = arguments
+                .get("command")
+                .or_else(|| arguments.get("cmd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let _timeout_secs = arguments
                 .get("timeout")
                 .and_then(|v| v.as_u64())

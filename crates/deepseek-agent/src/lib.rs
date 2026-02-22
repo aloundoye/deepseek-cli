@@ -16,7 +16,7 @@ use deepseek_core::{
     StreamChunk, ThinkingConfig, ToolCall, ToolChoice, ToolHost, is_valid_session_state_transition,
 };
 use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
-use deepseek_llm::{DeepSeekClient, LlmClient};
+use deepseek_llm::{DeepSeekClient, LlmClient, content_contains_tool_call};
 use deepseek_mcp::{McpManager, McpTool};
 use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
@@ -1325,6 +1325,7 @@ impl AgentEngine {
         let mut failure_tracker = FailureTracker::default();
         let mut current_mode = AgentMode::V3Autopilot;
         let mut budget_warned = false;
+        let mut tool_choice_retried = false;
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
         loop {
@@ -1617,6 +1618,42 @@ impl AgentEngine {
                 response
             };
 
+            // Tool-call-as-text rescue retry: if response.tool_calls is empty
+            // but the text contains known tool API names, retry once with
+            // tool_choice="required" to force the model to use structured
+            // function calling.
+            let response = if options.tools
+                && response.tool_calls.is_empty()
+                && !tool_choice_retried
+                && content_contains_tool_call(&response.text)
+            {
+                tool_choice_retried = true;
+                self.observer
+                    .verbose_log("tool-call-as-text detected: retrying with tool_choice=required");
+                let retry_request = ChatRequest {
+                    model: request_model.clone(),
+                    messages: messages.clone(),
+                    tools: tools.clone(),
+                    tool_choice: ToolChoice::required(),
+                    max_tokens: session.budgets.max_think_tokens.max(4096),
+                    temperature: if thinking.is_some() { None } else { Some(0.0) },
+                    thinking: thinking.clone(),
+                };
+                let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                if let Some(cb) = cb {
+                    self.llm.complete_chat_streaming(&retry_request, cb)?
+                } else {
+                    self.llm.complete_chat(&retry_request)?
+                }
+            } else {
+                // Reset flag on successful structured responses so a later turn
+                // can retry again if needed.
+                if !response.tool_calls.is_empty() {
+                    tool_choice_retried = false;
+                }
+                response
+            };
+
             // Record usage metrics
             let input_tok = estimate_tokens(
                 &messages
@@ -1789,8 +1826,22 @@ impl AgentEngine {
             // Execute each tool call and collect results
             for tc in &response.tool_calls {
                 let internal_name = map_tool_name(&tc.name);
-                let args: serde_json::Value =
+                let mut args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+
+                // Normalize bash.run args: model may send "command" (the
+                // canonical definition name) — copy it to "cmd" so all
+                // downstream code (policy, observation, mode_router) works
+                // unchanged.
+                if internal_name == "bash.run" {
+                    if let Some(obj) = args.as_object_mut() {
+                        if obj.contains_key("command") && !obj.contains_key("cmd") {
+                            if let Some(val) = obj.get("command").cloned() {
+                                obj.insert("cmd".to_string(), val);
+                            }
+                        }
+                    }
+                }
 
                 // Safety net: block disallowed tools at execution time
                 if let Some(ref deny_list) = options.disallowed_tools
@@ -2035,6 +2086,7 @@ impl AgentEngine {
                         let shell_id = Uuid::now_v7();
                         let cmd_str = args
                             .get("cmd")
+                            .or_else(|| args.get("command"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -2176,6 +2228,11 @@ impl AgentEngine {
                     output
                 } else {
                     failure_streak += 1;
+                    failure_tracker.record_failure();
+                    // Track denied tools in doom-loop detection so repeated
+                    // denials don't cause infinite retries.
+                    let sig = ToolSignature::new(internal_name, &args, Some(-2));
+                    failure_tracker.record_tool_signature(sig, false);
                     // Notify TUI of denial
                     if let Ok(mut cb_guard) = self.stream_callback.lock()
                         && let Some(ref mut cb) = *cb_guard
@@ -2186,7 +2243,7 @@ impl AgentEngine {
                         )));
                     }
                     format!(
-                        "Tool '{}' requires approval. Please grant permission to proceed.",
+                        "Tool '{}' was denied by the user. Do NOT retry this tool with the same arguments. Try a different approach or ask the user for guidance.",
                         internal_name
                     )
                 };
@@ -2273,17 +2330,17 @@ impl AgentEngine {
                     &self.cfg.llm.max_think_model,
                 );
 
-                let stream_cb: Option<deepseek_core::StreamCallback> =
-                    if let Ok(cb_guard) = self.stream_callback.lock()
-                        && cb_guard.is_some()
-                    {
-                        // Create a proxy callback. We can't borrow the mutex across
-                        // the r1_drive_loop call, so we just pass None for now and
-                        // let r1_drive use its own verbose logging.
-                        None
-                    } else {
-                        None
-                    };
+                let stream_cb: Option<deepseek_core::StreamCallback> = if let Ok(cb_guard) =
+                    self.stream_callback.lock()
+                    && cb_guard.is_some()
+                {
+                    // Create a proxy callback. We can't borrow the mutex across
+                    // the r1_drive_loop call, so we just pass None for now and
+                    // let r1_drive use its own verbose logging.
+                    None
+                } else {
+                    None
+                };
 
                 let tool_host_dyn: Arc<dyn deepseek_core::ToolHost + Send + Sync> =
                     self.tool_host.clone();
@@ -2303,10 +2360,8 @@ impl AgentEngine {
                 match outcome {
                     R1DriveOutcome::Done(done) => {
                         // R1 completed the task. Return answer.
-                        self.observer.verbose_log(&format!(
-                            "R1 drive-tools completed: {}",
-                            &done.summary
-                        ));
+                        self.observer
+                            .verbose_log(&format!("R1 drive-tools completed: {}", &done.summary));
                         if let Ok(mut cb_guard) = self.stream_callback.lock()
                             && let Some(ref mut cb) = *cb_guard
                         {
@@ -2319,10 +2374,7 @@ impl AgentEngine {
                         let answer = if done.verification.is_empty() {
                             done.summary.clone()
                         } else {
-                            format!(
-                                "{}\n\nVerification: {}",
-                                done.summary, done.verification
-                            )
+                            format!("{}\n\nVerification: {}", done.summary, done.verification)
                         };
                         messages.push(ChatMessage::Assistant {
                             content: Some(answer.clone()),
@@ -2342,10 +2394,8 @@ impl AgentEngine {
 
                     R1DriveOutcome::DelegatePatch(dp) => {
                         // R1 wants V3 to write a patch. Call V3 in patch-only mode.
-                        self.observer.verbose_log(&format!(
-                            "R1 delegating patch: {}",
-                            &dp.task
-                        ));
+                        self.observer
+                            .verbose_log(&format!("R1 delegating patch: {}", &dp.task));
                         if let Ok(mut cb_guard) = self.stream_callback.lock()
                             && let Some(ref mut cb) = *cb_guard
                         {
@@ -2394,11 +2444,10 @@ impl AgentEngine {
                                 };
                                 let proposal = self.tool_host.propose(patch_call);
                                 if proposal.approved {
-                                    let patch_result =
-                                        self.tool_host.execute(ApprovedToolCall {
-                                            invocation_id: proposal.invocation_id,
-                                            call: proposal.call,
-                                        });
+                                    let patch_result = self.tool_host.execute(ApprovedToolCall {
+                                        invocation_id: proposal.invocation_id,
+                                        call: proposal.call,
+                                    });
                                     if patch_result.success {
                                         self.observer.verbose_log("Patch applied successfully");
                                         // Run verification if acceptance criteria given
@@ -2419,27 +2468,21 @@ impl AgentEngine {
                                         failure_tracker.record_failure();
                                     }
                                 } else {
-                                    self.observer
-                                        .verbose_log("Patch apply denied by policy");
+                                    self.observer.verbose_log("Patch apply denied by policy");
                                     failure_tracker.record_failure();
                                 }
                             }
                             V3PatchOutcome::Failed { reason } => {
-                                self.observer.verbose_log(&format!(
-                                    "V3 patch failed: {reason}"
-                                ));
+                                self.observer
+                                    .verbose_log(&format!("V3 patch failed: {reason}"));
                                 failure_tracker.record_failure();
                             }
                         }
 
                         // After patch handling, re-check mode. If verify passed,
                         // hysteresis will allow return to V3. Otherwise stay in R1.
-                        let post_patch = decide_mode(
-                            &mode_router_config,
-                            current_mode,
-                            &failure_tracker,
-                            None,
-                        );
+                        let post_patch =
+                            decide_mode(&mode_router_config, current_mode, &failure_tracker, None);
                         current_mode = post_patch.mode;
                         // Continue the main loop (next iteration will either
                         // run V3 or re-enter R1 based on mode)
@@ -2467,9 +2510,8 @@ impl AgentEngine {
                     }
 
                     R1DriveOutcome::BudgetExhausted { steps_used } => {
-                        self.observer.verbose_log(&format!(
-                            "R1 budget exhausted after {steps_used} steps"
-                        ));
+                        self.observer
+                            .verbose_log(&format!("R1 budget exhausted after {steps_used} steps"));
                         current_mode = AgentMode::V3Autopilot;
                         messages.push(ChatMessage::User {
                             content: format!(
@@ -2481,9 +2523,8 @@ impl AgentEngine {
                     }
 
                     R1DriveOutcome::ParseFailure { last_error } => {
-                        self.observer.verbose_log(&format!(
-                            "R1 parse failure: {last_error}"
-                        ));
+                        self.observer
+                            .verbose_log(&format!("R1 parse failure: {last_error}"));
                         current_mode = AgentMode::V3Autopilot;
                         messages.push(ChatMessage::User {
                             content: format!(
@@ -2547,9 +2588,7 @@ impl AgentEngine {
             "rust"
         } else if workspace.join("package.json").exists() {
             "javascript"
-        } else if workspace.join("pyproject.toml").exists()
-            || workspace.join("setup.py").exists()
-        {
+        } else if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
             "python"
         } else if workspace.join("go.mod").exists() {
             "go"
@@ -2691,6 +2730,8 @@ impl AgentEngine {
              - **diagnostics_check**: Run language-specific diagnostics (cargo check, tsc, ruff, etc.).\n\
              - **patch_stage / patch_apply**: Stage and apply unified diffs with SHA verification.\n\
              - **notebook_read / notebook_edit**: Read and modify Jupyter notebooks.\n\n\
+             Important: When you need to use a tool, invoke it through the function calling API.\n\
+             Do NOT output tool names or arguments as text in your response.\n\n\
              # Safety Rules\n\
              - Always read a file before editing it — understand existing code first\n\
              - Never delete files, force-push, or run destructive commands without explicit user approval\n\
@@ -7555,7 +7596,7 @@ fn execute_mcp_stdio_tool(
     let init_params = json!({
         "protocolVersion": "2025-06-18",
         "capabilities": {},
-        "clientInfo": { "name": "deepseek-cli", "version": "0.1.0" }
+        "clientInfo": { "name": "deepseek-cli", "version": "0.2.0" }
     });
     write_mcp_request(&mut stdin, 1, "initialize", init_params)?;
 
@@ -9749,10 +9790,7 @@ mod tests {
             // The blast radius detection depends on the file change tracking
             // being connected to the mode router. Even if the config threshold
             // wasn't applied, confirm the flow completes successfully.
-            assert!(
-                !answer.is_empty(),
-                "answer should not be empty"
-            );
+            assert!(!answer.is_empty(), "answer should not be empty");
         }
     }
 }

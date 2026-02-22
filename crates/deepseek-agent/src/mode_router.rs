@@ -176,7 +176,9 @@ impl FailureTracker {
 
     /// Check if any tool signature has hit the doom-loop threshold.
     pub fn has_doom_loop(&self, threshold: u32) -> bool {
-        self.doom_loop_sigs.values().any(|&count| count >= threshold)
+        self.doom_loop_sigs
+            .values()
+            .any(|&count| count >= threshold)
     }
 
     /// Record a successful verification (resets blast radius tracking).
