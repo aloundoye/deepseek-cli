@@ -1,15 +1,20 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use deepseek_core::{AppConfig, EventKind};
 use deepseek_store::Store;
+use deepseek_ui::{ImageProtocol, detect_image_protocol, render_inline_image};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use uuid::Uuid;
 
+use crate::context::append_control_event;
 use crate::output::*;
-use crate::{VisualAnalyzeArgs, VisualCmd, VisualListArgs};
+use crate::{VisualAnalyzeArgs, VisualCmd, VisualListArgs, VisualShowArgs};
 
 pub(crate) fn parse_visual_cmd(args: Vec<String>) -> Result<VisualCmd> {
     if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
@@ -30,7 +35,15 @@ pub(crate) fn parse_visual_cmd(args: Vec<String>) -> Result<VisualCmd> {
             max_changed_artifacts: 0,
             expectations: None,
         })),
-        _ => Err(anyhow!("use /visual list|analyze")),
+        "show" => {
+            let target = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("usage: /visual show <artifact_id|path> [--no-open]"))?;
+            let no_open = args.iter().any(|value| value == "--no-open");
+            Ok(VisualCmd::Show(VisualShowArgs { target, no_open }))
+        }
+        _ => Err(anyhow!("use /visual list|analyze|show")),
     }
 }
 
@@ -116,6 +129,45 @@ pub(crate) struct VisualSemanticEntry {
 }
 
 pub(crate) fn run_visual(cwd: &Path, cmd: VisualCmd, json_mode: bool) -> Result<()> {
+    if let VisualCmd::Show(args) = cmd {
+        let payload = visual_show_payload(cwd, &args, !json_mode)?;
+        if json_mode {
+            print_json(&payload)?;
+            return Ok(());
+        }
+        match payload
+            .get("display_mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("none")
+        {
+            "inline" => {
+                println!(
+                    "displayed inline: {}",
+                    payload["resolved_path"].as_str().unwrap_or_default()
+                );
+            }
+            "external" => {
+                println!(
+                    "opened externally: {}",
+                    payload["resolved_path"].as_str().unwrap_or_default()
+                );
+            }
+            "path-only" => {
+                println!(
+                    "image path: {}",
+                    payload["resolved_path"].as_str().unwrap_or_default()
+                );
+            }
+            _ => {
+                println!(
+                    "image display unavailable: {}",
+                    payload["resolved_path"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        return Ok(());
+    }
+
     let payload = visual_payload(cwd, cmd)?;
     if json_mode {
         print_json(&payload)?;
@@ -142,6 +194,179 @@ pub(crate) fn run_visual(cwd: &Path, cmd: VisualCmd, json_mode: bool) -> Result<
 
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn visual_show_payload(
+    cwd: &Path,
+    args: &VisualShowArgs,
+    perform_display: bool,
+) -> Result<serde_json::Value> {
+    let cfg = AppConfig::load(cwd).unwrap_or_default();
+    let fallback = normalize_image_fallback(&cfg.ui.image_fallback);
+    let store = Store::new(cwd)?;
+    let resolved = resolve_visual_show_target(cwd, &store, &args.target)?;
+    if !resolved.path.exists() {
+        return Err(anyhow!(
+            "visual target does not exist: {}",
+            resolved.path.display()
+        ));
+    }
+    let bytes = fs::read(&resolved.path)
+        .with_context(|| format!("failed to read visual target: {}", resolved.path.display()))?;
+    let protocol = detect_image_protocol();
+    let mut display_mode = "none".to_string();
+    let mut opened_externally = false;
+    let mut inline_supported = false;
+
+    if let Some(escape) = render_inline_image(&bytes, protocol) {
+        inline_supported = true;
+        display_mode = "inline".to_string();
+        if perform_display {
+            let mut stdout = std::io::stdout();
+            use std::io::Write;
+            stdout.write_all(escape.as_bytes())?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+        }
+    } else if fallback == "open" && !args.no_open {
+        if perform_display {
+            open_external_target(&resolved.path)?;
+        }
+        opened_externally = true;
+        display_mode = "external".to_string();
+    } else if fallback == "path" || (fallback == "open" && args.no_open) {
+        display_mode = "path-only".to_string();
+    }
+
+    append_control_event(
+        cwd,
+        EventKind::TelemetryEventV1 {
+            name: "kpi.visual.display_mode".to_string(),
+            properties: json!({
+                "display_mode": display_mode,
+                "inline_supported": inline_supported,
+                "fallback": fallback,
+                "no_open": args.no_open,
+            }),
+        },
+    )?;
+
+    Ok(json!({
+        "schema": "deepseek.visual.show.v1",
+        "target": args.target,
+        "artifact_id": resolved.artifact_id,
+        "resolved_path": resolved.path.to_string_lossy().to_string(),
+        "mime": resolved.mime,
+        "size_bytes": bytes.len() as u64,
+        "terminal_protocol": protocol_label(protocol),
+        "fallback": fallback,
+        "opened_externally": opened_externally,
+        "display_mode": display_mode,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedVisualTarget {
+    path: PathBuf,
+    artifact_id: Option<Uuid>,
+    mime: String,
+}
+
+fn resolve_visual_show_target(
+    cwd: &Path,
+    store: &Store,
+    target: &str,
+) -> Result<ResolvedVisualTarget> {
+    if let Ok(artifact_id) = Uuid::parse_str(target)
+        && let Some(artifact) = store
+            .list_visual_artifacts(500)?
+            .into_iter()
+            .find(|record| record.artifact_id == artifact_id)
+    {
+        let path = resolve_visual_artifact_path(cwd, &artifact.path);
+        return Ok(ResolvedVisualTarget {
+            path: path.clone(),
+            artifact_id: Some(artifact.artifact_id),
+            mime: artifact.mime,
+        });
+    }
+
+    let path = resolve_visual_artifact_path(cwd, target);
+    Ok(ResolvedVisualTarget {
+        mime: infer_mime_from_path(&path),
+        path,
+        artifact_id: None,
+    })
+}
+
+fn infer_mime_from_path(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "gif" => "image/gif".to_string(),
+        "webp" => "image/webp".to_string(),
+        "svg" => "image/svg+xml".to_string(),
+        "pdf" => "application/pdf".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+fn normalize_image_fallback(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "open" => "open",
+        "path" => "path",
+        "none" => "none",
+        _ => "open",
+    }
+}
+
+fn protocol_label(protocol: ImageProtocol) -> &'static str {
+    match protocol {
+        ImageProtocol::Iterm2 => "iterm2",
+        ImageProtocol::Kitty => "kitty",
+        ImageProtocol::None => "none",
+    }
+}
+
+fn open_external_target(path: &Path) -> Result<()> {
+    let (program, args) = launcher_command_for_os(std::env::consts::OS, path)?;
+    let mut command = Command::new(program);
+    command.args(args);
+    let status = command.status()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "failed to open image with system launcher: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn launcher_command_for_os(os: &str, path: &Path) -> Result<(String, Vec<String>)> {
+    let target = path.to_string_lossy().to_string();
+    match os {
+        "macos" => Ok(("open".to_string(), vec![target])),
+        "linux" => Ok(("xdg-open".to_string(), vec![target])),
+        "windows" => Ok((
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                "".to_string(),
+                target,
+            ],
+        )),
+        _ => Err(anyhow!(
+            "external launcher is unsupported on this platform: {}",
+            os
+        )),
+    }
 }
 
 pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::Value> {
@@ -490,6 +715,9 @@ pub(crate) fn visual_payload(cwd: &Path, cmd: VisualCmd) -> Result<serde_json::V
             }
             Ok(payload)
         }
+        VisualCmd::Show(_) => Err(anyhow!(
+            "visual show is handled directly by run_visual; call visual_show_payload instead"
+        )),
     }
 }
 
@@ -969,5 +1197,38 @@ mod tests {
         let result =
             evaluate_visual_semantics(&[entry], &expectation).expect("semantic evaluation");
         assert_eq!(result["rules_failed"], 0);
+    }
+
+    #[test]
+    fn parse_visual_show_slash_command() {
+        let cmd = parse_visual_cmd(vec![
+            "show".to_string(),
+            "abc.png".to_string(),
+            "--no-open".to_string(),
+        ])
+        .expect("parse visual show");
+        match cmd {
+            VisualCmd::Show(args) => {
+                assert_eq!(args.target, "abc.png");
+                assert!(args.no_open);
+            }
+            _ => panic!("expected VisualCmd::Show"),
+        }
+    }
+
+    #[test]
+    fn launcher_selection_is_deterministic() {
+        let path = Path::new("/tmp/example.png");
+        let (program, args) = launcher_command_for_os("macos", path).expect("mac launcher");
+        assert_eq!(program, "open");
+        assert_eq!(args.len(), 1);
+
+        let (program, args) = launcher_command_for_os("linux", path).expect("linux launcher");
+        assert_eq!(program, "xdg-open");
+        assert_eq!(args.len(), 1);
+
+        let (program, args) = launcher_command_for_os("windows", path).expect("windows launcher");
+        assert_eq!(program, "cmd");
+        assert_eq!(args[0], "/C");
     }
 }

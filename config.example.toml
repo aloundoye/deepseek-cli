@@ -69,6 +69,10 @@ sandbox_wrapper = ""
 # Optional: auto-lint after fs.edit (from Aider). Lint output included in tool result.
 # lint_after_edit = "cargo fmt --check"
 
+[tools.chrome]
+# Strict-live by default. Set true only for offline deterministic test flows.
+allow_stub_fallback = false
+
 [plugins]
 enabled = true
 search_paths = [".deepseek/plugins", ".plugins"]
@@ -113,6 +117,10 @@ enable_tui = true
 keybindings_path = "~/.deepseek/keybindings.json"
 reduced_motion = false
 statusline_mode = "minimal"
+# Fallback mode when terminal cannot render inline images: open | path | none
+image_fallback = "open"
+# Optional base URL for teleport handoff links (used by `teleport link`)
+# handoff_base_url = "https://app.example.com/handoff"
 
 [experiments]
 visual_verification = false

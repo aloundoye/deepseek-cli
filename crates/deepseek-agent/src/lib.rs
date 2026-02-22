@@ -1641,6 +1641,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_mcp_resources_injects_unavailable_marker() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-agent-mcp-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = deepseek_mcp::McpManager::new(&workspace).expect("mcp manager");
+        manager
+            .add_server(deepseek_mcp::McpServer {
+                id: "broken".to_string(),
+                name: "broken".to_string(),
+                transport: deepseek_mcp::McpTransport::Stdio,
+                command: Some("definitely-not-a-real-command".to_string()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                metadata: serde_json::Value::Null,
+            })
+            .expect("add server");
+        let engine = AgentEngine::new(&workspace).expect("engine");
+        let out = engine.resolve_mcp_resources("inspect @broken:doc://intro please");
+        assert!(out.contains("[resource-unavailable: @broken:doc://intro"));
+        assert!(out.contains("inspect"));
+    }
+
+    #[test]
     fn expand_env_vars_basic() {
         let result = expand_env_vars("prefix-${NONEXISTENT_TEST_VAR_XYZ:-fallback}-suffix");
         assert_eq!(result, "prefix-fallback-suffix");

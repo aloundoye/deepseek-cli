@@ -2620,6 +2620,8 @@ impl Store {
                     ],
                 )?;
             }
+            EventKind::RemoteEnvExecutionStartedV1 { .. }
+            | EventKind::RemoteEnvExecutionCompletedV1 { .. } => {}
             EventKind::TeleportBundleCreatedV1 { bundle_id, path } => {
                 conn.execute(
                     "INSERT INTO replay_cassettes (cassette_id, session_id, deterministic, events_count, payload_json, created_at)
@@ -2632,6 +2634,8 @@ impl Store {
                     ],
                 )?;
             }
+            EventKind::TeleportHandoffLinkCreatedV1 { .. }
+            | EventKind::TeleportHandoffLinkConsumedV1 { .. } => {}
             EventKind::PermissionModeChangedV1 { from, to } => {
                 conn.execute(
                     "INSERT INTO permission_mode_log (session_id, from_mode, to_mode, changed_at)
@@ -2699,6 +2703,7 @@ impl Store {
                     ],
                 )?;
             }
+            EventKind::ReviewPublishedV1 { .. } => {}
             EventKind::ArtifactBundledV1 {
                 task_id,
                 artifact_path,
@@ -2853,12 +2858,17 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::OffPeakScheduledV1 { .. } => "OffPeakScheduled@v1",
         EventKind::VisualArtifactCapturedV1 { .. } => "VisualArtifactCaptured@v1",
         EventKind::RemoteEnvConfiguredV1 { .. } => "RemoteEnvConfigured@v1",
+        EventKind::RemoteEnvExecutionStartedV1 { .. } => "RemoteEnvExecutionStarted@v1",
+        EventKind::RemoteEnvExecutionCompletedV1 { .. } => "RemoteEnvExecutionCompleted@v1",
         EventKind::TeleportBundleCreatedV1 { .. } => "TeleportBundleCreated@v1",
+        EventKind::TeleportHandoffLinkCreatedV1 { .. } => "TeleportHandoffLinkCreated@v1",
+        EventKind::TeleportHandoffLinkConsumedV1 { .. } => "TeleportHandoffLinkConsumed@v1",
         EventKind::TelemetryEventV1 { .. } => "TelemetryEvent@v1",
         EventKind::PermissionModeChangedV1 { .. } => "PermissionModeChanged@v1",
         EventKind::WebSearchExecutedV1 { .. } => "WebSearchExecuted@v1",
         EventKind::ReviewStartedV1 { .. } => "ReviewStarted@v1",
         EventKind::ReviewCompletedV1 { .. } => "ReviewCompleted@v1",
+        EventKind::ReviewPublishedV1 { .. } => "ReviewPublished@v1",
         EventKind::TaskCreatedV1 { .. } => "TaskCreated@v1",
         EventKind::TaskCompletedV1 { .. } => "TaskCompleted@v1",
         EventKind::ArtifactBundledV1 { .. } => "ArtifactBundled@v1",

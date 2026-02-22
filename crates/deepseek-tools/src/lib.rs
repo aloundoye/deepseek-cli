@@ -56,6 +56,7 @@ pub struct LocalToolHost {
     plugins: Option<PluginManager>,
     hooks_enabled: bool,
     visual_verification_enabled: bool,
+    chrome_allow_stub_fallback: bool,
     lint_after_edit: Option<String>,
     review_mode: bool,
 }
@@ -96,6 +97,7 @@ impl LocalToolHost {
             plugins: PluginManager::new(workspace).ok(),
             hooks_enabled: cfg.plugins.enabled && cfg.plugins.enable_hooks,
             visual_verification_enabled: cfg.experiments.visual_verification,
+            chrome_allow_stub_fallback: cfg.tools.chrome.allow_stub_fallback,
             lint_after_edit,
             review_mode: false,
         })
@@ -119,9 +121,10 @@ impl LocalToolHost {
         u16::try_from(port).map_err(|_| anyhow!("invalid chrome debug port: {port}"))
     }
 
-    fn chrome_session_from_call(call: &ToolCall) -> Result<ChromeSession> {
+    fn chrome_session_from_call(&self, call: &ToolCall) -> Result<ChromeSession> {
         let port = Self::chrome_port_from_call(call)?;
         let mut session = ChromeSession::new(port)?;
+        session.set_allow_stub_fallback(self.chrome_allow_stub_fallback);
         session.check_connection()?;
         Ok(session)
     }
@@ -733,7 +736,7 @@ impl LocalToolHost {
                 {
                     return Err(anyhow!("url must start with http://, https://, or about:"));
                 }
-                let session = Self::chrome_session_from_call(call)?;
+                let session = self.chrome_session_from_call(call)?;
                 let result = session.navigate(url)?;
                 Ok(json!({
                     "url": url,
@@ -747,7 +750,7 @@ impl LocalToolHost {
                     .get("selector")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("selector missing"))?;
-                let session = Self::chrome_session_from_call(call)?;
+                let session = self.chrome_session_from_call(call)?;
                 let result = session.click(selector)?;
                 Ok(json!({
                     "selector": selector,
@@ -766,7 +769,7 @@ impl LocalToolHost {
                     .get("text")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("text missing"))?;
-                let session = Self::chrome_session_from_call(call)?;
+                let session = self.chrome_session_from_call(call)?;
                 let result = session.type_text(selector, text)?;
                 Ok(json!({
                     "selector": selector,
@@ -789,7 +792,7 @@ impl LocalToolHost {
                     "webp" => ScreenshotFormat::Webp,
                     other => return Err(anyhow!("unsupported screenshot format: {other}")),
                 };
-                let session = Self::chrome_session_from_call(call)?;
+                let session = self.chrome_session_from_call(call)?;
                 let image_base64 = session.screenshot(format)?;
                 Ok(json!({
                     "format": call.args.get("format").and_then(|v| v.as_str()).unwrap_or("png"),
@@ -797,7 +800,7 @@ impl LocalToolHost {
                 }))
             }
             "chrome.read_console" => {
-                let session = Self::chrome_session_from_call(call)?;
+                let session = self.chrome_session_from_call(call)?;
                 let entries = session.read_console()?;
                 Ok(json!({
                     "entries": entries,
@@ -810,7 +813,7 @@ impl LocalToolHost {
                     .get("expression")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("expression missing"))?;
-                let session = Self::chrome_session_from_call(call)?;
+                let session = self.chrome_session_from_call(call)?;
                 let value = session.evaluate(expression)?;
                 Ok(json!({
                     "expression": expression,
@@ -1190,7 +1193,20 @@ impl ToolHost for LocalToolHost {
         self.execute_hooks("pretooluse", Some(&call), None);
         let (success, output) = match self.run_tool(&call) {
             Ok(output) => (true, output),
-            Err(err) => (false, json!({"error": err.to_string()})),
+            Err(err) => {
+                let message = err.to_string();
+                let payload = if call.name.starts_with("chrome.") {
+                    let (kind, hints) = classify_chrome_error(&message);
+                    json!({
+                        "error": message,
+                        "error_kind": kind,
+                        "hints": hints,
+                    })
+                } else {
+                    json!({"error": message})
+                };
+                (false, payload)
+            }
         };
         if success {
             self.execute_hooks("posttooluse", Some(&call), Some(&output));
@@ -1202,6 +1218,46 @@ impl ToolHost for LocalToolHost {
             success,
             output,
         }
+    }
+}
+
+fn classify_chrome_error(message: &str) -> (&'static str, Vec<&'static str>) {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("connection refused")
+        || lower.contains("endpoint_unreachable")
+        || lower.contains("debugging endpoint is unavailable")
+    {
+        (
+            "endpoint_unreachable",
+            vec![
+                "Start Chrome with --remote-debugging-port=9222",
+                "Verify DEEPSEEK_CHROME_PORT points to the active debugging port",
+            ],
+        )
+    } else if lower.contains("no_page_targets") || lower.contains("no debuggable page target") {
+        (
+            "no_page_targets",
+            vec![
+                "Open at least one tab in the target Chrome profile",
+                "Run /chrome reconnect to create a recovery tab",
+            ],
+        )
+    } else if lower.contains("timed out") || lower.contains("endpoint_timeout") {
+        (
+            "endpoint_timeout",
+            vec![
+                "Retry /chrome reconnect once the browser is responsive",
+                "Confirm no firewall/proxy is blocking localhost CDP traffic",
+            ],
+        )
+    } else {
+        (
+            "chrome_error",
+            vec![
+                "Run /chrome status for live connection diagnostics",
+                "Run /chrome reconnect to recover stale sessions",
+            ],
+        )
     }
 }
 
@@ -4175,8 +4231,32 @@ mod tests {
     }
 
     #[test]
-    fn chrome_tool_calls_return_structured_payloads() {
+    fn chrome_tool_calls_fail_without_live_endpoint_by_default() {
         let (_workspace, host) = temp_host();
+        let navigate = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "chrome.navigate".to_string(),
+                args: json!({"url":"https://example.com"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!navigate.success);
+        assert!(navigate.output["error"].as_str().is_some());
+        assert!(navigate.output["error_kind"].as_str().is_some());
+        assert!(navigate.output["hints"].is_array());
+    }
+
+    #[test]
+    fn chrome_tool_calls_allow_stub_with_config_opt_in() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-tools-chrome-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let mut cfg = AppConfig::default();
+        cfg.tools.chrome.allow_stub_fallback = true;
+        cfg.save(&workspace).expect("save config");
+        let host = LocalToolHost::new(&workspace, PolicyEngine::default()).expect("tool host");
+
         let navigate = host.execute(ApprovedToolCall {
             invocation_id: Uuid::now_v7(),
             call: ToolCall {

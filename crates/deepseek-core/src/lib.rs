@@ -769,6 +769,12 @@ pub enum EventKind {
         findings_count: u64,
         critical_count: u64,
     },
+    ReviewPublishedV1 {
+        review_id: Uuid,
+        pr_number: u64,
+        comments_published: u64,
+        dry_run: bool,
+    },
     TaskCreatedV1 {
         task_id: Uuid,
         title: String,
@@ -827,9 +833,36 @@ pub enum EventKind {
         name: String,
         endpoint: String,
     },
+    RemoteEnvExecutionStartedV1 {
+        execution_id: Uuid,
+        profile_id: Uuid,
+        mode: String,
+        background: bool,
+        reference: String,
+    },
+    RemoteEnvExecutionCompletedV1 {
+        execution_id: Uuid,
+        profile_id: Uuid,
+        mode: String,
+        success: bool,
+        duration_ms: u64,
+        background: bool,
+        reference: String,
+    },
     TeleportBundleCreatedV1 {
         bundle_id: Uuid,
         path: String,
+    },
+    TeleportHandoffLinkCreatedV1 {
+        handoff_id: Uuid,
+        session_id: Uuid,
+        expires_at: String,
+    },
+    TeleportHandoffLinkConsumedV1 {
+        handoff_id: Uuid,
+        session_id: Uuid,
+        success: bool,
+        reason: String,
     },
     SessionStartedV1 {
         session_id: Uuid,
@@ -991,7 +1024,9 @@ impl EventKind {
             Self::WebSearchExecutedV1 { .. } => "web",
 
             // Review
-            Self::ReviewStartedV1 { .. } | Self::ReviewCompletedV1 { .. } => "review",
+            Self::ReviewStartedV1 { .. }
+            | Self::ReviewCompletedV1 { .. }
+            | Self::ReviewPublishedV1 { .. } => "review",
 
             // Artifact bundling
             Self::ArtifactBundledV1 { .. } => "artifact",
@@ -1009,10 +1044,14 @@ impl EventKind {
             Self::VisualArtifactCapturedV1 { .. } => "visual",
 
             // Remote environments
-            Self::RemoteEnvConfiguredV1 { .. } => "remote_env",
+            Self::RemoteEnvConfiguredV1 { .. }
+            | Self::RemoteEnvExecutionStartedV1 { .. }
+            | Self::RemoteEnvExecutionCompletedV1 { .. } => "remote_env",
 
             // Teleport
-            Self::TeleportBundleCreatedV1 { .. } => "teleport",
+            Self::TeleportBundleCreatedV1 { .. }
+            | Self::TeleportHandoffLinkCreatedV1 { .. }
+            | Self::TeleportHandoffLinkConsumedV1 { .. } => "teleport",
 
             // Notebook
             Self::NotebookEditedV1 { .. } => "notebook",
@@ -1288,6 +1327,7 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub router: RouterConfig,
     pub policy: PolicyConfig,
+    pub tools: ToolsConfig,
     pub plugins: PluginsConfig,
     pub skills: SkillsConfig,
     pub usage: UsageConfig,
@@ -1989,6 +2029,11 @@ pub struct UiConfig {
     pub keybindings_path: String,
     pub reduced_motion: bool,
     pub statusline_mode: String,
+    /// Image fallback mode when terminal protocol does not support inline rendering.
+    /// Allowed values: "open", "path", "none".
+    pub image_fallback: String,
+    /// Optional base URL used when generating teleport handoff links.
+    pub handoff_base_url: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -1998,6 +2043,30 @@ impl Default for UiConfig {
             keybindings_path: "~/.deepseek/keybindings.json".to_string(),
             reduced_motion: false,
             statusline_mode: "minimal".to_string(),
+            image_fallback: "open".to_string(),
+            handoff_base_url: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub chrome: ChromeToolsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChromeToolsConfig {
+    /// Keep deterministic placeholder fallbacks when live Chrome websocket
+    /// is unavailable. Defaults to false (strict-live behavior).
+    pub allow_stub_fallback: bool,
+}
+
+impl Default for ChromeToolsConfig {
+    fn default() -> Self {
+        Self {
+            allow_stub_fallback: false,
         }
     }
 }

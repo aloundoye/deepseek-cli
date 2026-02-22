@@ -565,6 +565,18 @@ struct ReviewArgs {
     /// Focus area for review (security, performance, correctness, style).
     #[arg(long)]
     focus: Option<String>,
+    /// Enforce strict JSON findings schema parsing.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    strict: bool,
+    /// Publish findings to GitHub PR comments (requires --pr and gh CLI).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    publish: bool,
+    /// Maximum number of inline comments to publish.
+    #[arg(long, default_value_t = 20)]
+    max_comments: usize,
+    /// Dry-run publishing (build publish plan without posting comments).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    dry_run: bool,
 }
 
 #[derive(Args, Default)]
@@ -911,6 +923,7 @@ enum BackgroundCmd {
 enum VisualCmd {
     List(VisualListArgs),
     Analyze(VisualAnalyzeArgs),
+    Show(VisualShowArgs),
 }
 
 #[derive(Args, Clone)]
@@ -971,8 +984,20 @@ struct VisualAnalyzeArgs {
     expectations: Option<String>,
 }
 
+#[derive(Args)]
+struct VisualShowArgs {
+    /// Artifact ID from `visual list` or an absolute/relative file path.
+    target: String,
+    /// Disable opening external viewer even when fallback mode is `open`.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    no_open: bool,
+}
+
 #[derive(Args, Default)]
 struct TeleportArgs {
+    #[command(subcommand)]
+    command: Option<TeleportCmd>,
+    // Legacy export/import flags remain for backward compatibility.
     #[arg(long)]
     session_id: Option<String>,
     #[arg(long)]
@@ -982,11 +1007,59 @@ struct TeleportArgs {
 }
 
 #[derive(Subcommand)]
+enum TeleportCmd {
+    /// Export a session bundle (legacy mode).
+    Export(TeleportExportArgs),
+    /// Import a session bundle (legacy mode).
+    Import(TeleportImportArgs),
+    /// Create a secure one-time handoff link for desktop/web clients.
+    Link(TeleportLinkArgs),
+    /// Consume a secure handoff link token and import the bundle.
+    Consume(TeleportConsumeArgs),
+}
+
+#[derive(Args, Default)]
+struct TeleportExportArgs {
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    output: Option<String>,
+}
+
+#[derive(Args, Default)]
+struct TeleportImportArgs {
+    input: String,
+}
+
+#[derive(Args, Default)]
+struct TeleportLinkArgs {
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long, default_value_t = 30)]
+    ttl_minutes: u64,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    open: bool,
+}
+
+#[derive(Args, Default)]
+struct TeleportConsumeArgs {
+    #[arg(long)]
+    handoff_id: String,
+    #[arg(long)]
+    token: String,
+}
+
+#[derive(Subcommand)]
 enum RemoteEnvCmd {
     List,
     Add(RemoteEnvAddArgs),
     Remove(RemoteEnvRemoveArgs),
     Check(RemoteEnvCheckArgs),
+    Exec(RemoteEnvExecArgs),
+    RunAgent(RemoteEnvRunAgentArgs),
+    Logs(RemoteEnvLogsArgs),
 }
 
 #[derive(Args)]
@@ -995,6 +1068,21 @@ struct RemoteEnvAddArgs {
     endpoint: String,
     #[arg(long, default_value = "token")]
     auth_mode: String,
+    /// Optional SSH username override.
+    #[arg(long)]
+    ssh_user: Option<String>,
+    /// Optional SSH port override.
+    #[arg(long)]
+    ssh_port: Option<u16>,
+    /// Optional SSH private key path.
+    #[arg(long)]
+    ssh_key_path: Option<String>,
+    /// Remote workspace root used by `remote-env run-agent`.
+    #[arg(long)]
+    workspace_root: Option<String>,
+    /// Additional environment key-value pairs (`KEY=VALUE`), repeatable.
+    #[arg(long = "env")]
+    env: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1005,6 +1093,51 @@ struct RemoteEnvRemoveArgs {
 #[derive(Args)]
 struct RemoteEnvCheckArgs {
     profile_id: String,
+}
+
+#[derive(Args)]
+struct RemoteEnvExecArgs {
+    profile_id: String,
+    #[arg(long = "cmd")]
+    cmd: String,
+    #[arg(long)]
+    timeout_seconds: Option<u64>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    background: bool,
+}
+
+#[derive(Args)]
+struct RemoteEnvRunAgentArgs {
+    profile_id: String,
+    #[arg(long)]
+    prompt: String,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    tools: bool,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    max_think: bool,
+    #[arg(long)]
+    timeout_seconds: Option<u64>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    background: bool,
+}
+
+#[derive(Args)]
+struct RemoteEnvLogsArgs {
+    job_id: String,
+    #[arg(long, default_value_t = 40)]
+    tail_lines: usize,
 }
 
 #[derive(Subcommand)]

@@ -822,6 +822,7 @@ dependencies = [
  "deepseek-store",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "uuid",
 ]
@@ -843,6 +844,7 @@ name = "deepseek-mcp"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "deepseek-store",
  "glob",

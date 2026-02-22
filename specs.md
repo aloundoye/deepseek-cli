@@ -22,6 +22,18 @@ Current production tradeoff for the two-model DeepSeek split:
 - **Deterministic completion gate:** when files changed, final responses are verification-gated even without a formal plan.
 - **Complex-task subagents:** deterministic complexity scoring controls autospawn; lifecycle is streamed to CLI/TUI and surfaced in Mission Control.
 
+### 1.2 2026-02-22 Parity Hardening Patch Train (P0-P6)
+
+This RFC now reflects the implemented hardening set that closed the six parity gaps identified in the prior audit:
+
+- **P0 MCP stdio resources:** `@server:uri` now executes real stdio `resources/read` requests (no stub path), with bounded parsing for text/blob payloads and explicit prompt markers on failure (`[resource-unavailable: ...]`).
+- **P1 Chrome strict-live default:** Chrome automation no longer returns fake success payloads by default. `tools.chrome.allow_stub_fallback=false` is now the default runtime behavior.
+- **P2 Structured review + publish loop:** `deepseek review` defaults to strict schema parsing (`deepseek.review.findings.v1`), persists structured findings, and supports publish workflows via `gh` (`--publish`, `--pr`, `--max-comments`, `--dry-run`).
+- **P3 Remote orchestration over SSH:** `remote-env` now supports execution orchestration (`exec`, `run-agent`, `logs`) with SSH profile metadata and background job integration.
+- **P4 Teleport secure handoff lifecycle:** `teleport link` and `teleport consume` now implement one-time tokenized handoff descriptors with expiry/one-time-use validation, plus JSON-RPC equivalents for desktop/web clients.
+- **P5 Terminal image fallback parity:** `visual show` now provides deterministic display fallback behavior (`inline|external|path-only|none`) driven by `ui.image_fallback`.
+- **P6 KPI instrumentation hooks:** telemetry events now capture key reliability signals for MCP resource resolution, Chrome live-connect failures, strict review parse/publish outcomes, remote exec outcomes/durations, teleport link consume outcomes, and visual display mode distribution.
+
 ---
 
 ## 2. Complete Feature Set

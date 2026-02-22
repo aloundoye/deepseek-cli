@@ -31,6 +31,20 @@
 
 ---
 
+## Patch Delta (2026-02-22)
+
+| Area | Status | Runtime Truth |
+|---|---|---|
+| MCP stdio resource resolution | DONE | `@server:uri` stdio path now issues real `resources/read` requests; failures surface as explicit `[resource-unavailable: ...]` markers. |
+| Chrome strict-live behavior | DONE | Default runtime is strict-live (`tools.chrome.allow_stub_fallback=false`), with structured failure payloads when live browser connectivity is unavailable. |
+| Structured review + publish | DONE | `deepseek review` defaults to strict findings schema parse (`deepseek.review.findings.v1`) and supports GitHub publication (`--publish --pr --max-comments --dry-run`). |
+| Remote environment orchestration | DONE | `deepseek remote-env` now supports `exec`, `run-agent`, and `logs` over SSH profiles in addition to `list/add/remove/check`. |
+| Teleport handoff lifecycle | DONE | One-time secure link flow implemented via `deepseek teleport link` and `deepseek teleport consume`, with matching JSON-RPC methods. |
+| Terminal image fallback parity | DONE | `deepseek visual show <artifact_id|path> [--no-open]` now supports deterministic fallback modes via `ui.image_fallback`. |
+| KPI instrumentation hooks | DONE | KPI telemetry events emitted for MCP resolve outcomes, Chrome failures, review parse/publish, remote exec outcomes, teleport consume outcomes, and visual display mode distribution. |
+
+---
+
 ## Feature Matrix
 
 ### 1. Workspace Architecture
