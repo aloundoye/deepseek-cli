@@ -7,3 +7,6 @@
 **/.git/
 .agent/
 .DS_Store
+/.idea
+DEEPSEEK.md
+CLAUDE.md

@@ -1,16 +1,26 @@
 # RFC (Comprehensive): DeepSeek CLI Agent in Rust – A Full-Featured Coding Assistant to Match and Surpass Claude Code use DeepSeek API
 
 **Status:** Completed
-**Date:** 2026-02-19
+**Date:** 2026-02-22
 **Goal:** A production-grade, open-source coding agent CLI powered by DeepSeek, designed to **match and surpass Claude Code** in feature completeness, developer experience, safety, and cost-effectiveness. Incorporates best features from Claude Code, OpenAI Codex CLI, and Google Antigravity. This RFC defines the complete feature set, system architecture, and implementation roadmap.
 
 ---
 
 ## 1. Introduction
 
-Claude Code has set a high bar for terminal-based AI coding assistants. DeepSeek’s models offer compelling advantages: significantly lower cost, a dedicated reasoning model (`deepseek-reasoner`), and an open ecosystem. By combining a thoughtful architecture with DeepSeek’s unique strengths, we can build a tool that not only replicates Claude Code’s capabilities but also introduces innovations like **automatic model escalation**, **deterministic replay**, and **aggressive cost optimization**.
+Claude Code has set a high bar for terminal-based AI coding assistants. DeepSeek’s models offer compelling advantages: significantly lower cost, a dedicated reasoning model (`deepseek-reasoner`), and an open ecosystem. The key practical constraint is a capability split: `deepseek-chat` supports function-calling tools, while `deepseek-reasoner` does not. The architecture therefore optimizes for a stable execution loop (V3 tool-driving), with R1 used as a reasoning copilot and explicit break-glass path.
 
 This RFC outlines the complete feature set, system design, and incremental implementation plan for the **DeepSeek CLI Agent** (codename: `deepseek`). It incorporates every feature from Claude Code as of February 2026, plus DeepSeek-specific enhancements, ensuring a truly competitive offering.
+
+### 1.1 Current Architecture Decision (Runtime Baseline)
+
+Current production tradeoff for the two-model DeepSeek split:
+
+- **Single execution owner:** `deepseek-chat` (V3.2) remains the default tool executor.
+- **R1 as copilot by default:** `deepseek-reasoner` is used at checkpoints (planning/diagnostics/review), not as default tool driver.
+- **R1DriveTools is break-glass:** full R1 JSON-intent tool-driving is disabled by default and requires explicit opt-in (`router.r1_drive_auto_escalation=true` or `--allow-r1-drive-tools`).
+- **Deterministic completion gate:** when files changed, final responses are verification-gated even without a formal plan.
+- **Complex-task subagents:** deterministic complexity scoring controls autospawn; lifecycle is streamed to CLI/TUI and surfaced in Mission Control.
 
 ---
 
@@ -74,15 +84,15 @@ The following features are derived from Claude Code’s current (2026) capabilit
 | `/rewind` | Rewind to previous checkpoint. |
 | `/export` | Export conversation to file. |
 | `/plan` | Enable plan mode for complex tasks. |
-| `/teleport` | Resume sessions at (future) web interface. |
-| `/remote-env` | Configure remote sessions. |
+| `/teleport` | Export/import session bundles for handoff and replay. |
+| `/remote-env` | Configure remote environment profiles and run endpoint health checks. |
 | `/status` | Current model, mode, and configuration. |
 | `/effort` | Control thinking depth (low/medium/high/max). |
 | `/context` | Inspect context window: token breakdown by source (system prompt, conversation, tools, memory). |
 | `/permissions` | View/change permission mode (ask/auto/locked). Dry-run evaluator shows what a tool call would produce under current mode. |
 | `/sandbox` | View/configure sandbox mode (allowlist/isolated/off/workspace-write/read-only). |
 | `/agents` | List running and completed subagents with status and output summaries. |
-| `/tasks` | Open Mission Control: view/manage task queue, reorder priorities, inspect artifacts. |
+| `/tasks` | Open Mission Control snapshot: task queue + subagent lane status. |
 | `/review` | Start a read-only code review pipeline. Presets: security, perf, style, PR-ready. Accepts `--diff`, `--staged`, `--pr N`, `--path P`, `--focus F`. |
 | `/search` | Web search: query the web and include results as context. Cached with TTL. Provenance metadata attached to results. |
 | `/terminal-setup` | Configure shell integration, prompt markers, and terminal capabilities. |
@@ -304,34 +314,34 @@ DeepSeek offers two model endpoints, but only `deepseek-chat` supports function 
 | Primary Mode | Non-thinking (Direct output) | Thinking (Chain-of-Thought, always-on) |
 | Thinking Mode | Yes (via `thinking` param) | Always-on |
 | Function Calling | **Yes** | **No** |
-| Best For | All agentic tasks (with thinking toggle) | Architect role: analysis via JSON intents |
+| Best For | All agentic tasks (with thinking toggle) | Copilot checkpoints (plan/diagnose/review), break-glass reasoning |
 | Context Window | 128K | 128K |
 
 **Key insight:** `deepseek-reasoner` does NOT support function calling. When tools are needed (the common case for an agentic coding assistant), we MUST use `deepseek-chat`. The DeepSeek API (V3.2) supports thinking mode on `deepseek-chat` via `thinking: {"type": "enabled", "budget_tokens": N}`, which gives us reasoning + function calling simultaneously.
 
 ### 4.4.2 Two-Mode Execution Architecture (Mode Router)
 
-The **Mode Router** (`deepseek-agent::mode_router`) selects between two execution modes per turn, implementing an Architect-Developer pattern:
+The **Mode Router** (`deepseek-agent::mode_router`) evaluates risk/failure signals each turn. Runtime policy keeps **V3Autopilot** as the stable default executor. **R1DriveTools** is available as break-glass only:
 
 | Mode | Model | How Tools Are Called | When Used |
 |------|-------|---------------------|-----------|
 | **V3Autopilot** (default) | `deepseek-chat` | API function calling (thinking + tools unified) | Most tasks; fast, single-call |
 | **R1DriveTools** (break-glass) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Explicitly enabled only (`router.r1_drive_auto_escalation=true` or `--allow-r1-drive-tools`) |
 
-**Escalation triggers** (V3Autopilot → R1DriveTools, checked by `decide_mode()` after each tool execution batch):
+**Escalation triggers** (signals computed by `decide_mode()` after each tool execution batch):
 1. **Doom-loop** (highest priority) — same tool signature (name + normalized args + exit code bucket) fails ≥ `doom_loop_threshold` (default 2) times
 2. **Repeated step failures** — consecutive failures ≥ `v3_max_step_failures` (effective default 2) times
 3. **Blast radius exceeded** — ≥ `blast_radius_threshold` (effective default 5) files changed without verification
 4. **Cross-module failures** — errors span 2+ distinct modules
 5. **Ambiguous errors** — latest `ObservationPack` classifies the failure as `ErrorClass::Ambiguous`
 
-When break-glass is disabled, these triggers are still evaluated but escalation is suppressed; the agent records suppression reason codes and injects an R1 consultation checkpoint while keeping V3 in control.
+When break-glass is disabled, these triggers are still evaluated but escalation is suppressed. The agent records suppression reason codes/events and injects an R1 consultation checkpoint while keeping V3 in control.
 
 **Mechanical recovery**: V3 has a bounded recovery mechanism (`v3_mechanical_recovery = true`) for mechanical errors (compile/lint/missing dependency) based on the latest `ObservationPack`, allowing one recovery attempt before escalation.
 
 **Policy doom-loop breaker**: When doom-loop detection fires and all failing signatures are `bash.run` policy errors (forbidden shell metacharacters, command not allowlisted), the agent injects a guidance message redirecting the model to built-in tools (`fs.glob`, `fs.grep`, `fs.read`) and resets failure trackers instead of escalating to R1 (which faces the same policy restrictions). This prevents infinite loops where V3 and R1 both repeatedly fail against the same policy barrier.
 
-**Hysteresis**: Once escalated to R1, stays there until verification passes (`verify_passed_since_r1`), R1 returns `done`/`abort`, or R1 budget is exhausted (forced return to V3). This prevents ping-ponging between modes.
+**Hysteresis**: once escalated to R1 (break-glass enabled), stay there until verification passes (`verify_passed_since_r1`), R1 returns `done`/`abort`, or R1 budget is exhausted (forced return to V3). This prevents ping-ponging between modes.
 
 **R1 consultation** (`deepseek-agent::consultation`): Lightweight alternative to full R1DriveTools escalation. V3 asks R1 for targeted advice on a specific subproblem — error analysis, architecture advice, plan review, or task decomposition. R1 returns text-only advice (no JSON intents, no tool execution). Advice is injected into V3's conversation as a tool result. V3 keeps control and tools throughout. `think_deeply` is in the core tier.
 
@@ -345,7 +355,7 @@ When break-glass is disabled, these triggers are still evaluated but escalation 
 
 **V3 patch writer** (`deepseek-agent::v3_patch`): When R1 issues `delegate_patch`, V3 is called with a focused prompt to produce a unified diff. Handles `need_more_context` requests by reading additional files. Max context requests configurable via `v3_patch_max_context_requests`.
 
-**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests), and final completion is verification-gated when files changed even without a formal plan. Verification failures feed back into the loop. In chat mode, a scored complexity decision triggers automatic subagent orchestration before the main execution loop, and summarized subagent findings are injected back into context.
+**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests), and final completion is verification-gated when files changed even without a formal plan. Verification failures feed back into the loop. Verification pass always resets failure/blast-radius tracker state via `record_verify_pass()`. In chat mode, a scored complexity decision triggers bounded automatic subagent orchestration before the main execution loop, and summarized subagent findings are injected back into context.
 
 **Key modules:**
 - `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `ToolSignature`, `decide_mode()`, escalation + hysteresis logic
@@ -441,12 +451,13 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
 ### 4.12 User Interface (TUI)
 
 - **Real-time streaming:** LLM responses are streamed token-by-token to the terminal via SSE parsing. The `LlmClient::complete_streaming()` method reads the HTTP response line-by-line, invoking a callback for each `content` or `reasoning_content` delta. In print mode (`-p`), tokens are flushed to stdout immediately. In `--output-format stream-json`, each chunk is emitted as a JSON line (`{"type":"content","text":"..."}`) for programmatic consumption. The `AgentEngine` holds an optional `StreamCallback` that, when set, is used for the first LLM call in the run.
+- **Subagent lifecycle stream:** Subagent spawn/completion/failure is streamed as typed chunks and surfaced live in transcript + Mission Control (`SubagentSpawned`, `SubagentCompleted`, `SubagentFailed`).
 - Built with `ratatui` and `crossterm`.
 - Layout:
   - Main conversation pane (scrollable, syntax highlighting).
   - Plan pane (collapsible) showing current plan and step progress.
   - Tool output pane (real-time logs from subagents or tool executions).
-  - **Mission Control pane** (toggle via `/tasks` or Ctrl+T): task queue with status indicators, subagent swimlanes, priority reordering. Shows running/pending/completed tasks with elapsed time and token usage.
+  - **Mission Control pane** (toggle via `/tasks` or Ctrl+T): task queue with status indicators and subagent swimlanes. Live subagent lifecycle events stream into this pane.
   - **Artifacts pane** (toggle via Ctrl+A): displays task artifacts from `.deepseek/artifacts/<task-id>/`. Each task bundle contains `plan.md`, `diff.patch`, `verification.md`. Artifacts are browsable and diffable inline.
   - Status bar: model, cost, pending approvals, background jobs, **permission mode indicator** (`[ASK]`/`[AUTO]`/`[LOCKED]`).
 - Keyboard shortcuts as listed in section 2.7.
@@ -458,6 +469,7 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
 In addition to the REPL, the CLI supports one-shot commands:
 
 - `deepseek ask "<prompt>" [--tools=true|false]` – single response (tools enabled by default; disable with `--tools=false`).
+- `deepseek chat [--tools=true|false] [--tui]` – interactive chat (tools enabled by default; disable with `--tools=false`).
 - `deepseek plan "<prompt>"` – generate a plan and exit.
 - `deepseek autopilot "<prompt>"` – run autonomous mode (may continue in background).
 - `deepseek run <session-id>` – resume a session.
@@ -480,6 +492,7 @@ In addition to the REPL, the CLI supports one-shot commands:
 
 **Per-invocation overrides:**
 - `--model <name>` overrides `llm.base_model` for this run.
+- `--allow-r1-drive-tools` enables break-glass automatic transition into R1DriveTools for the current run.
 - `llm.provider` is reserved but must be `"deepseek"` (the only supported provider).
 
 ---
@@ -561,6 +574,15 @@ auto_max_think = true              # Enables automatic thinking mode escalation
 threshold_high = 0.72
 escalate_on_invalid_plan = true
 max_escalations_per_unit = 1
+unified_thinking_tools = true      # Use deepseek-chat thinking+tools in one call
+mode_router_enabled = true         # Enable V3Autopilot/R1DriveTools routing
+r1_drive_auto_escalation = false   # Break-glass only by default
+v3_max_step_failures = 2
+blast_radius_threshold = 5
+v3_mechanical_recovery = true
+r1_max_steps = 30
+r1_max_parse_retries = 2
+v3_patch_max_context_requests = 3
 w1 = 0.2    # prompt_complexity
 w2 = 0.15   # repo_complexity
 w3 = 0.2    # failure_streak
@@ -671,8 +693,31 @@ error = "Red"
 
 ---
 
-## 8. Conclusion
+## 8. Remaining Parity Work (OpenCode / Aider / Claude Code)
 
-This RFC presents a complete blueprint for building a DeepSeek-powered coding agent that not only replicates every feature of Claude Code but also introduces DeepSeek-specific innovations. The modular architecture, emphasis on safety, deterministic replay, and incremental milestones ensure a path to a production-quality tool that can become the go-to open-source alternative.
+The current architecture is the best tradeoff for DeepSeek’s split capabilities, but full behavioral parity still requires targeted work:
 
-With the Rust ecosystem’s maturity and the DeepSeek API’s cost advantage, we are well-positioned to deliver a tool that developers will love. Let’s build it.
+1. **MCP stdio resources are not fully resolved yet**  
+Current stdio `resources/read` path returns a stub marker instead of full resource transport handling.
+
+2. **Browser automation still has deterministic fallback stubs outside strict mode**  
+Live CDP flows are available, but non-strict paths can still fall back to placeholders when no live endpoint exists.
+
+3. **Teleport is bundle export/import, not full web handoff workflow**  
+Current implementation focuses on local/session bundle transfer semantics.
+
+4. **Remote environment support is profile + connectivity checks, not remote execution orchestration**  
+Current commands configure profiles and run health probes; task execution remains local.
+
+5. **Review pipeline output is prompt-structured text, not a strict machine-checked issue schema with first-class PR comment publishing loop**  
+This limits deterministic post-processing and automated review publishing workflows.
+
+6. **Terminal image UX is protocol-limited**  
+Inline rendering is available for supported protocols (iTerm2/Kitty), with fallback behavior elsewhere.
+
+7. **KPI-driven auto-tuning loop is still manual**  
+Metrics exist, but closed-loop threshold/prompt auto-calibration is not yet formalized as an always-on controller.
+
+## 9. Conclusion
+
+This RFC now reflects the production architecture baseline: stable V3 tool execution, R1 copilot checkpoints by default, explicit break-glass R1DriveTools, deterministic completion gating, and visible complex-task subagent orchestration.

@@ -890,6 +890,7 @@ pub(crate) fn run_profile_benchmark(
 
     for case in selected_cases.drain(..) {
         let started = Instant::now();
+        #[allow(deprecated)]
         let result = engine.plan_only(&case.prompt);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         latencies.push(elapsed_ms);

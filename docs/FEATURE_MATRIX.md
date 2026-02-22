@@ -53,7 +53,7 @@
 | 2.1 | Project-wide awareness via index | DONE | `crates/deepseek-index/src/lib.rs` -- Tantivy `Index` + `QueryParser` + file manifest | `query_uses_tantivy_index` | `cargo test -p deepseek-index` | WalkBuilder respects gitignore |
 | 2.1 | Checkpointing | DONE | `crates/deepseek-memory/src/lib.rs` -- `create_checkpoint()`, `rewind_checkpoint()` | `rewind_uses_checkpoint_id_from_apply` | `cargo test -p deepseek-memory` | Events: `CheckpointCreatedV1`, `CheckpointRewoundV1` |
 | 2.1 | Fast mode | DONE | `crates/deepseek-llm/src/lib.rs` -- `build_payload()` caps max_tokens=2048, temperature=0.2 when fast_mode=true | `fast_mode_caps_max_tokens_in_payload` | `cargo test -p deepseek-llm` | Configurable via `llm.fast_mode` |
-| 2.1 | Parallel tool calls | DONE | `crates/deepseek-agent/src/lib.rs` -- `run_parallel_tool_calls()` | `parallel_execution_only_for_read_only_calls` | `cargo test -p deepseek-agent` | Thread-pool based parallel execution |
+| 2.1 | Parallel tool calls | DONE | `crates/deepseek-agent/src/subagents_runtime/delegated.rs` -- `should_parallel_execute_calls()` and delegated parallel execution path | `parallel_execution_only_for_read_only_calls` | `cargo test -p deepseek-agent` | Thread-pool based parallel execution |
 | 2.1 | Background execution (Ctrl+B) | DONE | `crates/deepseek-ui/src/lib.rs` -- `KeyCode::Char('b')` with Ctrl modifier | `background_run_shell_attach_tail_and_stop_emit_json` | `cargo test -p deepseek-cli --test cli_json` | `BackgroundJobStartedV1` / `BackgroundJobStoppedV1` events |
 | 2.1 | Print mode (`-p`) | DONE | `crates/deepseek-cli/src/main.rs` -- `#[arg(short = 'p', long = "print")] print_mode: bool` | `ask_json_*` tests | `cargo test -p deepseek-cli --test cli_json` | Reads from arg or stdin; supports `--output-format` |
 | 2.1 | Session continue (`-c`, `-r`) | DONE | `crates/deepseek-cli/src/main.rs` -- `continue_session: bool`, `resume_session: Option<String>` | `git_skills_replay_background_teleport_and_remote_env_emit_json` | `cargo test -p deepseek-cli --test cli_json` | `SessionResumedV1` event emitted |
@@ -76,8 +76,8 @@
 | 2.2 | `notebook.read` | DONE | `crates/deepseek-tools/src/lib.rs` -- reads .ipynb JSON, returns cell listing with type, source preview | `notebook_edit_replace_cell` | `cargo test -p deepseek-tools` | Cell index, type, source preview, source length |
 | 2.2 | `notebook.edit` | DONE | `crates/deepseek-tools/src/lib.rs` -- replace/insert/delete cells in .ipynb files with checkpoint | `notebook_edit_*` tests | `cargo test -p deepseek-tools` | Blocked in review mode; `NotebookEditedV1` event |
 | 2.2 | Multimodal LLM payload | DONE | `crates/deepseek-llm/src/lib.rs` -- `build_payload()` sends `image_url` content parts when `LlmRequest.images` present | Payload tests | `cargo test -p deepseek-llm` | `ImageContent { mime, base64_data }` struct in core |
-| 2.2 | `@file` references | DONE | `crates/deepseek-agent/src/lib.rs` -- `parse_prompt_references()` for `@path:line-line` syntax | `parses_prompt_references_with_optional_line_ranges` | `cargo test -p deepseek-agent` | Supports `@src/auth.ts:42-58` |
-| 2.2 | `@dir` references | DONE | `crates/deepseek-agent/src/lib.rs` -- `expand_dir_reference()` | `expands_dir_reference_with_gitignore_respect` | `cargo test -p deepseek-agent` | Gitignore-aware directory expansion |
+| 2.2 | `@file` references | DONE | `crates/deepseek-agent/src/chat/references.rs` -- `extract_prompt_references()` / `parse_prompt_reference()` for `@path:line-line` syntax | `parses_prompt_references_with_optional_line_ranges` | `cargo test -p deepseek-agent` | Supports `@src/auth.ts:42-58` |
+| 2.2 | `@dir` references | DONE | `crates/deepseek-agent/src/chat/references.rs` -- `expand_prompt_references()` directory expansion path | `expands_dir_reference_with_gitignore_respect` | `cargo test -p deepseek-agent` | Gitignore-aware directory expansion |
 | 2.2 | `respectGitignore` | DONE | `crates/deepseek-tools/src/lib.rs` -- WalkBuilder `respectGitignore` arg in fs.glob/fs.grep | `fs_glob_respects_gitignore_rules` | `cargo test -p deepseek-tools` | Controls @-mention file picker behavior |
 
 ### 4. Git Integration (Spec 2.3)
@@ -266,9 +266,9 @@
 |---|---|---|---|---|---|---|
 | 4.2 | Planner trait | DONE | `crates/deepseek-core/src/lib.rs` -- `trait Planner { create_plan, revise_plan }` | Agent tests (39 total) | `cargo test -p deepseek-agent` | Core abstraction |
 | 4.2 | Executor trait | DONE | `crates/deepseek-core/src/lib.rs` -- `trait Executor { run_step }` | Agent tests | `cargo test -p deepseek-agent` | Core abstraction |
-| 4.2 | SchemaPlanner impl | DONE | `crates/deepseek-agent/src/lib.rs` -- `impl Planner for SchemaPlanner`, generates JSON plans with intent-based steps | `plan_*` tests | `cargo test -p deepseek-agent` | Steps: search, git, edit, docs, verify |
-| 4.2 | SimpleExecutor impl | DONE | `crates/deepseek-agent/src/lib.rs` -- `impl Executor for SimpleExecutor`, runs steps via tool host | Executor tests | `cargo test -p deepseek-agent` | Approval checking, tool proposal flow |
-| 4.2 | Plan revision on failure | DONE | `crates/deepseek-agent/src/lib.rs` -- `revise_plan()` increments version, adds recovery step, annotates risk notes | `plan_revision_*` tests | `cargo test -p deepseek-agent` | Retains undone steps, adds targeted fix step |
+| 4.2 | SchemaPlanner impl | DONE | `crates/deepseek-agent/src/planner/generation.rs` + `crates/deepseek-agent/src/planner/parsing.rs` -- plan generation/parsing into structured JSON plan steps | `plan_*` tests | `cargo test -p deepseek-agent` | Steps: search, git, edit, docs, verify |
+| 4.2 | SimpleExecutor impl | DONE | `crates/deepseek-agent/src/chat/orchestrator.rs` + `crates/deepseek-agent/src/planner/step_tools.rs` -- plan-step execution via tool host and approvals | Executor tests | `cargo test -p deepseek-agent` | Approval checking, tool proposal flow |
+| 4.2 | Plan revision on failure | DONE | `crates/deepseek-agent/src/planner/generation.rs` -- `revise_plan_with_llm()` increments plan version and applies targeted recovery context | `plan_revision_*` tests | `cargo test -p deepseek-agent` | Retains undone steps, adds targeted fix step |
 | 4.2 | Plan structure | DONE | `crates/deepseek-core/src/lib.rs` -- `struct Plan { plan_id, version, goal, assumptions, steps, verification, risk_notes }` | Serialization tests | `cargo test -p deepseek-core` | `PlanCreatedV1`, `PlanRevisedV1` events |
 
 ### 14. Tool System (Spec 4.5)
@@ -323,7 +323,7 @@
 | 2.6 | Isolated contexts | DONE | `crates/deepseek-subagent/src/lib.rs` -- Each `SubagentTask` runs in own thread with clean context | `retries_failed_subagents_within_budget` | `cargo test -p deepseek-subagent` | No state pollution between agents |
 | 2.6 | Agent teams | DONE | `crates/deepseek-subagent/src/lib.rs` -- `SubagentTask.team: String` field for coordination | `subagent_team_*` tests | `cargo test -p deepseek-subagent` | Multiple agents on different components |
 | 2.6 | Resilience (retry after denial) | DONE | `crates/deepseek-subagent/src/lib.rs` -- `read_only_fallback: bool`, retry logic in `run_tasks()`, `used_read_only_fallback` in result | `approval_denied_triggers_read_only_fallback` | `cargo test -p deepseek-subagent` | Falls back to read-only on permission denial |
-| 2.6 | Subagent events | DONE | `crates/deepseek-core/src/lib.rs` + `crates/deepseek-agent/src/lib.rs` -- event log + stream chunks (`SubagentSpawned`, `SubagentCompleted`, `SubagentFailed`) | Event tests | `cargo test -p deepseek-core` | Full lifecycle tracking in event log and live UI stream |
+| 2.6 | Subagent events | DONE | `crates/deepseek-core/src/lib.rs` + `crates/deepseek-agent/src/subagents_runtime/orchestration.rs` -- event log + stream chunks (`SubagentSpawned`, `SubagentCompleted`, `SubagentFailed`) | Event tests | `cargo test -p deepseek-core` | Full lifecycle tracking in event log and live UI stream |
 
 ### 19. Hooks (Spec 2.9, 4.10)
 

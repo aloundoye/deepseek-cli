@@ -1391,6 +1391,7 @@ fn run() -> Result<()> {
         Commands::Plan(args) => {
             ensure_llm_ready(&cwd, cli.json)?;
             let engine = AgentEngine::new(&cwd)?;
+            #[allow(deprecated)]
             let plan = engine.plan_only(&args.prompt)?;
             if cli.json {
                 print_json(&plan)?;

@@ -172,7 +172,10 @@ pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
             ..Default::default()
         },
     )?;
-    engine.resume()
+    #[allow(deprecated)]
+    {
+        engine.resume()
+    }
 }
 
 // ── HTTP mock internals ─────────────────────────────────────────────────

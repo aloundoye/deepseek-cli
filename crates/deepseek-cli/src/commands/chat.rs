@@ -2470,7 +2470,10 @@ pub(crate) fn run_resume(cwd: &Path, args: RunArgs, json_mode: bool) -> Result<S
         ));
     }
     ensure_llm_ready(cwd, json_mode)?;
-    AgentEngine::new(cwd)?.resume()
+    #[allow(deprecated)]
+    {
+        AgentEngine::new(cwd)?.resume()
+    }
 }
 
 pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
