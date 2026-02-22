@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    ChatMessage, ChatRequest, DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest, LlmResponse,
-    LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
+    CacheStrategy, ChatMessage, ChatRequest, DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest,
+    LlmResponse, LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model,
+    normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -155,13 +156,9 @@ impl DeepSeekClient {
             messages.push(json!({"role": "user", "content": parts}));
         }
         if enable_server_cache {
-            if let Some(first) = messages.first_mut() {
-                annotate_cache_control(first);
-            }
-            if messages.len() > 1
-                && let Some(last) = messages.last_mut()
-            {
-                annotate_cache_control(last);
+            let strategy = &self.cfg.cache_strategy;
+            if *strategy != CacheStrategy::Off {
+                apply_cache_annotations(&mut messages, strategy);
             }
         }
 
@@ -177,12 +174,16 @@ impl DeepSeekClient {
     }
 
     fn build_chat_payload(&self, req: &ChatRequest) -> Value {
+        self.build_chat_payload_with_cache(req, self.cfg.prompt_cache_enabled)
+    }
+
+    fn build_chat_payload_with_cache(&self, req: &ChatRequest, enable_cache: bool) -> Value {
         let thinking_enabled = req
             .thinking
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
 
-        let messages: Vec<Value> = req
+        let mut messages: Vec<Value> = req
             .messages
             .iter()
             .map(|m| match m {
@@ -225,6 +226,13 @@ impl DeepSeekClient {
             })
             .collect();
 
+        if enable_cache {
+            let strategy = &self.cfg.cache_strategy;
+            if *strategy != CacheStrategy::Off {
+                apply_cache_annotations(&mut messages, strategy);
+            }
+        }
+
         let mut payload = json!({
             "model": normalize_deepseek_model(&req.model).unwrap_or(&req.model),
             "messages": messages,
@@ -247,7 +255,8 @@ impl DeepSeekClient {
     }
 
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: &str) -> Result<LlmResponse> {
-        let payload = self.build_chat_payload(req);
+        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
+        let mut payload = self.build_chat_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -266,6 +275,15 @@ impl DeepSeekClient {
                     let body = resp.text()?;
                     if status.is_success() {
                         return parse_non_streaming_payload(&body);
+                    }
+                    // Cache control rejection fallback
+                    if status == StatusCode::BAD_REQUEST
+                        && server_cache_enabled
+                        && payload_rejects_cache_control(&body)
+                    {
+                        server_cache_enabled = false;
+                        payload = self.build_chat_payload_with_cache(req, false);
+                        continue;
                     }
                     last_err = Some(format_api_error(
                         status,
@@ -300,6 +318,7 @@ impl DeepSeekClient {
         api_key: &str,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
+        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_chat_payload(req);
         payload["stream"] = json!(true);
 
@@ -329,6 +348,10 @@ impl DeepSeekClient {
                         // to the TUI.
                         let mut dsml_buffering = false;
                         let mut tool_call_buffering = false;
+                        // Suppress text display once structured tool_calls
+                        // deltas arrive — the text fragments between tool calls
+                        // are noise that confuses the TUI display.
+                        let mut has_structured_tool_calls = false;
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
@@ -373,7 +396,10 @@ impl DeepSeekClient {
                                     if !dsml_buffering && contains_dsml_markup(content) {
                                         dsml_buffering = true;
                                     }
-                                    if !dsml_buffering && !tool_call_buffering {
+                                    if !dsml_buffering
+                                        && !tool_call_buffering
+                                        && !has_structured_tool_calls
+                                    {
                                         // Check if accumulated content started
                                         // a DSML block we missed on earlier chunks.
                                         if contains_dsml_markup(&content_out) {
@@ -396,6 +422,7 @@ impl DeepSeekClient {
                                 if let Some(tool_calls) =
                                     delta.get("tool_calls").and_then(|v| v.as_array())
                                 {
+                                    has_structured_tool_calls = true;
                                     merge_stream_tool_calls(tool_calls, &mut tool_call_parts);
                                 }
                             }
@@ -403,6 +430,14 @@ impl DeepSeekClient {
 
                         if let Some(err) = last_err.take() {
                             return Err(err);
+                        }
+
+                        // If content text was streamed to the TUI but we also
+                        // have structured tool calls, tell the TUI to clear the
+                        // noise text fragments that appeared before/between
+                        // tool calls.
+                        if has_structured_tool_calls && !content_out.is_empty() {
+                            cb(StreamChunk::ClearStreamingText);
                         }
 
                         let mut tool_calls: Vec<LlmToolCall> = tool_call_parts
@@ -453,6 +488,16 @@ impl DeepSeekClient {
                     }
 
                     let body = resp.text().unwrap_or_default();
+                    // Cache control rejection fallback
+                    if status == StatusCode::BAD_REQUEST
+                        && server_cache_enabled
+                        && payload_rejects_cache_control(&body)
+                    {
+                        server_cache_enabled = false;
+                        payload = self.build_chat_payload_with_cache(req, false);
+                        payload["stream"] = json!(true);
+                        continue;
+                    }
                     last_err = Some(format_api_error(
                         status,
                         &body,
@@ -697,6 +742,30 @@ impl DeepSeekClient {
 fn annotate_cache_control(message: &mut Value) {
     if let Some(obj) = message.as_object_mut() {
         obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+}
+
+/// Apply cache annotations to a messages array based on the cache strategy.
+/// Annotates the stable prefix (system prompt + early messages) for cache hits.
+fn apply_cache_annotations(messages: &mut [Value], strategy: &CacheStrategy) {
+    match strategy {
+        CacheStrategy::Off => {}
+        CacheStrategy::Auto => {
+            // Annotate system prompt (index 0) + first user message (index 1)
+            if let Some(msg) = messages.first_mut() {
+                annotate_cache_control(msg);
+            }
+            if messages.len() > 1 {
+                annotate_cache_control(&mut messages[1]);
+            }
+        }
+        CacheStrategy::Aggressive => {
+            // Annotate the first 3 messages (system + early conversation prefix)
+            let count = messages.len().min(3);
+            for msg in messages[..count].iter_mut() {
+                annotate_cache_control(msg);
+            }
+        }
     }
 }
 
@@ -2001,6 +2070,103 @@ mod tests {
         unsafe {
             std::env::remove_var("DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST");
         }
+    }
+
+    #[test]
+    fn chat_payload_includes_cache_annotations_by_default() {
+        let cfg = LlmConfig::default();
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: "system prompt".to_string(),
+                },
+                ChatMessage::User {
+                    content: "hello".to_string(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 64,
+            temperature: Some(0.2),
+            thinking: None,
+        };
+        let payload = client.build_chat_payload(&req);
+        let messages = payload["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        // Auto strategy: system prompt + first user message annotated
+        assert!(messages[0].get("cache_control").is_some());
+        assert!(messages[1].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn chat_payload_off_strategy_has_no_cache_annotations() {
+        let cfg = LlmConfig {
+            cache_strategy: CacheStrategy::Off,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: "system prompt".to_string(),
+                },
+                ChatMessage::User {
+                    content: "hello".to_string(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 64,
+            temperature: Some(0.2),
+            thinking: None,
+        };
+        let payload = client.build_chat_payload(&req);
+        let messages = payload["messages"].as_array().expect("messages");
+        assert!(messages.iter().all(|m| m.get("cache_control").is_none()));
+    }
+
+    #[test]
+    fn chat_payload_aggressive_strategy_annotates_first_three() {
+        let cfg = LlmConfig {
+            cache_strategy: CacheStrategy::Aggressive,
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: "system prompt".to_string(),
+                },
+                ChatMessage::User {
+                    content: "hello".to_string(),
+                },
+                ChatMessage::Assistant {
+                    content: Some("hi there".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                },
+                ChatMessage::User {
+                    content: "follow up".to_string(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 64,
+            temperature: Some(0.2),
+            thinking: None,
+        };
+        let payload = client.build_chat_payload(&req);
+        let messages = payload["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 4);
+        // Aggressive: first 3 messages annotated, 4th is not
+        assert!(messages[0].get("cache_control").is_some());
+        assert!(messages[1].get("cache_control").is_some());
+        assert!(messages[2].get("cache_control").is_some());
+        assert!(messages[3].get("cache_control").is_none());
     }
 
     #[test]

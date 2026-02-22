@@ -341,10 +341,10 @@ fn analyze_performance_debug(text: &str) -> Vec<DebugIssue> {
                     ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
                 )
         }) {
-            if let Some(ms) = parse_duration_ms(token) {
-                if ms > slowest_ms {
-                    slowest_ms = ms;
-                }
+            if let Some(ms) = parse_duration_ms(token)
+                && ms > slowest_ms
+            {
+                slowest_ms = ms;
             }
             if let Some(mb) = parse_memory_mb(token)
                 && mb > memory_mb

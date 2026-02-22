@@ -681,20 +681,23 @@ impl LocalToolHost {
                 let results_count = results.len() as u64;
 
                 // Cache the results
-                let _ = self
-                    .store
-                    .set_web_search_cache(&deepseek_store::WebSearchCacheRecord {
-                        query_hash: query_hash.clone(),
-                        query: query.to_string(),
-                        results_json: results_json.clone(),
-                        results_count,
-                        cached_at: chrono::Utc::now().to_rfc3339(),
-                        ttl_seconds: 900, // 15 minutes
-                    });
+                if let Err(e) =
+                    self.store
+                        .set_web_search_cache(&deepseek_store::WebSearchCacheRecord {
+                            query_hash: query_hash.clone(),
+                            query: query.to_string(),
+                            results_json: results_json.clone(),
+                            results_count,
+                            cached_at: chrono::Utc::now().to_rfc3339(),
+                            ttl_seconds: 900, // 15 minutes
+                        })
+                {
+                    eprintln!("[deepseek WARN] web_search: failed to cache results: {e}");
+                }
 
                 // Emit event
                 let seq = self.store.next_seq_no(uuid::Uuid::nil()).unwrap_or(1);
-                let _ = self.store.append_event(&deepseek_core::EventEnvelope {
+                if let Err(e) = self.store.append_event(&deepseek_core::EventEnvelope {
                     seq_no: seq,
                     at: chrono::Utc::now(),
                     session_id: uuid::Uuid::nil(),
@@ -703,7 +706,9 @@ impl LocalToolHost {
                         results_count,
                         cached: false,
                     },
-                });
+                }) {
+                    eprintln!("[deepseek WARN] web_search: failed to emit event: {e}");
+                }
 
                 Ok(json!({
                     "query": query,
@@ -2187,6 +2192,23 @@ pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
                     "Hint: command not found. Check that the program is installed and in PATH."
                         .to_string(),
                 )
+            } else if lower.contains("forbidden shell metacharacters") {
+                Some(
+                    "Hint: bash.run does not allow shell metacharacters (pipes |, semicolons ;, &&, ||, backticks, $()). \
+                     Do NOT retry with similar commands. Instead use the built-in tools: \
+                     fs.grep for searching file contents, fs.glob for finding files by pattern, \
+                     fs.read for reading files. These tools do not have shell restrictions."
+                        .to_string(),
+                )
+            } else if lower.contains("not allowlisted") {
+                Some(
+                    "Hint: this command is not in the allowed command list. \
+                     Do NOT retry other shell commands — most are restricted. Instead use built-in tools: \
+                     fs.glob to list/find files, fs.grep to search content, fs.read to read files, \
+                     git_status/git_diff/git_show for git operations. \
+                     Only allowlisted commands (e.g. cargo, git, rg) can be run via bash.run."
+                        .to_string(),
+                )
             } else {
                 None
             }
@@ -2658,37 +2680,42 @@ fn parse_page_range(range: &str) -> Result<(usize, usize)> {
     }
 }
 
+/// Extract readable text from HTML, stripping tags, scripts, and styles.
+/// Uses the `scraper` crate for proper DOM-based extraction.
 fn strip_html_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let mut in_script = false;
-    let mut in_style = false;
-    let lower = html.to_ascii_lowercase();
-    let chars: Vec<char> = html.chars().collect();
-    let lower_chars: Vec<char> = lower.chars().collect();
+    use scraper::{Html, Selector};
 
-    let mut i = 0;
-    while i < chars.len() {
-        if !in_tag && chars[i] == '<' {
-            in_tag = true;
-            // Check for script/style open/close
-            let remaining: String = lower_chars[i..].iter().take(20).collect();
-            if remaining.starts_with("<script") {
-                in_script = true;
-            } else if remaining.starts_with("</script") {
-                in_script = false;
-            } else if remaining.starts_with("<style") {
-                in_style = true;
-            } else if remaining.starts_with("</style") {
-                in_style = false;
+    let document = Html::parse_document(html);
+
+    let body_sel = Selector::parse("body").unwrap_or_else(|_| Selector::parse("*").unwrap());
+
+    let mut out = String::with_capacity(html.len() / 2);
+
+    if let Some(element) = document.select(&body_sel).next() {
+        for text in element.text() {
+            // Skip text that is inside script/style by checking ancestors
+            // (scraper's .text() already skips script/style content in well-formed HTML)
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                out.push_str(trimmed);
+                out.push('\n');
             }
-        } else if in_tag && chars[i] == '>' {
-            in_tag = false;
-        } else if !in_tag && !in_script && !in_style {
-            out.push(chars[i]);
         }
-        i += 1;
     }
+
+    // If no <body> found, fall back to full document text
+    if out.is_empty() {
+        // No <body> found — extract text from root element
+        // (.text() already skips script/style content in well-formed HTML)
+        for text_node in document.root_element().text() {
+            let trimmed = text_node.trim();
+            if !trimmed.is_empty() {
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+        }
+    }
+
     // Collapse multiple blank lines
     let mut result = String::with_capacity(out.len());
     let mut blank_count = 0;
@@ -2708,21 +2735,81 @@ fn strip_html_tags(html: &str) -> String {
     result.trim().to_string()
 }
 
-/// Parse search results from DuckDuckGo HTML response.
+/// Parse search results from DuckDuckGo HTML response using CSS selectors.
+/// Falls back to legacy string matching if selector-based parsing fails.
 fn parse_search_results(html: &str, max_results: usize) -> Vec<serde_json::Value> {
+    let results = parse_search_results_css(html, max_results);
+    if results.is_empty() {
+        // Fallback to legacy string-matching parser
+        parse_search_results_legacy(html, max_results)
+    } else {
+        results
+    }
+}
+
+/// CSS selector-based DuckDuckGo HTML parser (primary).
+fn parse_search_results_css(html: &str, max_results: usize) -> Vec<serde_json::Value> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
     let mut results = Vec::new();
-    // Simple parsing: look for result links and snippets in DuckDuckGo HTML
-    // DuckDuckGo HTML uses class="result__a" for links and "result__snippet" for snippets
+
+    // DuckDuckGo result containers
+    let result_sel = match Selector::parse(".result, .web-result") {
+        Ok(s) => s,
+        Err(_) => return results,
+    };
+    let link_sel = Selector::parse(".result__a, .result-title-a, a.result__a")
+        .unwrap_or_else(|_| Selector::parse("a").unwrap());
+    let snippet_sel = Selector::parse(".result__snippet, .result-snippet")
+        .unwrap_or_else(|_| Selector::parse(".snippet").unwrap());
+
+    for element in document.select(&result_sel) {
+        if results.len() >= max_results {
+            break;
+        }
+
+        // Extract link and title
+        if let Some(link_el) = element.select(&link_sel).next() {
+            let url = link_el.value().attr("href").unwrap_or_default().to_string();
+            let title: String = link_el.text().collect::<Vec<_>>().join(" ");
+            let title = title.trim().to_string();
+
+            // Extract snippet
+            let snippet = if let Some(snippet_el) = element.select(&snippet_sel).next() {
+                snippet_el
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            };
+
+            if !url.is_empty() && !title.is_empty() {
+                results.push(json!({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                }));
+            }
+        }
+    }
+    results
+}
+
+/// Legacy string-matching parser (fallback).
+fn parse_search_results_legacy(html: &str, max_results: usize) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
     let lower = html.to_ascii_lowercase();
     let mut pos = 0;
     while results.len() < max_results {
-        // Find next result link
         let link_marker = "class=\"result__a\"";
         let link_pos = match lower[pos..].find(link_marker) {
             Some(p) => pos + p,
             None => break,
         };
-        // Extract href
         let href_start = match html[..link_pos].rfind("href=\"") {
             Some(p) => p + 6,
             None => {
@@ -2738,7 +2825,6 @@ fn parse_search_results(html: &str, max_results: usize) -> Vec<serde_json::Value
             }
         };
         let url = html[href_start..href_end].to_string();
-        // Extract title (text within the <a> tag)
         let tag_close = match html[link_pos..].find('>') {
             Some(p) => link_pos + p + 1,
             None => {
@@ -2754,7 +2840,6 @@ fn parse_search_results(html: &str, max_results: usize) -> Vec<serde_json::Value
             }
         };
         let title = strip_html_tags(&html[tag_close..tag_end]);
-        // Extract snippet
         let snippet_marker = "class=\"result__snippet\"";
         let snippet = if let Some(sp) = lower[tag_end..].find(snippet_marker) {
             let snippet_pos = tag_end + sp;
@@ -3293,7 +3378,9 @@ impl LocalToolHost {
                 exit_code,
             },
         };
-        let _ = self.store.append_event(&event);
+        if let Err(e) = self.store.append_event(&event) {
+            eprintln!("[deepseek WARN] hook: failed to emit event: {e}");
+        }
     }
 
     fn emit_visual_artifact_event(&self, path: &str, mime: &str) {
@@ -3313,7 +3400,9 @@ impl LocalToolHost {
                 mime: mime.to_string(),
             },
         };
-        let _ = self.store.append_event(&event);
+        if let Err(e) = self.store.append_event(&event) {
+            eprintln!("[deepseek WARN] visual_artifact: failed to emit event: {e}");
+        }
     }
 
     fn create_checkpoint(&self, reason: &str) -> Result<Option<Uuid>> {

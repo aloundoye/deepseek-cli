@@ -175,12 +175,10 @@ pub fn tiered_tool_definitions(
             }
             ToolTier::Extended => {
                 // Notebooks included if detected
-                if signals.has_notebooks
+                if (signals.has_notebooks
                     && (def.function.name == "notebook_read"
-                        || def.function.name == "notebook_edit")
-                {
-                    active.push(def);
-                } else if signals.prompt_mentions_chrome && def.function.name.starts_with("chrome_")
+                        || def.function.name == "notebook_edit"))
+                    || (signals.prompt_mentions_chrome && def.function.name.starts_with("chrome_"))
                 {
                     active.push(def);
                 } else {

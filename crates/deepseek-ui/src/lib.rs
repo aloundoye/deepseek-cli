@@ -15,6 +15,42 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use syntect::highlighting::{Theme as SyntectTheme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+
+/// Lazy-initialized syntect highlighting assets.
+struct SyntectAssets {
+    syntax_set: SyntaxSet,
+    theme: SyntectTheme,
+}
+
+/// Returns a reference to the shared syntect assets (loaded once).
+fn syntect_assets() -> &'static SyntectAssets {
+    use std::sync::OnceLock;
+    static ASSETS: OnceLock<SyntectAssets> = OnceLock::new();
+    ASSETS.get_or_init(|| {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+        let theme = theme_set
+            .themes
+            .get("base16-eighties.dark")
+            .cloned()
+            .unwrap_or_else(|| {
+                theme_set
+                    .themes
+                    .values()
+                    .next()
+                    .cloned()
+                    .expect("syntect ships with at least one theme")
+            });
+        SyntectAssets { syntax_set, theme }
+    })
+}
+
+/// Map a syntect RGBA color to a ratatui terminal color.
+fn syntect_color_to_ratatui(c: syntect::highlighting::Color) -> Color {
+    Color::Rgb(c.r, c.g, c.b)
+}
 
 /// Events sent from the background agent thread to the TUI event loop.
 pub enum TuiStreamEvent {
@@ -47,6 +83,11 @@ pub enum TuiStreamEvent {
         to: String,
         reason: String,
     },
+    /// Display an inline image in the terminal (raw bytes).
+    ImageDisplay { data: Vec<u8>, label: String },
+    /// Clear any previously streamed text — the response contained tool calls,
+    /// so interleaved text fragments are noise and should be removed.
+    ClearStreamingText,
     /// An error occurred during agent execution.
     Error(String),
     /// Agent execution completed with the given output.
@@ -495,8 +536,63 @@ fn syntax_keyword_color(word: &str) -> Option<Color> {
     }
 }
 
+/// Extract the language token from a code fence line (e.g. ```` ```rust ```` → `"rust"`).
+fn extract_fence_lang(fence: &str) -> &str {
+    fence.trim().trim_start_matches('`').trim()
+}
+
 /// Apply syntax highlighting to a line of code inside a code block.
-fn highlight_code_line(line: &str) -> Line<'static> {
+///
+/// Uses `syntect` when a matching syntax definition exists for the given
+/// `lang` (the language tag from the opening code fence).  Falls back to the
+/// keyword-based highlighter for unknown languages.
+fn highlight_code_line(line: &str, lang: &str) -> Line<'static> {
+    let assets = syntect_assets();
+    let syntax = if lang.is_empty() {
+        None
+    } else {
+        assets
+            .syntax_set
+            .find_syntax_by_token(lang)
+            .or_else(|| assets.syntax_set.find_syntax_by_extension(lang))
+    };
+
+    if let Some(syntax) = syntax {
+        use syntect::easy::HighlightLines;
+        let mut h = HighlightLines::new(syntax, &assets.theme);
+        if let Ok(ranges) = h.highlight_line(line, &assets.syntax_set) {
+            let spans: Vec<Span<'static>> = ranges
+                .into_iter()
+                .map(|(style, text)| {
+                    let fg = syntect_color_to_ratatui(style.foreground);
+                    let mut ratatui_style = Style::default().fg(fg);
+                    if style
+                        .font_style
+                        .contains(syntect::highlighting::FontStyle::BOLD)
+                    {
+                        ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+                    }
+                    if style
+                        .font_style
+                        .contains(syntect::highlighting::FontStyle::ITALIC)
+                    {
+                        ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+                    }
+                    Span::styled(text.to_string(), ratatui_style)
+                })
+                .collect();
+            if !spans.is_empty() {
+                return Line::from(spans);
+            }
+        }
+    }
+
+    // Fallback: keyword-based highlighting
+    highlight_code_line_fallback(line)
+}
+
+/// Keyword-based code highlighting used when syntect has no matching syntax.
+fn highlight_code_line_fallback(line: &str) -> Line<'static> {
     let mut spans = Vec::new();
     let mut chars = line.char_indices().peekable();
     let mut last = 0;
@@ -684,6 +780,54 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
                     continue;
                 }
             }
+        } else if bytes[i] == b'~' && i + 1 < len && bytes[i + 1] == b'~' {
+            // Strikethrough: ~~...~~
+            if let Some(end) = text[i + 2..].find("~~")
+                && end > 0
+            {
+                if i > seg_start {
+                    spans.push(Span::styled(text[seg_start..i].to_string(), base_style));
+                }
+                spans.extend(parse_inline_markdown(
+                    &text[i + 2..i + 2 + end],
+                    base_style
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ));
+                i = i + 2 + end + 2;
+                seg_start = i;
+                continue;
+            }
+        } else if bytes[i] == b'[' {
+            // Markdown link: [text](url)
+            if let Some(close_bracket) = text[i + 1..].find(']') {
+                let after_bracket = i + 1 + close_bracket + 1;
+                if after_bracket < len
+                    && bytes[after_bracket] == b'('
+                    && let Some(close_paren) = text[after_bracket + 1..].find(')')
+                {
+                    let link_text = &text[i + 1..i + 1 + close_bracket];
+                    let link_url = &text[after_bracket + 1..after_bracket + 1 + close_paren];
+                    if !link_text.is_empty() {
+                        if i > seg_start {
+                            spans.push(Span::styled(text[seg_start..i].to_string(), base_style));
+                        }
+                        spans.push(Span::styled(
+                            link_text.to_string(),
+                            base_style
+                                .fg(Color::LightBlue)
+                                .add_modifier(Modifier::UNDERLINED),
+                        ));
+                        spans.push(Span::styled(
+                            format!(" ({link_url})"),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        i = after_bracket + 1 + close_paren + 1;
+                        seg_start = i;
+                        continue;
+                    }
+                }
+            }
         }
         // Advance by one character (handle multi-byte safely).
         i += text[i..].chars().next().map_or(1, |c| c.len_utf8());
@@ -753,6 +897,37 @@ fn render_assistant_markdown(text: &str) -> Line<'static> {
         let dim = Style::default().fg(Color::DarkGray);
         let mut spans = vec![Span::styled("│ ".to_string(), dim)];
         spans.extend(parse_inline_markdown(quote, dim));
+        return Line::from(spans);
+    }
+
+    // Task list: - [ ] unchecked / - [x] checked
+    if let Some(rest) = text
+        .strip_prefix("- [ ] ")
+        .or_else(|| text.strip_prefix("* [ ] "))
+    {
+        let mut spans = vec![Span::styled(
+            "☐ ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+        spans.extend(parse_inline_markdown(rest, body_style));
+        return Line::from(spans);
+    }
+    if let Some(rest) = text
+        .strip_prefix("- [x] ")
+        .or_else(|| text.strip_prefix("* [x] "))
+        .or_else(|| text.strip_prefix("- [X] "))
+        .or_else(|| text.strip_prefix("* [X] "))
+    {
+        let mut spans = vec![Span::styled(
+            "☑ ".to_string(),
+            Style::default().fg(Color::Green),
+        )];
+        spans.extend(parse_inline_markdown(
+            rest,
+            body_style
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::CROSSED_OUT),
+        ));
         return Line::from(spans);
     }
 
@@ -1035,11 +1210,12 @@ fn style_transcript_line(
     entry: &TranscriptEntry,
     in_code_block: bool,
     in_diff_block: bool,
+    code_block_lang: &str,
 ) -> Line<'static> {
     if entry.kind == MessageKind::Assistant
         && let Some(meta_entry) = parse_stream_meta_entry(&entry.text)
     {
-        return style_transcript_line(&meta_entry, false, false);
+        return style_transcript_line(&meta_entry, false, false, "");
     }
 
     let (prefix, prefix_style, mut body_style) = match entry.kind {
@@ -1099,7 +1275,7 @@ fn style_transcript_line(
         if in_diff_block {
             return render_diff_line(text);
         }
-        return highlight_code_line(text);
+        return highlight_code_line(text, code_block_lang);
     }
 
     if entry.kind == MessageKind::Assistant && !in_code_block && looks_like_unfenced_diff_line(text)
@@ -1124,11 +1300,12 @@ fn style_continuation_line(
     entry: &TranscriptEntry,
     in_code_block: bool,
     in_diff_block: bool,
+    code_block_lang: &str,
 ) -> Line<'static> {
     if entry.kind == MessageKind::Assistant
         && let Some(meta_entry) = parse_stream_meta_entry(&entry.text)
     {
-        return style_transcript_line(&meta_entry, false, false);
+        return style_transcript_line(&meta_entry, false, false, "");
     }
 
     let mut body_style = match entry.kind {
@@ -1157,7 +1334,7 @@ fn style_continuation_line(
         if in_diff_block {
             return render_diff_line(text);
         }
-        return highlight_code_line(text);
+        return highlight_code_line(text, code_block_lang);
     }
     if entry.kind == MessageKind::Assistant && !in_code_block && looks_like_unfenced_diff_line(text)
     {
@@ -1205,6 +1382,7 @@ fn flush_transcript_above(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_code_block = false;
     let mut in_diff_block = false;
+    let mut code_block_lang = String::new();
     let mut diff_context_run: Vec<String> = Vec::new();
     let mut collapsed_plan_lines = 0usize;
     // Scan earlier entries to figure out if we're inside a code block
@@ -1214,9 +1392,11 @@ fn flush_transcript_above(
                 if !in_code_block {
                     in_code_block = true;
                     in_diff_block = code_fence_starts_diff(sub);
+                    code_block_lang = extract_fence_lang(sub).to_string();
                 } else {
                     in_code_block = false;
                     in_diff_block = false;
+                    code_block_lang.clear();
                 }
             }
         }
@@ -1263,9 +1443,11 @@ fn flush_transcript_above(
                 if !in_code_block {
                     in_code_block = true;
                     in_diff_block = code_fence_starts_diff(&sub_entry.text);
+                    code_block_lang = extract_fence_lang(&sub_entry.text).to_string();
                 } else {
                     in_code_block = false;
                     in_diff_block = false;
+                    code_block_lang.clear();
                 }
             }
             if i == 0 {
@@ -1273,12 +1455,14 @@ fn flush_transcript_above(
                     &sub_entry,
                     in_code_block,
                     in_diff_block,
+                    &code_block_lang,
                 ));
             } else {
                 lines.push(style_continuation_line(
                     &sub_entry,
                     in_code_block,
                     in_diff_block,
+                    &code_block_lang,
                 ));
             }
         }
@@ -1326,6 +1510,7 @@ fn flush_streaming_lines(
     buffer: &mut String,
     in_code_block: &mut bool,
     in_diff_block: &mut bool,
+    code_block_lang: &mut String,
     collapse_plan: bool,
 ) -> Result<()> {
     // Find the last newline — everything before it consists of complete lines.
@@ -1367,7 +1552,7 @@ fn flush_streaming_lines(
                 DIFF_CONTEXT_KEEP_HEAD,
                 DIFF_CONTEXT_KEEP_TAIL,
             );
-            styled_lines.push(style_transcript_line(&entry, false, false));
+            styled_lines.push(style_transcript_line(&entry, false, false, ""));
             continue;
         }
         let entry = TranscriptEntry {
@@ -1378,15 +1563,18 @@ fn flush_streaming_lines(
             if !*in_code_block {
                 *in_code_block = true;
                 *in_diff_block = code_fence_starts_diff(&entry.text);
+                *code_block_lang = extract_fence_lang(&entry.text).to_string();
             } else {
                 *in_code_block = false;
                 *in_diff_block = false;
+                code_block_lang.clear();
             }
         }
         styled_lines.push(style_transcript_line(
             &entry,
             *in_code_block,
             *in_diff_block,
+            code_block_lang,
         ));
     }
     flush_diff_context_run(
@@ -1475,6 +1663,8 @@ pub struct ChatShell {
     pub thinking_buffer: String,
     /// Current agent execution mode (e.g. "V3Autopilot", "R1DriveTools").
     pub agent_mode: String,
+    /// When true, disable spinner animations (accessibility/reduced-motion).
+    pub reduced_motion: bool,
 }
 
 impl ChatShell {
@@ -1563,6 +1753,16 @@ impl ChatShell {
         });
     }
 
+    /// Clear any partially streamed assistant text — used when the response turns out to
+    /// contain tool calls, making the interleaved text fragments visual noise.
+    pub fn clear_streaming_text(&mut self) {
+        if let Some(last) = self.transcript.last_mut()
+            && last.kind == MessageKind::Assistant
+        {
+            last.text.clear();
+        }
+    }
+
     /// Finalize the streaming response — ensure the complete output is in the transcript.
     /// If streaming deltas were received, replaces the partial entry with the final output.
     /// If no streaming happened, pushes the full output as new transcript entries.
@@ -1631,6 +1831,9 @@ impl ChatShell {
     }
 
     fn spinner_frame(&self) -> &'static str {
+        if self.reduced_motion {
+            return "●";
+        }
         const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         FRAMES[self.spinner_tick % FRAMES.len()]
     }
@@ -1902,6 +2105,7 @@ where
         status,
         KeyBindings::default(),
         TuiTheme::default(),
+        false,
         rx,
         move |prompt| {
             let result = on_submit(prompt);
@@ -1921,7 +2125,8 @@ where
 pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
-    _theme: TuiTheme,
+    theme: TuiTheme,
+    reduced_motion: bool,
     stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
     mut refresh_status: S,
@@ -1993,6 +2198,7 @@ where
 
     let mut shell = ChatShell {
         agent_mode: "V3Autopilot".to_string(),
+        reduced_motion,
         ..Default::default()
     };
     let mut input = String::new();
@@ -2022,6 +2228,7 @@ where
     let mut streaming_buffer = String::new();
     let mut streaming_in_code_block = false;
     let mut streaming_in_diff_block = false;
+    let mut streaming_code_block_lang = String::new();
     let mut mission_control_visible = false;
     let mut artifacts_visible = false;
     let mut plan_collapsed = false;
@@ -2046,6 +2253,7 @@ where
             &mut streaming_buffer,
             &mut streaming_in_code_block,
             &mut streaming_in_diff_block,
+            &mut streaming_code_block_lang,
             plan_collapsed,
         )?;
 
@@ -2083,7 +2291,7 @@ where
                 );
             } else if !streaming_buffer.is_empty() {
                 let styled = if let Some(meta) = parse_stream_meta_entry(&streaming_buffer) {
-                    style_transcript_line(&meta, false, false)
+                    style_transcript_line(&meta, false, false, "")
                 } else {
                     let partial_entry = TranscriptEntry {
                         kind: MessageKind::Assistant,
@@ -2174,96 +2382,93 @@ where
                     )])),
                     input_area,
                 );
+            } else if reverse_search_active {
+                let match_preview = reverse_search_index
+                    .and_then(|idx| history.get(idx))
+                    .cloned()
+                    .unwrap_or_else(|| "<no match>".to_string());
+                let text = format!(
+                    "(reverse-i-search)`{}': {}",
+                    reverse_search_query,
+                    truncate_inline(&match_preview, width.saturating_sub(28) as usize)
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![Span::styled(
+                        truncate_inline(&text, width.saturating_sub(1) as usize),
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::BOLD),
+                    )])),
+                    input_area,
+                );
             } else {
-                if reverse_search_active {
-                    let match_preview = reverse_search_index
-                        .and_then(|idx| history.get(idx))
-                        .cloned()
-                        .unwrap_or_else(|| "<no match>".to_string());
-                    let text = format!(
-                        "(reverse-i-search)`{}': {}",
-                        reverse_search_query,
-                        truncate_inline(&match_preview, width.saturating_sub(28) as usize)
-                    );
-                    frame.render_widget(
-                        Paragraph::new(Line::from(vec![Span::styled(
-                            truncate_inline(&text, width.saturating_sub(1) as usize),
+                let (prompt_str, prompt_style) = if vim_enabled {
+                    match vim_mode {
+                        VimMode::Normal => (
+                            ": ",
                             Style::default()
-                                .fg(Color::LightYellow)
+                                .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
-                        )])),
-                        input_area,
-                    );
-                } else {
-                    let (prompt_str, prompt_style) = if vim_enabled {
-                        match vim_mode {
-                            VimMode::Normal => (
-                                ": ",
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            VimMode::Visual => (
-                                ": ",
-                                Style::default()
-                                    .fg(Color::Magenta)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            VimMode::Command => (
-                                ": ",
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            VimMode::Insert => (
-                                "> ",
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        }
-                    } else {
-                        (
+                        ),
+                        VimMode::Visual => (
+                            ": ",
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        VimMode::Command => (
+                            ": ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        VimMode::Insert => (
                             "> ",
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
-                        )
-                    };
-
-                    if vim_enabled && vim_mode == VimMode::Command {
-                        let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-                        let input_text = format!(":{}{}", vim_command_buffer, cursor_ch);
-                        frame.render_widget(
-                            Paragraph::new(Line::from(vec![
-                                Span::styled(prompt_str.to_string(), prompt_style),
-                                Span::raw(input_text),
-                            ])),
-                            input_area,
-                        );
-                    } else {
-                        let before = &input[..cursor_pos.min(input.len())];
-                        let after = &input[cursor_pos.min(input.len())..];
-                        let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-                        let mut spans = vec![
-                            Span::styled(prompt_str.to_string(), prompt_style),
-                            Span::raw(format!("{}{}{}", before, cursor_ch, after)),
-                        ];
-                        if cursor_pos >= input.len()
-                            && let Some(ghost) = history_ghost_suffix(&history, &input)
-                        {
-                            spans.push(Span::styled(
-                                ghost,
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            ));
-                        }
-                        frame.render_widget(Paragraph::new(Line::from(spans)), input_area);
+                        ),
                     }
+                } else {
+                    (
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                };
+
+                if vim_enabled && vim_mode == VimMode::Command {
+                    let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
+                    let input_text = format!(":{}{}", vim_command_buffer, cursor_ch);
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(prompt_str.to_string(), prompt_style),
+                            Span::raw(input_text),
+                        ])),
+                        input_area,
+                    );
+                } else {
+                    let before = &input[..cursor_pos.min(input.len())];
+                    let after = &input[cursor_pos.min(input.len())..];
+                    let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
+                    let mut spans = vec![
+                        Span::styled(prompt_str.to_string(), prompt_style),
+                        Span::raw(format!("{}{}{}", before, cursor_ch, after)),
+                    ];
+                    if cursor_pos >= input.len()
+                        && let Some(ghost) = history_ghost_suffix(&history, &input)
+                    {
+                        spans.push(Span::styled(
+                            ghost,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    }
+                    frame.render_widget(Paragraph::new(Line::from(spans)), input_area);
                 }
             }
-
             // Row 3: thin separator line below input
             let sep2_area = Rect::new(area.x, area.y + 3, width, 1);
             frame.render_widget(
@@ -2292,14 +2497,14 @@ where
             } else if let Some(ref tool) = shell.active_tool {
                 status_spans.push(Span::styled(
                     format!(" {} {} ", shell.spinner_frame(), tool),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.secondary),
                 ));
                 status_spans.push(Span::raw(" "));
             }
             status_spans.push(Span::styled(
                 format!(" {} ", status.model),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ));
             let mode_color = match status.permission_mode.as_str() {
@@ -2463,6 +2668,20 @@ where
                     shell.push_system(label);
                     info_line = format!("mode: {from} -> {to}");
                 }
+                TuiStreamEvent::ImageDisplay { data, label } => {
+                    // Render inline image if terminal supports it
+                    if !display_image_inline(&data) {
+                        shell.push_system(format!("[image: {label} ({} bytes)]", data.len()));
+                    } else {
+                        shell.push_system(format!("[image: {label}]"));
+                    }
+                }
+                TuiStreamEvent::ClearStreamingText => {
+                    // The response contained tool calls — clear the noise text
+                    // fragments that were streamed before/between them.
+                    streaming_buffer.clear();
+                    shell.clear_streaming_text();
+                }
                 TuiStreamEvent::ApprovalNeeded {
                     tool_name,
                     args_summary,
@@ -2485,6 +2704,7 @@ where
                     streaming_buffer.clear();
                     streaming_in_code_block = false;
                     streaming_in_diff_block = false;
+                    streaming_code_block_lang.clear();
                     shell.is_thinking = false;
                     shell.thinking_buffer.clear();
                     shell.push_error(&msg);
@@ -2519,6 +2739,7 @@ where
                     last_printed_idx = shell.transcript.len();
                     streaming_in_code_block = false;
                     streaming_in_diff_block = false;
+                    streaming_code_block_lang.clear();
                     info_line = "ok".to_string();
                     is_processing = false;
                     shell.active_tool = None;
@@ -3657,12 +3878,7 @@ fn history_reverse_search_index(
         return None;
     }
 
-    for idx in (0..history.len()).rev() {
-        if matches(&history[idx]) {
-            return Some(idx);
-        }
-    }
-    None
+    (0..history.len()).rev().find(|&idx| matches(&history[idx]))
 }
 
 fn apply_reverse_search_result(
@@ -3715,6 +3931,7 @@ fn parse_vim_slash_command(prompt: &str) -> Option<Result<VimSlashCommand, &'sta
     Some(Ok(cmd))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_vim_command(
     command: VimSlashCommand,
     vim_enabled: &mut bool,
@@ -4461,7 +4678,7 @@ mod tests {
             kind: MessageKind::Assistant,
             text: "[tool: fs.read] path=missing.md".to_string(),
         };
-        let rendered = style_transcript_line(&entry, false, false);
+        let rendered = style_transcript_line(&entry, false, false, "");
         let text: String = rendered.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("⚡"));
         assert!(text.contains("fs.read"));
@@ -4473,7 +4690,7 @@ mod tests {
             kind: MessageKind::Assistant,
             text: "+let value = 1;".to_string(),
         };
-        let rendered = style_transcript_line(&entry, false, false);
+        let rendered = style_transcript_line(&entry, false, false, "");
         let text: String = rendered.iter().map(|s| s.content.to_string()).collect();
         assert!(text.starts_with('+'));
     }
@@ -4914,5 +5131,197 @@ mod tests {
             !line.contains("agent="),
             "V3 mode should not show agent= in statusline"
         );
+    }
+
+    #[test]
+    fn syntect_highlights_rust_code() {
+        let line = highlight_code_line("let x = 42;", "rust");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "let x = 42;");
+        // syntect should produce more than one span (keyword, ident, number)
+        assert!(
+            line.spans.len() > 1,
+            "syntect should tokenize Rust: got {} span(s)",
+            line.spans.len()
+        );
+    }
+
+    #[test]
+    fn syntect_falls_back_for_unknown_lang() {
+        let line = highlight_code_line("hello world", "xyzzylang99");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn syntect_highlights_python_code() {
+        let line = highlight_code_line("def hello():", "python");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("def"));
+        assert!(
+            line.spans.len() > 1,
+            "syntect should tokenize Python: got {} span(s)",
+            line.spans.len()
+        );
+    }
+
+    #[test]
+    fn extract_fence_lang_extracts_language() {
+        assert_eq!(extract_fence_lang("```rust"), "rust");
+        assert_eq!(extract_fence_lang("```python"), "python");
+        assert_eq!(extract_fence_lang("```"), "");
+        assert_eq!(extract_fence_lang("```js "), "js");
+    }
+
+    #[test]
+    fn inline_markdown_strikethrough() {
+        let spans = parse_inline_markdown("before ~~deleted~~ after", Style::default());
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "before deleted after");
+        // The "deleted" span should have CROSSED_OUT modifier
+        let deleted_span = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "deleted")
+            .unwrap();
+        assert!(
+            deleted_span
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT),
+            "strikethrough text should have CROSSED_OUT modifier"
+        );
+    }
+
+    #[test]
+    fn inline_markdown_link() {
+        let spans =
+            parse_inline_markdown("click [here](https://example.com) now", Style::default());
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("here"));
+        assert!(text.contains("https://example.com"));
+        // Link text should be underlined
+        let link_span = spans.iter().find(|s| s.content.as_ref() == "here").unwrap();
+        assert!(
+            link_span.style.add_modifier.contains(Modifier::UNDERLINED),
+            "link text should be underlined"
+        );
+    }
+
+    #[test]
+    fn task_list_unchecked_renders_box() {
+        let line = render_assistant_markdown("- [ ] todo item");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("☐"), "unchecked task should show ☐");
+        assert!(text.contains("todo item"));
+    }
+
+    #[test]
+    fn task_list_checked_renders_checkmark() {
+        let line = render_assistant_markdown("- [x] done item");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("☑"), "checked task should show ☑");
+        assert!(text.contains("done item"));
+    }
+}
+
+// ─── Terminal Image Rendering ───────────────────────────────────────────────
+
+/// Terminal image protocol support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageProtocol {
+    /// iTerm2 inline image protocol (also supported by WezTerm, mintty).
+    Iterm2,
+    /// Kitty graphics protocol.
+    Kitty,
+    /// No inline image support — use ASCII placeholder.
+    None,
+}
+
+/// Detect which image protocol the current terminal supports.
+pub fn detect_image_protocol() -> ImageProtocol {
+    // iTerm2 and WezTerm set TERM_PROGRAM
+    if let Ok(program) = std::env::var("TERM_PROGRAM") {
+        let lower = program.to_ascii_lowercase();
+        if lower.contains("iterm") || lower.contains("wezterm") || lower.contains("mintty") {
+            return ImageProtocol::Iterm2;
+        }
+    }
+    // Kitty sets TERM=xterm-kitty or TERM_PROGRAM=kitty
+    if let Ok(term) = std::env::var("TERM")
+        && term.contains("kitty")
+    {
+        return ImageProtocol::Kitty;
+    }
+    if let Ok(program) = std::env::var("TERM_PROGRAM")
+        && program.to_ascii_lowercase().contains("kitty")
+    {
+        return ImageProtocol::Kitty;
+    }
+    // KITTY_WINDOW_ID is set inside Kitty
+    if std::env::var("KITTY_WINDOW_ID").is_ok() {
+        return ImageProtocol::Kitty;
+    }
+    ImageProtocol::None
+}
+
+/// Render an image inline in the terminal.
+/// `data` is the raw image bytes. Returns the escape sequence to write.
+pub fn render_inline_image(data: &[u8], protocol: ImageProtocol) -> Option<String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    match protocol {
+        ImageProtocol::Iterm2 => {
+            let b64 = engine.encode(data);
+            // iTerm2 protocol: ESC ] 1337 ; File=[args] : <base64> BEL
+            Some(format!(
+                "\x1b]1337;File=inline=1;size={};preserveAspectRatio=1:{}\x07",
+                data.len(),
+                b64
+            ))
+        }
+        ImageProtocol::Kitty => {
+            let b64 = engine.encode(data);
+            // Kitty protocol: send in chunks of 4096 bytes
+            let mut output = String::new();
+            let chunks: Vec<&str> = {
+                let mut v = Vec::new();
+                let mut i = 0;
+                while i < b64.len() {
+                    let end = (i + 4096).min(b64.len());
+                    v.push(&b64[i..end]);
+                    i = end;
+                }
+                v
+            };
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let more = if idx < chunks.len() - 1 { 1 } else { 0 };
+                if idx == 0 {
+                    // First chunk: action=transmit+display, format=100 (auto-detect)
+                    output.push_str(&format!("\x1b_Ga=T,f=100,m={more};{chunk}\x1b\\"));
+                } else {
+                    // Continuation chunks
+                    output.push_str(&format!("\x1b_Gm={more};{chunk}\x1b\\"));
+                }
+            }
+            Some(output)
+        }
+        ImageProtocol::None => None,
+    }
+}
+
+/// Print an image inline to stdout, if the terminal supports it.
+/// Returns true if the image was displayed, false if no protocol is available.
+pub fn display_image_inline(data: &[u8]) -> bool {
+    let protocol = detect_image_protocol();
+    if let Some(escape) = render_inline_image(data, protocol) {
+        use std::io::Write;
+        let mut out = io::stdout();
+        let _ = out.write_all(escape.as_bytes());
+        let _ = writeln!(out);
+        let _ = out.flush();
+        true
+    } else {
+        false
     }
 }

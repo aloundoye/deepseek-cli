@@ -161,10 +161,11 @@ impl ChromeSession {
     pub fn reconnect(&mut self, create_tab_if_missing: bool) -> Result<ChromeConnectionStatus> {
         let connected_before = self.check_connection()?;
         let mut created_tab = false;
-        if create_tab_if_missing && self.ws_debug_url.is_none() {
-            if self.create_tab("about:blank").is_ok() {
-                created_tab = true;
-            }
+        if create_tab_if_missing
+            && self.ws_debug_url.is_none()
+            && self.create_tab("about:blank").is_ok()
+        {
+            created_tab = true;
         }
         self.check_connection()?;
         let targets = self.list_tabs().unwrap_or_default();

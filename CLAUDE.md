@@ -93,16 +93,35 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Mode router** (`deepseek-agent::mode_router`): Selects between two execution modes per turn:
 - **V3Autopilot** (default): `deepseek-chat` with unified thinking + tools in a single API call. Fast, handles most tasks.
-- **R1DriveTools**: R1 (`deepseek-reasoner`) drives tools step-by-step via structured JSON intents (`tool_intent`, `delegate_patch`, `done`, `abort`). Orchestrator validates + executes via `ToolHost`. R1 receives `ObservationPack` context between steps. Escalation triggers: repeated step failures (≥2), ambiguous errors, blast radius (≥5 files changed), cross-module failures. V3 gets one mechanical recovery attempt for compile/lint errors before escalation. R1 budget capped at `r1_max_steps` (default 30).
+- **R1DriveTools** (escalation): R1 (`deepseek-reasoner`) drives tools step-by-step via structured JSON intents (`tool_intent`, `delegate_patch`, `done`, `abort`). Orchestrator validates + executes via `ToolHost`. R1 receives `ObservationPack` context between steps. R1 budget capped at `r1_max_steps` (default 30).
+
+**Escalation triggers** (V3Autopilot → R1DriveTools, checked by `decide_mode()` after each tool execution batch):
+1. **Doom-loop** (highest priority): same tool signature (name + normalized args + exit code bucket) fails ≥ `doom_loop_threshold` (default 2) times.
+2. **Repeated step failures**: consecutive failures ≥ `v3_max_step_failures` (default 5). V3 gets one mechanical recovery attempt for compile/lint/dependency errors before escalation (`v3_mechanical_recovery = true`).
+3. **Ambiguous errors**: `ErrorClass::Ambiguous` — error cannot be classified.
+4. **Blast radius exceeded**: ≥ `blast_radius_threshold` (default 10) files changed without verification.
+5. **Cross-module failures**: errors span 2+ distinct modules.
+
+**Policy doom-loop breaker** (`deepseek-agent/src/lib.rs`): When doom-loop detection fires and all failing signatures are `bash.run` policy errors (forbidden metacharacters, command not allowlisted), the agent injects a guidance message redirecting the model to built-in tools (`fs.glob`, `fs.grep`, `fs.read`) and resets failure trackers instead of escalating to R1 (which faces the same policy restrictions).
+
+**Hysteresis**: Once escalated to R1, stays there until verification passes (`verify_passed_since_r1`), R1 returns `done`/`abort`, or R1 budget is exhausted (forced return to V3).
+
+**R1 consultation** (`deepseek-agent::consultation`): Lightweight alternative to full R1DriveTools escalation. V3 asks R1 for targeted advice on a subproblem (error analysis, architecture, plan review, task decomposition). R1 returns text-only advice (no JSON intents, no tool execution). Advice is injected into V3's conversation as a tool result. V3 keeps control throughout.
+
+**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests). Verification failures feed back into the loop.
 
 Key modules in `deepseek-agent`:
-- `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `decide_mode()`, escalation logic
+- `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `ToolSignature`, `decide_mode()`, escalation + hysteresis logic
 - `protocol.rs` — R1 JSON envelope types (`R1Response`, `ToolIntent`, `DelegatePatch`), parsing + validation, V3 patch response parsing
 - `observation.rs` — `ObservationPack`, `ErrorClass`, error classification, compact R1 context serialization
 - `r1_drive.rs` — R1 drive-tools loop: R1 → JSON intent → tool execution → observation → loop
 - `v3_patch.rs` — V3 as patch-only writer: produces unified diffs from R1's `delegate_patch` instructions
+- `consultation.rs` — R1 consultation: lightweight text-only advice without full escalation
+- `plan_discipline.rs` — Plan state machine, trigger detection, step tracking, verification gating
 
-**TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`.
+**Streaming text suppression** (`deepseek-llm`): When the model's streaming response contains both text content deltas and structured `tool_calls`, text fragments are suppressed from the TUI display once the first tool call delta arrives. After streaming completes, a `ClearStreamingText` signal removes any pre-tool-call text noise from the transcript. This prevents the choppy display of interleaved text fragments between tool calls.
+
+**TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`. Handles `ClearStreamingText` to discard noise text when tool calls are present.
 
 ## Conventions
 
@@ -145,7 +164,7 @@ DeepSeek V3.2 (`deepseek-chat`) officially supports **thinking mode with functio
 
 Older DeepSeek API versions could intermittently output **raw DSML markup** when thinking was combined with tools. The DSML rescue parser in `deepseek-llm/src/lib.rs` (`rescue_raw_tool_calls()`) remains as a safety net, parsing Format A (`<｜DSML｜invoke>`) and Format B (`<｜tool▁call▁begin｜>`) markup into proper `Vec<LlmToolCall>`.
 
-**Workaround for complex failures**: The mode router automatically escalates from V3Autopilot to R1DriveTools when repeated failures, ambiguous errors, or high blast radius are detected. R1 drives tools via JSON intents with a step budget (`r1_max_steps`, default 30).
+**Workaround for complex failures**: The mode router automatically escalates from V3Autopilot to R1DriveTools when doom-loops, repeated failures (≥5), ambiguous errors, blast radius (≥10 files), or cross-module errors are detected. R1 drives tools via JSON intents with a step budget (`r1_max_steps`, default 30). For policy-related doom-loops (bash.run restrictions), the agent injects tool guidance and resets trackers instead of escalating to R1.
 
 ## Supply-Chain Security
 

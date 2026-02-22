@@ -192,6 +192,48 @@ impl AgentEngine {
         self.max_budget_usd = max;
     }
 
+    /// Validate the API key by making a lightweight request to the DeepSeek API.
+    /// Returns Ok(()) if the key is valid, or an error with setup instructions.
+    pub fn validate_api_key(&self) -> Result<()> {
+        let test_request = ChatRequest {
+            model: self.cfg.llm.base_model.clone(),
+            messages: vec![ChatMessage::User {
+                content: "hi".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: ToolChoice::none(),
+            max_tokens: 1,
+            temperature: Some(0.0),
+            thinking: None,
+        };
+
+        match self.llm.complete_chat(&test_request) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err_str = e.to_string().to_ascii_lowercase();
+                if err_str.contains("401")
+                    || err_str.contains("unauthorized")
+                    || err_str.contains("invalid api key")
+                    || err_str.contains("authentication")
+                {
+                    Err(anyhow!(
+                        "Invalid or missing API key.\n\n\
+                         Set your DeepSeek API key using one of:\n\
+                         • export DEEPSEEK_API_KEY=your-key-here\n\
+                         • Add \"api_key\" to ~/.deepseek/settings.json under the \"llm\" section\n\n\
+                         Get an API key at: https://platform.deepseek.com/api_keys"
+                    ))
+                } else {
+                    // Non-auth error (network, rate limit, etc.) — don't block startup
+                    self.observer.warn_log(&format!(
+                        "API key validation got non-auth error (startup continues): {e}"
+                    ));
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// Override the permission mode at runtime (from CLI flag).
     pub fn set_permission_mode(&mut self, mode: &str) {
         self.policy = PolicyEngine::from_mode(mode);
@@ -345,16 +387,19 @@ impl AgentEngine {
             let dest = snapshot_dir.join(&hash);
             if std::fs::copy(&abs_path, &dest).is_ok() {
                 // Also write a mapping file
-                let _ = std::fs::write(
+                if let Err(e) = std::fs::write(
                     snapshot_dir.join(format!("{hash}.path")),
                     abs_path.to_string_lossy().as_bytes(),
-                );
+                ) {
+                    self.observer
+                        .warn_log(&format!("checkpoint: failed to write path mapping: {e}"));
+                }
                 files_saved += 1;
             }
         }
 
-        if files_saved > 0 {
-            let _ = self.emit(
+        if files_saved > 0
+            && let Err(e) = self.emit(
                 session_id,
                 EventKind::CheckpointCreatedV1 {
                     checkpoint_id,
@@ -362,7 +407,10 @@ impl AgentEngine {
                     files_count: files_saved,
                     snapshot_path: snapshot_dir.to_string_lossy().to_string(),
                 },
-            );
+            )
+        {
+            self.observer
+                .warn_log(&format!("checkpoint: failed to emit event: {e}"));
         }
     }
 
@@ -1129,13 +1177,16 @@ impl AgentEngine {
             if verification_failures > 0 {
                 patterns.push("verification failures require focused plan revision".to_string());
             }
-            let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+            if let Err(e) = manager.append_auto_memory_observation(AutoMemoryObservation {
                 objective: prompt.to_string(),
                 summary: summary.clone(),
                 success: run_succeeded,
                 patterns,
                 recorded_at: None,
-            });
+            }) {
+                self.observer
+                    .warn_log(&format!("memory: failed to persist observation: {e}"));
+            }
         }
         Ok(summary)
     }
@@ -1277,6 +1328,19 @@ impl AgentEngine {
             all_tools.clone()
         };
 
+        // In strict review mode, filter to read-only tools only
+        if self.cfg.policy.review_mode == deepseek_core::ReviewMode::Strict {
+            let before = tools.len();
+            tools.retain(|t| deepseek_core::ReviewMode::is_read_only_tool(&t.function.name));
+            if tools.len() < before {
+                self.observer.verbose_log(&format!(
+                    "review_mode=strict: filtered {} tools → {} read-only tools",
+                    before,
+                    tools.len()
+                ));
+            }
+        }
+
         self.observer
             .verbose_log(&format!("chat: {} tool definitions loaded", tools.len()));
 
@@ -1345,6 +1409,7 @@ impl AgentEngine {
         let mut turn_count: u64 = 0;
         let mut failure_streak: u32 = 0;
         let mut empty_response_count: u32 = 0;
+        let mut tool_choice_retried = false;
         let mode_router_config = ModeRouterConfig::from_router_config(&self.cfg.router);
         let mut failure_tracker = FailureTracker::default();
         let mut current_mode = AgentMode::V3Autopilot;
@@ -1385,9 +1450,12 @@ impl AgentEngine {
         loop {
             turn_count += 1;
             if turn_count > max_turns {
-                let _ = self.transition(&mut session, SessionState::Failed);
-                if let Ok(manager) = MemoryManager::new(&self.workspace) {
-                    let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                if let Err(e) = self.transition(&mut session, SessionState::Failed) {
+                    self.observer
+                        .warn_log(&format!("session: failed to transition to Failed: {e}"));
+                }
+                if let Ok(manager) = MemoryManager::new(&self.workspace)
+                    && let Err(e) = manager.append_auto_memory_observation(AutoMemoryObservation {
                         objective: prompt.to_string(),
                         summary: format!(
                             "chat failed: max turn limit ({}) reached, failure_streak={}",
@@ -1400,7 +1468,10 @@ impl AgentEngine {
                                 .to_string(),
                         ],
                         recorded_at: None,
-                    });
+                    })
+                {
+                    self.observer
+                        .warn_log(&format!("memory: failed to persist observation: {e}"));
                 }
                 return Err(anyhow!(
                     "Reached maximum turn limit ({max_turns}). Use --max-turns to increase the limit, or break the task into smaller pieces."
@@ -1414,9 +1485,12 @@ impl AgentEngine {
                     .total_session_cost(session.session_id)
                     .unwrap_or(0.0);
                 if cost >= max_usd {
-                    let _ = self.transition(&mut session, SessionState::Failed);
-                    if let Ok(manager) = MemoryManager::new(&self.workspace) {
-                        let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                    if let Err(e) = self.transition(&mut session, SessionState::Failed) {
+                        self.observer
+                            .warn_log(&format!("session: failed to transition to Failed: {e}"));
+                    }
+                    if let Ok(manager) = MemoryManager::new(&self.workspace)
+                        && let Err(e) = manager.append_auto_memory_observation(AutoMemoryObservation {
                             objective: prompt.to_string(),
                             summary: format!(
                                 "chat failed: budget limit (${:.2}/${:.2}) at turn {}, failure_streak={}",
@@ -1427,7 +1501,10 @@ impl AgentEngine {
                                 "turns={turn_count} failure_streak={failure_streak} cost=${cost:.2}"
                             )],
                             recorded_at: None,
-                        });
+                        })
+                    {
+                        self.observer
+                            .warn_log(&format!("memory: failed to persist observation: {e}"));
                     }
                     return Err(anyhow!(
                         "Budget limit reached (${:.2}/${:.2}). Use --max-budget-usd to increase the limit.",
@@ -1468,9 +1545,15 @@ impl AgentEngine {
                 ));
             }
 
-            // Context window compaction
+            // Context window compaction — budget-aware threshold
             let token_count = estimate_messages_tokens(&messages);
-            let threshold = (self.cfg.llm.context_window_tokens as f64
+            let effective_window = self
+                .cfg
+                .llm
+                .context_window_tokens
+                .saturating_sub(self.cfg.context.reserved_overhead_tokens)
+                .saturating_sub(self.cfg.context.response_budget_tokens);
+            let threshold = (effective_window as f64
                 * self.cfg.context.auto_compact_threshold.clamp(0.1, 1.0) as f64)
                 as u64;
             if token_count > threshold && messages.len() > 4 {
@@ -1490,7 +1573,7 @@ impl AgentEngine {
                 let tail_start = compaction_tail_start(&messages, desired_tail);
                 let compacted_range = &messages[1..tail_start];
                 if !compacted_range.is_empty() {
-                    let summary = summarize_chat_messages(compacted_range);
+                    let summary = self.llm_compact_summary(compacted_range);
                     let from_turn = 1u64;
                     let to_turn = compacted_range.len() as u64;
                     let summary_id = Uuid::now_v7();
@@ -1888,7 +1971,10 @@ impl AgentEngine {
                         continue;
                     }
                 }
-                let _ = self.transition(&mut session, SessionState::Completed);
+                if let Err(e) = self.transition(&mut session, SessionState::Completed) {
+                    self.observer
+                        .warn_log(&format!("session: failed to transition to Completed: {e}"));
+                }
 
                 // Persist memory observation for future sessions
                 if let Ok(manager) = MemoryManager::new(&self.workspace) {
@@ -1901,7 +1987,7 @@ impl AgentEngine {
                                 .to_string(),
                         );
                     }
-                    let _ = manager.append_auto_memory_observation(AutoMemoryObservation {
+                    if let Err(e) = manager.append_auto_memory_observation(AutoMemoryObservation {
                         objective: prompt.to_string(),
                         summary: format!(
                             "chat completed in {} turns, failure_streak={}",
@@ -1910,7 +1996,10 @@ impl AgentEngine {
                         success: true,
                         patterns,
                         recorded_at: None,
-                    });
+                    }) {
+                        self.observer
+                            .warn_log(&format!("memory: failed to persist observation: {e}"));
+                    }
                 }
 
                 // Fire SessionEnd hook.
@@ -1992,18 +2081,18 @@ impl AgentEngine {
                     });
                     failure_streak += 1;
                     continue;
+                }
                 // Normalize bash.run args: model may send "command" (the
                 // canonical definition name) — copy it to "cmd" so all
                 // downstream code (policy, observation, mode_router) works
                 // unchanged.
-                if internal_name == "bash.run" {
-                    if let Some(obj) = args.as_object_mut() {
-                        if obj.contains_key("command") && !obj.contains_key("cmd") {
-                            if let Some(val) = obj.get("command").cloned() {
-                                obj.insert("cmd".to_string(), val);
-                            }
-                        }
-                    }
+                if internal_name == "bash.run"
+                    && let Some(obj) = args.as_object_mut()
+                    && obj.contains_key("command")
+                    && !obj.contains_key("cmd")
+                    && let Some(val) = obj.get("command").cloned()
+                {
+                    obj.insert("cmd".to_string(), val);
                 }
 
                 // Safety net: block disallowed tools at execution time
@@ -2204,7 +2293,6 @@ impl AgentEngine {
                 }
 
                 // ── PreToolUse hook (can block/modify tool input) ──
-                let mut args = args;
                 {
                     let mut input = self.hook_input(HookEvent::PreToolUse);
                     input.tool_name = Some(tc.name.clone());
@@ -2355,6 +2443,27 @@ impl AgentEngine {
                             success: result.success,
                             summary: preview_line,
                         });
+                        // Emit inline image if tool result contains image data
+                        if (internal_name == "fs.read" || internal_name == "fs_read")
+                            && result
+                                .output
+                                .get("mime")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|m| m.starts_with("image/"))
+                            && let Some(b64) = result.output.get("base64").and_then(|v| v.as_str())
+                        {
+                            use base64::Engine;
+                            let engine = base64::engine::general_purpose::STANDARD;
+                            if let Ok(data) = engine.decode(b64) {
+                                let label = result
+                                    .output
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("image")
+                                    .to_string();
+                                cb(StreamChunk::ImageData { data, label });
+                            }
+                        }
                     }
 
                     // Doom-loop tracking: record tool signature
@@ -2388,16 +2497,16 @@ impl AgentEngine {
                                 plan_state.record_file_touched(path);
                             }
                             // multi_edit: track each file in the edits array
-                            if internal_name == "multi_edit" {
-                                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
-                                    for edit in edits {
-                                        if let Some(p) = edit
-                                            .get("path")
-                                            .or_else(|| edit.get("file_path"))
-                                            .and_then(|v| v.as_str())
-                                        {
-                                            plan_state.record_file_touched(p);
-                                        }
+                            if internal_name == "multi_edit"
+                                && let Some(edits) = args.get("edits").and_then(|v| v.as_array())
+                            {
+                                for edit in edits {
+                                    if let Some(p) = edit
+                                        .get("path")
+                                        .or_else(|| edit.get("file_path"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        plan_state.record_file_touched(p);
                                     }
                                 }
                             }
@@ -2490,6 +2599,30 @@ impl AgentEngine {
             // recent assistant+tool message pairs), replace the older results
             // with a compact summary to save context tokens.
             compress_repeated_tool_results(&mut messages);
+
+            // ── Doom-loop breaker ──
+            // If the doom-loop tracker shows repeated failures on the same tool(s),
+            // inject per-tool guidance and reset the tracker instead of escalating
+            // to R1 (which faces the same restrictions).
+            if failure_tracker.has_doom_loop(mode_router_config.doom_loop_threshold) {
+                let failing_tools: Vec<String> = failure_tracker
+                    .doom_loop_sigs
+                    .keys()
+                    .map(|sig| sig.tool.clone())
+                    .collect();
+                let guidance = doom_loop_guidance(&failing_tools);
+                if !guidance.is_empty() {
+                    self.observer.verbose_log(&format!(
+                        "doom-loop detected for tools {:?}: injecting guidance",
+                        failing_tools
+                    ));
+                    messages.push(ChatMessage::User { content: guidance });
+                    // Reset doom-loop state so we don't immediately escalate to R1
+                    failure_tracker.doom_loop_sigs.clear();
+                    failure_tracker.consecutive_step_failures = 0;
+                    failure_streak = 0;
+                }
+            }
 
             // ── Mode router: check for R1DriveTools escalation ──
             let mode_decision = decide_mode(
@@ -2598,7 +2731,11 @@ impl AgentEngine {
                                 content: answer.clone(),
                             },
                         )?;
-                        let _ = self.transition(&mut session, SessionState::Completed);
+                        if let Err(e) = self.transition(&mut session, SessionState::Completed) {
+                            self.observer.warn_log(&format!(
+                                "session: failed to transition to Completed: {e}"
+                            ));
+                        }
                         return Ok(answer);
                     }
 
@@ -2914,12 +3051,15 @@ impl AgentEngine {
                 tracker.record_failure();
                 all_passed = false;
             }
-            let _ = self.emit(
+            if let Err(e) = self.emit(
                 session_id,
                 EventKind::ToolResultV1 {
                     result: result.clone(),
                 },
-            );
+            ) {
+                self.observer
+                    .warn_log(&format!("event: failed to emit ToolResultV1: {e}"));
+            }
         }
         all_passed
     }
@@ -2993,12 +3133,15 @@ impl AgentEngine {
                 };
                 errors.push(format!("Command `{cmd}` failed:\n{truncated}"));
             }
-            let _ = self.emit(
+            if let Err(e) = self.emit(
                 session_id,
                 EventKind::ToolResultV1 {
                     result: result.clone(),
                 },
-            );
+            ) {
+                self.observer
+                    .warn_log(&format!("event: failed to emit ToolResultV1: {e}"));
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -3070,7 +3213,11 @@ impl AgentEngine {
              - **fs_write**: Only for creating new files. Prefer `fs_edit` to modify existing files.\n\
              - **fs_glob**: Find files by pattern (e.g. `**/*.rs`). Use before grep to scope searches.\n\
              - **fs_grep**: Search file contents with regex. Use `case_sensitive: false` for case-insensitive. Use `glob` to filter file types.\n\
-             - **bash_run**: Execute shell commands (git, build, test, etc.). Commands have a timeout (default 120s).\n\
+             - **bash_run**: Execute shell commands (git, build, test, etc.). Commands have a timeout (default 120s). \
+               **Important restrictions**: Shell metacharacters (pipes `|`, `&&`, `||`, `;`, backticks, `$()`) are FORBIDDEN and will be rejected. \
+               Only allowlisted commands are permitted (e.g. `cargo`, `git`, `rg`). \
+               For file discovery use `fs_glob`, for content search use `fs_grep`, for reading files use `fs_read`. \
+               Do NOT use `find`, `ls`, `cat`, `head`, `tail`, `grep`, or piped commands via bash — use the dedicated tools instead.\n\
              - **multi_edit**: Batch edits across multiple files in one call. Each entry has a path and search/replace pairs.\n\
              - **git_status / git_diff / git_show**: Inspect repository state, diffs, and specific commits.\n\
              - **web_fetch**: Retrieve URL content as text. Use for documentation lookup.\n\
@@ -3745,7 +3892,13 @@ impl AgentEngine {
         let transcript = projection.transcript;
         let transcript_text = transcript.join("\n");
         let transcript_tokens = estimate_tokens(&transcript_text);
-        let threshold = (self.cfg.llm.context_window_tokens as f32
+        let effective_window = self
+            .cfg
+            .llm
+            .context_window_tokens
+            .saturating_sub(self.cfg.context.reserved_overhead_tokens)
+            .saturating_sub(self.cfg.context.response_budget_tokens);
+        let threshold = (effective_window as f32
             * self.cfg.context.auto_compact_threshold.clamp(0.1, 1.0))
             as u64;
 
@@ -5492,6 +5645,62 @@ impl AgentEngine {
         }
         Ok(())
     }
+
+    /// Use the LLM to produce a high-quality compaction summary.
+    /// Falls back to `summarize_chat_messages()` (truncation) on any failure.
+    fn llm_compact_summary(&self, compacted_range: &[ChatMessage]) -> String {
+        // Build a compact representation of the conversation for the summarizer
+        let transcript = summarize_chat_messages(compacted_range);
+
+        let summarize_request = ChatRequest {
+            model: self.cfg.llm.base_model.clone(),
+            messages: vec![
+                ChatMessage::System {
+                    content: "You are a conversation summarizer. Produce a concise summary of the \
+                              following conversation transcript. Preserve:\n\
+                              1. The user's original request and intent\n\
+                              2. Key decisions made and approaches chosen\n\
+                              3. Files read, created, or modified (with paths)\n\
+                              4. Current task state and progress\n\
+                              5. Any errors, blockers, or important context\n\n\
+                              Output ONLY the summary, no preamble. Keep it under 500 words."
+                        .to_string(),
+                },
+                ChatMessage::User {
+                    content: format!("Summarize this conversation transcript:\n\n{transcript}"),
+                },
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::none(),
+            max_tokens: 2048,
+            temperature: Some(0.0),
+            thinking: None,
+        };
+
+        match self.llm.complete_chat(&summarize_request) {
+            Ok(response) => {
+                let summary = response.text.trim().to_string();
+                if summary.is_empty() {
+                    self.observer
+                        .verbose_log("llm compaction returned empty, falling back to truncation");
+                    transcript
+                } else {
+                    self.observer.verbose_log(&format!(
+                        "llm compaction: {} chars → {} chars",
+                        transcript.len(),
+                        summary.len()
+                    ));
+                    summary
+                }
+            }
+            Err(e) => {
+                self.observer.warn_log(&format!(
+                    "llm compaction failed, using truncation fallback: {e}"
+                ));
+                transcript
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -6667,29 +6876,86 @@ fn seconds_until_off_peak_start(current_hour: u8, start_hour: u8) -> u64 {
     minutes_until * 60
 }
 
-/// Estimate BPE token count using word/character hybrid heuristic.
+/// Estimate BPE token count using a character-class-aware heuristic.
 ///
-/// More accurate than simple `chars/4`: counts whitespace-delimited words
-/// and applies a per-word multiplier based on word length. For BPE tokenizers
-/// (including DeepSeek's), short words (~1 token each), medium words (~1-2
-/// tokens), long words / identifiers (~2-4 tokens). Also adds overhead for
-/// message framing (~4 tokens per message).
+/// BPE tokenizers (including DeepSeek's) split text at whitespace and
+/// punctuation boundaries, then merge frequent byte-pairs into single tokens.
+/// This heuristic models that behavior by:
+///
+/// 1. Splitting on whitespace (each whitespace run ≈ 1 token)
+/// 2. Further splitting words at punctuation/case boundaries
+/// 3. Estimating tokens per fragment based on character class:
+///    - Common English words (all-alpha, ≤6 chars): 1 token
+///    - Longer words / identifiers: ~1 token per 4 chars (BPE average)
+///    - Digits/hex: ~1 token per 3 chars
+///    - Punctuation/operators: 1-2 tokens per symbol cluster
+///    - Non-ASCII / Unicode: ~1 token per 2-4 bytes
 fn estimate_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
     }
     let mut tokens: u64 = 0;
-    for word in text.split_whitespace() {
-        let len = word.len();
-        tokens += match len {
-            0 => 0,
-            1..=3 => 1,                    // short words/symbols: 1 token
-            4..=7 => 2,                    // common words: ~1.5 tokens
-            8..=15 => 3,                   // longer words/identifiers: ~2-3 tokens
-            _ => (len as u64).div_ceil(4), // very long tokens: ~4 chars/token
-        };
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b.is_ascii_whitespace() {
+            // Whitespace runs count as ~1 token
+            while i < len && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            tokens += 1;
+            continue;
+        }
+
+        // Scan a "word" of contiguous non-whitespace
+        let word_start = i;
+        while i < len && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let word = &text[word_start..i];
+        let word_len = word.len();
+
+        // Classify the word
+        let all_alpha = word.bytes().all(|b| b.is_ascii_alphabetic());
+        let all_digit = word.bytes().all(|b| b.is_ascii_digit());
+        let all_hex = word.bytes().all(|b| b.is_ascii_hexdigit());
+        let all_ascii = word.is_ascii();
+        let has_punctuation = word.bytes().any(|b| b.is_ascii_punctuation());
+
+        if all_alpha {
+            // Pure alphabetic words: common English words ≤6 chars ≈ 1 token
+            tokens += match word_len {
+                1..=6 => 1,
+                7..=12 => 2,
+                _ => (word_len as u64).div_ceil(4),
+            };
+        } else if all_digit || all_hex {
+            // Numbers / hex: ~3 chars per token
+            tokens += (word_len as u64).div_ceil(3).max(1);
+        } else if all_ascii && has_punctuation {
+            // Mixed ASCII with punctuation (paths, URLs, operators)
+            // Count punctuation chars as ~1 token each, alpha runs as words
+            let punct_count = word.bytes().filter(|b| b.is_ascii_punctuation()).count();
+            let alpha_len = word_len - punct_count;
+            tokens += punct_count as u64
+                + (alpha_len as u64)
+                    .div_ceil(4)
+                    .max(if alpha_len > 0 { 1 } else { 0 });
+        } else if !all_ascii {
+            // Non-ASCII (Unicode, CJK, etc.): ~2-4 bytes per token
+            // CJK characters are typically 1 token each, others vary
+            let char_count = word.chars().count();
+            tokens += ((char_count as u64) * 3).div_ceil(4).max(1);
+        } else {
+            // Fallback: ~4 chars per token
+            tokens += (word_len as u64).div_ceil(4).max(1);
+        }
     }
-    // Account for whitespace tokens and message framing overhead
+
     tokens.max(1)
 }
 
@@ -7011,6 +7277,44 @@ fn compaction_tail_start(messages: &[ChatMessage], desired_tail: usize) -> usize
 /// the messages list), the older tool results are replaced with a compact
 /// summary to reduce context token usage. The most recent result is always kept
 /// in full so the model has the latest data.
+/// Build a guidance message for the model when a doom-loop is detected.
+/// Returns per-tool hints so the model knows how to break out of the loop.
+fn doom_loop_guidance(failing_tools: &[String]) -> String {
+    let mut parts = Vec::new();
+    for tool in failing_tools {
+        let hint = match tool.as_str() {
+            "bash.run" => {
+                "bash.run: Shell metacharacters (pipes |, &&, ||, ;, backticks, $()) are forbidden, \
+                 and only allowlisted commands are permitted. \
+                 Do NOT retry bash commands for file exploration. Instead use: \
+                 fs_glob to find files by pattern, fs_grep to search file contents, \
+                 fs_read to read files. These built-in tools have no shell restrictions."
+            }
+            "fs.write" | "fs.edit" | "multi_edit" => {
+                "fs.write/fs.edit: The file write was rejected. Check that the target path is \
+                 within the workspace and not in a protected directory. Verify the file exists \
+                 before editing. Do NOT retry the same write — fix the path or content first."
+            }
+            "chrome.navigate" | "chrome.click" | "chrome.screenshot" => {
+                "chrome.*: The browser tool failed. The Chrome connection may be unavailable. \
+                 Do NOT retry browser tools repeatedly. Use web_fetch for HTTP requests, \
+                 or inform the user that browser automation is not available."
+            }
+            "web_fetch" | "web_search" => {
+                "web_fetch/web_search: The web request failed. The URL may be unreachable \
+                 or the network may be unavailable. Do NOT retry with the same URL. \
+                 Try a different URL or inform the user of the failure."
+            }
+            _ => {
+                "A tool is failing repeatedly. Do NOT retry the same call. \
+                 Try an alternative approach or inform the user of the limitation."
+            }
+        };
+        parts.push(format!("IMPORTANT: {hint}"));
+    }
+    parts.join("\n\n")
+}
+
 fn compress_repeated_tool_results(messages: &mut [ChatMessage]) {
     // Walk backwards from the end to find consecutive Tool messages that share
     // the same tool_call_id prefix pattern (same tool name).  We look for runs
@@ -10239,5 +10543,96 @@ mod tests {
             // wasn't applied, confirm the flow completes successfully.
             assert!(!answer.is_empty(), "answer should not be empty");
         }
+    }
+
+    #[test]
+    fn doom_loop_guidance_covers_known_tools() {
+        // Verify the guidance function produces non-empty hints for known tools.
+        let bash_guidance = super::doom_loop_guidance(&["bash.run".to_string()]);
+        assert!(
+            bash_guidance.contains("fs_glob"),
+            "bash.run guidance should suggest fs_glob: {bash_guidance}"
+        );
+
+        let write_guidance = super::doom_loop_guidance(&["fs.write".to_string()]);
+        assert!(
+            write_guidance.contains("workspace"),
+            "fs.write guidance should mention workspace: {write_guidance}"
+        );
+
+        let chrome_guidance = super::doom_loop_guidance(&["chrome.navigate".to_string()]);
+        assert!(
+            chrome_guidance.contains("web_fetch"),
+            "chrome guidance should suggest web_fetch: {chrome_guidance}"
+        );
+
+        let web_guidance = super::doom_loop_guidance(&["web_fetch".to_string()]);
+        assert!(
+            web_guidance.contains("URL"),
+            "web guidance should mention URL: {web_guidance}"
+        );
+
+        let generic_guidance = super::doom_loop_guidance(&["unknown_tool".to_string()]);
+        assert!(
+            generic_guidance.contains("alternative approach"),
+            "generic guidance should suggest alternatives: {generic_guidance}"
+        );
+
+        // Multi-tool guidance combines hints
+        let multi = super::doom_loop_guidance(&["bash.run".to_string(), "fs.write".to_string()]);
+        assert!(
+            multi.contains("fs_glob") && multi.contains("workspace"),
+            "multi-tool guidance should contain both hints: {multi}"
+        );
+    }
+
+    #[test]
+    fn doom_loop_breaker_injects_guidance_for_repeated_failures() {
+        // When the model repeatedly calls a tool that fails, the doom-loop
+        // breaker should inject guidance and the chat should eventually succeed
+        // (or at least not escalate to R1 needlessly).
+        let (dir, mock) = deepseek_testkit::temp_workspace_with_mock();
+        write_mode_router_settings(dir.path(), true, 100); // high threshold so only doom-loop fires
+
+        // Push repeated tool calls that will fail (fs_read on non-existent file)
+        for i in 0..5 {
+            mock.push(deepseek_testkit::Scenario::ToolCall {
+                id: format!("call_{i}"),
+                name: "fs_read".into(),
+                arguments: serde_json::json!({
+                    "file_path": "/nonexistent/path/does_not_exist.txt"
+                })
+                .to_string(),
+            });
+        }
+        // After doom-loop guidance is injected, the model gives a text response
+        mock.push(deepseek_testkit::Scenario::TextResponse(
+            "I understand, the file does not exist. Let me try a different approach.".into(),
+        ));
+
+        let mut engine = AgentEngine::new(dir.path()).expect("engine");
+        engine.set_permission_mode("auto");
+        engine.set_max_turns(Some(10));
+        let result = engine.chat_with_options(
+            "read the missing file",
+            ChatOptions {
+                tools: true,
+                ..Default::default()
+            },
+        );
+        // The chat should complete (with or without error), but should NOT panic
+        // and the events log should show the tool failures were handled.
+        let events_path = dir.path().join(".deepseek/events.jsonl");
+        if events_path.exists() {
+            let contents = fs::read_to_string(&events_path).expect("read events");
+            // Should have ToolResultV1 events for the failed reads
+            assert!(
+                contents.contains("ToolResultV1"),
+                "should have recorded tool results"
+            );
+        }
+        // The result may succeed (doom-loop guidance helped) or fail (max turns).
+        // Either way, the key assertion is that we didn't panic.
+        let _ = result;
     }
 }

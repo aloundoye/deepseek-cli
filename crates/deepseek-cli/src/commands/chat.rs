@@ -69,6 +69,8 @@ pub(crate) fn run_chat(
     if let Some(cli) = cli {
         apply_cli_flags(&mut engine, cli);
     }
+    // Validate API key works before entering chat loop
+    engine.validate_api_key()?;
     let mut force_max_think = cli
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
@@ -877,6 +879,14 @@ pub(crate) fn run_chat(
                         let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
                         let _ = handle.flush();
                     }
+                    deepseek_core::StreamChunk::ImageData { label, .. } => {
+                        let _ = writeln!(handle, "[image: {label}]");
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::ClearStreamingText => {
+                        // In non-TUI mode, nothing to clear — text already
+                        // written to stdout. Ignore.
+                    }
                     deepseek_core::StreamChunk::Done => {
                         let _ = writeln!(handle);
                         let _ = handle.flush();
@@ -947,6 +957,7 @@ pub(crate) fn run_chat_tui(
         status,
         bindings,
         theme,
+        cfg.ui.reduced_motion,
         rx,
         |prompt| {
             // Handle slash commands synchronously, sending result via channel.
@@ -1410,6 +1421,12 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ModeTransition { from, to, reason } => {
                     let _ = tx_stream.send(TuiStreamEvent::ModeTransition { from, to, reason });
                 }
+                StreamChunk::ImageData { data, label } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ImageDisplay { data, label });
+                }
+                StreamChunk::ClearStreamingText => {
+                    let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
+                }
                 StreamChunk::Done => {}
             }));
 
@@ -1657,10 +1674,10 @@ fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
         let raw = std::fs::read_to_string(&local_path)?;
         let mut root =
             serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| json!({}));
-        if let Some(llm) = root.get_mut("llm").and_then(|entry| entry.as_object_mut()) {
-            if llm.remove("api_key").is_some() {
-                settings_updated = true;
-            }
+        if let Some(llm) = root.get_mut("llm").and_then(|entry| entry.as_object_mut())
+            && llm.remove("api_key").is_some()
+        {
+            settings_updated = true;
         }
         std::fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
     }
@@ -2181,8 +2198,10 @@ fn parse_debug_analysis_args(args: &[String]) -> Result<Option<DoctorArgs>> {
         ));
     }
 
-    let mut doctor_args = DoctorArgs::default();
-    doctor_args.mode = mode;
+    let mut doctor_args = DoctorArgs {
+        mode,
+        ..DoctorArgs::default()
+    };
     if remaining.len() == 1 && Path::new(&remaining[0]).exists() {
         doctor_args.analyze_file = Some(remaining[0].clone());
     } else {
@@ -2351,6 +2370,22 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                         let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
                     }
                     let _ = handle.flush();
+                }
+                StreamChunk::ImageData { label, .. } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "image", "label": label}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "[image: {label}]");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::ClearStreamingText => {
+                    // In non-TUI mode, nothing to clear — text already
+                    // written to stdout.
                 }
                 StreamChunk::Done => {
                     if stream_json {

@@ -296,12 +296,11 @@ pub fn v3_patch_write(
 
 /// Parse a file spec like "src/lib.rs:10-50" into (path, optional (start, end)).
 fn parse_file_spec(spec: &str) -> (&str, Option<(usize, usize)>) {
-    if let Some((path, range)) = spec.rsplit_once(':') {
-        if let Some((start, end)) = range.split_once('-') {
-            if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
-                return (path, Some((s, e)));
-            }
-        }
+    if let Some((path, range)) = spec.rsplit_once(':')
+        && let Some((start, end)) = range.split_once('-')
+        && let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>())
+    {
+        return (path, Some((s, e)));
     }
     (spec, None)
 }

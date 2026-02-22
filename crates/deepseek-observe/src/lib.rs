@@ -86,6 +86,12 @@ impl Observer {
         }
     }
 
+    /// Log a warning — always written to log file, and to stderr.
+    pub fn warn_log(&self, msg: &str) {
+        eprintln!("[deepseek WARN] {msg}");
+        let _ = self.append_log_line(&format!("{} WARN {msg}", Utc::now().to_rfc3339()));
+    }
+
     fn append_log_line(&self, line: &str) -> Result<()> {
         let mut f = OpenOptions::new()
             .create(true)

@@ -147,15 +147,15 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
 /// Strip markdown code fences (```json ... ``` or ``` ... ```)
 fn strip_code_fences(text: &str) -> &str {
     let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("```json") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim();
-        }
+    if let Some(rest) = trimmed.strip_prefix("```json")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim();
     }
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim();
-        }
+    if let Some(rest) = trimmed.strip_prefix("```")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim();
     }
     trimmed
 }
@@ -316,12 +316,11 @@ impl std::fmt::Display for R1ParseError {
 /// V3 should return either a unified diff or `{"type":"need_more_context",...}`.
 pub fn parse_v3_patch_response(text: &str) -> V3PatchResponse {
     // Check for need_more_context JSON first
-    if let Some(json_str) = extract_json_object(text) {
-        if let Ok(nmc) = serde_json::from_str::<NeedMoreContext>(json_str) {
-            if nmc.response_type == "need_more_context" {
-                return V3PatchResponse::NeedMoreContext(nmc);
-            }
-        }
+    if let Some(json_str) = extract_json_object(text)
+        && let Ok(nmc) = serde_json::from_str::<NeedMoreContext>(json_str)
+        && nmc.response_type == "need_more_context"
+    {
+        return V3PatchResponse::NeedMoreContext(nmc);
     }
 
     // Otherwise treat entire output as unified diff
@@ -334,18 +333,18 @@ fn extract_unified_diff(text: &str) -> String {
     let trimmed = text.trim();
 
     // Try to extract from ```diff ... ``` fences
-    if let Some(rest) = trimmed.strip_prefix("```diff") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim().to_string();
-        }
+    if let Some(rest) = trimmed.strip_prefix("```diff")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim().to_string();
     }
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            // Only use if it looks like a diff
-            let inner = inner.trim();
-            if inner.starts_with("---") || inner.starts_with("diff ") {
-                return inner.to_string();
-            }
+    if let Some(rest) = trimmed.strip_prefix("```")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        // Only use if it looks like a diff
+        let inner = inner.trim();
+        if inner.starts_with("---") || inner.starts_with("diff ") {
+            return inner.to_string();
         }
     }
 

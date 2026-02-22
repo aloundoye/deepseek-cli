@@ -1112,6 +1112,11 @@ pub enum StreamChunk {
         to: String,
         reason: String,
     },
+    /// An image was read and should be displayed inline in the terminal.
+    ImageData { data: Vec<u8>, label: String },
+    /// Clear any previously streamed text — the response contains tool calls,
+    /// so the interleaved text fragments should be discarded from the display.
+    ClearStreamingText,
     /// Streaming is done; the final assembled response follows.
     Done,
 }
@@ -1454,6 +1459,19 @@ fn merge_json_value(base: &mut serde_json::Value, overlay: &serde_json::Value) {
     }
 }
 
+/// Prompt caching strategy for API requests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheStrategy {
+    /// Annotate system prompt + first user message (stable prefix).
+    #[default]
+    Auto,
+    /// Annotate system prompt + first 3 messages (more aggressive prefix caching).
+    Aggressive,
+    /// No cache annotations.
+    Off,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
@@ -1469,6 +1487,7 @@ pub struct LlmConfig {
     pub fast_mode: bool,
     pub language: String,
     pub prompt_cache_enabled: bool,
+    pub cache_strategy: CacheStrategy,
     pub timeout_seconds: u64,
     pub max_retries: u8,
     pub retry_base_ms: u64,
@@ -1490,6 +1509,7 @@ impl Default for LlmConfig {
             fast_mode: false,
             language: "en".to_string(),
             prompt_cache_enabled: true,
+            cache_strategy: CacheStrategy::Auto,
             timeout_seconds: 60,
             max_retries: 3,
             retry_base_ms: 400,
@@ -1618,6 +1638,46 @@ impl std::str::FromStr for ApprovalMode {
     }
 }
 
+/// Review mode controls which tools are sent to the LLM.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewMode {
+    /// All tools available (default behavior).
+    #[default]
+    Off,
+    /// All tools sent but write tools require explicit user approval before execution.
+    Suggest,
+    /// Only read-only tools are sent to the LLM — write tools are omitted entirely.
+    Strict,
+}
+
+impl ReviewMode {
+    /// Returns true if this tool name is read-only and allowed in strict mode.
+    pub fn is_read_only_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "fs_read"
+                | "fs_glob"
+                | "fs_grep"
+                | "fs_list"
+                | "git_status"
+                | "git_diff"
+                | "git_show"
+                | "git_log"
+                | "web_search"
+                | "web_fetch"
+                | "notebook_read"
+                | "index_query"
+                | "think_deeply"
+                | "spawn_task"
+                | "task_output"
+                | "task_list"
+                | "task_get"
+                | "user_question"
+        )
+    }
+}
+
 /// Sandbox enforcement mode for tool execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1709,6 +1769,9 @@ pub struct PolicyConfig {
     /// OS-level sandbox configuration.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Review mode: controls which tools are sent to the LLM.
+    #[serde(default)]
+    pub review_mode: ReviewMode,
 }
 
 impl Default for PolicyConfig {
@@ -1743,6 +1806,7 @@ impl Default for PolicyConfig {
             permission_mode: PermissionMode::Ask,
             lint_after_edit: None,
             sandbox: SandboxConfig::default(),
+            review_mode: ReviewMode::Off,
         }
     }
 }
@@ -1855,6 +1919,14 @@ pub struct ContextConfig {
     /// Higher values retain more context at the cost of more tokens.
     #[serde(default)]
     pub compaction_tail_window: Option<usize>,
+    /// Tokens reserved for tool definitions + system prompt overhead.
+    /// Subtracted from the context window before applying `auto_compact_threshold`.
+    #[serde(default)]
+    pub reserved_overhead_tokens: u64,
+    /// Tokens reserved for the model's response.
+    /// Ensures enough space remains for output after filling conversation history.
+    #[serde(default)]
+    pub response_budget_tokens: u64,
 }
 
 impl Default for ContextConfig {
@@ -1863,6 +1935,8 @@ impl Default for ContextConfig {
             auto_compact_threshold: 0.86,
             compact_preview: true,
             compaction_tail_window: None,
+            reserved_overhead_tokens: 4_000,
+            response_budget_tokens: 8_192,
         }
     }
 }

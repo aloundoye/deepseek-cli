@@ -44,6 +44,7 @@ impl ConsultationType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "error_analysis" => Self::ErrorAnalysis,

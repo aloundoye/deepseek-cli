@@ -109,29 +109,29 @@ fn require_string(args: &Value, field: &str, msg: &str) -> Result<(), String> {
 /// Models may use either `path` or `file_path` depending on the schema version.
 fn require_path(args: &Value) -> Result<(), String> {
     for field in &["path", "file_path"] {
-        if let Some(Value::String(s)) = args.get(*field) {
-            if !s.is_empty() {
-                return Ok(());
-            }
+        if let Some(Value::String(s)) = args.get(*field)
+            && !s.is_empty()
+        {
+            return Ok(());
         }
     }
     Err("'path' (or 'file_path') is required".to_string())
 }
 
 fn validate_line_range(args: &Value) -> Result<(), String> {
-    if let Some(start) = args.get("start_line").and_then(|v| v.as_i64()) {
-        if start < 1 {
-            return Err("start_line must be >= 1 (lines are 1-based)".to_string());
-        }
+    if let Some(start) = args.get("start_line").and_then(|v| v.as_i64())
+        && start < 1
+    {
+        return Err("start_line must be >= 1 (lines are 1-based)".to_string());
     }
     if let Some(end) = args.get("end_line").and_then(|v| v.as_i64()) {
         if end < 1 {
             return Err("end_line must be >= 1 (lines are 1-based)".to_string());
         }
-        if let Some(start) = args.get("start_line").and_then(|v| v.as_i64()) {
-            if end < start {
-                return Err(format!("end_line ({end}) must be >= start_line ({start})"));
-            }
+        if let Some(start) = args.get("start_line").and_then(|v| v.as_i64())
+            && end < start
+        {
+            return Err(format!("end_line ({end}) must be >= start_line ({start})"));
         }
     }
     Ok(())

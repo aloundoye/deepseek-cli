@@ -260,10 +260,10 @@ pub fn r1_drive_loop(
                 // Track file changes
                 if result.success {
                     tracker.record_success();
-                    if is_write_tool(&intent.tool) {
-                        if let Some(path) = intent.args.get("file_path").and_then(|v| v.as_str()) {
-                            tracker.record_file_change(path);
-                        }
+                    if is_write_tool(&intent.tool)
+                        && let Some(path) = intent.args.get("file_path").and_then(|v| v.as_str())
+                    {
+                        tracker.record_file_change(path);
                     }
                 } else {
                     tracker.record_failure();
@@ -297,12 +297,12 @@ pub fn r1_drive_loop(
                 obs_builder = ObservationPackBuilder::new(step, repo.clone());
 
                 // If intent requested verification, note it
-                if intent.verify_after {
-                    if let Some(cb) = stream_callback {
-                        cb(StreamChunk::ContentDelta(format!(
-                            "[r1_drive step {step}] verification requested\n"
-                        )));
-                    }
+                if intent.verify_after
+                    && let Some(cb) = stream_callback
+                {
+                    cb(StreamChunk::ContentDelta(format!(
+                        "[r1_drive step {step}] verification requested\n"
+                    )));
                 }
             }
 

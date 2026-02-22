@@ -4,7 +4,20 @@
 //! - **V3Autopilot**: `deepseek-chat` with thinking + tools (fast, default).
 //! - **R1DriveTools**: R1 emits tool-intent JSON, orchestrator executes, R1 iterates.
 //!
-//! Escalation policy: V3 → R1 on doom-loops, ambiguous errors, blast radius, cross-module.
+//! Escalation triggers (checked by `decide_mode()` after each tool execution batch):
+//! 1. **Doom-loop** (highest priority): same `ToolSignature` fails ≥ threshold (default 2).
+//! 2. **Repeated step failures**: consecutive failures ≥ threshold (default 5).
+//! 3. **Ambiguous errors**: `ErrorClass::Ambiguous`.
+//! 4. **Blast radius**: ≥ threshold (default 10) files changed without verification.
+//! 5. **Cross-module failures**: errors span 2+ modules.
+//!
+//! Special case: policy doom-loop breaker (in agent `lib.rs`, not here). When all
+//! doom-loop signatures are `bash.run` policy errors, the agent injects tool guidance
+//! and resets trackers instead of escalating — R1 faces the same policy restrictions.
+//!
+//! V3 also has lightweight R1 consultation (`consultation.rs`) as an alternative to
+//! full escalation — R1 returns text-only advice while V3 keeps control and tools.
+//!
 //! Hysteresis: once in R1, stay until verify green, R1 `done`/`abort`, or budget exhausted.
 
 use crate::observation::{ErrorClass, ObservationPack};
@@ -338,13 +351,13 @@ pub fn decide_mode(
     }
 
     // 2. Ambiguous errors
-    if let Some(obs) = observation {
-        if obs.error_class == ErrorClass::Ambiguous {
-            return ModeDecision {
-                mode: AgentMode::R1DriveTools,
-                reason: Some(EscalationReason::AmbiguousError),
-            };
-        }
+    if let Some(obs) = observation
+        && obs.error_class == ErrorClass::Ambiguous
+    {
+        return ModeDecision {
+            mode: AgentMode::R1DriveTools,
+            reason: Some(EscalationReason::AmbiguousError),
+        };
     }
 
     // 3. Blast radius
@@ -416,8 +429,10 @@ mod tests {
             enabled: false,
             ..default_config()
         };
-        let mut tracker = FailureTracker::default();
-        tracker.consecutive_step_failures = 100;
+        let tracker = FailureTracker {
+            consecutive_step_failures: 100,
+            ..FailureTracker::default()
+        };
         let decision = decide_mode(&config, AgentMode::V3Autopilot, &tracker, None);
         assert_eq!(decision.mode, AgentMode::V3Autopilot);
     }
@@ -522,8 +537,10 @@ mod tests {
             r1_max_steps: 5,
             ..default_config()
         };
-        let mut tracker = FailureTracker::default();
-        tracker.r1_steps_used = 5;
+        let tracker = FailureTracker {
+            r1_steps_used: 5,
+            ..FailureTracker::default()
+        };
         let decision = decide_mode(&config, AgentMode::R1DriveTools, &tracker, None);
         assert_eq!(decision.mode, AgentMode::V3Autopilot);
         assert_eq!(decision.reason, Some(EscalationReason::R1BudgetExhausted));
@@ -532,17 +549,21 @@ mod tests {
     #[test]
     fn stays_in_r1_drive_within_budget() {
         let config = default_config();
-        let mut tracker = FailureTracker::default();
-        tracker.r1_steps_used = 3;
+        let tracker = FailureTracker {
+            r1_steps_used: 3,
+            ..FailureTracker::default()
+        };
         let decision = decide_mode(&config, AgentMode::R1DriveTools, &tracker, None);
         assert_eq!(decision.mode, AgentMode::R1DriveTools);
     }
 
     #[test]
     fn verify_pass_resets_tracker() {
-        let mut tracker = FailureTracker::default();
-        tracker.consecutive_step_failures = 5;
-        tracker.v3_recovery_used = true;
+        let mut tracker = FailureTracker {
+            consecutive_step_failures: 5,
+            v3_recovery_used: true,
+            ..FailureTracker::default()
+        };
         tracker.record_file_change("a.rs");
         tracker.record_error_module("auth");
         tracker.record_verify_pass();

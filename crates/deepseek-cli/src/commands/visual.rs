@@ -794,7 +794,7 @@ fn infer_component_hints(
 fn infer_component_name(artifact_path: &str) -> Option<String> {
     let stem = Path::new(artifact_path).file_stem()?.to_str()?;
     let parts = stem
-        .split(|ch: char| ch == '-' || ch == '_' || ch == '.')
+        .split(['-', '_', '.'])
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();

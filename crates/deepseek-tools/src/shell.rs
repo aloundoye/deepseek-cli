@@ -26,7 +26,22 @@ impl ShellRunner for PlatformShellRunner {
 
         let status = child.wait_timeout(timeout)?;
         if status.is_none() {
-            child.kill()?;
+            // Timeout: escalate SIGTERM → SIGKILL
+            #[cfg(unix)]
+            {
+                // Send SIGTERM first for graceful shutdown
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                }
+                // Wait briefly for graceful exit, then force kill
+                if child.wait_timeout(Duration::from_secs(2))?.is_none() {
+                    let _ = child.kill(); // SIGKILL
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
             let output = child.wait_with_output()?;
             return Ok(ShellRunResult {
                 status: output.status.code(),
@@ -58,6 +73,12 @@ fn spawn_command(cmd: &str, cwd: &Path) -> Result<Child> {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.stdin(Stdio::null());
+        // Harden shell environment
+        command.env("LC_ALL", "C"); // Prevent locale-dependent output
+        command.env_remove("LD_PRELOAD"); // Prevent library injection (Linux)
+        command.env_remove("DYLD_INSERT_LIBRARIES"); // Prevent library injection (macOS)
+        command.env_remove("LD_LIBRARY_PATH"); // Prevent library path hijacking
+        command.env_remove("DYLD_LIBRARY_PATH"); // Prevent library path hijacking (macOS)
         let program = command.get_program().to_string_lossy().to_string();
         match command.spawn() {
             Ok(child) => return Ok(child),

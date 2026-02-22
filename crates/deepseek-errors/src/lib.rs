@@ -86,10 +86,8 @@ impl EnhancedError {
         output.push_str(&format!("  {}\n", self.message));
 
         // Context (if verbose)
-        if verbose {
-            if let Some(context) = &self.context {
-                output.push_str(&format!("\n  Context: {}\n", context));
-            }
+        if verbose && let Some(context) = &self.context {
+            output.push_str(&format!("\n  Context: {}\n", context));
         }
 
         // Suggestions
@@ -144,6 +142,12 @@ impl std::error::Error for EnhancedError {}
 pub struct ErrorHandler {
     verbose: bool,
     show_suggestions: bool,
+}
+
+impl Default for ErrorHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ErrorHandler {
@@ -266,7 +270,7 @@ pub mod errors {
     pub fn file_not_found(path: &str) -> EnhancedError {
         EnhancedError::new(
             "File Not Found",
-            &format!("The file '{}' does not exist.", path),
+            format!("The file '{}' does not exist.", path),
             ErrorType::Validation,
         )
         .with_suggestions(vec![
@@ -280,7 +284,7 @@ pub mod errors {
     pub fn invalid_configuration(field: &str, value: &str) -> EnhancedError {
         EnhancedError::new(
             "Invalid Configuration",
-            &format!("Invalid value '{}' for field '{}'.", value, field),
+            format!("Invalid value '{}' for field '{}'.", value, field),
             ErrorType::Configuration,
         )
         .with_suggestions(vec![
@@ -294,7 +298,7 @@ pub mod errors {
     pub fn tool_permission_denied(tool: &str) -> EnhancedError {
         EnhancedError::new(
             "Tool Permission Denied",
-            &format!("Permission denied for tool '{}'.", tool),
+            format!("Permission denied for tool '{}'.", tool),
             ErrorType::Permission,
         )
         .with_suggestions(vec![
@@ -318,6 +322,12 @@ pub struct GuidanceTip {
     pub message: String,
     pub context: Vec<String>, // When to show this tip
     pub frequency: u32,       // How often to show (1 = always, 10 = rarely)
+}
+
+impl Default for UserGuidance {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UserGuidance {

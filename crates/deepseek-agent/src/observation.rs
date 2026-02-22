@@ -287,26 +287,26 @@ pub fn extract_file_refs(text: &str) -> Vec<String> {
         // Rust-style: --> src/lib.rs:42:10
         if let Some(arrow_pos) = line.find("--> ") {
             let rest = &line[arrow_pos + 4..];
-            if let Some(ref_str) = rest.split_whitespace().next() {
-                if ref_str.contains(':') && !ref_str.starts_with("http") {
-                    refs.push(ref_str.to_string());
-                }
+            if let Some(ref_str) = rest.split_whitespace().next()
+                && ref_str.contains(':')
+                && !ref_str.starts_with("http")
+            {
+                refs.push(ref_str.to_string());
             }
         }
         // Generic: path.rs:42 or path.rs:42:10
         for word in line.split_whitespace() {
             let cleaned = word.trim_matches(|c: char| c == ',' || c == ')' || c == '(');
-            if let Some((path, rest)) = cleaned.split_once(':') {
-                if (path.ends_with(".rs")
+            if let Some((path, rest)) = cleaned.split_once(':')
+                && (path.ends_with(".rs")
                     || path.ends_with(".py")
                     || path.ends_with(".ts")
                     || path.ends_with(".js")
                     || path.ends_with(".go"))
-                    && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
-                    && !refs.contains(&cleaned.to_string())
-                {
-                    refs.push(cleaned.to_string());
-                }
+                && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && !refs.contains(&cleaned.to_string())
+            {
+                refs.push(cleaned.to_string());
             }
         }
     }

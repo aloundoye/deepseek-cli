@@ -28,3 +28,7 @@ deepseek-memory = { path = "../deepseek-memory" }
 deepseek-chrome = { path = "../deepseek-chrome" }
 base64.workspace = true
 pdf-extract.workspace = true
+scraper.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

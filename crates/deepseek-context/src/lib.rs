@@ -147,16 +147,15 @@ impl ContextManager {
         let mut imports = Vec::new();
 
         for line in content.lines() {
-            if let Some(pattern) = self.import_patterns.get(ext.as_str()) {
-                if let Some(caps) = pattern.captures(line) {
-                    if let Some(import) = caps.get(1) {
-                        let import_str = import.as_str();
+            if let Some(pattern) = self.import_patterns.get(ext.as_str())
+                && let Some(caps) = pattern.captures(line)
+                && let Some(import) = caps.get(1)
+            {
+                let import_str = import.as_str();
 
-                        // Try to resolve import to actual file
-                        if let Some(resolved) = self.resolve_import(path, import_str) {
-                            imports.push(resolved);
-                        }
-                    }
+                // Try to resolve import to actual file
+                if let Some(resolved) = self.resolve_import(path, import_str) {
+                    imports.push(resolved);
                 }
             }
         }
