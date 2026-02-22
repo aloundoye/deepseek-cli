@@ -1,12 +1,17 @@
 pub mod consultation;
 pub mod mode_router;
 pub mod observation;
+pub mod plan_discipline;
 pub mod protocol;
 pub mod r1_drive;
 pub mod v3_patch;
 
 use crate::mode_router::{AgentMode, FailureTracker, ModeRouterConfig, ToolSignature, decide_mode};
 use crate::observation::RepoFacts;
+use crate::plan_discipline::{
+    PlanState, PlanStatus, derive_verify_commands, detect_planning_triggers, inject_step_context,
+    inject_verification_feedback, remove_step_context,
+};
 use crate::r1_drive::{R1DriveConfig, R1DriveOutcome, r1_drive_loop};
 use crate::v3_patch::{FileReader, V3PatchConfig, V3PatchOutcome, v3_patch_write};
 use anyhow::{Context as _, Result, anyhow};
@@ -1344,6 +1349,37 @@ impl AgentEngine {
         let mut failure_tracker = FailureTracker::default();
         let mut current_mode = AgentMode::V3Autopilot;
         let mut budget_warned = false;
+
+        // ── Plan discipline: detect triggers and generate plan if needed ──
+        let context_signals = deepseek_tools::detect_signals(prompt, &self.workspace);
+        let planning_triggers = detect_planning_triggers(
+            prompt,
+            context_signals.codebase_file_count,
+            failure_streak,
+            context_signals.prompt_is_complex,
+        );
+        let mut plan_state = PlanState::default();
+        if planning_triggers.should_plan() {
+            let derived_verify = derive_verify_commands(&self.workspace);
+            if let Some(plan) = self.generate_plan_for_chat(prompt, &messages) {
+                let verify = if plan.verification.is_empty() {
+                    derived_verify
+                } else {
+                    plan.verification.clone()
+                };
+                self.observer.verbose_log(&format!(
+                    "plan_discipline: generated {}-step plan for: {}",
+                    plan.steps.len(),
+                    plan.goal
+                ));
+                plan_state = PlanState::with_plan(plan, verify);
+                plan_state.start_execution();
+            } else {
+                self.observer
+                    .verbose_log("plan_discipline: plan generation failed, continuing without");
+            }
+        }
+
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
         loop {
@@ -1459,10 +1495,17 @@ impl AgentEngine {
                     let to_turn = compacted_range.len() as u64;
                     let summary_id = Uuid::now_v7();
 
+                    // ── Plan discipline: pin plan summary into compaction ──
+                    let plan_summary_addendum = if plan_state.plan.is_some() {
+                        format!("\n\n{}", plan_state.to_compact_summary())
+                    } else {
+                        String::new()
+                    };
+
                     let mut new_messages = vec![messages[0].clone()];
                     new_messages.push(ChatMessage::User {
                         content: format!(
-                            "[Context compacted — prior conversation summary]\n{summary}"
+                            "[Context compacted — prior conversation summary]\n{summary}{plan_summary_addendum}"
                         ),
                     });
                     new_messages.extend_from_slice(&messages[tail_start..]);
@@ -1577,6 +1620,9 @@ impl AgentEngine {
                 }
             }
 
+            // ── Plan discipline: inject current step context ──
+            let injected_plan_ctx = inject_step_context(&mut messages, &plan_state);
+
             let request = ChatRequest {
                 model: request_model.clone(),
                 messages: messages.clone(),
@@ -1591,6 +1637,11 @@ impl AgentEngine {
                 temperature: if thinking.is_some() { None } else { Some(0.0) },
                 thinking: thinking.clone(),
             };
+
+            // Remove injected plan context immediately so it doesn't persist in history
+            if injected_plan_ctx.is_some() {
+                remove_step_context(&mut messages);
+            }
 
             self.observer.verbose_log(&format!(
                 "turn {turn_count}: calling LLM model={} messages={} tools={}",
@@ -1670,6 +1721,79 @@ impl AgentEngine {
 
             // If the model returned text content with no tool calls, we're done
             if response.tool_calls.is_empty() {
+                // ── Plan discipline: verification gate ──
+                // Before returning, check if we need to run verification.
+                if plan_state.status == PlanStatus::Executing {
+                    plan_state.enter_verification();
+                }
+                if plan_state.status == PlanStatus::Verifying {
+                    if plan_state.verification_is_noop() {
+                        // No verify commands — treat as pass
+                        plan_state.verification_passed();
+                    } else {
+                        match self.run_verification_with_output(
+                            &plan_state.verify_commands,
+                            &mut failure_tracker,
+                            session.session_id,
+                        ) {
+                            Ok(()) => {
+                                self.observer
+                                    .verbose_log("plan_discipline: verification passed");
+                                plan_state.verification_passed();
+                            }
+                            Err(error_msg) => {
+                                plan_state.verification_failed(&error_msg);
+                                self.observer.verbose_log(&format!(
+                                    "plan_discipline: verification failed (streak={})",
+                                    plan_state.verify_failure_streak
+                                ));
+
+                                // Consult R1 after 2+ repeated failures on the same error
+                                if plan_state.verify_failure_streak >= 2 {
+                                    let consultation = crate::consultation::ConsultationRequest {
+                                        question: "Verification keeps failing with the same error. \
+                                                   Analyze the error and suggest a targeted fix strategy."
+                                            .to_string(),
+                                        context: error_msg.clone(),
+                                        consultation_type:
+                                            crate::consultation::ConsultationType::ErrorAnalysis,
+                                    };
+                                    if let Ok(advice) = crate::consultation::consult_r1(
+                                        self.llm.as_ref(),
+                                        &self.cfg.llm.max_think_model,
+                                        &consultation,
+                                        None,
+                                    ) {
+                                        messages.push(ChatMessage::User {
+                                            content: format!(
+                                                "<r1-advice type=\"verification_fix\">\n{}\n</r1-advice>",
+                                                advice.advice
+                                            ),
+                                        });
+                                    }
+                                }
+
+                                // Inject failure feedback and re-enter loop
+                                inject_verification_feedback(
+                                    &mut messages,
+                                    &error_msg,
+                                    plan_state.verify_failure_streak,
+                                );
+
+                                if plan_state.verify_failure_streak >= 4 {
+                                    // Give up after 4 repeated failures — fall through to return
+                                    self.observer.verbose_log(
+                                        "plan_discipline: giving up after 4 repeated verify failures",
+                                    );
+                                } else {
+                                    // Re-enter loop for fixes
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // The answer shown to the user may include reasoning_content as
                 // fallback, but the message persisted for API history must NOT
                 // include reasoning_content (it wastes context tokens on resume).
@@ -2196,7 +2320,7 @@ impl AgentEngine {
                     if result.success {
                         failure_streak = 0;
                         failure_tracker.record_success();
-                        // Track file changes for blast radius
+                        // Track file changes for blast radius + plan discipline
                         if matches!(
                             deepseek_core::ToolName::from_internal_name(internal_name),
                             Some(
@@ -2206,9 +2330,29 @@ impl AgentEngine {
                                     | deepseek_core::ToolName::PatchApply
                             )
                         ) {
-                            if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
+                            if let Some(path) = args
+                                .get("path")
+                                .or_else(|| args.get("file_path"))
+                                .and_then(|v| v.as_str())
+                            {
                                 failure_tracker.record_file_change(path);
+                                plan_state.record_file_touched(path);
                             }
+                            // multi_edit: track each file in the edits array
+                            if internal_name == "multi_edit" {
+                                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                                    for edit in edits {
+                                        if let Some(p) = edit
+                                            .get("path")
+                                            .or_else(|| edit.get("file_path"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            plan_state.record_file_touched(p);
+                                        }
+                                    }
+                                }
+                            }
+                            plan_state.maybe_advance_step();
                         }
                     } else {
                         failure_streak += 1;
@@ -2624,6 +2768,62 @@ impl AgentEngine {
         }
     }
 
+    /// Generate a lightweight plan for the chat discipline loop.
+    ///
+    /// Calls V3 with no tools to produce a JSON plan, then parses it using
+    /// the existing `parse_plan_from_llm` infrastructure. Returns `None` on
+    /// failure (graceful degradation — the loop continues without a plan).
+    fn generate_plan_for_chat(&self, prompt: &str, messages: &[ChatMessage]) -> Option<Plan> {
+        let planning_prompt = format!(
+            "Before executing, create a step-by-step plan for the following task.\n\n\
+             Task: {prompt}\n\n\
+             Return a JSON object with these fields:\n\
+             - \"goal\": string (1-sentence summary)\n\
+             - \"assumptions\": [string] (what you're assuming)\n\
+             - \"steps\": [{{\"title\": string, \"intent\": string, \"tools\": [string], \"files\": [string]}}]\n\
+             - \"verification\": [string] (shell commands to verify success)\n\
+             - \"risk_notes\": [string]\n\n\
+             Keep it concise: 3-8 steps max. Only include files you plan to modify.\n\
+             Return ONLY the JSON object, no markdown fences."
+        );
+
+        // Build minimal messages: system + planning prompt
+        let plan_messages = vec![
+            messages.first().cloned().unwrap_or(ChatMessage::System {
+                content: "You are a coding assistant creating a task plan.".to_string(),
+            }),
+            ChatMessage::User {
+                content: planning_prompt,
+            },
+        ];
+
+        let request = ChatRequest {
+            model: self.cfg.llm.base_model.clone(),
+            messages: plan_messages,
+            tools: vec![],
+            tool_choice: ToolChoice::none(),
+            max_tokens: 2048,
+            temperature: Some(0.3),
+            thinking: None,
+        };
+
+        match self.llm.complete_chat(&request) {
+            Ok(response) => {
+                let text = if !response.text.is_empty() {
+                    &response.text
+                } else {
+                    &response.reasoning_content
+                };
+                parse_plan_from_llm(text, prompt)
+            }
+            Err(e) => {
+                self.observer
+                    .verbose_log(&format!("plan_discipline: LLM plan generation error: {e}"));
+                None
+            }
+        }
+    }
+
     /// Run verification commands and return true if all pass.
     fn run_verification(
         &self,
@@ -2668,6 +2868,89 @@ impl AgentEngine {
             );
         }
         all_passed
+    }
+
+    /// Run verification commands and return error output on failure.
+    ///
+    /// Like `run_verification` but returns `Err(error_text)` with the
+    /// concatenated output of all failing commands, enabling the plan
+    /// discipline loop to inject the error into the conversation for fixes.
+    fn run_verification_with_output(
+        &self,
+        commands: &[String],
+        tracker: &mut FailureTracker,
+        session_id: uuid::Uuid,
+    ) -> std::result::Result<(), String> {
+        let mut errors = Vec::new();
+        for cmd in commands {
+            self.observer
+                .verbose_log(&format!("verify: running `{cmd}`"));
+            let tool_call = deepseek_core::ToolCall {
+                name: "bash.run".to_string(),
+                args: serde_json::json!({"cmd": cmd, "timeout_ms": 60000}),
+                requires_approval: false,
+            };
+            let proposal = self.tool_host.propose(tool_call);
+            if !proposal.approved {
+                self.observer
+                    .verbose_log(&format!("verify: `{cmd}` denied by policy"));
+                errors.push(format!("Command `{cmd}` denied by policy"));
+                continue;
+            }
+            let result = self.tool_host.execute(ApprovedToolCall {
+                invocation_id: proposal.invocation_id,
+                call: proposal.call,
+            });
+            if result.success {
+                self.observer
+                    .verbose_log(&format!("verify: `{cmd}` passed"));
+            } else {
+                self.observer
+                    .verbose_log(&format!("verify: `{cmd}` FAILED"));
+                tracker.record_failure();
+                // Extract error output from ToolResult
+                let output_text = result
+                    .output
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        result
+                            .output
+                            .get("stderr")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| {
+                        result
+                            .output
+                            .get("stdout")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| result.output.to_string());
+                // Cap at 2000 chars to avoid flooding context
+                let truncated = if output_text.len() > 2000 {
+                    format!(
+                        "{}...(truncated)",
+                        &output_text[..output_text.floor_char_boundary(2000)]
+                    )
+                } else {
+                    output_text
+                };
+                errors.push(format!("Command `{cmd}` failed:\n{truncated}"));
+            }
+            let _ = self.emit(
+                session_id,
+                EventKind::ToolResultV1 {
+                    result: result.clone(),
+                },
+            );
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n\n"))
+        }
     }
 
     /// Build a system prompt for chat-with-tools mode.
@@ -2817,7 +3100,15 @@ impl AgentEngine {
              - Use `fs_grep` with `glob` patterns to narrow searches (e.g., `glob: \"*.rs\"`)\n\
              - Prefer `fs_edit` over `fs_write` for existing files — it preserves unchanged content\n\
              - Use `multi_edit` when editing 2+ files for the same logical change\n\
-             - If you need a tool not in your current set, use `tool_search` to discover it",
+             - If you need a tool not in your current set, use `tool_search` to discover it\n\n\
+             # Plan-Aware Execution\n\
+             When a <plan-context> message appears, it describes the current step in a structured plan:\n\
+             - Focus on completing the current step before moving to the next\n\
+             - Use the tools and files listed for that step\n\
+             When a <verification-failure> message appears:\n\
+             - Read the error carefully and identify the root cause\n\
+             - Make targeted fixes to address the specific failure\n\
+             - Do NOT repeat the same fix if it already failed",
         );
 
         // Add language preference if set.
