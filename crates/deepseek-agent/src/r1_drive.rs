@@ -22,6 +22,8 @@ use deepseek_core::{
 };
 use deepseek_llm::LlmClient;
 use deepseek_observe::Observer;
+use deepseek_tools::normalize_tool_args_with_workspace;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Outcome of an R1 drive-tools session.
@@ -56,19 +58,19 @@ const R1_SYSTEM_PROMPT: &str = r#"You are a senior software architect directing 
 7. Use "abort" only when the task is fundamentally impossible.
 
 ## Tool argument formats
-- read_file: {"file_path": "path/to/file"}
-- write_file: {"file_path": "path/to/file", "content": "..."}
-- edit_file: {"file_path": "path/to/file", "old_string": "...", "new_string": "..."}
+- read_file: {"path": "path/to/file"} (alias: file_path)
+- write_file: {"path": "path/to/file", "content": "..."} (alias: file_path)
+- edit_file: {"path": "path/to/file", "search": "...", "replace": "..."} (aliases: old_string/new_string)
 - glob: {"pattern": "**/*.rs"}
 - ripgrep: {"pattern": "regex", "glob": "*.rs"}
-- run_cmd: {"command": "cargo test", "timeout_ms": 30000}
+- run_cmd: {"cmd": "cargo test", "timeout": 60} (aliases: command/timeout_ms)
 - git_status: {}
 - git_diff: {"ref": "HEAD"}
-- list_dir: {"path": "src/"}
+- list_dir: {"dir": "src/"} (alias: path)
 - apply_patch: {"patch": "unified diff text"}
-- multi_edit: {"edits": [{"file_path": "...", "old_string": "...", "new_string": "..."}]}
+- multi_edit: {"files": [{"path": "...", "edits": [{"search": "...", "replace": "..."}]}]}
 - diagnostics_check: {"path": "src/"}
-- index_query: {"query": "search terms"}
+- index_query: {"q": "search terms"} (alias: query)
 "#;
 
 /// Configuration for an R1 drive session.
@@ -109,6 +111,7 @@ pub fn r1_drive_loop(
     llm: &(dyn LlmClient + Send + Sync),
     tool_host: &Arc<dyn ToolHost + Send + Sync>,
     observer: &Observer,
+    workspace: &Path,
     repo: &RepoFacts,
     tracker: &mut FailureTracker,
     task_description: &str,
@@ -234,7 +237,7 @@ pub fn r1_drive_loop(
                 }
 
                 // Execute the tool
-                let result = execute_r1_tool_intent(&intent, tool_host, observer);
+                let result = execute_r1_tool_intent(&intent, tool_host, observer, workspace);
 
                 // Build action record
                 let output_str = result.output.to_string();
@@ -452,14 +455,17 @@ fn execute_r1_tool_intent(
     intent: &ToolIntent,
     tool_host: &Arc<dyn ToolHost + Send + Sync>,
     observer: &Observer,
+    workspace: &Path,
 ) -> ToolResult {
     let internal_name = r1_tool_to_internal(&intent.tool)
         .unwrap_or("unknown")
         .to_string();
+    let mut normalized_args = intent.args.clone();
+    normalize_tool_args_with_workspace(&internal_name, &mut normalized_args, workspace);
 
     let tool_call = ToolCall {
         name: internal_name.clone(),
-        args: intent.args.clone(),
+        args: normalized_args,
         requires_approval: false,
     };
 

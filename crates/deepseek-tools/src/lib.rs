@@ -7,7 +7,7 @@ pub use tool_tiers::{
     ToolContextSignals, ToolTier, detect_signals, format_tool_search_results,
     search_extended_tools, tiered_tool_definitions, tool_search_definition, tool_tier,
 };
-pub use validation::validate_tool_args;
+pub use validation::{normalize_tool_args, normalize_tool_args_with_workspace, validate_tool_args};
 
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};

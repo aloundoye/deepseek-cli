@@ -316,23 +316,22 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 | Mode | Model | How Tools Are Called | When Used |
 |------|-------|---------------------|-----------|
 | **V3Autopilot** (default) | `deepseek-chat` | API function calling (thinking + tools unified) | Most tasks; fast, single-call |
-| **R1DriveTools** (escalation) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Complex failures, ambiguous errors, high blast radius |
+| **R1DriveTools** (escalation) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Doom-loops, repeated failures, blast radius escalation, cross-module failures |
 
 **Escalation triggers** (V3Autopilot → R1DriveTools, checked by `decide_mode()` after each tool execution batch):
 1. **Doom-loop** (highest priority) — same tool signature (name + normalized args + exit code bucket) fails ≥ `doom_loop_threshold` (default 2) times
-2. **Repeated step failures** — consecutive failures ≥ `v3_max_step_failures` (default 5) times
-3. **Ambiguous errors** — error cannot be classified (not compile/test/lint/runtime)
-4. **Blast radius exceeded** — ≥ `blast_radius_threshold` (default 10) files changed without verification
-5. **Cross-module failures** — errors span 2+ distinct modules
-6. **Architectural task** — prompt keywords suggest refactor/migrate/restructure
+2. **Repeated step failures** — consecutive failures ≥ `v3_max_step_failures` (effective default 2) times
+3. **Blast radius exceeded** — ≥ `blast_radius_threshold` (effective default 5) files changed without verification
+4. **Cross-module failures** — errors span 2+ distinct modules
+5. **Ambiguous errors** — latest `ObservationPack` classifies the failure as `ErrorClass::Ambiguous`
 
-**Mechanical recovery**: V3 gets one bounded recovery attempt for compile errors, lint errors, or missing dependencies before escalation (`v3_mechanical_recovery = true`). This avoids unnecessary R1 calls for simple fix-and-retry scenarios.
+**Mechanical recovery**: V3 has a bounded recovery mechanism (`v3_mechanical_recovery = true`) for mechanical errors (compile/lint/missing dependency) based on the latest `ObservationPack`, allowing one recovery attempt before escalation.
 
 **Policy doom-loop breaker**: When doom-loop detection fires and all failing signatures are `bash.run` policy errors (forbidden shell metacharacters, command not allowlisted), the agent injects a guidance message redirecting the model to built-in tools (`fs.glob`, `fs.grep`, `fs.read`) and resets failure trackers instead of escalating to R1 (which faces the same policy restrictions). This prevents infinite loops where V3 and R1 both repeatedly fail against the same policy barrier.
 
 **Hysteresis**: Once escalated to R1, stays there until verification passes (`verify_passed_since_r1`), R1 returns `done`/`abort`, or R1 budget is exhausted (forced return to V3). This prevents ping-ponging between modes.
 
-**R1 consultation** (`deepseek-agent::consultation`): Lightweight alternative to full R1DriveTools escalation. V3 asks R1 for targeted advice on a specific subproblem — error analysis, architecture advice, plan review, or task decomposition. R1 returns text-only advice (no JSON intents, no tool execution). Advice is injected into V3's conversation as a tool result. V3 keeps control and tools throughout. This gives V3 more room to self-correct before full escalation (reflected in the raised `v3_max_step_failures` default of 5).
+**R1 consultation** (`deepseek-agent::consultation`): Lightweight alternative to full R1DriveTools escalation. V3 asks R1 for targeted advice on a specific subproblem — error analysis, architecture advice, plan review, or task decomposition. R1 returns text-only advice (no JSON intents, no tool execution). Advice is injected into V3's conversation as a tool result. V3 keeps control and tools throughout. `think_deeply` is in the core tier.
 
 **R1 drive-tools loop** (`deepseek-agent::r1_drive`):
 1. R1 receives an `ObservationPack` (actions, errors, diffs, test results, repo facts)
@@ -344,7 +343,7 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 
 **V3 patch writer** (`deepseek-agent::v3_patch`): When R1 issues `delegate_patch`, V3 is called with a focused prompt to produce a unified diff. Handles `need_more_context` requests by reading additional files. Max context requests configurable via `v3_patch_max_context_requests`.
 
-**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests). Verification failures feed back into the loop.
+**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests). Verification failures feed back into the loop. In chat mode, broad/complex plans can trigger automatic subagent orchestration before the main execution loop, and summarized subagent findings are injected back into context.
 
 **Key modules:**
 - `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `ToolSignature`, `decide_mode()`, escalation + hysteresis logic
@@ -360,14 +359,14 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 **Configuration** (all in `[router]` section):
 ```toml
 mode_router_enabled = true          # Enable mode routing (false = always V3Autopilot)
-v3_max_step_failures = 5            # Consecutive failures before escalation
-blast_radius_threshold = 10         # Files changed without verify before escalation
+v3_max_step_failures = 2            # Consecutive failures before escalation
+blast_radius_threshold = 5          # Files changed without verify before escalation
 v3_mechanical_recovery = true       # Allow V3 one recovery attempt for compile/lint errors
 r1_max_steps = 30                   # Max R1 drive-tools steps per task
 r1_max_parse_retries = 2            # Max retries when R1 JSON fails validation
 v3_patch_max_context_requests = 3   # Max context requests from V3 patch writer
-doom_loop_threshold = 2             # Same tool signature failures before escalation
 ```
+`doom_loop_threshold` is currently fixed at `2` in `ModeRouterConfig::from_router_config()` (not user-configurable in `[router]` yet).
 
 ### 4.5 Tool System
 
