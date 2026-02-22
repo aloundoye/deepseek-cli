@@ -87,7 +87,20 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Tool flow**: `ToolCall` → `ToolProposal` (policy check) → `ApprovedToolCall` → `ToolResult` → event journal. Tools include `fs.read`, `fs.write`, `fs.edit`, `fs.grep`, `fs.glob`, `bash.run`, `git.*`, `web.*`, `notebook.*`, `multi_edit`, and plugins.
 
-**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true` instead of switching models. However, **thinking mode is forcibly disabled when tools are active** (see "Known DeepSeek API Limitations" below). Thinking mode is only applied for pure text responses (no tools) and the legacy planner path. `deepseek-reasoner` does NOT support function calling and is only used for legacy planner paths without tools.
+**Model router** (`deepseek-router`): Weighted complexity scoring toggles thinking mode on `deepseek-chat`. When the score crosses the threshold (default 0.72), the router sets `thinking_enabled=true`.
+
+**Unified thinking + tools** (primary, DeepSeek V3.2): When `router.unified_thinking_tools = true` (default), `deepseek-chat` is called with both `thinking: {type: "enabled"}` and `tools: [...]` in a single API call. The model reasons via chain-of-thought and emits tool calls in one pass. Per V3.2 docs: `reasoning_content` is **kept** within the current tool loop (same user question) so the model retains its logical thread, and **stripped** from prior conversation turns (previous user questions) to save bandwidth. Temperature, top_p, and penalty params are omitted when thinking is enabled.
+
+**Mode router** (`deepseek-agent::mode_router`): Selects between two execution modes per turn:
+- **V3Autopilot** (default): `deepseek-chat` with unified thinking + tools in a single API call. Fast, handles most tasks.
+- **R1DriveTools**: R1 (`deepseek-reasoner`) drives tools step-by-step via structured JSON intents (`tool_intent`, `delegate_patch`, `done`, `abort`). Orchestrator validates + executes via `ToolHost`. R1 receives `ObservationPack` context between steps. Escalation triggers: repeated step failures (≥2), ambiguous errors, blast radius (≥5 files changed), cross-module failures. V3 gets one mechanical recovery attempt for compile/lint errors before escalation. R1 budget capped at `r1_max_steps` (default 30).
+
+Key modules in `deepseek-agent`:
+- `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `decide_mode()`, escalation logic
+- `protocol.rs` — R1 JSON envelope types (`R1Response`, `ToolIntent`, `DelegatePatch`), parsing + validation, V3 patch response parsing
+- `observation.rs` — `ObservationPack`, `ErrorClass`, error classification, compact R1 context serialization
+- `r1_drive.rs` — R1 drive-tools loop: R1 → JSON intent → tool execution → observation → loop
+- `v3_patch.rs` — V3 as patch-only writer: produces unified diffs from R1's `delegate_patch` instructions
 
 **TUI** (`deepseek-ui`): Simple chat interface — full-width transcript with auto-scroll, input area, status bar. Streaming tokens displayed in real-time via `StreamCallback`.
 
@@ -114,19 +127,25 @@ Config sections: `llm`, `router`, `policy`, `plugins`, `skills`, `usage`, `conte
 
 ## Known DeepSeek API Limitations
 
-### Thinking mode + tools = DSML markup leak
+### Thinking mode + tools (DeepSeek V3.2)
 
-When `thinking: {"type": "enabled", "budget_tokens": N}` is sent alongside `tools: [...]` in a `/chat/completions` request, the DeepSeek API intermittently outputs **raw DSML markup** (e.g. `<｜DSML｜function_calls>`, `<｜DSML｜invoke name="...">`) in the content stream instead of returning structured `tool_calls` in the response. This is a known upstream issue (tracked in sglang #14695, vllm #28219, vercel/ai #10778).
+DeepSeek V3.2 (`deepseek-chat`) officially supports **thinking mode with function calling** in a single API call. This is the default mode (`router.unified_thinking_tools = true`).
 
-**Consequence**: Thinking mode and function calling are mutually exclusive in practice. The codebase enforces this in two places:
+**V3.2 rules for `reasoning_content` in tool loops:**
+1. Within a tool loop (single user question): **keep `reasoning_content` in history** so the model retains its logical thread.
+2. When a new user question starts: **clear `reasoning_content` from prior turns** to save bandwidth.
+3. Temperature, top_p, presence_penalty, frequency_penalty are **unsupported with thinking mode** — omit them.
+4. `deepseek-reasoner` (R1) still does **NOT** support function calling — use `deepseek-chat` with `thinking: {type: "enabled"}`.
 
-1. **`deepseek-agent/src/lib.rs` — `chat_with_options()`**: The `thinking` config is only built when `decision.thinking_enabled && !options.tools`. When tools are active, `thinking` is always `None` and `temperature` is set to `Some(0.0)`. The escalation retry path also skips thinking when tools are present.
+**Implementation** (`deepseek-agent/src/lib.rs` — `chat_with_options()`):
+- Thinking is enabled when `decision.thinking_enabled && (!options.tools || unified_thinking_tools)`.
+- `reasoning_content` is stripped only from assistant messages *before* the last User message (prior turns), kept from current tool loop messages.
 
-2. **`deepseek-llm/src/lib.rs` — DSML rescue parser**: As a safety net, `rescue_raw_tool_calls()` detects DSML markup in response content and parses it into proper `Vec<LlmToolCall>`. This covers both Format A (`<｜DSML｜invoke>` blocks) and Format B (legacy `<｜tool▁call▁begin｜>` markers). The rescue runs on all three response paths: non-streaming, streaming payload, and live streaming. The streaming path also buffers DSML content to prevent raw markup from appearing in the TUI.
+### DSML markup leak (safety net)
 
-**What still gets thinking mode**: Pure text responses (no tools), the legacy planner path, and any turn where `options.tools = false`.
+Older DeepSeek API versions could intermittently output **raw DSML markup** when thinking was combined with tools. The DSML rescue parser in `deepseek-llm/src/lib.rs` (`rescue_raw_tool_calls()`) remains as a safety net, parsing Format A (`<｜DSML｜invoke>`) and Format B (`<｜tool▁call▁begin｜>`) markup into proper `Vec<LlmToolCall>`.
 
-**If DeepSeek fixes this upstream**: Remove the `&& !options.tools` guard in `chat_with_options()` and the `tools.is_empty()` check in the escalation retry. The DSML rescue parser can be kept as a defensive fallback.
+**Workaround for complex failures**: The mode router automatically escalates from V3Autopilot to R1DriveTools when repeated failures, ambiguous errors, or high blast radius are detected. R1 drives tools via JSON intents with a step budget (`r1_max_steps`, default 30).
 
 ## Supply-Chain Security
 

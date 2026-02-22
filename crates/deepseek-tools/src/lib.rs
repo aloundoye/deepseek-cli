@@ -559,11 +559,13 @@ impl LocalToolHost {
                 }))
             }
             "bash.run" => {
+                // Accept both "cmd" (canonical) and "command" (model hallucination)
                 let cmd = call
                     .args
                     .get("cmd")
+                    .or_else(|| call.args.get("command"))
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("cmd missing"))?;
+                    .ok_or_else(|| anyhow!("cmd missing — expected 'cmd' parameter"))?;
                 self.enforce_sandbox_mode(cmd)?;
                 self.policy.check_command(cmd)?;
                 let timeout = call
@@ -594,7 +596,7 @@ impl LocalToolHost {
                     .unwrap_or(30);
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(timeout))
-                    .user_agent("deepseek-cli/0.1")
+                    .user_agent("deepseek-cli/0.2")
                     .build()?;
                 let resp = client.get(url).send()?;
                 let status = resp.status().as_u16();
@@ -660,7 +662,7 @@ impl LocalToolHost {
                 );
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(15))
-                    .user_agent("deepseek-cli/0.1")
+                    .user_agent("deepseek-cli/0.2")
                     .build()?;
                 let resp = client.get(&search_url).send()?;
                 let body = resp.text()?;
@@ -1364,7 +1366,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "cmd": {
+                        "command": {
                             "type": "string",
                             "description": "The shell command to execute"
                         },
@@ -1381,7 +1383,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "description": "Set to true to run this command in the background. Returns immediately with a shell_id. Use task_output to check results."
                         }
                     },
-                    "required": ["cmd"]
+                    "required": ["command"]
                 }),
             },
         },

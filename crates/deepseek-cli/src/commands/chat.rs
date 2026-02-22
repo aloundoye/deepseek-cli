@@ -853,6 +853,10 @@ pub(crate) fn run_chat(
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ReasoningDelta(_) => {}
+                    deepseek_core::StreamChunk::ModeTransition { from, to, reason } => {
+                        let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
+                        let _ = handle.flush();
+                    }
                     deepseek_core::StreamChunk::Done => {
                         let _ = writeln!(handle);
                         let _ = handle.flush();
@@ -1361,6 +1365,9 @@ pub(crate) fn run_chat_tui(
                 }
                 StreamChunk::ReasoningDelta(s) => {
                     let _ = tx_stream.send(TuiStreamEvent::ReasoningDelta(s));
+                }
+                StreamChunk::ModeTransition { from, to, reason } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ModeTransition { from, to, reason });
                 }
                 StreamChunk::Done => {}
             }));
@@ -2266,6 +2273,18 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                         let _ = handle.flush();
                     }
                     // In text mode, reasoning is not shown
+                }
+                StreamChunk::ModeTransition { from, to, reason } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "mode_transition", "from": from, "to": to, "reason": reason}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
+                    }
+                    let _ = handle.flush();
                 }
                 StreamChunk::Done => {
                     if stream_json {
