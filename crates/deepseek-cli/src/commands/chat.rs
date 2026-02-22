@@ -853,6 +853,26 @@ pub(crate) fn run_chat(
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ReasoningDelta(_) => {}
+                    deepseek_core::StreamChunk::ToolCallStart {
+                        tool_name,
+                        args_summary,
+                    } => {
+                        let _ = writeln!(handle, "\n[tool: {tool_name}] {args_summary}");
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::ToolCallEnd {
+                        tool_name,
+                        duration_ms,
+                        success,
+                        summary,
+                    } => {
+                        let status = if success { "ok" } else { "error" };
+                        let _ = writeln!(
+                            handle,
+                            "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}"
+                        );
+                        let _ = handle.flush();
+                    }
                     deepseek_core::StreamChunk::ModeTransition { from, to, reason } => {
                         let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
                         let _ = handle.flush();
@@ -1365,6 +1385,27 @@ pub(crate) fn run_chat_tui(
                 }
                 StreamChunk::ReasoningDelta(s) => {
                     let _ = tx_stream.send(TuiStreamEvent::ReasoningDelta(s));
+                }
+                StreamChunk::ToolCallStart {
+                    tool_name,
+                    args_summary,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ToolCallStart {
+                        tool_name,
+                        args_summary,
+                    });
+                }
+                StreamChunk::ToolCallEnd {
+                    tool_name,
+                    duration_ms,
+                    summary,
+                    ..
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ToolCallEnd {
+                        tool_name,
+                        duration_ms,
+                        summary,
+                    });
                 }
                 StreamChunk::ModeTransition { from, to, reason } => {
                     let _ = tx_stream.send(TuiStreamEvent::ModeTransition { from, to, reason });
@@ -2273,6 +2314,31 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                         let _ = handle.flush();
                     }
                     // In text mode, reasoning is not shown
+                }
+                StreamChunk::ToolCallStart { tool_name, args_summary } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "tool_start", "tool": tool_name, "args": args_summary}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "\n[tool: {tool_name}] {args_summary}");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::ToolCallEnd { tool_name, duration_ms, success, summary } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type": "tool_end", "tool": tool_name, "duration_ms": duration_ms, "success": success, "summary": summary}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let status = if success { "ok" } else { "error" };
+                        let _ = writeln!(handle, "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}");
+                    }
+                    let _ = handle.flush();
                 }
                 StreamChunk::ModeTransition { from, to, reason } => {
                     if stream_json {

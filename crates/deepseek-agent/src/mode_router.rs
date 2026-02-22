@@ -56,8 +56,11 @@ impl Default for ModeRouterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            v3_max_step_failures: 2,
-            blast_radius_threshold: 5,
+            // Raised from 2 → 5: V3 now has R1 consultation via think_deeply,
+            // so it gets more attempts before full R1DriveTools escalation.
+            v3_max_step_failures: 5,
+            // Raised from 5 → 10: higher threshold for blast radius escalation.
+            blast_radius_threshold: 10,
             v3_mechanical_recovery: true,
             r1_max_steps: 30,
             r1_max_parse_retries: 2,
@@ -176,7 +179,9 @@ impl FailureTracker {
 
     /// Check if any tool signature has hit the doom-loop threshold.
     pub fn has_doom_loop(&self, threshold: u32) -> bool {
-        self.doom_loop_sigs.values().any(|&count| count >= threshold)
+        self.doom_loop_sigs
+            .values()
+            .any(|&count| count >= threshold)
     }
 
     /// Record a successful verification (resets blast radius tracking).
