@@ -32,9 +32,8 @@ pub fn tool_tier(api_name: &str) -> ToolTier {
         | "multi_edit" => ToolTier::Core,
 
         // Core: agent-level tools always available
-        "user_question" | "spawn_task" | "task_output" | "task_stop" | "kill_shell" => {
-            ToolTier::Core
-        }
+        "user_question" | "spawn_task" | "task_output" | "task_stop" | "kill_shell"
+        | "think_deeply" => ToolTier::Core,
 
         // Contextual: git tools (included in git repos)
         "git_status" | "git_diff" | "git_show" => ToolTier::Contextual,
@@ -266,6 +265,7 @@ mod tests {
         assert_eq!(tool_tier("multi_edit"), ToolTier::Core);
         assert_eq!(tool_tier("user_question"), ToolTier::Core);
         assert_eq!(tool_tier("spawn_task"), ToolTier::Core);
+        assert_eq!(tool_tier("think_deeply"), ToolTier::Core);
     }
 
     #[test]

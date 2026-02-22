@@ -4,7 +4,58 @@
 //! model a clear error message to self-correct without wasting an execution
 //! cycle.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
+
+/// Normalize tool arguments into the canonical shapes expected by tool host
+/// implementations.
+///
+/// This makes the execution layer resilient to common schema variants
+/// (`file_path` vs `path`, `command` vs `cmd`, `timeout_ms` vs `timeout`,
+/// legacy `multi_edit.edits` vs canonical `multi_edit.files`).
+pub fn normalize_tool_args(tool_name: &str, args: &mut Value) {
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+
+    match tool_name {
+        "fs.read" | "fs.write" | "fs.edit" | "notebook.read" | "notebook.edit"
+        | "diagnostics.check" => {
+            move_alias(obj, "file_path", "path");
+        }
+        "fs.list" => {
+            move_alias(obj, "path", "dir");
+        }
+        "bash.run" => {
+            move_alias(obj, "command", "cmd");
+            if !obj.contains_key("timeout")
+                && let Some(ms) = obj.get("timeout_ms").and_then(|v| v.as_u64())
+            {
+                // Tool host expects timeout in seconds.
+                let secs = ((ms.saturating_add(999)) / 1000).clamp(1, 600);
+                obj.insert("timeout".to_string(), Value::from(secs));
+            }
+            obj.remove("timeout_ms");
+        }
+        "index.query" => {
+            move_alias(obj, "query", "q");
+        }
+        "multi_edit" => {
+            normalize_multi_edit(obj);
+        }
+        _ => {}
+    }
+}
+
+/// Normalize tool arguments and map absolute in-workspace paths to workspace-relative.
+///
+/// This preserves strict policy checks (absolute paths outside workspace are still
+/// rejected) while keeping compatibility with model outputs that provide absolute
+/// file paths under the current workspace.
+pub fn normalize_tool_args_with_workspace(tool_name: &str, args: &mut Value, workspace: &Path) {
+    normalize_tool_args(tool_name, args);
+    relativize_workspace_paths(tool_name, args, workspace);
+}
 
 /// Validate tool arguments before execution.
 ///
@@ -64,33 +115,235 @@ pub fn validate_tool_args(tool_name: &str, args: &Value) -> Result<(), String> {
             Ok(())
         }
         "multi_edit" => {
-            if let Some(edits) = args.get("edits") {
-                if !edits.is_array() {
-                    return Err("'edits' must be an array of edit objects".to_string());
+            if let Some(files) = args.get("files") {
+                if !files.is_array() {
+                    return Err("'files' must be an array".to_string());
                 }
-                if let Some(arr) = edits.as_array() {
+                if let Some(arr) = files.as_array() {
                     if arr.is_empty() {
-                        return Err("'edits' array must not be empty".to_string());
+                        return Err("'files' array must not be empty".to_string());
                     }
-                    for (i, edit) in arr.iter().enumerate() {
-                        if edit
+                    for (i, file) in arr.iter().enumerate() {
+                        let path = file
                             .get("path")
-                            .or_else(|| edit.get("file_path"))
+                            .or_else(|| file.get("file_path"))
                             .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .is_empty()
-                        {
-                            return Err(format!("edits[{i}]: 'path' is required"));
+                            .unwrap_or("");
+                        if path.is_empty() {
+                            return Err(format!("files[{i}]: 'path' is required"));
+                        }
+                        let edits =
+                            file.get("edits")
+                                .and_then(|v| v.as_array())
+                                .ok_or_else(|| {
+                                    format!("files[{i}]: 'edits' must be a non-empty array")
+                                })?;
+                        if edits.is_empty() {
+                            return Err(format!("files[{i}]: 'edits' must not be empty"));
                         }
                     }
                 }
+            } else if let Some(edits) = args.get("edits") {
+                // Backward compatibility for legacy shape.
+                if !edits.is_array() {
+                    return Err("'edits' must be an array of edit objects".to_string());
+                }
+                if let Some(arr) = edits.as_array()
+                    && arr.is_empty()
+                {
+                    return Err("'edits' array must not be empty".to_string());
+                }
             } else {
-                return Err("'edits' field is required".to_string());
+                return Err("'files' (or legacy 'edits') field is required".to_string());
             }
             Ok(())
         }
         _ => Ok(()), // Unknown tools pass through without validation
     }
+}
+
+fn move_alias(obj: &mut Map<String, Value>, from: &str, to: &str) {
+    if !obj.contains_key(to)
+        && let Some(v) = obj.get(from).cloned()
+    {
+        obj.insert(to.to_string(), v);
+    }
+}
+
+fn relativize_workspace_paths(tool_name: &str, args: &mut Value, workspace: &Path) {
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+
+    let workspace_roots = collect_workspace_roots(workspace);
+    if workspace_roots.is_empty() {
+        return;
+    }
+
+    match tool_name {
+        "fs.read" | "fs.write" | "fs.edit" | "notebook.read" | "notebook.edit"
+        | "diagnostics.check" => {
+            relativize_path_field(obj, "path", &workspace_roots);
+        }
+        "fs.list" => {
+            relativize_path_field(obj, "dir", &workspace_roots);
+        }
+        "fs.glob" => {
+            relativize_path_field(obj, "base", &workspace_roots);
+        }
+        "multi_edit" => {
+            if let Some(files) = obj.get_mut("files").and_then(|v| v.as_array_mut()) {
+                for file in files {
+                    if let Some(file_obj) = file.as_object_mut() {
+                        relativize_path_field(file_obj, "path", &workspace_roots);
+                    }
+                }
+            }
+            relativize_path_field(obj, "path", &workspace_roots);
+        }
+        _ => {}
+    }
+}
+
+fn collect_workspace_roots(workspace: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if workspace.is_absolute() {
+        roots.push(workspace.to_path_buf());
+    }
+    if let Ok(canonical) = std::fs::canonicalize(workspace)
+        && !roots.contains(&canonical)
+    {
+        roots.push(canonical);
+    }
+    roots
+}
+
+fn relativize_path_field(obj: &mut Map<String, Value>, field: &str, workspace_roots: &[PathBuf]) {
+    let original = obj
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let Some(original) = original else {
+        return;
+    };
+
+    if let Some(relative) = absolute_to_workspace_relative(&original, workspace_roots) {
+        obj.insert(field.to_string(), Value::String(relative));
+    }
+}
+
+fn absolute_to_workspace_relative(path: &str, workspace_roots: &[PathBuf]) -> Option<String> {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return None;
+    }
+
+    for root in workspace_roots {
+        if let Ok(rel) = candidate.strip_prefix(root) {
+            return Some(normalize_relative_path(rel));
+        }
+    }
+
+    if let Ok(canonical_candidate) = std::fs::canonicalize(candidate) {
+        for root in workspace_roots {
+            if let Ok(rel) = canonical_candidate.strip_prefix(root) {
+                return Some(normalize_relative_path(rel));
+            }
+        }
+    }
+
+    None
+}
+
+fn normalize_relative_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_multi_edit(obj: &mut Map<String, Value>) {
+    // Canonical shape already provided: normalize nested aliases only.
+    if let Some(files) = obj.get_mut("files").and_then(|v| v.as_array_mut()) {
+        for file in files {
+            let Some(file_obj) = file.as_object_mut() else {
+                continue;
+            };
+            move_alias(file_obj, "file_path", "path");
+            if let Some(edits) = file_obj.get_mut("edits").and_then(|v| v.as_array_mut()) {
+                for edit in edits {
+                    let Some(edit_obj) = edit.as_object_mut() else {
+                        continue;
+                    };
+                    normalize_edit_fields(edit_obj);
+                }
+            }
+        }
+        return;
+    }
+
+    let parent_path = obj
+        .get("path")
+        .or_else(|| obj.get("file_path"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+
+    let edits_value = match obj.remove("edits") {
+        Some(v) => v,
+        None => return,
+    };
+    let Some(edits_arr) = edits_value.as_array() else {
+        obj.insert("edits".to_string(), edits_value);
+        return;
+    };
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+
+    for raw_edit in edits_arr {
+        let Some(raw_obj) = raw_edit.as_object() else {
+            continue;
+        };
+        let mut edit_obj = raw_obj.clone();
+        normalize_edit_fields(&mut edit_obj);
+
+        let path = edit_obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .or_else(|| parent_path.clone());
+        let Some(path) = path else {
+            continue;
+        };
+
+        edit_obj.remove("path");
+        grouped
+            .entry(path)
+            .or_default()
+            .push(Value::Object(edit_obj));
+    }
+
+    if grouped.is_empty() {
+        obj.insert("edits".to_string(), edits_value);
+        return;
+    }
+
+    let mut files = Vec::new();
+    for (path, edits) in grouped {
+        let mut file_obj = Map::new();
+        file_obj.insert("path".to_string(), Value::String(path));
+        file_obj.insert("edits".to_string(), Value::Array(edits));
+        files.push(Value::Object(file_obj));
+    }
+    obj.insert("files".to_string(), Value::Array(files));
+}
+
+fn normalize_edit_fields(edit_obj: &mut Map<String, Value>) {
+    move_alias(edit_obj, "file_path", "path");
+    move_alias(edit_obj, "old_string", "search");
+    move_alias(edit_obj, "new_string", "replace");
 }
 
 fn require_string(args: &Value, field: &str, msg: &str) -> Result<(), String> {
@@ -141,6 +394,19 @@ fn validate_line_range(args: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_workspace(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp workspace");
+        dir
+    }
 
     #[test]
     fn fs_read_valid() {
@@ -245,7 +511,7 @@ mod tests {
         assert!(
             validate_tool_args(
                 "multi_edit",
-                &json!({"edits": [{"path": "f.rs", "search": "a", "replace": "b"}]})
+                &json!({"files": [{"path": "f.rs", "edits": [{"search": "a", "replace": "b"}]}]})
             )
             .is_ok()
         );
@@ -253,17 +519,96 @@ mod tests {
 
     #[test]
     fn multi_edit_empty_edits() {
-        let err = validate_tool_args("multi_edit", &json!({"edits": []})).unwrap_err();
-        assert!(err.contains("empty"), "{err}");
+        let err = validate_tool_args("multi_edit", &json!({"files": []})).unwrap_err();
+        assert!(err.contains("empty") || err.contains("required"), "{err}");
     }
 
     #[test]
     fn multi_edit_missing_path() {
         let err = validate_tool_args(
             "multi_edit",
-            &json!({"edits": [{"search": "a", "replace": "b"}]}),
+            &json!({"files": [{"edits": [{"search":"a","replace":"b"}]}]}),
         )
         .unwrap_err();
         assert!(err.contains("path"), "{err}");
+    }
+
+    #[test]
+    fn normalize_bash_run_aliases() {
+        let mut args = json!({"command": "cargo test", "timeout_ms": 3100});
+        normalize_tool_args("bash.run", &mut args);
+        assert_eq!(args["cmd"], "cargo test");
+        assert_eq!(args["timeout"], 4);
+        assert!(args.get("timeout_ms").is_none());
+    }
+
+    #[test]
+    fn normalize_multi_edit_legacy_grouping() {
+        let mut args = json!({
+            "edits": [
+                {"file_path": "a.rs", "old_string": "A", "new_string": "B"},
+                {"path": "a.rs", "search": "C", "replace": "D"},
+                {"path": "b.rs", "old_string": "X", "new_string": "Y"}
+            ]
+        });
+        normalize_tool_args("multi_edit", &mut args);
+        let files = args.get("files").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f["path"] == "a.rs"));
+        assert!(files.iter().any(|f| f["path"] == "b.rs"));
+    }
+
+    #[test]
+    fn normalize_multi_edit_with_parent_path() {
+        let mut args = json!({
+            "path": "src/lib.rs",
+            "edits": [
+                {"old_string": "foo", "new_string": "bar"}
+            ]
+        });
+        normalize_tool_args("multi_edit", &mut args);
+        let files = args.get("files").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn normalize_with_workspace_relativizes_legacy_absolute_file_path() {
+        let dir = make_temp_workspace("deepseek-tools-validation-path");
+        let target = dir.join("src/lib.rs");
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        fs::write(&target, "fn main() {}").expect("write");
+
+        let mut args = json!({"file_path": target.to_string_lossy().to_string()});
+        normalize_tool_args_with_workspace("fs.read", &mut args, &dir);
+        assert_eq!(args["path"], "src/lib.rs");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_with_workspace_relativizes_nonexistent_absolute_path_under_workspace() {
+        let dir = make_temp_workspace("deepseek-tools-validation-missing");
+        let target = dir.join("missing.rs");
+        let mut args = json!({"file_path": target.to_string_lossy().to_string()});
+        normalize_tool_args_with_workspace("fs.read", &mut args, &dir);
+        assert_eq!(args["path"], "missing.rs");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_with_workspace_relativizes_multi_edit_files() {
+        let dir = make_temp_workspace("deepseek-tools-validation-multi");
+        let file_a = dir.join("a.rs");
+        let mut args = json!({
+            "files": [{
+                "path": file_a.to_string_lossy().to_string(),
+                "edits": [{"search": "a", "replace": "b"}]
+            }]
+        });
+
+        normalize_tool_args_with_workspace("multi_edit", &mut args, &dir);
+        let files = args.get("files").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(files[0]["path"], "a.rs");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

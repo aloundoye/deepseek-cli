@@ -7,7 +7,10 @@ pub mod r1_drive;
 pub mod v3_patch;
 
 use crate::mode_router::{AgentMode, FailureTracker, ModeRouterConfig, ToolSignature, decide_mode};
-use crate::observation::RepoFacts;
+use crate::observation::{
+    ActionRecord, ObservationPack, ObservationPackBuilder, RepoFacts, extract_file_refs,
+    summarize_args,
+};
 use crate::plan_discipline::{
     PlanState, PlanStatus, derive_verify_commands, detect_planning_triggers, inject_step_context,
     inject_verification_feedback, remove_step_context,
@@ -34,7 +37,7 @@ use deepseek_store::{
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
 use deepseek_tools::{
     AGENT_LEVEL_TOOLS, LocalToolHost, PLAN_MODE_TOOLS, filter_tool_definitions, map_tool_name,
-    tool_definitions, tool_error_hint, validate_tool_args,
+    normalize_tool_args_with_workspace, tool_definitions, tool_error_hint, validate_tool_args,
 };
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -237,6 +240,16 @@ impl AgentEngine {
     /// Override the permission mode at runtime (from CLI flag).
     pub fn set_permission_mode(&mut self, mode: &str) {
         self.policy = PolicyEngine::from_mode(mode);
+        match LocalToolHost::new(&self.workspace, self.policy.clone()) {
+            Ok(host) => {
+                self.tool_host = Arc::new(host);
+            }
+            Err(e) => {
+                self.observer.warn_log(&format!(
+                    "failed to rebuild tool host for permission mode `{mode}`: {e}"
+                ));
+            }
+        }
     }
 
     /// Enable verbose logging on the observer.
@@ -1447,6 +1460,34 @@ impl AgentEngine {
 
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
+        if let Some(plan) = plan_state.plan.as_ref()
+            && should_spawn_chat_subagents(&options, &context_signals, plan)
+        {
+            match self.run_subagents(session.session_id, plan) {
+                Ok(notes) if !notes.is_empty() => {
+                    let summary = summarize_subagent_notes(&notes);
+                    self.emit(
+                        session.session_id,
+                        EventKind::TurnAddedV1 {
+                            role: "assistant".to_string(),
+                            content: format!("[subagents]\n{summary}"),
+                        },
+                    )?;
+                    self.tool_host.fire_session_hooks("notification");
+                    messages.push(ChatMessage::User {
+                        content: format!(
+                            "<subagent-findings>\n{summary}\nUse these findings as additional context while executing the task.\n</subagent-findings>"
+                        ),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.observer
+                        .verbose_log(&format!("chat subagent orchestration failed: {e}"));
+                }
+            }
+        }
+
         loop {
             turn_count += 1;
             if turn_count > max_turns {
@@ -1849,6 +1890,7 @@ impl AgentEngine {
                     if plan_state.verification_is_noop() {
                         // No verify commands — treat as pass
                         plan_state.verification_passed();
+                        failure_tracker.record_verify_pass();
                     } else {
                         match self.run_verification_with_output(
                             &plan_state.verify_commands,
@@ -1859,6 +1901,7 @@ impl AgentEngine {
                                 self.observer
                                     .verbose_log("plan_discipline: verification passed");
                                 plan_state.verification_passed();
+                                failure_tracker.record_verify_pass();
                             }
                             Err(error_msg) => {
                                 plan_state.verification_failed(&error_msg);
@@ -2060,10 +2103,15 @@ impl AgentEngine {
             )?;
 
             // Execute each tool call and collect results
+            let mode_obs_step = u32::try_from(turn_count).unwrap_or(u32::MAX);
+            let mode_obs_repo = self.build_repo_facts();
+            let mut mode_observation_action: Option<ActionRecord> = None;
+            let mut mode_observation_stderr: Option<String> = None;
             for tc in &response.tool_calls {
                 let internal_name = map_tool_name(&tc.name);
                 let mut args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
+                normalize_tool_args_with_workspace(internal_name, &mut args, &self.workspace);
 
                 // ── Pre-execution argument validation ──
                 if let Err(validation_error) = validate_tool_args(internal_name, &args) {
@@ -2080,19 +2128,17 @@ impl AgentEngine {
                         content: hint,
                     });
                     failure_streak += 1;
+                    failure_tracker.record_failure();
+                    let action = build_observation_action(
+                        internal_name,
+                        &args,
+                        false,
+                        None,
+                        "validation_error",
+                    );
+                    mode_observation_action = Some(action);
+                    mode_observation_stderr = Some(validation_error.clone());
                     continue;
-                }
-                // Normalize bash.run args: model may send "command" (the
-                // canonical definition name) — copy it to "cmd" so all
-                // downstream code (policy, observation, mode_router) works
-                // unchanged.
-                if internal_name == "bash.run"
-                    && let Some(obj) = args.as_object_mut()
-                    && obj.contains_key("command")
-                    && !obj.contains_key("cmd")
-                    && let Some(val) = obj.get("command").cloned()
-                {
-                    obj.insert("cmd".to_string(), val);
                 }
 
                 // Safety net: block disallowed tools at execution time
@@ -2166,6 +2212,23 @@ impl AgentEngine {
                         tool_call_id: tc.id.clone(),
                         content: result_text,
                     });
+                    let mcp_action = build_observation_action(
+                        internal_name,
+                        &args,
+                        mcp_success,
+                        None,
+                        "mcp_tool",
+                    );
+                    if !mcp_success {
+                        failure_streak += 1;
+                        failure_tracker.record_failure();
+                        mode_observation_stderr = Some("mcp tool failure".to_string());
+                    } else if mode_observation_action.is_none() {
+                        mode_observation_action = Some(mcp_action.clone());
+                    }
+                    if !mcp_success {
+                        mode_observation_action = Some(mcp_action);
+                    }
                     continue;
                 }
 
@@ -2310,6 +2373,33 @@ impl AgentEngine {
                     // Apply updated input if the hook modified tool parameters.
                     if let Some(ref updated) = hr.updated_input {
                         args = updated.clone();
+                        normalize_tool_args_with_workspace(
+                            internal_name,
+                            &mut args,
+                            &self.workspace,
+                        );
+                        if let Err(validation_error) = validate_tool_args(internal_name, &args) {
+                            let hint = format!(
+                                "Invalid arguments for `{internal_name}` after hook update: {validation_error}\n\
+                                 Fix the arguments and try again."
+                            );
+                            messages.push(ChatMessage::Tool {
+                                tool_call_id: tc.id.clone(),
+                                content: hint,
+                            });
+                            failure_streak += 1;
+                            failure_tracker.record_failure();
+                            let action = build_observation_action(
+                                internal_name,
+                                &args,
+                                false,
+                                None,
+                                "validation_error_after_hook",
+                            );
+                            mode_observation_action = Some(action);
+                            mode_observation_stderr = Some(validation_error.clone());
+                            continue;
+                        }
                     }
                     Self::inject_hook_context(&mut messages, &hr);
                 }
@@ -2472,6 +2562,24 @@ impl AgentEngine {
                         .get("exit_code")
                         .and_then(|v| v.as_i64())
                         .map(|v| v as i32);
+                    let output_for_observation = result.output.to_string();
+                    let action = build_observation_action(
+                        internal_name,
+                        &args,
+                        result.success,
+                        exit_code,
+                        &output_for_observation,
+                    );
+                    if !result.success {
+                        mode_observation_action = Some(action.clone());
+                        mode_observation_stderr = Some(output_for_observation.clone());
+                        record_error_modules_from_output(
+                            &mut failure_tracker,
+                            &output_for_observation,
+                        );
+                    } else if mode_observation_action.is_none() {
+                        mode_observation_action = Some(action.clone());
+                    }
                     let sig = ToolSignature::new(internal_name, &args, exit_code);
                     failure_tracker.record_tool_signature(sig, result.success);
 
@@ -2496,17 +2604,18 @@ impl AgentEngine {
                                 failure_tracker.record_file_change(path);
                                 plan_state.record_file_touched(path);
                             }
-                            // multi_edit: track each file in the edits array
+                            // multi_edit: track each file in the canonical files array.
                             if internal_name == "multi_edit"
-                                && let Some(edits) = args.get("edits").and_then(|v| v.as_array())
+                                && let Some(files) = args.get("files").and_then(|v| v.as_array())
                             {
-                                for edit in edits {
-                                    if let Some(p) = edit
+                                for file in files {
+                                    if let Some(p) = file
                                         .get("path")
-                                        .or_else(|| edit.get("file_path"))
+                                        .or_else(|| file.get("file_path"))
                                         .and_then(|v| v.as_str())
                                     {
                                         plan_state.record_file_touched(p);
+                                        failure_tracker.record_file_change(p);
                                     }
                                 }
                             }
@@ -2566,6 +2675,17 @@ impl AgentEngine {
                         internal_name
                     )
                 };
+                if !approved {
+                    let action = build_observation_action(
+                        internal_name,
+                        &args,
+                        false,
+                        Some(-2),
+                        "tool denied by user",
+                    );
+                    mode_observation_action = Some(action);
+                    mode_observation_stderr = Some("tool denied by user".to_string());
+                }
 
                 // Add tool result message to conversation
                 let tool_msg = ChatMessage::Tool {
@@ -2593,6 +2713,15 @@ impl AgentEngine {
                     EventKind::ChatTurnV1 { message: tool_msg },
                 )?;
             }
+            let mode_observation: Option<ObservationPack> = mode_observation_action.map(|action| {
+                let mut builder = ObservationPackBuilder::new(mode_obs_step, mode_obs_repo.clone());
+                builder.add_action(action);
+                if let Some(stderr) = mode_observation_stderr.as_deref() {
+                    builder.set_stderr(stderr);
+                }
+                builder.set_changed_files(failure_tracker.files_changed_since_verify.clone());
+                builder.build()
+            });
 
             // ── Compress repeated tool call patterns ──
             // If the same tool was called 3+ times in a row (across the most
@@ -2629,7 +2758,7 @@ impl AgentEngine {
                 &mode_router_config,
                 current_mode,
                 &failure_tracker,
-                None, // ObservationPack not built yet in this iteration
+                mode_observation.as_ref(),
             );
             if mode_decision.mode != current_mode {
                 if let Some(ref reason) = mode_decision.reason {
@@ -2693,6 +2822,7 @@ impl AgentEngine {
                     self.llm.as_ref(),
                     &tool_host_dyn,
                     &self.observer,
+                    &self.workspace,
                     &repo_facts,
                     &mut failure_tracker,
                     prompt,
@@ -3028,7 +3158,7 @@ impl AgentEngine {
                 .verbose_log(&format!("verify: running `{cmd}`"));
             let tool_call = deepseek_core::ToolCall {
                 name: "bash.run".to_string(),
-                args: serde_json::json!({"cmd": cmd, "timeout_ms": 60000}),
+                args: serde_json::json!({"cmd": cmd, "timeout": 60}),
                 requires_approval: false,
             };
             let proposal = self.tool_host.propose(tool_call);
@@ -3081,7 +3211,7 @@ impl AgentEngine {
                 .verbose_log(&format!("verify: running `{cmd}`"));
             let tool_call = deepseek_core::ToolCall {
                 name: "bash.run".to_string(),
-                args: serde_json::json!({"cmd": cmd, "timeout_ms": 60000}),
+                args: serde_json::json!({"cmd": cmd, "timeout": 60}),
                 requires_approval: false,
             };
             let proposal = self.tool_host.propose(tool_call);
@@ -7072,6 +7202,50 @@ fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+fn build_observation_action(
+    tool_name: &str,
+    args: &serde_json::Value,
+    success: bool,
+    exit_code: Option<i32>,
+    output: &str,
+) -> ActionRecord {
+    let output_head = if output.len() > 500 {
+        let cut = output.floor_char_boundary(500);
+        format!("{}...", &output[..cut])
+    } else {
+        output.to_string()
+    };
+
+    ActionRecord {
+        tool: tool_name.to_string(),
+        args_summary: summarize_args(tool_name, args),
+        success,
+        exit_code,
+        output_head,
+        refs: extract_file_refs(output),
+    }
+}
+
+fn record_error_modules_from_output(tracker: &mut FailureTracker, output: &str) {
+    for file_ref in extract_file_refs(output) {
+        if let Some(module) = extract_module_name_from_ref(&file_ref) {
+            tracker.record_error_module(&module);
+        }
+    }
+}
+
+fn extract_module_name_from_ref(file_ref: &str) -> Option<String> {
+    let path = file_ref.split(':').next()?;
+    let parts: Vec<&str> = path.split('/').collect();
+    for part in parts.iter().rev().skip(1) {
+        if !matches!(*part, "src" | "lib" | "tests" | "test" | "." | "..") {
+            return Some((*part).to_string());
+        }
+    }
+    let filename = parts.last()?;
+    filename.split('.').next().map(|s| s.to_string())
+}
+
 fn truncate_tool_output(tool_name: &str, output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output.to_string();
@@ -8191,6 +8365,24 @@ fn summarize_transcript(transcript: &[String], max_lines: usize) -> String {
     format!("Auto-compacted transcript summary:\n{rendered}")
 }
 
+fn should_spawn_chat_subagents(
+    options: &ChatOptions,
+    signals: &deepseek_tools::ToolContextSignals,
+    plan: &Plan,
+) -> bool {
+    if !options.tools || plan.steps.len() < 2 {
+        return false;
+    }
+    let target_count = plan
+        .steps
+        .iter()
+        .flat_map(|step| step.files.iter().map(|f| f.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
+    let broad_scope = target_count >= 2 || plan.steps.len() >= 4;
+    broad_scope && (signals.prompt_is_complex || signals.codebase_file_count >= 250)
+}
+
 fn summarize_subagent_notes(notes: &[String]) -> String {
     notes
         .iter()
@@ -8864,6 +9056,58 @@ mod tests {
         assert_eq!(lines.len(), 12);
         assert!(summary.contains("one"));
         assert!(!summary.contains("thirteen"));
+    }
+
+    #[test]
+    fn chat_subagent_spawn_trigger_requires_broad_complex_scope() {
+        let plan = Plan {
+            plan_id: Uuid::now_v7(),
+            version: 1,
+            goal: "implement subsystem migration".to_string(),
+            assumptions: vec![],
+            steps: vec![
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Inspect API".to_string(),
+                    intent: "search".to_string(),
+                    tools: vec!["fs.read".to_string()],
+                    files: vec!["src/api.rs".to_string()],
+                    done: false,
+                },
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Inspect service".to_string(),
+                    intent: "search".to_string(),
+                    tools: vec!["fs.read".to_string()],
+                    files: vec!["src/service.rs".to_string()],
+                    done: false,
+                },
+            ],
+            verification: vec!["cargo test -p deepseek-agent".to_string()],
+            risk_notes: vec![],
+        };
+        let signals = deepseek_tools::ToolContextSignals {
+            prompt_is_complex: true,
+            ..Default::default()
+        };
+        let options = ChatOptions {
+            tools: true,
+            ..Default::default()
+        };
+
+        assert!(should_spawn_chat_subagents(&options, &signals, &plan));
+
+        let mut non_broad = plan.clone();
+        non_broad.steps[1].files = vec!["src/api.rs".to_string()];
+        assert!(!should_spawn_chat_subagents(&options, &signals, &non_broad));
+        assert!(!should_spawn_chat_subagents(
+            &ChatOptions {
+                tools: false,
+                ..Default::default()
+            },
+            &signals,
+            &plan
+        ));
     }
 
     #[test]
