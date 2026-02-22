@@ -316,7 +316,7 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 | Mode | Model | How Tools Are Called | When Used |
 |------|-------|---------------------|-----------|
 | **V3Autopilot** (default) | `deepseek-chat` | API function calling (thinking + tools unified) | Most tasks; fast, single-call |
-| **R1DriveTools** (escalation) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Doom-loops, repeated failures, blast radius escalation, cross-module failures |
+| **R1DriveTools** (break-glass) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Explicitly enabled only (`router.r1_drive_auto_escalation=true` or `--allow-r1-drive-tools`) |
 
 **Escalation triggers** (V3Autopilot → R1DriveTools, checked by `decide_mode()` after each tool execution batch):
 1. **Doom-loop** (highest priority) — same tool signature (name + normalized args + exit code bucket) fails ≥ `doom_loop_threshold` (default 2) times
@@ -324,6 +324,8 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 3. **Blast radius exceeded** — ≥ `blast_radius_threshold` (effective default 5) files changed without verification
 4. **Cross-module failures** — errors span 2+ distinct modules
 5. **Ambiguous errors** — latest `ObservationPack` classifies the failure as `ErrorClass::Ambiguous`
+
+When break-glass is disabled, these triggers are still evaluated but escalation is suppressed; the agent records suppression reason codes and injects an R1 consultation checkpoint while keeping V3 in control.
 
 **Mechanical recovery**: V3 has a bounded recovery mechanism (`v3_mechanical_recovery = true`) for mechanical errors (compile/lint/missing dependency) based on the latest `ObservationPack`, allowing one recovery attempt before escalation.
 
@@ -343,7 +345,7 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 
 **V3 patch writer** (`deepseek-agent::v3_patch`): When R1 issues `delegate_patch`, V3 is called with a focused prompt to produce a unified diff. Handles `need_more_context` requests by reading additional files. Max context requests configurable via `v3_patch_max_context_requests`.
 
-**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests). Verification failures feed back into the loop. In chat mode, broad/complex plans can trigger automatic subagent orchestration before the main execution loop, and summarized subagent findings are injected back into context.
+**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests), and final completion is verification-gated when files changed even without a formal plan. Verification failures feed back into the loop. In chat mode, a scored complexity decision triggers automatic subagent orchestration before the main execution loop, and summarized subagent findings are injected back into context.
 
 **Key modules:**
 - `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `ToolSignature`, `decide_mode()`, escalation + hysteresis logic
@@ -359,6 +361,7 @@ The **Mode Router** (`deepseek-agent::mode_router`) selects between two executio
 **Configuration** (all in `[router]` section):
 ```toml
 mode_router_enabled = true          # Enable mode routing (false = always V3Autopilot)
+r1_drive_auto_escalation = false    # Break-glass: allow automatic R1DriveTools escalation
 v3_max_step_failures = 2            # Consecutive failures before escalation
 blast_radius_threshold = 5          # Files changed without verify before escalation
 v3_mechanical_recovery = true       # Allow V3 one recovery attempt for compile/lint errors
@@ -454,7 +457,7 @@ All tool calls are journaled (proposal, approval, result) in the event log. For 
 
 In addition to the REPL, the CLI supports one-shot commands:
 
-- `deepseek ask "<prompt>"` – single response (no tools by default).
+- `deepseek ask "<prompt>" [--tools=true|false]` – single response (tools enabled by default; disable with `--tools=false`).
 - `deepseek plan "<prompt>"` – generate a plan and exit.
 - `deepseek autopilot "<prompt>"` – run autonomous mode (may continue in background).
 - `deepseek run <session-id>` – resume a session.

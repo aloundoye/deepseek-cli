@@ -93,7 +93,7 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **Mode router** (`deepseek-agent::mode_router`): Selects between two execution modes per turn:
 - **V3Autopilot** (default): `deepseek-chat` with unified thinking + tools in a single API call. Fast, handles most tasks.
-- **R1DriveTools** (escalation): R1 (`deepseek-reasoner`) drives tools step-by-step via structured JSON intents (`tool_intent`, `delegate_patch`, `done`, `abort`). Orchestrator validates + executes via `ToolHost`. R1 receives `ObservationPack` context between steps. R1 budget capped at `r1_max_steps` (default 30).
+- **R1DriveTools** (break-glass): R1 (`deepseek-reasoner`) drives tools step-by-step via structured JSON intents (`tool_intent`, `delegate_patch`, `done`, `abort`). Orchestrator validates + executes via `ToolHost`. R1 receives `ObservationPack` context between steps. R1 budget capped at `r1_max_steps` (default 30). Automatic transition is disabled by default (`router.r1_drive_auto_escalation = false`) unless explicitly enabled (config or `--allow-r1-drive-tools`).
 
 **Escalation triggers** (V3Autopilot → R1DriveTools, checked by `decide_mode()` after each tool execution batch):
 1. **Doom-loop** (highest priority): same tool signature (name + normalized args + exit code bucket) fails ≥ `doom_loop_threshold` (default 2) times.
@@ -101,6 +101,8 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 3. **Blast radius exceeded**: ≥ `blast_radius_threshold` (effective default 5) files changed without verification.
 4. **Cross-module failures**: errors span 2+ distinct modules.
 5. **Ambiguous errors**: `ErrorClass::Ambiguous` from the latest `ObservationPack`.
+
+When break-glass is disabled and a trigger fires, escalation is suppressed, a `RouterEscalationV1` suppression reason is recorded, and the agent injects an automatic R1 consultation checkpoint into the V3 loop.
 
 **Mechanical recovery note**: V3 mechanical-recovery logic (`v3_mechanical_recovery = true`) is active when the latest observation is mechanical (compile/lint/missing dependency), allowing one bounded recovery attempt before escalation.
 
@@ -110,7 +112,7 @@ The old `run_once_with_mode()` method still exists for backward compatibility. I
 
 **R1 consultation** (`deepseek-agent::consultation`): Lightweight alternative to full R1DriveTools escalation. V3 asks R1 for targeted advice on a subproblem (error analysis, architecture, plan review, task decomposition). R1 returns text-only advice (no JSON intents, no tool execution). Advice is injected into V3's conversation as a tool result. V3 keeps control throughout. `think_deeply` is a core tool in the default tier set.
 
-**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests). Verification failures feed back into the loop. In chat mode, broad/complex plans can trigger automatic subagent orchestration (`run_subagents`) before the main execution loop, and summarized findings are injected into context.
+**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests), and final completion is verification-gated when files changed even without a formal plan. Verification failures feed back into the loop. In chat mode, a scored complexity decision controls automatic subagent orchestration (`run_subagents`) before the main execution loop, and summarized findings are injected into context.
 
 Key modules in `deepseek-agent`:
 - `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `ToolSignature`, `decide_mode()`, escalation + hysteresis logic
@@ -166,7 +168,7 @@ DeepSeek V3.2 (`deepseek-chat`) officially supports **thinking mode with functio
 
 Older DeepSeek API versions could intermittently output **raw DSML markup** when thinking was combined with tools. The DSML rescue parser in `deepseek-llm/src/lib.rs` (`rescue_raw_tool_calls()`) remains as a safety net, parsing Format A (`<｜DSML｜invoke>`) and Format B (`<｜tool▁call▁begin｜>`) markup into proper `Vec<LlmToolCall>`.
 
-**Workaround for complex failures**: The mode router automatically escalates from V3Autopilot to R1DriveTools when doom-loops, repeated failures (≥2), ambiguous errors, blast radius (≥5 files), or cross-module errors are detected. R1 drives tools via JSON intents with a step budget (`r1_max_steps`, default 30). For policy-related doom-loops (bash.run restrictions), the agent injects tool guidance and resets trackers instead of escalating to R1.
+**Workaround for complex failures**: The mode router still detects doom-loops, repeated failures (≥2), ambiguous errors, blast radius (≥5 files), and cross-module errors. By default (`r1_drive_auto_escalation = false`), R1DriveTools escalation is suppressed and the agent injects an R1 consultation checkpoint while keeping V3 in control. Enabling break-glass (`r1_drive_auto_escalation = true` or `--allow-r1-drive-tools`) allows full R1 drive-tools escalation with step budget (`r1_max_steps`, default 30). For policy-related doom-loops (bash.run restrictions), the agent injects tool guidance and resets trackers instead of escalating to R1.
 
 ## Supply-Chain Security
 
