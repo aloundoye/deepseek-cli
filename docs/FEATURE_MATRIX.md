@@ -167,8 +167,8 @@
 | 2.4 | `/context` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Context` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Token breakdown by source |
 | 2.4 | `/permissions` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Permissions(args)` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | View/change mode, dry-run evaluator |
 | 2.4 | `/sandbox` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Sandbox(args)` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | allowlist/isolated/off/workspace-write/read-only |
-| 2.4 | `/agents` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Agents` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Running and completed subagents |
-| 2.4 | `/tasks` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Tasks(args)` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Mission Control pane |
+| 2.4 | `/agents` | DONE | `crates/deepseek-cli/src/commands/chat.rs` + `crates/deepseek-store/src/lib.rs` -- live subagent run listing (`list_subagent_runs`) | `parses_new_slash_commands`, `list_subagent_runs_filters_by_session` | `cargo test -p deepseek-ui && cargo test -p deepseek-store list_subagent_runs_filters_by_session` | Running/completed/failed subagents with output/error summaries |
+| 2.4 | `/tasks` | DONE | `crates/deepseek-cli/src/commands/chat.rs` + `crates/deepseek-cli/src/commands/tasks.rs` -- mission-control snapshot (tasks + subagents) | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Mission Control summary in REPL/TUI slash flow |
 | 2.4 | `/review` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Review(args)` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Read-only review pipeline with presets |
 | 2.4 | `/search` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::Search(args)` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Web search with TTL cache and provenance |
 | 2.4 | `/terminal-setup` | DONE | `crates/deepseek-ui/src/lib.rs` -- `SlashCommand::TerminalSetup` | `parses_new_slash_commands` | `cargo test -p deepseek-ui` | Shell integration, prompt markers |
@@ -323,7 +323,7 @@
 | 2.6 | Isolated contexts | DONE | `crates/deepseek-subagent/src/lib.rs` -- Each `SubagentTask` runs in own thread with clean context | `retries_failed_subagents_within_budget` | `cargo test -p deepseek-subagent` | No state pollution between agents |
 | 2.6 | Agent teams | DONE | `crates/deepseek-subagent/src/lib.rs` -- `SubagentTask.team: String` field for coordination | `subagent_team_*` tests | `cargo test -p deepseek-subagent` | Multiple agents on different components |
 | 2.6 | Resilience (retry after denial) | DONE | `crates/deepseek-subagent/src/lib.rs` -- `read_only_fallback: bool`, retry logic in `run_tasks()`, `used_read_only_fallback` in result | `approval_denied_triggers_read_only_fallback` | `cargo test -p deepseek-subagent` | Falls back to read-only on permission denial |
-| 2.6 | Subagent events | DONE | `crates/deepseek-core/src/lib.rs` -- `SubagentSpawnedV1`, `SubagentCompletedV1`, `SubagentFailedV1` | Event tests | `cargo test -p deepseek-core` | Full lifecycle tracking in event log |
+| 2.6 | Subagent events | DONE | `crates/deepseek-core/src/lib.rs` + `crates/deepseek-agent/src/lib.rs` -- event log + stream chunks (`SubagentSpawned`, `SubagentCompleted`, `SubagentFailed`) | Event tests | `cargo test -p deepseek-core` | Full lifecycle tracking in event log and live UI stream |
 
 ### 19. Hooks (Spec 2.9, 4.10)
 
@@ -401,7 +401,7 @@
 | 4.12 | Main conversation pane | DONE | `crates/deepseek-ui/src/lib.rs` -- ratatui layout with scrollable `Paragraph`, syntax highlighting | UI layout tests | `cargo test -p deepseek-ui` | Markdown rendering with `syntect` |
 | 4.12 | Plan pane (collapsible) | DONE | `crates/deepseek-ui/src/lib.rs` -- collapsible plan pane showing step progress | UI layout tests | `cargo test -p deepseek-ui` | Toggle visibility; shows step done/pending |
 | 4.12 | Tool output pane | DONE | `crates/deepseek-ui/src/lib.rs` -- real-time logs from subagents and tool executions | UI layout tests | `cargo test -p deepseek-ui` | Streaming tool output |
-| 4.12 | Mission Control pane (Ctrl+T) | DONE | `crates/deepseek-ui/src/lib.rs` -- `toggle_mission_control`, task queue with status indicators, subagent swimlanes | Mission control tests | `cargo test -p deepseek-ui` | Running/pending/completed with elapsed time |
+| 4.12 | Mission Control pane (Ctrl+T) | DONE | `crates/deepseek-ui/src/lib.rs` + `crates/deepseek-cli/src/commands/chat.rs` -- `toggle_mission_control`, live subagent lifecycle ingestion | Mission control tests | `cargo test -p deepseek-ui` | Running/pending/completed updates stream in real time |
 | 4.12 | Artifacts pane (Ctrl+A) | DONE | `crates/deepseek-ui/src/lib.rs` -- `toggle_artifacts`, displays `.deepseek/artifacts/<task-id>/` | Artifacts tests | `cargo test -p deepseek-ui` | Browsable bundles: plan.md, diff.patch, verification.md |
 | 4.12 | Status bar | DONE | `crates/deepseek-ui/src/lib.rs` -- `render_statusline()` and `render_statusline_spans()` | `styled_statusline_spans_include_mode_badge` | `cargo test -p deepseek-ui` | Model, cost, approvals, jobs, tasks, permission mode, context usage |
 | 4.12 | Syntax highlighting | DONE | `crates/deepseek-ui/src/lib.rs` -- `syntect`-based highlighting in conversation pane | UI rendering tests | `cargo test -p deepseek-ui` | Language-aware code blocks |

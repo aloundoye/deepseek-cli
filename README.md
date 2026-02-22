@@ -74,6 +74,7 @@ Execution behavior:
 - Planner steps can execute multiple declared tools per step (up to 3), in declared order.
 - Declared tool syntax supports `name:arg` and `name(arg)` forms (for example `bash.run:cargo test --workspace`).
 - Subagents run model-backed analysis with delegated read-only tool probes and are recorded in transcript/status output.
+- R1DriveTools escalation is break-glass by default; normal flow stays V3 tool-executor with R1 consultation checkpoints.
 - Task-role subagents now run bounded delegated tool execution (including isolated subagent artifact writes) with merge-arbitration summaries when multiple subagents target the same file.
 - Delegated subagent execution now includes approval-aware retries with bounded read-only fallback paths.
 - Autopilot supports live pause/resume control via pause files and `deepseek autopilot pause|resume`, plus live status sampling with `deepseek autopilot status --follow`.
@@ -103,8 +104,8 @@ Execution behavior:
 
 ## Command Overview
 
-- `deepseek chat [--tools] [--tui]` (TUI is default in interactive terminals)
-- `deepseek ask "<prompt>" [--tools]`
+- `deepseek chat [--tools=true|false] [--tui]` (TUI is default in interactive terminals; tools default to true)
+- `deepseek ask "<prompt>" [--tools=true|false]` (tools default to true)
 - `deepseek plan "<prompt>"`
 - `deepseek run [session-id]`
 - `deepseek profile [--benchmark] [--benchmark-cases N] [--benchmark-seed N] [--benchmark-suite <path>] [--benchmark-pack <name>] [--benchmark-signing-key-env ENV] [--benchmark-min-success-rate F] [--benchmark-min-quality-rate F] [--benchmark-max-p95-ms N] [--benchmark-baseline <path>] [--benchmark-max-regression-ms N] [--benchmark-compare <path>] [--benchmark-compare-strict] [--benchmark-output <path>]`
@@ -136,6 +137,7 @@ Execution behavior:
 
 Global flag:
 - `--json`
+- `--allow-r1-drive-tools` (break-glass: allow automatic R1DriveTools escalation for this run)
 
 Interactive slash commands:
 - `/help`, `/init`, `/clear`, `/compact`, `/memory`, `/config`, `/model`

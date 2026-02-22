@@ -17,6 +17,8 @@
 //!
 //! V3 also has lightweight R1 consultation (`consultation.rs`) as an alternative to
 //! full escalation — R1 returns text-only advice while V3 keeps control and tools.
+//! Final mode application is controlled by the caller: when break-glass is disabled,
+//! callers may suppress transitions into R1DriveTools and inject consultation instead.
 //!
 //! Hysteresis: once in R1, stay until verify green, R1 `done`/`abort`, or budget exhausted.
 
@@ -49,6 +51,9 @@ impl std::fmt::Display for AgentMode {
 pub struct ModeRouterConfig {
     /// Enable mode routing (false = always V3Autopilot).
     pub enabled: bool,
+    /// Allow automatic escalation to R1DriveTools.
+    /// When false, R1DriveTools must be explicitly enabled by caller.
+    pub r1_drive_auto_escalation: bool,
     /// Max consecutive failures on same step before escalating from V3 to R1.
     pub v3_max_step_failures: u32,
     /// Max files changed since last green verify before escalating.
@@ -69,6 +74,7 @@ impl Default for ModeRouterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            r1_drive_auto_escalation: false,
             // Keep defaults aligned with RouterConfig/config.example.toml.
             v3_max_step_failures: 2,
             blast_radius_threshold: 5,
@@ -86,6 +92,7 @@ impl ModeRouterConfig {
     pub fn from_router_config(rc: &deepseek_core::RouterConfig) -> Self {
         Self {
             enabled: rc.mode_router_enabled,
+            r1_drive_auto_escalation: rc.r1_drive_auto_escalation,
             v3_max_step_failures: rc.v3_max_step_failures,
             blast_radius_threshold: rc.blast_radius_threshold,
             v3_mechanical_recovery: rc.v3_mechanical_recovery,

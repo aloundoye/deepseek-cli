@@ -30,6 +30,9 @@ unified_thinking_tools = true
 # V3_AUTOPILOT is the default (deepseek-chat with unified thinking + tools).
 # R1_DRIVE_TOOLS escalates to deepseek-reasoner driving tools via JSON intents.
 mode_router_enabled = true
+# Break-glass toggle: allow automatic R1DriveTools escalation.
+# Default false keeps R1 in consultation mode unless explicitly enabled.
+r1_drive_auto_escalation = false
 # Max consecutive step failures before escalating from V3 to R1.
 v3_max_step_failures = 2
 # Max files changed without verification before escalating.

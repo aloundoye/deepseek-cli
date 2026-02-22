@@ -1112,6 +1112,24 @@ pub enum StreamChunk {
         to: String,
         reason: String,
     },
+    /// A subagent was spawned for a complex task lane.
+    SubagentSpawned {
+        run_id: String,
+        name: String,
+        goal: String,
+    },
+    /// A subagent completed successfully.
+    SubagentCompleted {
+        run_id: String,
+        name: String,
+        summary: String,
+    },
+    /// A subagent failed.
+    SubagentFailed {
+        run_id: String,
+        name: String,
+        error: String,
+    },
     /// An image was read and should be displayed inline in the terminal.
     ImageData { data: Vec<u8>, label: String },
     /// Clear any previously streamed text — the response contains tool calls,
@@ -1532,6 +1550,10 @@ pub struct RouterConfig {
     /// When false, always uses V3Autopilot.
     #[serde(default = "default_true_bool")]
     pub mode_router_enabled: bool,
+    /// Allow automatic escalation into R1DriveTools mode.
+    /// When false (default), R1DriveTools is break-glass only (manual opt-in).
+    #[serde(default)]
+    pub r1_drive_auto_escalation: bool,
     /// Max consecutive failures on the same step before escalating from V3 to R1.
     #[serde(default = "default_v3_max_step_failures")]
     pub v3_max_step_failures: u32,
@@ -1567,6 +1589,7 @@ impl Default for RouterConfig {
             max_escalations_per_unit: 1,
             unified_thinking_tools: true,
             mode_router_enabled: true,
+            r1_drive_auto_escalation: false,
             v3_max_step_failures: 2,
             blast_radius_threshold: 5,
             v3_mechanical_recovery: true,

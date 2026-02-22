@@ -83,6 +83,24 @@ pub enum TuiStreamEvent {
         to: String,
         reason: String,
     },
+    /// A complex-task subagent was started.
+    SubagentSpawned {
+        run_id: String,
+        name: String,
+        goal: String,
+    },
+    /// A subagent completed.
+    SubagentCompleted {
+        run_id: String,
+        name: String,
+        summary: String,
+    },
+    /// A subagent failed.
+    SubagentFailed {
+        run_id: String,
+        name: String,
+        error: String,
+    },
     /// Display an inline image in the terminal (raw bytes).
     ImageDisplay { data: Vec<u8>, label: String },
     /// Clear any previously streamed text — the response contained tool calls,
@@ -2667,6 +2685,38 @@ where
                     };
                     shell.push_system(label);
                     info_line = format!("mode: {from} -> {to}");
+                }
+                TuiStreamEvent::SubagentSpawned { run_id, name, goal } => {
+                    let goal_compact = truncate_inline(&goal.replace('\n', " "), 120);
+                    shell.push_mission_control(format!(
+                        "spawned {name} ({run_id}) goal={goal_compact}"
+                    ));
+                    shell.push_system(format!("[subagent] started {name}: {goal_compact}"));
+                    info_line = format!("subagent started: {name}");
+                }
+                TuiStreamEvent::SubagentCompleted {
+                    run_id,
+                    name,
+                    summary,
+                } => {
+                    let summary_compact = truncate_inline(&summary.replace('\n', " "), 120);
+                    shell.push_mission_control(format!(
+                        "completed {name} ({run_id}) summary={summary_compact}"
+                    ));
+                    shell.push_system(format!("[subagent] completed {name}: {summary_compact}"));
+                    info_line = format!("subagent completed: {name}");
+                }
+                TuiStreamEvent::SubagentFailed {
+                    run_id,
+                    name,
+                    error,
+                } => {
+                    let error_compact = truncate_inline(&error.replace('\n', " "), 120);
+                    shell.push_mission_control(format!(
+                        "failed {name} ({run_id}) error={error_compact}"
+                    ));
+                    shell.push_error(format!("[subagent] failed {name}: {error_compact}"));
+                    info_line = format!("subagent failed: {name}");
                 }
                 TuiStreamEvent::ImageDisplay { data, label } => {
                     // Render inline image if terminal supports it

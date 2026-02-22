@@ -5,6 +5,7 @@ use deepseek_core::{
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -1256,6 +1257,97 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn list_subagent_runs(
+        &self,
+        session_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<SubagentRunRecord>> {
+        let conn = self.db()?;
+        let capped_limit = limit.clamp(1, 1000) as i64;
+        if let Some(session_id) = session_id {
+            let mut event_stmt = conn.prepare(
+                "SELECT payload
+                 FROM events
+                 WHERE session_id = ?1
+                   AND kind IN ('SubagentSpawned@v1', 'SubagentCompleted@v1', 'SubagentFailed@v1')
+                 ORDER BY seq_no ASC",
+            )?;
+            let event_rows =
+                event_stmt.query_map(params![session_id.to_string()], |r| r.get::<_, String>(0))?;
+            let mut session_run_ids = HashSet::new();
+            for payload_row in event_rows {
+                let payload = payload_row?;
+                let Ok(kind) = serde_json::from_str::<EventKind>(&payload) else {
+                    continue;
+                };
+                match kind {
+                    EventKind::SubagentSpawnedV1 { run_id, .. }
+                    | EventKind::SubagentCompletedV1 { run_id, .. }
+                    | EventKind::SubagentFailedV1 { run_id, .. } => {
+                        session_run_ids.insert(run_id.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            if session_run_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut stmt = conn.prepare(
+                "SELECT run_id, name, goal, status, output, error, created_at, updated_at
+                 FROM subagent_runs
+                 ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(SubagentRunRecord {
+                    run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                    name: r.get(1)?,
+                    goal: r.get(2)?,
+                    status: r.get(3)?,
+                    output: r.get(4)?,
+                    error: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let record = row?;
+                if !session_run_ids.contains(&record.run_id.to_string()) {
+                    continue;
+                }
+                out.push(record);
+                if out.len() >= capped_limit as usize {
+                    break;
+                }
+            }
+            Ok(out)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT run_id, name, goal, status, output, error, created_at, updated_at
+                 FROM subagent_runs
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![capped_limit], |r| {
+                Ok(SubagentRunRecord {
+                    run_id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                    name: r.get(1)?,
+                    goal: r.get(2)?,
+                    status: r.get(3)?,
+                    output: r.get(4)?,
+                    error: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        }
     }
 
     pub fn insert_cost_ledger(
@@ -2935,6 +3027,90 @@ mod tests {
             .expect("load latest")
             .expect("should exist");
         assert_eq!(latest.session_id, s2.session_id);
+    }
+
+    #[test]
+    fn list_subagent_runs_filters_by_session() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        let s1 = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        let s2 = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&s1).expect("save s1");
+        store.save_session(&s2).expect("save s2");
+
+        let run1 = Uuid::now_v7();
+        let run2 = Uuid::now_v7();
+        store
+            .append_event(&EventEnvelope {
+                seq_no: 1,
+                at: Utc::now(),
+                session_id: s1.session_id,
+                kind: EventKind::SubagentSpawnedV1 {
+                    run_id: run1,
+                    name: "planner".to_string(),
+                    goal: "plan".to_string(),
+                },
+            })
+            .expect("append s1 subagent");
+        store
+            .append_event(&EventEnvelope {
+                seq_no: 2,
+                at: Utc::now(),
+                session_id: s1.session_id,
+                kind: EventKind::SubagentCompletedV1 {
+                    run_id: run1,
+                    output: "done".to_string(),
+                },
+            })
+            .expect("append s1 complete");
+        store
+            .append_event(&EventEnvelope {
+                seq_no: 1,
+                at: Utc::now(),
+                session_id: s2.session_id,
+                kind: EventKind::SubagentSpawnedV1 {
+                    run_id: run2,
+                    name: "executor".to_string(),
+                    goal: "exec".to_string(),
+                },
+            })
+            .expect("append s2 subagent");
+
+        let s1_runs = store
+            .list_subagent_runs(Some(s1.session_id), 20)
+            .expect("list s1");
+        assert_eq!(s1_runs.len(), 1);
+        assert_eq!(s1_runs[0].run_id, run1);
+        assert_eq!(s1_runs[0].status, "completed");
+
+        let s2_runs = store
+            .list_subagent_runs(Some(s2.session_id), 20)
+            .expect("list s2");
+        assert_eq!(s2_runs.len(), 1);
+        assert_eq!(s2_runs[0].run_id, run2);
     }
 
     #[test]

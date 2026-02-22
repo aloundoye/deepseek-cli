@@ -12,10 +12,20 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
     match command {
         TasksCmd::List => {
             let tasks = store.list_tasks(None)?;
+            let session_id = store
+                .load_latest_session()?
+                .map(|session| session.session_id);
+            let subagents = store.list_subagent_runs(session_id, 20)?;
             if json_mode {
-                print_json(&json!({"tasks": tasks}))?;
+                print_json(&json!({"tasks": tasks, "subagents": subagents}))?;
             } else if tasks.is_empty() {
                 println!("No tasks in queue.");
+                if !subagents.is_empty() {
+                    println!("\nRecent subagents:");
+                    for run in &subagents {
+                        println!("- {} [{}] {}", run.name, run.status, run.run_id);
+                    }
+                }
             } else {
                 println!("{:<36}  {:<10}  {:<4}  TITLE", "ID", "STATUS", "PRI");
                 println!("{}", "-".repeat(80));
@@ -26,6 +36,12 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
                     );
                 }
                 println!("\n{} task(s) total.", tasks.len());
+                if !subagents.is_empty() {
+                    println!("\nRecent subagents:");
+                    for run in &subagents {
+                        println!("- {} [{}] {}", run.name, run.status, run.run_id);
+                    }
+                }
             }
         }
         TasksCmd::Show(args) => {

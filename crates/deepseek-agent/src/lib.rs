@@ -63,6 +63,9 @@ type SubagentWorkerFn =
 pub struct ChatOptions {
     /// Whether to include tool definitions and allow tool execution.
     pub tools: bool,
+    /// Allow escalation into R1DriveTools mode for this chat session.
+    /// Default false keeps R1DriveTools as break-glass only.
+    pub allow_r1_drive_tools: bool,
     /// Force max-think routing for this chat turn sequence.
     pub force_max_think: bool,
     /// If set, only these tool function names are sent to the LLM.
@@ -858,7 +861,7 @@ impl AgentEngine {
         let mut plan = self.plan_only_with_mode(prompt, force_max_think, non_urgent)?;
         session = self.ensure_session()?;
         self.transition(&mut session, SessionState::ExecutingStep)?;
-        let subagent_notes = self.run_subagents(session.session_id, &plan)?;
+        let subagent_notes = self.run_subagents(session.session_id, &plan, None)?;
         let runtime_goal = augment_goal_with_subagent_notes(&plan.goal, &subagent_notes);
         if !subagent_notes.is_empty() {
             self.emit(
@@ -1460,30 +1463,54 @@ impl AgentEngine {
 
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
-        if let Some(plan) = plan_state.plan.as_ref()
-            && should_spawn_chat_subagents(&options, &context_signals, plan)
-        {
-            match self.run_subagents(session.session_id, plan) {
-                Ok(notes) if !notes.is_empty() => {
-                    let summary = summarize_subagent_notes(&notes);
-                    self.emit(
-                        session.session_id,
-                        EventKind::TurnAddedV1 {
-                            role: "assistant".to_string(),
-                            content: format!("[subagents]\n{summary}"),
-                        },
-                    )?;
-                    self.tool_host.fire_session_hooks("notification");
-                    messages.push(ChatMessage::User {
-                        content: format!(
-                            "<subagent-findings>\n{summary}\nUse these findings as additional context while executing the task.\n</subagent-findings>"
-                        ),
-                    });
+        if let Some(plan) = plan_state.plan.as_ref() {
+            let spawn_decision = decide_chat_subagent_spawn(
+                &options,
+                &context_signals,
+                plan,
+                self.subagents.max_concurrency,
+            );
+            if spawn_decision.should_spawn {
+                match self.run_subagents(session.session_id, plan, Some(spawn_decision.task_budget))
+                {
+                    Ok(notes) if !notes.is_empty() => {
+                        let summary = summarize_subagent_notes(&notes);
+                        self.emit(
+                            session.session_id,
+                            EventKind::TurnAddedV1 {
+                                role: "assistant".to_string(),
+                                content: format!("[subagents]\n{summary}"),
+                            },
+                        )?;
+                        self.tool_host.fire_session_hooks("notification");
+                        messages.push(ChatMessage::User {
+                            content: format!(
+                                "<subagent-findings>\n{summary}\nUse these findings as additional context while executing the task.\n</subagent-findings>"
+                            ),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.observer
+                            .verbose_log(&format!("chat subagent orchestration failed: {e}"));
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    self.observer
-                        .verbose_log(&format!("chat subagent orchestration failed: {e}"));
+            } else if spawn_decision.blocked_by_tools {
+                let notice = format!(
+                    "[subagents] complex task detected (score {:.2}) but tools are disabled (--tools=false), so subagent orchestration is skipped.",
+                    spawn_decision.score
+                );
+                self.emit(
+                    session.session_id,
+                    EventKind::TurnAddedV1 {
+                        role: "assistant".to_string(),
+                        content: notice.clone(),
+                    },
+                )?;
+                if let Ok(cb_guard) = self.stream_callback.lock()
+                    && let Some(ref cb) = *cb_guard
+                {
+                    cb(StreamChunk::ContentDelta(format!("{notice}\n")));
                 }
             }
         }
@@ -1881,6 +1908,9 @@ impl AgentEngine {
 
             // If the model returned text content with no tool calls, we're done
             if response.tool_calls.is_empty() {
+                let changed_files_before_completion =
+                    failure_tracker.files_changed_since_verify.clone();
+                let mut completion_verified = false;
                 // ── Plan discipline: verification gate ──
                 // Before returning, check if we need to run verification.
                 if plan_state.status == PlanStatus::Executing {
@@ -1891,6 +1921,7 @@ impl AgentEngine {
                         // No verify commands — treat as pass
                         plan_state.verification_passed();
                         failure_tracker.record_verify_pass();
+                        completion_verified = true;
                     } else {
                         match self.run_verification_with_output(
                             &plan_state.verify_commands,
@@ -1902,6 +1933,7 @@ impl AgentEngine {
                                     .verbose_log("plan_discipline: verification passed");
                                 plan_state.verification_passed();
                                 failure_tracker.record_verify_pass();
+                                completion_verified = true;
                             }
                             Err(error_msg) => {
                                 plan_state.verification_failed(&error_msg);
@@ -1955,23 +1987,82 @@ impl AgentEngine {
                         }
                     }
                 }
+                if !completion_verified && !changed_files_before_completion.is_empty() {
+                    let fallback_verify = derive_verify_commands(&self.workspace);
+                    if fallback_verify.is_empty() {
+                        self.observer.verbose_log(
+                            "completion_gate: no verification command derived; treating as pass",
+                        );
+                        failure_tracker.record_verify_pass();
+                    } else {
+                        match self.run_verification_with_output(
+                            &fallback_verify,
+                            &mut failure_tracker,
+                            session.session_id,
+                        ) {
+                            Ok(()) => {
+                                self.observer
+                                    .verbose_log("completion_gate: verification passed");
+                                failure_tracker.record_verify_pass();
+                            }
+                            Err(error_msg) => {
+                                self.observer
+                                    .verbose_log("completion_gate: verification failed");
+                                let consultation = crate::consultation::ConsultationRequest {
+                                    question: "Final completion verification failed. Suggest a focused fix strategy before final answer."
+                                        .to_string(),
+                                    context: error_msg.clone(),
+                                    consultation_type:
+                                        crate::consultation::ConsultationType::ErrorAnalysis,
+                                };
+                                if let Ok(advice) = crate::consultation::consult_r1(
+                                    self.llm.as_ref(),
+                                    &self.cfg.llm.max_think_model,
+                                    &consultation,
+                                    None,
+                                ) {
+                                    messages.push(ChatMessage::User {
+                                        content: format!(
+                                            "<r1-advice type=\"completion_verify_fix\">\n{}\n</r1-advice>",
+                                            advice.advice
+                                        ),
+                                    });
+                                }
+                                inject_verification_feedback(&mut messages, &error_msg, 1);
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 // The answer shown to the user may include reasoning_content as
                 // fallback, but the message persisted for API history must NOT
                 // include reasoning_content (it wastes context tokens on resume).
-                let answer = if !response.text.is_empty() {
+                let mut answer = if !response.text.is_empty() {
                     response.text.clone()
                 } else if !response.reasoning_content.is_empty() {
                     response.reasoning_content.clone()
                 } else {
                     "(No response generated)".to_string()
                 };
+                let mut advisory_added = false;
+                if changed_files_before_completion.len() >= 3
+                    && let Some(advice) = self.consult_r1_final_review(
+                        prompt,
+                        &answer,
+                        &changed_files_before_completion,
+                    )
+                {
+                    answer.push_str("\n\n[Copilot Review - Advisory]\n");
+                    answer.push_str(&advice);
+                    advisory_added = true;
+                }
 
                 // For chat history / session resume, only store the actual text
                 // content — strip reasoning_content. The reasoning was already
                 // displayed to the user via streaming.
-                let history_content = if !response.text.is_empty() {
-                    Some(response.text.clone())
+                let history_content = if !response.text.is_empty() || advisory_added {
+                    Some(answer.clone())
                 } else {
                     // reasoning_content was used as the answer for display but
                     // we store a compact placeholder in the API message history.
@@ -2760,11 +2851,49 @@ impl AgentEngine {
                 &failure_tracker,
                 mode_observation.as_ref(),
             );
-            if mode_decision.mode != current_mode {
-                if let Some(ref reason) = mode_decision.reason {
+            let mut next_mode = mode_decision.mode;
+            let mut next_reason = mode_decision.reason.clone();
+            let allow_r1_drive_tools =
+                mode_router_config.r1_drive_auto_escalation || options.allow_r1_drive_tools;
+            if next_mode == AgentMode::R1DriveTools
+                && current_mode != AgentMode::R1DriveTools
+                && !allow_r1_drive_tools
+            {
+                let suppressed_reason = next_reason
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_else(|| "unspecified".to_string());
+                self.observer.verbose_log(&format!(
+                    "turn {turn_count}: suppressing R1DriveTools escalation ({suppressed_reason}); break-glass disabled"
+                ));
+                self.emit(
+                    session.session_id,
+                    EventKind::RouterEscalationV1 {
+                        reason_codes: vec![
+                            "r1_drive_breakglass_disabled".to_string(),
+                            format!("suppressed_{suppressed_reason}"),
+                        ],
+                    },
+                )?;
+                if let Some(advice) = self.consult_r1_on_suppressed_escalation(
+                    &suppressed_reason,
+                    prompt,
+                    mode_observation.as_ref(),
+                ) {
+                    messages.push(ChatMessage::User {
+                        content: format!(
+                            "<r1-checkpoint reason=\"{suppressed_reason}\">\n{advice}\n</r1-checkpoint>"
+                        ),
+                    });
+                }
+                next_mode = current_mode;
+                next_reason = None;
+            }
+            if next_mode != current_mode {
+                if let Some(ref reason) = next_reason {
                     self.observer.verbose_log(&format!(
                         "turn {turn_count}: mode transition {} -> {} (reason: {reason})",
-                        current_mode, mode_decision.mode
+                        current_mode, next_mode
                     ));
                     self.emit(
                         session.session_id,
@@ -2778,12 +2907,12 @@ impl AgentEngine {
                     {
                         cb(StreamChunk::ModeTransition {
                             from: current_mode.to_string(),
-                            to: mode_decision.mode.to_string(),
+                            to: next_mode.to_string(),
                             reason: reason.to_string(),
                         });
                     }
                 }
-                current_mode = mode_decision.mode;
+                current_mode = next_mode;
             }
 
             // ── R1DriveTools dispatch ──
@@ -3280,6 +3409,81 @@ impl AgentEngine {
         }
     }
 
+    fn consult_r1_on_suppressed_escalation(
+        &self,
+        reason: &str,
+        prompt: &str,
+        observation: Option<&ObservationPack>,
+    ) -> Option<String> {
+        let consultation_type = match reason {
+            "ambiguous_error" | "repeated_step_failure" | "doom_loop" => {
+                crate::consultation::ConsultationType::ErrorAnalysis
+            }
+            "cross_module_failure" | "blast_radius_exceeded" | "architectural_task" => {
+                crate::consultation::ConsultationType::ArchitectureAdvice
+            }
+            _ => crate::consultation::ConsultationType::TaskDecomposition,
+        };
+        let context = observation
+            .map(ObservationPack::to_r1_context)
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| format!("Prompt: {prompt}"));
+        let request = crate::consultation::ConsultationRequest {
+            question: format!(
+                "Escalation to R1DriveTools was suppressed ({reason}) because break-glass mode is disabled. \
+                 Provide the next concrete steps for the V3 executor loop."
+            ),
+            context,
+            consultation_type,
+        };
+        let stream_callback = self.stream_callback.lock().ok().and_then(|g| g.clone());
+        match crate::consultation::consult_r1(
+            self.llm.as_ref(),
+            &self.cfg.llm.max_think_model,
+            &request,
+            stream_callback.as_ref(),
+        ) {
+            Ok(result) => Some(result.advice),
+            Err(error) => {
+                self.observer.verbose_log(&format!(
+                    "r1 checkpoint consultation failed after suppressed escalation: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    fn consult_r1_final_review(
+        &self,
+        prompt: &str,
+        candidate_answer: &str,
+        changed_files: &[String],
+    ) -> Option<String> {
+        let context = format!(
+            "Prompt:\n{prompt}\n\nChanged files:\n{}\n\nCandidate final answer:\n{candidate_answer}",
+            changed_files.join("\n")
+        );
+        let request = crate::consultation::ConsultationRequest {
+            question: "Provide a short advisory review of this completion. Focus on risks, missing verification, and likely regressions."
+                .to_string(),
+            context,
+            consultation_type: crate::consultation::ConsultationType::PlanReview,
+        };
+        match crate::consultation::consult_r1(
+            self.llm.as_ref(),
+            &self.cfg.llm.max_think_model,
+            &request,
+            None,
+        ) {
+            Ok(result) => Some(result.advice),
+            Err(error) => {
+                self.observer
+                    .verbose_log(&format!("r1 final advisory review skipped: {error}"));
+                None
+            }
+        }
+    }
+
     /// Build a system prompt for chat-with-tools mode.
     /// Build the static portion of the system prompt at construction time.
     /// This includes project markers, platform info, tool guidelines, safety rules, etc.
@@ -3535,12 +3739,18 @@ impl AgentEngine {
         ))
     }
 
-    fn run_subagents(&self, session_id: Uuid, plan: &Plan) -> Result<Vec<String>> {
-        let max_tasks = self
+    fn run_subagents(
+        &self,
+        session_id: Uuid,
+        plan: &Plan,
+        task_budget: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let default_budget = self
             .subagents
             .max_concurrency
             .saturating_mul(3)
             .max(self.subagents.max_concurrency);
+        let max_tasks = task_budget.unwrap_or(default_budget).max(1);
         let lane_plan = plan_subagent_execution_lanes(&plan.steps, max_tasks);
         let mut tasks = Vec::new();
         let mut task_targets = HashMap::new();
@@ -3630,6 +3840,15 @@ impl AgentEngine {
                     goal: task.goal.clone(),
                 },
             )?;
+            if let Ok(cb_guard) = self.stream_callback.lock()
+                && let Some(ref cb) = *cb_guard
+            {
+                cb(StreamChunk::SubagentSpawned {
+                    run_id: task.run_id.to_string(),
+                    name: task.name.clone(),
+                    goal: task.goal.clone(),
+                });
+            }
             self.tool_host.fire_session_hooks("subagentspawned");
             self.store.upsert_subagent_run(&SubagentRunRecord {
                 run_id: task.run_id,
@@ -3772,6 +3991,14 @@ impl AgentEngine {
             }
             let persisted_goal = format!("{} [{}]", meta.goal, details.join(" "));
             if result.success {
+                let output_summary = if result.output.len() > 240 {
+                    format!(
+                        "{}...",
+                        &result.output[..result.output.floor_char_boundary(240)]
+                    )
+                } else {
+                    result.output.clone()
+                };
                 self.emit(
                     session_id,
                     EventKind::SubagentCompletedV1 {
@@ -3779,10 +4006,19 @@ impl AgentEngine {
                         output: result.output.clone(),
                     },
                 )?;
+                if let Ok(cb_guard) = self.stream_callback.lock()
+                    && let Some(ref cb) = *cb_guard
+                {
+                    cb(StreamChunk::SubagentCompleted {
+                        run_id: result.run_id.to_string(),
+                        name: meta.name.clone(),
+                        summary: output_summary,
+                    });
+                }
                 self.tool_host.fire_session_hooks("subagentcompleted");
                 self.store.upsert_subagent_run(&SubagentRunRecord {
                     run_id: result.run_id,
-                    name: meta.name,
+                    name: meta.name.clone(),
                     goal: persisted_goal,
                     status: "completed".to_string(),
                     output: Some(result.output.clone()),
@@ -3814,10 +4050,19 @@ impl AgentEngine {
                         error: error.clone(),
                     },
                 )?;
+                if let Ok(cb_guard) = self.stream_callback.lock()
+                    && let Some(ref cb) = *cb_guard
+                {
+                    cb(StreamChunk::SubagentFailed {
+                        run_id: result.run_id.to_string(),
+                        name: meta.name.clone(),
+                        error: error.clone(),
+                    });
+                }
                 self.tool_host.fire_session_hooks("subagentcompleted");
                 self.store.upsert_subagent_run(&SubagentRunRecord {
                     run_id: result.run_id,
-                    name: meta.name,
+                    name: meta.name.clone(),
                     goal: persisted_goal,
                     status: "failed".to_string(),
                     output: None,
@@ -8365,22 +8610,109 @@ fn summarize_transcript(transcript: &[String], max_lines: usize) -> String {
     format!("Auto-compacted transcript summary:\n{rendered}")
 }
 
-fn should_spawn_chat_subagents(
+#[derive(Debug, Clone, Copy)]
+struct ChatSubagentSpawnDecision {
+    should_spawn: bool,
+    blocked_by_tools: bool,
+    score: f32,
+    task_budget: usize,
+}
+
+fn decide_chat_subagent_spawn(
     options: &ChatOptions,
     signals: &deepseek_tools::ToolContextSignals,
     plan: &Plan,
-) -> bool {
-    if !options.tools || plan.steps.len() < 2 {
-        return false;
+    max_concurrency: usize,
+) -> ChatSubagentSpawnDecision {
+    let step_count = plan.steps.len();
+    if step_count == 0 {
+        return ChatSubagentSpawnDecision {
+            should_spawn: false,
+            blocked_by_tools: false,
+            score: 0.0,
+            task_budget: 1,
+        };
     }
     let target_count = plan
+        .steps
+        .iter()
+        .flat_map(|step| {
+            if step.files.is_empty() {
+                subagent_targets_for_step(step)
+            } else {
+                step.files.clone()
+            }
+        })
+        .map(|target| target.trim().to_string())
+        .filter(|target| !target.is_empty())
+        .collect::<HashSet<_>>()
+        .len();
+    let write_steps = plan
+        .steps
+        .iter()
+        .filter(|step| {
+            let intent = step.intent.to_ascii_lowercase();
+            intent.contains("edit")
+                || intent.contains("write")
+                || intent.contains("patch")
+                || step.tools.iter().any(|tool| {
+                    tool.contains("fs.write")
+                        || tool.contains("fs.edit")
+                        || tool.contains("multi_edit")
+                        || tool.contains("patch.apply")
+                })
+        })
+        .count();
+    let write_ratio = if step_count > 0 {
+        write_steps as f32 / step_count as f32
+    } else {
+        0.0
+    };
+    let verification_breadth = (plan.verification.len() as f32 / 4.0).clamp(0.0, 1.0);
+    let domain_count = plan
+        .steps
+        .iter()
+        .map(|step| {
+            let targets = subagent_targets_for_step(step);
+            subagent_domain_for_step(step, &targets)
+        })
+        .collect::<HashSet<_>>()
+        .len();
+    let step_factor = (step_count as f32 / 6.0).clamp(0.0, 1.0);
+    let target_factor = (target_count as f32 / 5.0).clamp(0.0, 1.0);
+    let repo_factor = (signals.codebase_file_count as f32 / 400.0).clamp(0.0, 1.0);
+    let cross_domain = if domain_count >= 2 { 1.0 } else { 0.0 };
+    let prompt_complex = if signals.prompt_is_complex { 1.0 } else { 0.0 };
+    let score = step_factor * 0.28
+        + target_factor * 0.22
+        + cross_domain * 0.15
+        + write_ratio * 0.12
+        + verification_breadth * 0.10
+        + prompt_complex * 0.08
+        + repo_factor * 0.05;
+    let threshold = 0.27;
+    let scope_large_enough = step_count >= 2 || target_count >= 2;
+    let should_spawn = options.tools && scope_large_enough && score >= threshold;
+    let blocked_by_tools = !options.tools && scope_large_enough && score >= threshold;
+    let max_lanes = plan
         .steps
         .iter()
         .flat_map(|step| step.files.iter().map(|f| f.as_str()))
         .collect::<HashSet<_>>()
         .len();
-    let broad_scope = target_count >= 2 || plan.steps.len() >= 4;
-    broad_scope && (signals.prompt_is_complex || signals.codebase_file_count >= 250)
+    let max_budget = max_concurrency
+        .saturating_mul(3)
+        .max(max_concurrency)
+        .max(2);
+    let lane_hint = (((score * max_budget as f32).ceil() as usize).max(2))
+        .min(max_lanes.max(2))
+        .min(max_budget);
+    ChatSubagentSpawnDecision {
+        should_spawn,
+        blocked_by_tools,
+        score: score.clamp(0.0, 1.0),
+        task_budget: lane_hint,
+    }
 }
 
 fn summarize_subagent_notes(notes: &[String]) -> String {
@@ -9059,7 +9391,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_subagent_spawn_trigger_requires_broad_complex_scope() {
+    fn chat_subagent_spawn_decision_scores_scope_and_tools() {
         let plan = Plan {
             plan_id: Uuid::now_v7(),
             version: 1,
@@ -9095,19 +9427,27 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(should_spawn_chat_subagents(&options, &signals, &plan));
+        let decision = decide_chat_subagent_spawn(&options, &signals, &plan, 7);
+        assert!(decision.should_spawn);
+        assert!(!decision.blocked_by_tools);
+        assert!(decision.task_budget >= 2);
 
         let mut non_broad = plan.clone();
         non_broad.steps[1].files = vec!["src/api.rs".to_string()];
-        assert!(!should_spawn_chat_subagents(&options, &signals, &non_broad));
-        assert!(!should_spawn_chat_subagents(
+        let non_broad_decision = decide_chat_subagent_spawn(&options, &signals, &non_broad, 7);
+        assert!(!non_broad_decision.should_spawn);
+
+        let blocked_decision = decide_chat_subagent_spawn(
             &ChatOptions {
                 tools: false,
                 ..Default::default()
             },
             &signals,
-            &plan
-        ));
+            &plan,
+            7,
+        );
+        assert!(!blocked_decision.should_spawn);
+        assert!(blocked_decision.blocked_by_tools);
     }
 
     #[test]

@@ -128,6 +128,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
         .unwrap_or(false);
     ChatOptions {
         tools,
+        allow_r1_drive_tools: cli.allow_r1_drive_tools,
         force_max_think,
         allowed_tools: effective_allowed,
         disallowed_tools: effective_disallowed,

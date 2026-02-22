@@ -7,7 +7,7 @@ use deepseek_core::{AppConfig, EventKind, StreamChunk, runtime_dir};
 use deepseek_mcp::McpManager;
 use deepseek_memory::{ExportFormat, MemoryManager};
 use deepseek_skills::SkillManager;
-use deepseek_store::Store;
+use deepseek_store::{Store, SubagentRunRecord};
 use deepseek_ui::{
     KeyBindings, SlashCommand, TuiStreamEvent, TuiTheme, load_keybindings, render_statusline,
     run_tui_shell_with_bindings,
@@ -28,7 +28,7 @@ use crate::util::*;
 use crate::{
     Cli, CompactArgs, ConfigCmd, DoctorArgs, DoctorModeArg, ExportArgs, McpCmd, McpGetArgs,
     McpRemoveArgs, MemoryCmd, MemoryEditArgs, MemoryShowArgs, MemorySyncArgs, RewindArgs, RunArgs,
-    SearchArgs, SkillRunArgs, SkillsCmd, TasksCmd, UsageArgs,
+    SearchArgs, SkillRunArgs, SkillsCmd, UsageArgs,
 };
 
 // Commands that chat dispatches to
@@ -45,13 +45,152 @@ use crate::commands::remote_env::{parse_remote_env_cmd, remote_env_now, run_remo
 use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
 use crate::commands::status::{current_ui_status, run_context, run_status, run_usage};
-use crate::commands::tasks::run_tasks;
 use crate::commands::teleport::{parse_teleport_args, run_teleport, teleport_now};
 use crate::commands::visual::{parse_visual_cmd, run_visual, visual_payload};
 
 fn is_max_think_selection(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("reasoner") || lower.contains("max") || lower.contains("high")
+}
+
+fn truncate_inline(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        text.to_string()
+    } else {
+        format!("{}...", &text[..text.floor_char_boundary(max_chars)])
+    }
+}
+
+fn agents_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
+    let store = Store::new(cwd)?;
+    let session_id = store
+        .load_latest_session()?
+        .map(|session| session.session_id);
+    let runs = store.list_subagent_runs(session_id, limit)?;
+    Ok(json!({
+        "schema": "deepseek.chat.agents.v1",
+        "session_id": session_id.map(|id| id.to_string()),
+        "count": runs.len(),
+        "agents": runs,
+    }))
+}
+
+fn mission_control_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
+    let store = Store::new(cwd)?;
+    let session_id = store
+        .load_latest_session()?
+        .map(|session| session.session_id);
+    let tasks = store.list_tasks(session_id)?;
+    let subagents = store.list_subagent_runs(session_id, limit)?;
+    let running_subagents = subagents
+        .iter()
+        .filter(|run| run.status.eq_ignore_ascii_case("running"))
+        .count();
+    let failed_subagents = subagents
+        .iter()
+        .filter(|run| run.status.eq_ignore_ascii_case("failed"))
+        .count();
+    Ok(json!({
+        "schema": "deepseek.chat.mission_control.v1",
+        "session_id": session_id.map(|id| id.to_string()),
+        "tasks": tasks,
+        "subagents": subagents,
+        "summary": {
+            "task_count": tasks.len(),
+            "subagent_count": subagents.len(),
+            "running_subagents": running_subagents,
+            "failed_subagents": failed_subagents,
+        }
+    }))
+}
+
+fn render_agents_payload(payload: &serde_json::Value) -> String {
+    let runs = payload
+        .get("agents")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if runs.is_empty() {
+        return "No subagent runs recorded in this session.".to_string();
+    }
+    let parsed_runs = runs
+        .into_iter()
+        .filter_map(|row| serde_json::from_value::<SubagentRunRecord>(row).ok())
+        .collect::<Vec<_>>();
+    if parsed_runs.is_empty() {
+        return "No subagent runs recorded in this session.".to_string();
+    }
+    let mut lines = vec![format!("Subagents ({} total):", parsed_runs.len())];
+    for run in parsed_runs {
+        let detail = run
+            .output
+            .as_deref()
+            .or(run.error.as_deref())
+            .unwrap_or_default()
+            .replace('\n', " ");
+        let detail = truncate_inline(&detail, 120);
+        lines.push(format!(
+            "- {} [{}] {} — {}",
+            run.name, run.status, run.run_id, detail
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_mission_control_payload(payload: &serde_json::Value) -> String {
+    let tasks = payload
+        .get("tasks")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let subagents = payload
+        .get("subagents")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Mission Control: {} task(s), {} subagent run(s)",
+        tasks.len(),
+        subagents.len()
+    )];
+    if tasks.is_empty() {
+        lines.push("- Tasks: none".to_string());
+    } else {
+        lines.push("- Tasks:".to_string());
+        for task in tasks.iter().take(10) {
+            let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("task");
+            let status = task
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let priority = task
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default();
+            lines.push(format!("  - {title} [{status}] priority={priority}"));
+        }
+    }
+    if subagents.is_empty() {
+        lines.push("- Subagents: none".to_string());
+    } else {
+        lines.push("- Subagents:".to_string());
+        for run in subagents.iter().take(10) {
+            let name = run
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subagent");
+            let status = run
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let run_id = run
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            lines.push(format!("  - {name} [{status}] {run_id}"));
+        }
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn run_chat(
@@ -75,9 +214,16 @@ pub(crate) fn run_chat(
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
         .unwrap_or(false);
+    let allow_r1_drive_tools = cli.map(|value| value.allow_r1_drive_tools).unwrap_or(false);
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
-        return run_chat_tui(cwd, allow_tools, &cfg, force_max_think);
+        return run_chat_tui(
+            cwd,
+            allow_tools,
+            allow_r1_drive_tools,
+            &cfg,
+            force_max_think,
+        );
     }
     if force_tui && !interactive_tty {
         return Err(anyhow!("--tui requires an interactive terminal"));
@@ -432,16 +578,20 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Agents => {
+                    let payload = agents_payload(cwd, 20)?;
                     if json_mode {
-                        print_json(&json!({"agents": "subagent listing"}))?;
+                        print_json(&payload)?;
                     } else {
-                        println!(
-                            "Subagent status: use 'deepseek background list' for running agents."
-                        );
+                        println!("{}", render_agents_payload(&payload));
                     }
                 }
                 SlashCommand::Tasks(_args) => {
-                    run_tasks(cwd, TasksCmd::List, json_mode)?;
+                    let payload = mission_control_payload(cwd, 20)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!("{}", render_mission_control_payload(&payload));
+                    }
                 }
                 SlashCommand::Review(args) => {
                     if json_mode {
@@ -826,6 +976,7 @@ pub(crate) fn run_chat(
                                 &rendered,
                                 ChatOptions {
                                     tools: allow_tools,
+                                    allow_r1_drive_tools,
                                     force_max_think,
                                     additional_dirs: additional_dirs.clone(),
                                     ..Default::default()
@@ -879,6 +1030,34 @@ pub(crate) fn run_chat(
                         let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
                         let _ = handle.flush();
                     }
+                    deepseek_core::StreamChunk::SubagentSpawned { run_id, name, goal } => {
+                        let _ = writeln!(handle, "[subagent:spawned] {name} ({run_id}) {goal}");
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::SubagentCompleted {
+                        run_id,
+                        name,
+                        summary,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[subagent:completed] {name} ({run_id}) {}",
+                            summary.replace('\n', " ")
+                        );
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::SubagentFailed {
+                        run_id,
+                        name,
+                        error,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[subagent:failed] {name} ({run_id}) {}",
+                            error.replace('\n', " ")
+                        );
+                        let _ = handle.flush();
+                    }
                     deepseek_core::StreamChunk::ImageData { label, .. } => {
                         let _ = writeln!(handle, "[image: {label}]");
                         let _ = handle.flush();
@@ -899,6 +1078,7 @@ pub(crate) fn run_chat(
             prompt,
             ChatOptions {
                 tools: allow_tools,
+                allow_r1_drive_tools,
                 force_max_think,
                 additional_dirs: additional_dirs.clone(),
                 ..Default::default()
@@ -918,6 +1098,7 @@ pub(crate) fn run_chat(
 pub(crate) fn run_chat_tui(
     cwd: &Path,
     allow_tools: bool,
+    allow_r1_drive_tools: bool,
     cfg: &AppConfig,
     initial_force_max_think: bool,
 ) -> Result<()> {
@@ -1225,8 +1406,14 @@ pub(crate) fn run_chat_tui(
                     out
                 }
                 SlashCommand::Sandbox(_) => format!("Sandbox mode: {}", AppConfig::load(cwd).unwrap_or_default().policy.sandbox_mode),
-                SlashCommand::Agents => "Use 'deepseek background list' for subagent status.".to_string(),
-                SlashCommand::Tasks(_) => "Use 'deepseek tasks list' for task queue.".to_string(),
+                SlashCommand::Agents => {
+                    let payload = agents_payload(cwd, 20)?;
+                    render_agents_payload(&payload)
+                }
+                SlashCommand::Tasks(_) => {
+                    let payload = mission_control_payload(cwd, 20)?;
+                    render_mission_control_payload(&payload)
+                }
                 SlashCommand::Review(_) => "Use 'deepseek review' subcommand for code review.".to_string(),
                 SlashCommand::Search(args) => {
                     let query = args.join(" ");
@@ -1421,6 +1608,31 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ModeTransition { from, to, reason } => {
                     let _ = tx_stream.send(TuiStreamEvent::ModeTransition { from, to, reason });
                 }
+                StreamChunk::SubagentSpawned { run_id, name, goal } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SubagentSpawned { run_id, name, goal });
+                }
+                StreamChunk::SubagentCompleted {
+                    run_id,
+                    name,
+                    summary,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SubagentCompleted {
+                        run_id,
+                        name,
+                        summary,
+                    });
+                }
+                StreamChunk::SubagentFailed {
+                    run_id,
+                    name,
+                    error,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::SubagentFailed {
+                        run_id,
+                        name,
+                        error,
+                    });
+                }
                 StreamChunk::ImageData { data, label } => {
                     let _ = tx_stream.send(TuiStreamEvent::ImageDisplay { data, label });
                 }
@@ -1436,6 +1648,7 @@ pub(crate) fn run_chat_tui(
                         &prompt,
                         ChatOptions {
                             tools: allow_tools,
+                            allow_r1_drive_tools,
                             force_max_think: max_think,
                             additional_dirs: prompt_additional_dirs,
                             ..Default::default()
@@ -2368,6 +2581,58 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                         let _ = writeln!(handle);
                     } else {
                         let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::SubagentSpawned { run_id, name, goal } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"subagent_spawned","run_id":run_id,"name":name,"goal":goal}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "[subagent:spawned] {name} ({run_id}) {goal}");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::SubagentCompleted {
+                    run_id,
+                    name,
+                    summary,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"subagent_completed","run_id":run_id,"name":name,"summary":summary}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[subagent:completed] {name} ({run_id}) {}",
+                            summary.replace('\n', " ")
+                        );
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::SubagentFailed {
+                    run_id,
+                    name,
+                    error,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"subagent_failed","run_id":run_id,"name":name,"error":error}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[subagent:failed] {name} ({run_id}) {}",
+                            error.replace('\n', " ")
+                        );
                     }
                     let _ = handle.flush();
                 }
