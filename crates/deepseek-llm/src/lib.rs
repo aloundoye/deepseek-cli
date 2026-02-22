@@ -232,10 +232,8 @@ impl DeepSeekClient {
             "stream": false
         });
         // DeepSeek API requires temperature to be omitted when thinking is enabled.
-        if !thinking_enabled {
-            if let Some(temp) = req.temperature {
-                payload["temperature"] = json!(temp);
-            }
+        if !thinking_enabled && let Some(temp) = req.temperature {
+            payload["temperature"] = json!(temp);
         }
         if let Some(ref thinking) = req.thinking {
             payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
@@ -326,9 +324,11 @@ impl DeepSeekClient {
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
                         let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
-                        // Track whether we're inside a DSML markup block so we
-                        // can buffer it instead of emitting to the TUI.
+                        // Track whether we're inside a DSML markup block or a
+                        // plain-text tool call so we can buffer instead of emitting
+                        // to the TUI.
                         let mut dsml_buffering = false;
+                        let mut tool_call_buffering = false;
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
@@ -373,11 +373,15 @@ impl DeepSeekClient {
                                     if !dsml_buffering && contains_dsml_markup(content) {
                                         dsml_buffering = true;
                                     }
-                                    if !dsml_buffering {
+                                    if !dsml_buffering && !tool_call_buffering {
                                         // Check if accumulated content started
                                         // a DSML block we missed on earlier chunks.
                                         if contains_dsml_markup(&content_out) {
                                             dsml_buffering = true;
+                                        } else if content_contains_tool_call(&content_out) {
+                                            // Model is emitting a tool call as
+                                            // plain text — suppress from TUI.
+                                            tool_call_buffering = true;
                                         } else {
                                             cb(StreamChunk::ContentDelta(content.to_string()));
                                         }
@@ -1184,32 +1188,34 @@ fn contains_dsml_markup(content: &str) -> bool {
     DSML_MARKERS.iter().any(|marker| content.contains(marker))
 }
 
-/// Attempt to parse raw DSML markup out of content and return extracted tool
-/// calls plus the cleaned content (markup stripped).  Returns `None` if no
-/// DSML markup is detected.
+/// Attempt to parse raw tool calls out of content text and return extracted tool
+/// calls plus the cleaned content (markup/tool-text stripped).  Returns `None`
+/// if no rescuable patterns are detected.
+///
+/// Handles three formats:
+///   - Format A: DSML full-width delimiter blocks
+///   - Format B: DSML legacy token marker blocks
+///   - Format C: Plain-text tool calls (model outputs `tool_name\n{json}` as content)
 fn rescue_raw_tool_calls(content: &str) -> Option<(String, Vec<LlmToolCall>)> {
-    if !contains_dsml_markup(content) {
-        return None;
+    // Try DSML formats first (Format A and B)
+    if contains_dsml_markup(content) {
+        let mut tool_calls = Vec::new();
+        let mut call_counter: usize = 0;
+
+        rescue_dsml_format_a(content, &mut tool_calls, &mut call_counter);
+
+        if tool_calls.is_empty() {
+            rescue_dsml_format_b(content, &mut tool_calls, &mut call_counter);
+        }
+
+        if !tool_calls.is_empty() {
+            let cleaned = strip_dsml_markup(content);
+            return Some((cleaned, tool_calls));
+        }
     }
 
-    let mut tool_calls = Vec::new();
-    let mut call_counter: usize = 0;
-
-    // Try Format A: <｜DSML｜invoke name="..."> blocks
-    rescue_dsml_format_a(content, &mut tool_calls, &mut call_counter);
-
-    // Try Format B: <｜tool▁call▁begin｜> blocks
-    if tool_calls.is_empty() {
-        rescue_dsml_format_b(content, &mut tool_calls, &mut call_counter);
-    }
-
-    if tool_calls.is_empty() {
-        return None;
-    }
-
-    // Strip all DSML markup from content to produce clean text
-    let cleaned = strip_dsml_markup(content);
-    Some((cleaned, tool_calls))
+    // Try Format C: plain-text tool calls (e.g. "some text bash_run\n{...json...}")
+    rescue_plaintext_tool_calls(content)
 }
 
 /// Parse Format A DSML invoke blocks.
@@ -1384,6 +1390,284 @@ fn strip_dsml_markup(content: &str) -> String {
     cleaned.push_str(remaining);
 
     cleaned.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Format C rescue — plain-text tool calls
+// ---------------------------------------------------------------------------
+//
+// When DeepSeek outputs tool calls as plain text content instead of structured
+// function calling, we see patterns like:
+//
+//   Let me read the file. fs_read
+//   {
+//     "path": "/README.md"
+//   }
+//
+// or inline:  bash_run{"command": "ls"}
+//
+// This rescue scans for known tool API names followed by a JSON object.
+
+/// Known tool API name prefixes. Used for cheap early-exit before doing a full
+/// tool-name scan of accumulated streaming content.
+const TOOL_NAME_PREFIXES: &[&str] = &[
+    "fs_",
+    "bash_",
+    "git_",
+    "web_",
+    "multi_",
+    "patch_",
+    "chrome_",
+    "notebook_",
+    "index_",
+    "diagnostics_",
+    "task_",
+    "spawn_",
+    "enter_",
+    "exit_",
+    "kill_",
+    "user_",
+    "mcp_",
+    "skill",
+];
+
+/// Returns `true` if `content` contains a known tool API name at a word
+/// boundary followed by end-of-string, whitespace, `{`, or a backtick.
+/// Used during streaming to detect when the model is emitting a tool call
+/// as plain text so we can suppress it from the TUI.
+pub fn content_contains_tool_call(content: &str) -> bool {
+    // Cheap guard: skip scanning unless content contains a likely prefix.
+    if !TOOL_NAME_PREFIXES.iter().any(|pfx| content.contains(pfx)) && !content.contains("skill") {
+        return false;
+    }
+
+    for &name in known_tool_api_names() {
+        let mut search_from = 0;
+        while let Some(pos) = content[search_from..].find(name) {
+            let abs = search_from + pos;
+            // Word boundary check (same as rescue_plaintext_tool_calls)
+            if abs > 0 {
+                let prev = content.as_bytes()[abs - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    search_from = abs + name.len();
+                    continue;
+                }
+            }
+            let after = abs + name.len();
+            if after >= content.len() {
+                // Tool name at end of content — might be in-progress
+                return true;
+            }
+            let next = content.as_bytes()[after];
+            if next.is_ascii_whitespace() || next == b'{' || next == b'`' || next == b'\n' {
+                return true;
+            }
+            search_from = after;
+        }
+    }
+    false
+}
+
+/// Known tool API names used for Format C rescue matching.
+pub fn known_tool_api_names() -> &'static [&'static str] {
+    // Build from ToolName::ALL — this is a fixed set so a static slice is fine.
+    // We use a macro-like approach: just list them explicitly for zero allocation.
+    &[
+        "fs_read",
+        "fs_write",
+        "fs_edit",
+        "fs_list",
+        "fs_glob",
+        "fs_grep",
+        "bash_run",
+        "multi_edit",
+        "git_status",
+        "git_diff",
+        "git_show",
+        "web_fetch",
+        "web_search",
+        "notebook_read",
+        "notebook_edit",
+        "index_query",
+        "patch_stage",
+        "patch_apply",
+        "diagnostics_check",
+        "chrome_navigate",
+        "chrome_click",
+        "chrome_type_text",
+        "chrome_screenshot",
+        "chrome_read_console",
+        "chrome_evaluate",
+        "user_question",
+        "task_create",
+        "task_update",
+        "task_get",
+        "task_list",
+        "spawn_task",
+        "task_output",
+        "task_stop",
+        "enter_plan_mode",
+        "exit_plan_mode",
+        "skill",
+        "kill_shell",
+        "mcp_search",
+    ]
+}
+
+/// Strip markdown code fences (`` ```lang `` and `` ``` `` lines) from content.
+/// This normalises Format C tool calls wrapped in markdown fences so the
+/// plaintext rescue scanner can match them.
+///
+/// Example:
+/// ```text
+/// "```bash\nbash_run\n```\n```json\n{...}\n```"  →  "\nbash_run\n\n{...}\n"
+/// ```
+fn strip_markdown_fences(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for line in content.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            // Drop the fence line entirely; preserve the newline boundary.
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Attempt to rescue plain-text tool calls from content.
+/// Returns `(cleaned_text, tool_calls)` if any tool calls were found.
+fn rescue_plaintext_tool_calls(content: &str) -> Option<(String, Vec<LlmToolCall>)> {
+    let names = known_tool_api_names();
+
+    // Quick check: does the content contain any known tool name?
+    let has_any = names.iter().any(|name| content.contains(name));
+    if !has_any {
+        return None;
+    }
+
+    // Strip markdown code fences so that wrapped tool calls
+    // (```bash\nbash_run\n```\n```json\n{...}\n```) are normalised
+    // to bare `tool_name\n{json}` before scanning.
+    let content = &strip_markdown_fences(content);
+
+    let mut tool_calls = Vec::new();
+    let mut call_counter: usize = 0;
+    // Track byte ranges to strip from the cleaned output
+    let mut strip_ranges: Vec<(usize, usize)> = Vec::new();
+
+    // For each known tool name, find occurrences in content
+    for &name in names {
+        let mut search_from = 0;
+        while let Some(pos) = content[search_from..].find(name) {
+            let abs_pos = search_from + pos;
+
+            // Check word boundary: the character before the tool name must be
+            // start-of-string, whitespace, or newline (avoid matching substrings
+            // like "prefix_fs_read").
+            if abs_pos > 0 {
+                let prev = content.as_bytes()[abs_pos - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    search_from = abs_pos + name.len();
+                    continue;
+                }
+            }
+
+            let after_name = abs_pos + name.len();
+            if after_name >= content.len() {
+                search_from = after_name;
+                continue;
+            }
+
+            // Find the opening '{' after the tool name (skip whitespace/newlines)
+            let rest = &content[after_name..];
+            let trimmed = rest.trim_start();
+            if !trimmed.starts_with('{') {
+                search_from = after_name;
+                continue;
+            }
+
+            let json_start = after_name + (rest.len() - trimmed.len());
+
+            // Find the matching closing '}' by counting braces
+            if let Some(json_end) = find_matching_brace(&content[json_start..]) {
+                let json_str = &content[json_start..json_start + json_end + 1];
+
+                // Validate it's actual JSON
+                if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
+                    call_counter += 1;
+                    tool_calls.push(LlmToolCall {
+                        id: format!("plaintext_rescue_{call_counter}"),
+                        name: name.to_string(),
+                        arguments: json_str.to_string(),
+                    });
+                    strip_ranges.push((abs_pos, json_start + json_end + 1));
+                    search_from = json_start + json_end + 1;
+                    continue;
+                }
+            }
+
+            search_from = after_name;
+        }
+    }
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    // Build cleaned content by stripping the tool call regions
+    strip_ranges.sort_by_key(|&(start, _)| start);
+    let mut cleaned = String::with_capacity(content.len());
+    let mut last_end = 0;
+    for (start, end) in &strip_ranges {
+        if *start > last_end {
+            cleaned.push_str(&content[last_end..*start]);
+        }
+        last_end = *end;
+    }
+    if last_end < content.len() {
+        cleaned.push_str(&content[last_end..]);
+    }
+
+    Some((cleaned.trim().to_string(), tool_calls))
+}
+
+/// Find the index of the matching closing brace for an opening '{' at position 0.
+/// Returns `None` if no matching brace is found.
+fn find_matching_brace(s: &str) -> Option<usize> {
+    debug_assert!(s.starts_with('{'));
+    let mut depth: u32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape_next = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2255,6 +2539,76 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_rescue_single_tool_call() {
+        let content = r#"I'll analyze the project structure.
+
+bash_run
+{
+  "command": "find . -type f -name \"*.rs\" | head -30",
+  "description": "Get an overview of project files"
+}"#;
+        let (cleaned, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash_run");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert!(args["command"].as_str().unwrap().contains("find"));
+        assert!(cleaned.contains("analyze the project"));
+        assert!(!cleaned.contains("bash_run"));
+    }
+
+    #[test]
+    fn plaintext_rescue_inline_tool_call() {
+        let content = r#"Let me read the file. fs_read{"path": "/README.md"}"#;
+        let (cleaned, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs_read");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["path"], "/README.md");
+        assert!(cleaned.contains("read the file"));
+        assert!(!cleaned.contains("fs_read"));
+    }
+
+    #[test]
+    fn plaintext_rescue_multiple_tool_calls() {
+        let content = r#"Let me check both.
+fs_read
+{"path": "src/main.rs"}
+Now the other.
+fs_glob
+{"pattern": "**/*.toml"}"#;
+        let (_, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "fs_read");
+        assert_eq!(calls[1].name, "fs_glob");
+    }
+
+    #[test]
+    fn plaintext_rescue_ignores_embedded_names() {
+        // "fs_read" is part of a word — should not match
+        let content = "The prefix_fs_read function is useful.";
+        assert!(rescue_raw_tool_calls(content).is_none());
+    }
+
+    #[test]
+    fn plaintext_rescue_no_json_after_name() {
+        let content = "Use bash_run to execute commands.";
+        assert!(rescue_raw_tool_calls(content).is_none());
+    }
+
+    #[test]
+    fn plaintext_rescue_nested_json() {
+        let content = r#"bash_run
+{
+  "command": "echo '{\"nested\": true}'"
+}"#;
+        let (_, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash_run");
+    }
+
+    #[test]
     fn dsml_contains_detects_markers() {
         assert!(contains_dsml_markup(
             "some <\u{ff5c}DSML\u{ff5c}invoke> text"
@@ -2281,5 +2635,74 @@ mod tests {
         assert_eq!(got.tool_calls.len(), 1);
         assert_eq!(got.tool_calls[0].name, "fs_read");
         assert!(!got.text.contains("DSML"));
+    }
+
+    // --- strip_markdown_fences tests ---
+
+    #[test]
+    fn strip_markdown_fences_removes_fences() {
+        let input = "```bash\nbash_run\n```\n```json\n{\"command\": \"ls\"}\n```";
+        let out = strip_markdown_fences(input);
+        assert!(!out.contains("```"));
+        assert!(out.contains("bash_run"));
+        assert!(out.contains("{\"command\": \"ls\"}"));
+    }
+
+    #[test]
+    fn strip_markdown_fences_preserves_plain_content() {
+        let input = "Hello world\nNo fences here";
+        let out = strip_markdown_fences(input);
+        assert!(out.contains("Hello world"));
+        assert!(out.contains("No fences here"));
+    }
+
+    #[test]
+    fn plaintext_rescue_markdown_wrapped_tool_call() {
+        // Format C with markdown code fences — the most common DeepSeek V3 failure mode
+        let content = "I'll analyze the project...\n\n```bash\nbash_run\n```\n```json\n{\n  \"command\": \"find . -type f\",\n  \"description\": \"List files\"\n}\n```";
+        let (cleaned, calls) =
+            rescue_raw_tool_calls(content).expect("should rescue markdown-wrapped tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash_run");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert!(args["command"].as_str().unwrap().contains("find"));
+        assert!(cleaned.contains("analyze the project"));
+    }
+
+    #[test]
+    fn plaintext_rescue_markdown_wrapped_fs_read() {
+        let content =
+            "Let me read the file.\n\n```\nfs_read\n```\n```json\n{\"path\": \"/README.md\"}\n```";
+        let (_, calls) = rescue_raw_tool_calls(content).expect("should rescue");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs_read");
+    }
+
+    // --- content_contains_tool_call tests ---
+
+    #[test]
+    fn content_contains_tool_call_detects_name() {
+        assert!(content_contains_tool_call("I will run bash_run\n"));
+        assert!(content_contains_tool_call("fs_read{\"path\": \"x\"}"));
+        assert!(content_contains_tool_call("text\nbash_run"));
+    }
+
+    #[test]
+    fn content_contains_tool_call_ignores_embedded() {
+        assert!(!content_contains_tool_call("prefix_fs_read is a function"));
+        assert!(!content_contains_tool_call("This has no tool names."));
+    }
+
+    #[test]
+    fn content_contains_tool_call_at_word_boundary() {
+        // After newline
+        assert!(content_contains_tool_call(
+            "some text\nfs_glob{\"pattern\": \"*.rs\"}"
+        ));
+        // After space
+        assert!(content_contains_tool_call("use git_status "));
+        // Should not match inside a word
+        assert!(!content_contains_tool_call("my_bash_run_thing"));
     }
 }

@@ -17,7 +17,7 @@ use deepseek_core::{
     StreamChunk, ThinkingConfig, ToolCall, ToolChoice, ToolHost, is_valid_session_state_transition,
 };
 use deepseek_hooks::{HookEvent, HookInput, HookResult, HookRuntime, HooksConfig};
-use deepseek_llm::{DeepSeekClient, LlmClient};
+use deepseek_llm::{DeepSeekClient, LlmClient, content_contains_tool_call};
 use deepseek_mcp::{McpManager, McpTool};
 use deepseek_memory::{AutoMemoryObservation, MemoryManager};
 use deepseek_observe::Observer;
@@ -1344,6 +1344,7 @@ impl AgentEngine {
         let mut failure_tracker = FailureTracker::default();
         let mut current_mode = AgentMode::V3Autopilot;
         let mut budget_warned = false;
+        let mut tool_choice_retried = false;
         self.transition(&mut session, SessionState::ExecutingStep)?;
 
         loop {
@@ -1641,6 +1642,42 @@ impl AgentEngine {
                 response
             };
 
+            // Tool-call-as-text rescue retry: if response.tool_calls is empty
+            // but the text contains known tool API names, retry once with
+            // tool_choice="required" to force the model to use structured
+            // function calling.
+            let response = if options.tools
+                && response.tool_calls.is_empty()
+                && !tool_choice_retried
+                && content_contains_tool_call(&response.text)
+            {
+                tool_choice_retried = true;
+                self.observer
+                    .verbose_log("tool-call-as-text detected: retrying with tool_choice=required");
+                let retry_request = ChatRequest {
+                    model: request_model.clone(),
+                    messages: messages.clone(),
+                    tools: tools.clone(),
+                    tool_choice: ToolChoice::required(),
+                    max_tokens: session.budgets.max_think_tokens.max(4096),
+                    temperature: if thinking.is_some() { None } else { Some(0.0) },
+                    thinking: thinking.clone(),
+                };
+                let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+                if let Some(cb) = cb {
+                    self.llm.complete_chat_streaming(&retry_request, cb)?
+                } else {
+                    self.llm.complete_chat(&retry_request)?
+                }
+            } else {
+                // Reset flag on successful structured responses so a later turn
+                // can retry again if needed.
+                if !response.tool_calls.is_empty() {
+                    tool_choice_retried = false;
+                }
+                response
+            };
+
             // Record usage metrics
             let input_tok = estimate_tokens(
                 &messages
@@ -1813,7 +1850,7 @@ impl AgentEngine {
             // Execute each tool call and collect results
             for tc in &response.tool_calls {
                 let internal_name = map_tool_name(&tc.name);
-                let args: serde_json::Value =
+                let mut args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
 
                 // ── Pre-execution argument validation ──
@@ -1832,6 +1869,18 @@ impl AgentEngine {
                     });
                     failure_streak += 1;
                     continue;
+                // Normalize bash.run args: model may send "command" (the
+                // canonical definition name) — copy it to "cmd" so all
+                // downstream code (policy, observation, mode_router) works
+                // unchanged.
+                if internal_name == "bash.run" {
+                    if let Some(obj) = args.as_object_mut() {
+                        if obj.contains_key("command") && !obj.contains_key("cmd") {
+                            if let Some(val) = obj.get("command").cloned() {
+                                obj.insert("cmd".to_string(), val);
+                            }
+                        }
+                    }
                 }
 
                 // Safety net: block disallowed tools at execution time
@@ -2102,6 +2151,7 @@ impl AgentEngine {
                         let shell_id = Uuid::now_v7();
                         let cmd_str = args
                             .get("cmd")
+                            .or_else(|| args.get("command"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -2243,6 +2293,11 @@ impl AgentEngine {
                     output
                 } else {
                     failure_streak += 1;
+                    failure_tracker.record_failure();
+                    // Track denied tools in doom-loop detection so repeated
+                    // denials don't cause infinite retries.
+                    let sig = ToolSignature::new(internal_name, &args, Some(-2));
+                    failure_tracker.record_tool_signature(sig, false);
                     // Notify TUI of denial
                     if let Ok(mut cb_guard) = self.stream_callback.lock()
                         && let Some(ref mut cb) = *cb_guard
@@ -2255,7 +2310,7 @@ impl AgentEngine {
                         });
                     }
                     format!(
-                        "Tool '{}' requires approval. Please grant permission to proceed.",
+                        "Tool '{}' was denied by the user. Do NOT retry this tool with the same arguments. Try a different approach or ask the user for guidance.",
                         internal_name
                     )
                 };
@@ -2742,6 +2797,8 @@ impl AgentEngine {
              - **diagnostics_check**: Run language-specific diagnostics (cargo check, tsc, ruff, etc.).\n\
              - **patch_stage / patch_apply**: Stage and apply unified diffs with SHA verification.\n\
              - **notebook_read / notebook_edit**: Read and modify Jupyter notebooks.\n\n\
+             Important: When you need to use a tool, invoke it through the function calling API.\n\
+             Do NOT output tool names or arguments as text in your response.\n\n\
              # Safety Rules\n\
              - Always read a file before editing it — understand existing code first\n\
              - Never delete files, force-push, or run destructive commands without explicit user approval\n\
@@ -7696,7 +7753,7 @@ fn execute_mcp_stdio_tool(
     let init_params = json!({
         "protocolVersion": "2025-06-18",
         "capabilities": {},
-        "clientInfo": { "name": "deepseek-cli", "version": "0.1.0" }
+        "clientInfo": { "name": "deepseek-cli", "version": "0.2.0" }
     });
     write_mcp_request(&mut stdin, 1, "initialize", init_params)?;
 
