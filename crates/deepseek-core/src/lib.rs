@@ -1094,6 +1094,18 @@ pub enum StreamChunk {
     ContentDelta(String),
     /// A reasoning/thinking text delta.
     ReasoningDelta(String),
+    /// A tool call has started execution.
+    ToolCallStart {
+        tool_name: String,
+        args_summary: String,
+    },
+    /// A tool call has completed execution.
+    ToolCallEnd {
+        tool_name: String,
+        duration_ms: u64,
+        success: bool,
+        summary: String,
+    },
     /// Agent mode transition (e.g., V3Autopilot → R1DriveTools).
     ModeTransition {
         from: String,
@@ -1839,6 +1851,10 @@ impl Default for UsageConfig {
 pub struct ContextConfig {
     pub auto_compact_threshold: f32,
     pub compact_preview: bool,
+    /// Number of recent messages to preserve during compaction.
+    /// Higher values retain more context at the cost of more tokens.
+    #[serde(default)]
+    pub compaction_tail_window: Option<usize>,
 }
 
 impl Default for ContextConfig {
@@ -1846,6 +1862,7 @@ impl Default for ContextConfig {
         Self {
             auto_compact_threshold: 0.86,
             compact_preview: true,
+            compaction_tail_window: None,
         }
     }
 }

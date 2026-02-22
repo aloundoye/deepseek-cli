@@ -1,3 +1,4 @@
+pub mod consultation;
 pub mod mode_router;
 pub mod observation;
 pub mod protocol;
@@ -28,7 +29,7 @@ use deepseek_store::{
 use deepseek_subagent::{SubagentManager, SubagentRole, SubagentTask};
 use deepseek_tools::{
     AGENT_LEVEL_TOOLS, LocalToolHost, PLAN_MODE_TOOLS, filter_tool_definitions, map_tool_name,
-    tool_definitions, tool_error_hint,
+    tool_definitions, tool_error_hint, validate_tool_args,
 };
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -1205,14 +1206,31 @@ impl AgentEngine {
                 base
             }
         };
-        let all_tools = if options.tools {
-            let mut all = tool_definitions();
+        // Build tiered tool set: core + contextual + tool_search meta-tool.
+        // Extended tools are available on-demand via tool_search.
+        let (all_tools, extended_tool_defs) = if options.tools {
+            let full_defs = tool_definitions();
+            let signals = deepseek_tools::detect_signals(prompt, &self.workspace);
+            let (mut active, extended) =
+                deepseek_tools::tiered_tool_definitions(full_defs, &signals);
+
+            // Add tool_search meta-tool for discovering extended tools
+            if !extended.is_empty() {
+                active.push(deepseek_tools::tool_search_definition());
+            }
+
+            self.observer.verbose_log(&format!(
+                "Tool tiers: {} active, {} extended (discoverable via tool_search)",
+                active.len(),
+                extended.len()
+            ));
+
             // Merge plugin tool definitions
             let plugin_defs = deepseek_tools::plugin_tool_definitions(&self.workspace);
             if !plugin_defs.is_empty() {
                 self.observer
                     .verbose_log(&format!("Plugins: {} tools merged", plugin_defs.len()));
-                all.extend(plugin_defs);
+                active.extend(plugin_defs);
             }
             // Discover and merge MCP tools
             let mcp_defs = self.discover_mcp_tool_definitions();
@@ -1223,24 +1241,25 @@ impl AgentEngine {
                 let context_threshold = self.cfg.llm.context_window_tokens / 10; // 10% of context
                 if mcp_token_estimate > context_threshold {
                     // Too many MCP tools — add mcp_search instead for on-demand discovery
-                    all.push(mcp_search_tool_definition());
+                    active.push(mcp_search_tool_definition());
                     self.observer.verbose_log(&format!(
                         "MCP: {} tools exceed context threshold, using mcp_search lazy loading",
                         mcp_tool_count
                     ));
                 } else {
-                    all.extend(mcp_defs);
+                    active.extend(mcp_defs);
                     self.observer
                         .verbose_log(&format!("MCP: {} tools merged", mcp_tool_count));
                 }
             }
-            filter_tool_definitions(
-                all,
+            let filtered = filter_tool_definitions(
+                active,
                 options.allowed_tools.as_deref(),
                 options.disallowed_tools.as_deref(),
-            )
+            );
+            (filtered, extended)
         } else {
-            vec![]
+            (vec![], vec![])
         };
         // In plan mode, restrict to read-only tools
         let mut tools = if plan_mode_active {
@@ -1427,7 +1446,12 @@ impl AgentEngine {
 
                 // Keep system prompt (index 0) plus a tail window, but never
                 // start the tail on a Tool message (that would orphan it).
-                let desired_tail = 6.min(messages.len() - 1);
+                let desired_tail = self
+                    .cfg
+                    .context
+                    .compaction_tail_window
+                    .unwrap_or(12)
+                    .min(messages.len() - 1);
                 let tail_start = compaction_tail_start(&messages, desired_tail);
                 let compacted_range = &messages[1..tail_start];
                 if !compacted_range.is_empty() {
@@ -1829,6 +1853,22 @@ impl AgentEngine {
                 let mut args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
 
+                // ── Pre-execution argument validation ──
+                if let Err(validation_error) = validate_tool_args(internal_name, &args) {
+                    let hint = format!(
+                        "Invalid arguments for `{internal_name}`: {validation_error}\n\
+                         Fix the arguments and try again."
+                    );
+                    self.observer.verbose_log(&format!(
+                        "validation rejected {}: {validation_error}",
+                        internal_name
+                    ));
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: hint,
+                    });
+                    failure_streak += 1;
+                    continue;
                 // Normalize bash.run args: model may send "command" (the
                 // canonical definition name) — copy it to "cmd" so all
                 // downstream code (policy, observation, mode_router) works
@@ -1883,7 +1923,10 @@ impl AgentEngine {
                     if let Ok(cb) = self.stream_callback.lock()
                         && let Some(ref cb) = *cb
                     {
-                        cb(StreamChunk::ContentDelta(format!("\n[mcp: {}]\n", tc.name)));
+                        cb(StreamChunk::ToolCallStart {
+                            tool_name: tc.name.clone(),
+                            args_summary: summarize_tool_args(&tc.name, &args),
+                        });
                     }
                     let tool_start = Instant::now();
                     let result_text = match self.execute_mcp_tool(&tc.name, &args) {
@@ -1891,14 +1934,20 @@ impl AgentEngine {
                         Err(e) => format!("MCP tool error: {e}"),
                     };
                     let elapsed = tool_start.elapsed();
+                    let mcp_success = !result_text.starts_with("MCP tool error:");
                     if let Ok(cb) = self.stream_callback.lock()
                         && let Some(ref cb) = *cb
                     {
-                        cb(StreamChunk::ContentDelta(format!(
-                            "[mcp: {}] done ({:.1}s)\n",
-                            tc.name,
-                            elapsed.as_secs_f64()
-                        )));
+                        cb(StreamChunk::ToolCallEnd {
+                            tool_name: tc.name.clone(),
+                            duration_ms: elapsed.as_millis() as u64,
+                            success: mcp_success,
+                            summary: if mcp_success {
+                                "done".to_string()
+                            } else {
+                                "error".to_string()
+                            },
+                        });
                     }
                     let result_text = truncate_tool_output(&tc.name, &result_text, 30000);
                     messages.push(ChatMessage::Tool {
@@ -1927,6 +1976,27 @@ impl AgentEngine {
                             tool_list.join("\n")
                         )
                     };
+                    messages.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: result,
+                    });
+                    continue;
+                }
+
+                // ── tool_search meta-tool (discover extended tools) ──
+                if internal_name == "tool_search" {
+                    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let matches = deepseek_tools::search_extended_tools(query, &extended_tool_defs);
+                    // Dynamically add discovered tools to the active set for remaining turns
+                    for matched in &matches {
+                        if !tools
+                            .iter()
+                            .any(|t| t.function.name == matched.function.name)
+                        {
+                            tools.push(matched.clone());
+                        }
+                    }
+                    let result = deepseek_tools::format_tool_search_results(&matches);
                     messages.push(ChatMessage::Tool {
                         tool_call_id: tc.id.clone(),
                         content: result,
@@ -2065,15 +2135,10 @@ impl AgentEngine {
                     if let Ok(mut cb_guard) = self.stream_callback.lock()
                         && let Some(ref mut cb) = *cb_guard
                     {
-                        let detail = if tool_arg_summary.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {tool_arg_summary}")
-                        };
-                        cb(StreamChunk::ContentDelta(format!(
-                            "\n[tool: {}]{detail}\n",
-                            internal_name
-                        )));
+                        cb(StreamChunk::ToolCallStart {
+                            tool_name: internal_name.to_string(),
+                            args_summary: tool_arg_summary.clone(),
+                        });
                     }
 
                     // Intercept bash.run with run_in_background: true
@@ -2148,7 +2213,6 @@ impl AgentEngine {
                     if let Ok(mut cb_guard) = self.stream_callback.lock()
                         && let Some(ref mut cb) = *cb_guard
                     {
-                        let status_label = if result.success { "ok" } else { "error" };
                         let output_str = result.output.to_string();
                         let preview = if output_str.len() > 200 {
                             format!("{}...", &output_str[..output_str.floor_char_boundary(200)])
@@ -2162,11 +2226,12 @@ impl AgentEngine {
                             .chars()
                             .take(120)
                             .collect::<String>();
-                        cb(StreamChunk::ContentDelta(format!(
-                            "[tool: {}] {status_label} ({:.1}s) {preview_line}\n",
-                            internal_name,
-                            tool_elapsed.as_secs_f64()
-                        )));
+                        cb(StreamChunk::ToolCallEnd {
+                            tool_name: internal_name.to_string(),
+                            duration_ms: tool_elapsed.as_millis() as u64,
+                            success: result.success,
+                            summary: preview_line,
+                        });
                     }
 
                     // Doom-loop tracking: record tool signature
@@ -2237,10 +2302,12 @@ impl AgentEngine {
                     if let Ok(mut cb_guard) = self.stream_callback.lock()
                         && let Some(ref mut cb) = *cb_guard
                     {
-                        cb(StreamChunk::ContentDelta(format!(
-                            "\n[tool: {}] denied (requires approval)\n",
-                            internal_name
-                        )));
+                        cb(StreamChunk::ToolCallEnd {
+                            tool_name: internal_name.to_string(),
+                            duration_ms: 0,
+                            success: false,
+                            summary: "denied (requires approval)".to_string(),
+                        });
                     }
                     format!(
                         "Tool '{}' was denied by the user. Do NOT retry this tool with the same arguments. Try a different approach or ask the user for guidance.",
@@ -2757,6 +2824,57 @@ impl AgentEngine {
              - When done, briefly explain what you changed and why",
             std::env::consts::OS,
             std::env::consts::ARCH,
+        );
+
+        // ── Enriched guidance: decision trees, workflows, and examples ──
+        base.push_str(
+            "\n\n# Tool Selection Decision Tree\n\
+             When searching for code:\n\
+             - Know the exact file path? → `fs_read`\n\
+             - Know a regex pattern? → `fs_grep` (add `glob` to narrow file types)\n\
+             - Know a filename pattern? → `fs_glob`\n\
+             - Need semantic code search? → `index_query`\n\
+             - Need to explore directory structure? → `fs_list`\n\n\
+             When modifying code:\n\
+             - Small targeted edit (one search/replace)? → `fs_edit`\n\
+             - Multiple edits across files? → `multi_edit`\n\
+             - Creating a brand new file? → `fs_write`\n\
+             - Need to rename/move files? → `bash_run` with `git mv`\n\n\
+             When debugging:\n\
+             - Get exact error first → `bash_run` with build/test command\n\
+             - Read the failing code → `fs_read` with relevant line range\n\
+             - Search for related code → `fs_grep` for function/type names\n\
+             - Apply fix → `fs_edit` with precise search string\n\
+             - Verify fix → `bash_run` to rebuild/retest\n\n\
+             # Workflow Patterns\n\n\
+             ## Read-Before-Write (ALWAYS follow this)\n\
+             1. `fs_read` the file to understand current content\n\
+             2. Plan your edit based on the actual file content\n\
+             3. `fs_edit` with an exact search string from the file\n\
+             4. Verify with `diagnostics_check` or `bash_run`\n\n\
+             ## Investigate-Before-Fix\n\
+             1. `fs_grep` / `fs_glob` to find relevant files\n\
+             2. `fs_read` to understand the code\n\
+             3. `bash_run` to reproduce the issue\n\
+             4. `fs_edit` to apply the fix\n\
+             5. `bash_run` to verify the fix works\n\n\
+             ## Multi-File Changes\n\
+             1. Plan all changes before starting\n\
+             2. Use `multi_edit` for related edits across 2+ files\n\
+             3. Run `diagnostics_check` after all edits\n\
+             4. Use `git_diff` to review changes before committing\n\n\
+             # Error Recovery Guide\n\
+             - `fs_edit` fails \"search string not found\" → `fs_read` the file first to get exact content\n\
+             - `bash_run` times out → break into smaller commands or increase timeout\n\
+             - Same approach fails twice → do NOT repeat it. Try a different strategy\n\
+             - Stuck after 2-3 attempts → use `think_deeply` to get R1 reasoning advice\n\
+             - Compilation error → read the error, find the exact line, fix it, rebuild\n\n\
+             # Efficiency Guidelines\n\
+             - Combine related reads: read relevant files before starting edits\n\
+             - Use `fs_grep` with `glob` patterns to narrow searches (e.g., `glob: \"*.rs\"`)\n\
+             - Prefer `fs_edit` over `fs_write` for existing files — it preserves unchanged content\n\
+             - Use `multi_edit` when editing 2+ files for the same logical change\n\
+             - If you need a tool not in your current set, use `tool_search` to discover it",
         );
 
         // Add language preference if set.
@@ -4261,14 +4379,10 @@ impl AgentEngine {
         if let Ok(mut cb_guard) = self.stream_callback.lock()
             && let Some(ref mut cb) = *cb_guard
         {
-            let detail = if arg_summary.is_empty() {
-                String::new()
-            } else {
-                format!(" {arg_summary}")
-            };
-            cb(StreamChunk::ContentDelta(format!(
-                "\n[tool: {tool_name}]{detail}\n"
-            )));
+            cb(StreamChunk::ToolCallStart {
+                tool_name: tool_name.to_string(),
+                args_summary: arg_summary.clone(),
+            });
         }
 
         let tool_start = Instant::now();
@@ -4283,6 +4397,7 @@ impl AgentEngine {
             "task_stop" => self.handle_task_stop(args),
             "skill" => self.handle_skill(args),
             "kill_shell" => self.handle_kill_shell(args),
+            "think_deeply" => self.handle_think_deeply(args),
             // Plan mode tools are handled inline in chat loop, not here
             "enter_plan_mode" | "exit_plan_mode" => Ok("Plan mode transition handled.".to_string()),
             _ => Err(anyhow!("unknown agent tool: {tool_name}")),
@@ -4305,10 +4420,12 @@ impl AgentEngine {
                 .chars()
                 .take(120)
                 .collect::<String>();
-            cb(StreamChunk::ContentDelta(format!(
-                "[tool: {tool_name}] {status_label} ({:.1}s) {preview_line}\n",
-                tool_elapsed.as_secs_f64()
-            )));
+            cb(StreamChunk::ToolCallEnd {
+                tool_name: tool_name.to_string(),
+                duration_ms: tool_elapsed.as_millis() as u64,
+                success: status_label == "ok",
+                summary: preview_line,
+            });
         }
 
         Ok(output)
@@ -4985,6 +5102,46 @@ impl AgentEngine {
             "status": "stopped",
             "was_running": was_running
         }))?)
+    }
+
+    /// Handle the `think_deeply` tool: consult R1 for targeted advice.
+    fn handle_think_deeply(&self, args: &serde_json::Value) -> Result<String> {
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let context = args
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let consultation_type = consultation::ConsultationType::from_str(
+            args.get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error_analysis"),
+        );
+
+        if question.is_empty() {
+            return Err(anyhow!("question parameter is required"));
+        }
+
+        let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+        let result = consultation::consult_r1(
+            self.llm.as_ref(),
+            &self.cfg.llm.max_think_model,
+            &consultation::ConsultationRequest {
+                question,
+                context,
+                consultation_type,
+            },
+            cb.as_ref(),
+        )?;
+
+        Ok(format!(
+            "## R1 Analysis\n\n{}\n\n---\n*Use this advice to guide your next actions. You have full tool access.*",
+            result.advice
+        ))
     }
 
     fn emit_patch_events_if_any(

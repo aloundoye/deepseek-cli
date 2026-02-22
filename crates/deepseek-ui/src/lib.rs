@@ -4885,7 +4885,10 @@ mod tests {
         };
         let spans = render_statusline_spans(&status, None, "", None, None, false, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(!text.contains(" R1 "), "status bar should not show R1 badge in V3 mode");
+        assert!(
+            !text.contains(" R1 "),
+            "status bar should not show R1 badge in V3 mode"
+        );
     }
 
     #[test]
@@ -4907,6 +4910,9 @@ mod tests {
             ..Default::default()
         };
         let line = render_statusline(&status);
-        assert!(!line.contains("agent="), "V3 mode should not show agent= in statusline");
+        assert!(
+            !line.contains("agent="),
+            "V3 mode should not show agent= in statusline"
+        );
     }
 }
