@@ -99,6 +99,7 @@ pub fn run_architect(
             max_tokens: 4096,
             temperature: None,
             thinking: Some(deepseek_core::ThinkingConfig::enabled(16_384)),
+            images: vec![],
         };
 
         let response = llm.complete_chat(&req)?;
@@ -346,6 +347,7 @@ fn list_files(root: &Path, workspace: Option<&Path>) -> Vec<String> {
         .hidden(false)
         .git_ignore(true)
         .git_exclude(true)
+        .add_custom_ignore_filename(".deepseekignore")
         .build();
     for entry in walker.flatten() {
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {

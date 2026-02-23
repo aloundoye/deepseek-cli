@@ -114,39 +114,6 @@ fn ask_json_rejects_invalid_deepseek_profile() {
 }
 
 #[test]
-fn ask_json_requires_speciale_profile_when_speciale_model_is_selected() {
-    let workspace = TempDir::new().expect("workspace");
-    let mock = start_mock_llm_server();
-    configure_runtime_for_mock_llm(workspace.path(), &mock.endpoint);
-    fs::write(
-        workspace.path().join(".deepseek/settings.local.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "llm": {
-                "provider": "deepseek",
-                "profile": "v3_2",
-                "base_model": "deepseek-v3.2-speciale",
-                "endpoint": mock.endpoint,
-                "api_key_env": "DEEPSEEK_API_KEY"
-            }
-        }))
-        .expect("serialize settings"),
-    )
-    .expect("settings");
-
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("deepseek"))
-        .current_dir(workspace.path())
-        .env("DEEPSEEK_API_KEY", "test-api-key")
-        .args(["--json", "ask", "hello"])
-        .assert()
-        .failure()
-        .get_output()
-        .stderr
-        .clone();
-    let stderr = String::from_utf8_lossy(&output);
-    assert!(stderr.contains("requires llm.profile='v3_2_speciale'"));
-}
-
-#[test]
 fn config_show_redacts_api_key_in_json_and_text_modes() {
     let workspace = TempDir::new().expect("workspace");
     let runtime = workspace.path().join(".deepseek");

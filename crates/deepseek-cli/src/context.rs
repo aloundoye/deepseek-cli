@@ -1,9 +1,8 @@
 use anyhow::{Result, anyhow};
 use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
 use deepseek_core::{
-    AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventEnvelope,
-    EventKind, Session, SessionBudgets, SessionState, normalize_deepseek_model,
-    normalize_deepseek_profile, runtime_dir,
+    AppConfig, EventEnvelope, EventKind, Session, SessionBudgets, SessionState,
+    normalize_deepseek_model, normalize_deepseek_profile, runtime_dir,
 };
 use deepseek_store::Store;
 use serde_json::json;
@@ -85,6 +84,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         disable_team_orchestration: false,
         detect_urls: cli.detect_urls,
         watch_files: cli.watch_files,
+        images: vec![],
     }
 }
 
@@ -107,15 +107,15 @@ pub(crate) fn ensure_llm_ready_with_cfg(
             cfg.llm.provider
         ));
     }
-    let profile = normalize_deepseek_profile(&cfg.llm.profile).ok_or_else(|| {
+    let _profile = normalize_deepseek_profile(&cfg.llm.profile).ok_or_else(|| {
         anyhow!(
-            "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+            "unsupported llm.profile='{}' (supported: v3_2)",
             cfg.llm.profile
         )
     })?;
     if normalize_deepseek_model(&cfg.llm.base_model).is_none() {
         return Err(anyhow!(
-            "unsupported llm.base_model='{}' (supported aliases: deepseek-chat, deepseek-reasoner, deepseek-v3.2, deepseek-v3.2-speciale)",
+            "unsupported llm.base_model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
             cfg.llm.base_model
         ));
     }
@@ -125,20 +125,6 @@ pub(crate) fn ensure_llm_ready_with_cfg(
             cfg.llm.max_think_model
         ));
     }
-    let base_lower = cfg.llm.base_model.trim().to_ascii_lowercase();
-    if base_lower.contains("speciale") && profile != DEEPSEEK_PROFILE_V32_SPECIALE {
-        return Err(anyhow!(
-            "llm.base_model='{}' requires llm.profile='v3_2_speciale'",
-            cfg.llm.base_model
-        ));
-    }
-    if profile == DEEPSEEK_PROFILE_V32_SPECIALE && !json_mode {
-        eprintln!(
-            "warning: llm.profile=v3_2_speciale is documented as a limited release ending on {}. Use v3_2 if unavailable.",
-            DEEPSEEK_V32_SPECIALE_END_DATE
-        );
-    }
-
     let env_key = cfg.llm.api_key_env.trim();
     if env_key.is_empty() {
         return Err(anyhow!(

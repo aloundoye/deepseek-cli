@@ -78,6 +78,7 @@ pub fn analyze(
             } else {
                 None
             },
+            images: options.images.clone(),
         };
 
         let response = llm.complete_chat(&request)?;
@@ -119,8 +120,13 @@ fn build_system_prompt(
     let mut prompt = if matches!(options.mode, ChatMode::Ask | ChatMode::Context)
         && repoish_bootstrap
     {
+        let role = if matches!(options.mode, ChatMode::Context) {
+            "You are a codebase analysis specialist. Focus exclusively on understanding architecture, dependencies, patterns, and structure. Do not suggest code changes or generate code."
+        } else {
+            "You are a precise software engineering assistant."
+        };
         let mut base = vec![
-            "You are a precise software engineering assistant.",
+            role,
             "Assume you are operating inside the current repository unless explicitly told otherwise.",
             "Use AUTO_CONTEXT_BOOTSTRAP_V1 as primary context and provide analysis immediately.",
             "Output sections in this exact order: Initial Analysis, Key Findings, Follow-ups.",
@@ -246,5 +252,43 @@ mod tests {
 
         let ok = "Initial Analysis\nA\nKey Findings\nB\nFollow-ups\n- q1\n";
         assert!(validate_analysis_shape(ok, true).is_none());
+    }
+
+    #[test]
+    fn context_mode_system_prompt_excludes_code_gen() {
+        let options = ChatOptions {
+            mode: ChatMode::Context,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&options, true, false);
+        assert!(
+            prompt.contains("codebase analysis specialist"),
+            "Context mode should use analysis-specialist role"
+        );
+        assert!(
+            prompt.contains("Do not suggest code changes"),
+            "Context mode should prohibit code generation"
+        );
+        assert!(
+            !prompt.contains("precise software engineering assistant"),
+            "Context mode should not use generic assistant role"
+        );
+    }
+
+    #[test]
+    fn ask_mode_system_prompt_uses_generic_role() {
+        let options = ChatOptions {
+            mode: ChatMode::Ask,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&options, true, false);
+        assert!(
+            prompt.contains("precise software engineering assistant"),
+            "Ask mode should use generic assistant role"
+        );
+        assert!(
+            !prompt.contains("codebase analysis specialist"),
+            "Ask mode should not use context-specialist role"
+        );
     }
 }

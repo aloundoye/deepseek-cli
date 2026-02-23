@@ -321,6 +321,7 @@ fn workspace_file_paths(workspace: &Path, respect_gitignore: bool) -> Vec<PathBu
     builder.git_global(respect_gitignore);
     builder.git_exclude(respect_gitignore);
     builder.require_git(false);
+    builder.add_custom_ignore_filename(".deepseekignore");
 
     let mut out = Vec::new();
     for entry in builder.build() {

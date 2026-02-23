@@ -1321,7 +1321,7 @@ impl RpcHandler for IdeRpcHandler {
                     "session/open", "session/resume", "session/fork", "session/list",
                     "session/remote_resume", "session/handoff_export", "session/handoff_import",
                     "session/handoff_link_create", "session/handoff_link_consume",
-                    "prompt/execute", "prompt/stream_next",
+                    "prompt/execute", "prompt/stream_next", "stream/chunk",
                     "tool/approve", "tool/deny",
                     "patch/preview", "patch/apply",
                     "diagnostics/list", "events/poll",

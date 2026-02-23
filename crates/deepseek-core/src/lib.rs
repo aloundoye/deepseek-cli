@@ -6,12 +6,10 @@ use uuid::Uuid;
 
 pub type Result<T> = anyhow::Result<T>;
 
-// DeepSeek V3.2 API model aliases.
+// DeepSeek API model constants.
 pub const DEEPSEEK_V32_CHAT_MODEL: &str = "deepseek-chat";
 pub const DEEPSEEK_V32_REASONER_MODEL: &str = "deepseek-reasoner";
 pub const DEEPSEEK_PROFILE_V32: &str = "v3_2";
-pub const DEEPSEEK_PROFILE_V32_SPECIALE: &str = "v3_2_speciale";
-pub const DEEPSEEK_V32_SPECIALE_END_DATE: &str = "2025-12-15";
 
 pub fn normalize_deepseek_model(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
@@ -24,9 +22,6 @@ pub fn normalize_deepseek_model(model: &str) -> Option<&'static str> {
         | "reasoner"
         | "v3.2-reasoner"
         | "v3_2_reasoner" => Some(DEEPSEEK_V32_REASONER_MODEL),
-        "deepseek-v3.2-speciale" | "deepseek-v3.2-special" | "v3.2-speciale" | "v3_2_speciale" => {
-            Some(DEEPSEEK_V32_CHAT_MODEL)
-        }
         _ => None,
     }
 }
@@ -35,9 +30,6 @@ pub fn normalize_deepseek_profile(profile: &str) -> Option<&'static str> {
     let normalized = profile.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "" | "v3_2" | "v3.2" | "v32" | "deepseek-v3.2" => Some(DEEPSEEK_PROFILE_V32),
-        "v3_2_speciale" | "v3.2-speciale" | "v32-speciale" | "deepseek-v3.2-speciale" => {
-            Some(DEEPSEEK_PROFILE_V32_SPECIALE)
-        }
         _ => None,
     }
 }
@@ -1234,6 +1226,11 @@ pub enum StreamChunk {
     },
     /// An image was read and should be displayed inline in the terminal.
     ImageData { data: Vec<u8>, label: String },
+    /// Watch mode auto-triggered because comment digest changed.
+    WatchTriggered {
+        digest: u64,
+        comment_count: usize,
+    },
     /// Clear any previously streamed text — the response contains tool calls,
     /// so the interleaved text fragments should be discarded from the display.
     ClearStreamingText,
@@ -1418,6 +1415,14 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "image",
             "label": label,
         }),
+        StreamChunk::WatchTriggered {
+            digest,
+            comment_count,
+        } => serde_json::json!({
+            "type": "watch_triggered",
+            "digest": digest,
+            "comment_count": comment_count,
+        }),
         StreamChunk::ClearStreamingText => serde_json::json!({
             "type": "clear_streaming_text",
         }),
@@ -1568,6 +1573,8 @@ pub struct ChatRequest {
     /// When set, enables thinking mode on `deepseek-chat`.
     /// The API requires `temperature` to be omitted when thinking is enabled.
     pub thinking: Option<ThinkingConfig>,
+    /// Optional images to include with the user message (multimodal).
+    pub images: Vec<ImageContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2675,8 +2682,6 @@ mod tests {
             Just("deepseek-reasoner"),
             Just("deepseek-v3.2-reasoner"),
             Just("reasoner"),
-            Just("deepseek-v3.2-speciale"),
-            Just("v3_2_speciale"),
         ]
     }
 

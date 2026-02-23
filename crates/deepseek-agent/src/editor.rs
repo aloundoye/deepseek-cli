@@ -87,6 +87,7 @@ pub fn run_editor(
             max_tokens: 8192,
             temperature: Some(0.0),
             thinking: None,
+            images: vec![],
         };
 
         let response = llm.complete_chat(&req)?;

@@ -91,7 +91,10 @@ impl ContextManager {
         self.file_graph = DiGraph::new();
         self.node_indices.clear();
 
-        let walker = WalkBuilder::new(&self.workspace_root).hidden(false).build();
+        let walker = WalkBuilder::new(&self.workspace_root)
+            .hidden(false)
+            .add_custom_ignore_filename(".deepseekignore")
+            .build();
 
         // First pass: add all files as nodes
         for entry in walker {
@@ -537,6 +540,56 @@ mod tests {
         // Should be significantly shorter
         assert!(compressed_lines < 100);
         assert!(compressed.contains("compressed"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn deepseekignore_excludes_files() -> Result<()> {
+        let dir = TempDir::new()?;
+        let root = dir.path();
+
+        // Create normal files
+        fs::write(root.join("visible.rs"), "fn visible() {}")?;
+
+        // Create a "secret" directory with files
+        fs::create_dir_all(root.join("secret"))?;
+        fs::write(root.join("secret/hidden.rs"), "fn hidden() {}")?;
+
+        // Create .deepseekignore excluding "secret/"
+        fs::write(root.join(".deepseekignore"), "secret/\n")?;
+
+        let mut manager = ContextManager::new(root)?;
+        manager.analyze_workspace()?;
+
+        let file_paths: Vec<String> = (0..manager.file_count())
+            .filter_map(|_| None::<String>) // We check via suggest_relevant_files
+            .collect();
+        let _ = file_paths;
+
+        // suggest_relevant_files should not include secret/hidden.rs
+        let hidden_results = manager.suggest_relevant_files("hidden", 50);
+        let hidden_paths: Vec<String> = hidden_results
+            .iter()
+            .map(|s| s.path.display().to_string())
+            .collect();
+        assert!(
+            !hidden_paths.iter().any(|p| p.contains("secret")),
+            "secret/ should be excluded by .deepseekignore, got: {:?}",
+            hidden_paths
+        );
+
+        // visible.rs should be included
+        let visible_results = manager.suggest_relevant_files("visible", 50);
+        let visible_paths: Vec<String> = visible_results
+            .iter()
+            .map(|s| s.path.display().to_string())
+            .collect();
+        assert!(
+            visible_paths.iter().any(|p| p.contains("visible")),
+            "visible.rs should be included, got: {:?}",
+            visible_paths
+        );
 
         Ok(())
     }

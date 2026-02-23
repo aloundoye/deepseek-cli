@@ -12,6 +12,11 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <notificationGroup id="DeepSeek" displayType="BALLOON" isLogByDefault="true"/>
+        <toolWindow id="DeepSeek"
+                    anchor="right"
+                    secondary="false"
+                    factoryClass="com.deepseek.ide.DeepSeekToolWindowFactory"
+                    icon="AllIcons.Actions.Execute"/>
     </extensions>
 
     <actions>

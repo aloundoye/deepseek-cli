@@ -1,5 +1,5 @@
 [llm]
-# DeepSeek V3.2 aliases
+# DeepSeek API model settings
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 provider = "deepseek"

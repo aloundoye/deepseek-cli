@@ -143,6 +143,13 @@ fn make_relative(workspace: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Clear the global tag cache (used by `/map-refresh`).
+pub fn clear_tag_cache() {
+    let _ = with_tag_extractor(|e| {
+        let _ = e.clear_cache();
+    });
+}
+
 /// Global tag extractor with SQLite cache, lazily initialized.
 /// Wrapped in Mutex because rusqlite::Connection is not Sync.
 fn with_tag_extractor<F, R>(f: F) -> Option<R>

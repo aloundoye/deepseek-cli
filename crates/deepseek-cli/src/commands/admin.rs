@@ -1,9 +1,6 @@
 use anyhow::{Result, anyhow};
 use deepseek_agent::{AgentEngine, ChatOptions};
-use deepseek_core::{
-    AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventKind, ToolCall,
-    normalize_deepseek_profile, runtime_dir,
-};
+use deepseek_core::{AppConfig, EventKind, ToolCall, normalize_deepseek_profile, runtime_dir};
 use deepseek_index::IndexService;
 use deepseek_policy::{PolicyEngine, TeamPolicyLocks, team_policy_locks};
 use deepseek_store::Store;
@@ -279,7 +276,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
-    let profile = normalize_deepseek_profile(&cfg.llm.profile).unwrap_or("invalid");
+    let _profile = normalize_deepseek_profile(&cfg.llm.profile).unwrap_or("invalid");
 
     let checks = json!({
         "git": command_exists("git"),
@@ -293,12 +290,6 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         warnings.push(format!(
             "{} not set and llm.api_key not configured",
             cfg.llm.api_key_env
-        ));
-    }
-    if profile == DEEPSEEK_PROFILE_V32_SPECIALE {
-        warnings.push(format!(
-            "llm.profile=v3_2_speciale is a limited release profile (documented end date: {})",
-            DEEPSEEK_V32_SPECIALE_END_DATE
         ));
     }
     if checks["git"].as_bool() != Some(true) {

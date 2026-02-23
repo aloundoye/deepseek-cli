@@ -5,11 +5,14 @@ mod complexity;
 mod editor;
 mod gather_context;
 mod intent;
-mod linter;
+pub mod linter;
 mod r#loop;
 mod repo_map_v2;
 mod team;
 mod verify;
+pub mod watch;
+
+pub use repo_map_v2::clear_tag_cache;
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -73,6 +76,8 @@ pub struct ChatOptions {
     pub detect_urls: bool,
     /// Watch mode hint (CLI handles filesystem watch orchestration).
     pub watch_files: bool,
+    /// Images to include with the next LLM request (multimodal paste).
+    pub images: Vec<deepseek_core::ImageContent>,
 }
 
 pub struct AgentEngine {
@@ -174,6 +179,7 @@ impl AgentEngine {
             max_tokens: 1,
             temperature: Some(0.0),
             thinking: None,
+            images: vec![],
         };
 
         match self.llm.complete_chat(&test_request) {
