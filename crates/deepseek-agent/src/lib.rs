@@ -5,6 +5,7 @@ mod complexity;
 mod editor;
 mod gather_context;
 mod intent;
+mod linter;
 mod r#loop;
 mod repo_map_v2;
 mod team;
@@ -145,6 +146,21 @@ impl AgentEngine {
 
     pub fn set_max_budget_usd(&mut self, max: Option<f64>) {
         self.max_budget_usd = max;
+    }
+
+    /// Enable lint auto-fix loop with a single command (convenience for --lint-cmd).
+    pub fn set_lint_command(&mut self, lang: &str, cmd: &str) {
+        self.cfg.agent_loop.lint.enabled = true;
+        self.cfg
+            .agent_loop
+            .lint
+            .commands
+            .insert(lang.to_string(), cmd.to_string());
+    }
+
+    /// Enable lint auto-fix loop (convenience for --auto-lint).
+    pub fn enable_lint(&mut self) {
+        self.cfg.agent_loop.lint.enabled = true;
     }
 
     pub fn validate_api_key(&self) -> Result<()> {

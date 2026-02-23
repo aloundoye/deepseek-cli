@@ -198,6 +198,146 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                     feedback.apply_feedback = None;
                     feedback.last_diff_summary = Some(summary);
 
+                    // ── Lint auto-fix sub-loop ──────────────────────
+                    let lint_commands = crate::linter::derive_lint_commands(
+                        &cfg.lint,
+                        &success.changed_files,
+                    );
+                    if !lint_commands.is_empty() {
+                        let mut lint_fixed_total: u32 = 0;
+                        for lint_iter in 1..=cfg.lint.max_iterations.max(1) {
+                            engine.stream(StreamChunk::LintStarted {
+                                iteration: lint_iter,
+                                commands: lint_commands.clone(),
+                            });
+
+                            let lint_result = if let Ok(mut approval_guard) =
+                                engine.approval_handler.lock()
+                            {
+                                let callback = approval_guard.as_mut().map(|cb| {
+                                    cb as &mut dyn FnMut(&deepseek_core::ToolCall) -> anyhow::Result<bool>
+                                });
+                                crate::linter::run_lint(
+                                    engine.tool_host.as_ref(),
+                                    &lint_commands,
+                                    cfg.lint.timeout_seconds,
+                                    callback,
+                                )
+                            } else {
+                                crate::linter::run_lint(
+                                    engine.tool_host.as_ref(),
+                                    &lint_commands,
+                                    cfg.lint.timeout_seconds,
+                                    None,
+                                )
+                            };
+
+                            if lint_result.success {
+                                engine.stream(StreamChunk::LintCompleted {
+                                    iteration: lint_iter,
+                                    success: true,
+                                    fixed: lint_fixed_total,
+                                    remaining: 0,
+                                });
+                                break;
+                            }
+
+                            lint_fixed_total += lint_result.fixed;
+                            engine.stream(StreamChunk::LintCompleted {
+                                iteration: lint_iter,
+                                success: false,
+                                fixed: lint_fixed_total,
+                                remaining: lint_result.remaining,
+                            });
+
+                            // If we've exhausted lint iterations, proceed to verify anyway
+                            if lint_iter >= cfg.lint.max_iterations.max(1) {
+                                break;
+                            }
+
+                            // Feed lint errors back to editor for a fix attempt
+                            feedback.verify_feedback = Some(format!(
+                                "LINT_ERRORS (iteration {lint_iter}):\n{}",
+                                lint_result.summary
+                            ));
+                            feedback.apply_feedback = None;
+
+                            // Re-run editor with lint feedback
+                            engine.stream(StreamChunk::EditorStarted {
+                                iteration,
+                                files: file_context.len() as u32,
+                            });
+                            let lint_fix_input = EditorInput {
+                                user_prompt: prompt,
+                                iteration,
+                                plan: &plan,
+                                files: &file_context,
+                                verify_feedback: feedback.verify_feedback.as_deref(),
+                                apply_feedback: None,
+                                max_diff_bytes: cfg.max_diff_bytes as usize,
+                                debug_context: options.debug_context,
+                            };
+                            let lint_fix_response = match run_editor(
+                                engine.llm.as_ref(),
+                                &engine.cfg,
+                                &lint_fix_input,
+                                cfg.editor_parse_retries as usize,
+                            ) {
+                                Ok(r) => r,
+                                Err(_) => break, // editor failed, proceed to verify
+                            };
+                            let lint_fix_diff = match lint_fix_response {
+                                EditorResponse::Diff(d) => {
+                                    engine.stream(StreamChunk::EditorCompleted {
+                                        iteration,
+                                        status: "lint_fix".to_string(),
+                                    });
+                                    d
+                                }
+                                _ => break, // unexpected response, proceed to verify
+                            };
+
+                            // Re-apply the lint fix diff
+                            let lint_allowed: HashSet<String> =
+                                plan.files.iter().map(|f| f.path.clone()).collect();
+                            let lint_hashes = build_expected_hashes(&file_context);
+                            engine.stream(StreamChunk::ApplyStarted { iteration });
+                            match apply_unified_diff(
+                                &engine.workspace,
+                                &lint_fix_diff,
+                                &lint_allowed,
+                                &lint_hashes,
+                                cfg.apply_strategy.clone(),
+                            ) {
+                                Ok(lint_apply) => {
+                                    engine.stream(StreamChunk::ApplyCompleted {
+                                        iteration,
+                                        success: true,
+                                        summary: format!(
+                                            "lint_fix patch={} files={}",
+                                            lint_apply.patch_id,
+                                            lint_apply.changed_files.join(",")
+                                        ),
+                                    });
+                                    // Update file context hashes for next iteration
+                                    for changed_file in &lint_apply.changed_files {
+                                        let full = engine.workspace.join(changed_file);
+                                        if let Ok(content) = fs::read_to_string(&full) {
+                                            for ctx in file_context.iter_mut() {
+                                                if ctx.path == *changed_file {
+                                                    ctx.content = content.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => break, // apply failed, proceed to verify
+                            }
+                        }
+                        feedback.verify_feedback = None;
+                    }
+                    // ── End lint sub-loop ────────────────────────────
+
                     let verify_commands = if plan.verify_commands.is_empty() {
                         derive_verify_commands(&engine.workspace)
                     } else {
@@ -253,8 +393,17 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                             loc_delta: stats.loc_delta as u64,
                             verify_commands: verify_commands.clone(),
                             verify_status: verify_result.summary.clone(),
-                            suggested_message,
+                            suggested_message: suggested_message.clone(),
                         });
+
+                        // ── Commit proposal: ask user ──────────────────
+                        propose_commit(
+                            engine,
+                            &success.changed_files,
+                            &suggested_message,
+                        );
+                        // ── End commit proposal ────────────────────────
+
                         let response = format_success_response(&plan, &verify_commands);
                         engine.stream(StreamChunk::ContentDelta(response.clone()));
                         engine.stream(StreamChunk::Done);
@@ -342,6 +491,120 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str) -> Result<bool> {
         return handler(&call);
     }
     Ok(false)
+}
+
+/// Ask the user whether to commit after a successful verify pass.
+/// If the user accepts (or provides a custom message), stage and commit the changed files.
+/// If the user declines or no handler is set, skip silently.
+fn propose_commit(engine: &AgentEngine, changed_files: &[String], suggested_message: &str) {
+    use deepseek_core::UserQuestion;
+    use std::process::Command;
+
+    let handler = if let Ok(guard) = engine.user_question_handler.lock() {
+        guard.clone()
+    } else {
+        None
+    };
+
+    let handler = match handler {
+        Some(h) => h,
+        None => {
+            // No user question handler — skip commit proposal
+            engine.stream(StreamChunk::CommitSkipped);
+            return;
+        }
+    };
+
+    let question = UserQuestion {
+        question: format!(
+            "Commit {} changed file(s)?\nSuggested message: \"{}\"\n\nReply 'yes' to accept, type a custom message, or 'no' to skip.",
+            changed_files.len(),
+            suggested_message
+        ),
+        options: vec![
+            "yes".to_string(),
+            "no".to_string(),
+        ],
+    };
+
+    let answer = match handler(question) {
+        Some(a) => a,
+        None => {
+            engine.stream(StreamChunk::CommitSkipped);
+            return;
+        }
+    };
+
+    let answer_lower = answer.trim().to_ascii_lowercase();
+    if answer_lower == "no" || answer_lower == "skip" || answer_lower.is_empty() {
+        engine.stream(StreamChunk::CommitSkipped);
+        return;
+    }
+
+    let commit_message = if answer_lower == "yes" || answer_lower == "y" {
+        suggested_message.to_string()
+    } else {
+        // User provided a custom message
+        answer.trim().to_string()
+    };
+
+    // Stage changed files
+    let mut stage_args = vec!["add", "--"];
+    let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+    stage_args.extend(file_refs);
+
+    let stage_result = Command::new("git")
+        .args(&stage_args)
+        .current_dir(&engine.workspace)
+        .output();
+
+    if let Err(e) = stage_result {
+        engine.stream(StreamChunk::ContentDelta(format!(
+            "\nFailed to stage files: {e}\n"
+        )));
+        engine.stream(StreamChunk::CommitSkipped);
+        return;
+    }
+
+    // Commit
+    let mut commit_args = vec!["commit", "-m", &commit_message];
+    if engine.cfg.git.require_signing {
+        commit_args.push("-S");
+    }
+
+    let commit_result = Command::new("git")
+        .args(&commit_args)
+        .current_dir(&engine.workspace)
+        .output();
+
+    match commit_result {
+        Ok(output) if output.status.success() => {
+            // Extract SHA from commit output
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let sha = stdout
+                .split_whitespace()
+                .find(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
+                .unwrap_or("unknown")
+                .to_string();
+            engine.stream(StreamChunk::CommitCompleted {
+                sha,
+                message: commit_message,
+            });
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            engine.stream(StreamChunk::ContentDelta(format!(
+                "\nCommit failed: {stderr}\n"
+            )));
+            engine.stream(StreamChunk::CommitSkipped);
+        }
+        Err(e) => {
+            engine.stream(StreamChunk::ContentDelta(format!(
+                "\nCommit failed: {e}\n"
+            )));
+            engine.stream(StreamChunk::CommitSkipped);
+        }
+    }
 }
 
 fn build_expected_hashes(file_context: &[EditorFileContext]) -> HashMap<String, String> {

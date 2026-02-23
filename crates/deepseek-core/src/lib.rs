@@ -1157,6 +1157,18 @@ pub enum StreamChunk {
         success: bool,
         summary: String,
     },
+    /// Lint phase started (between Apply and Verify).
+    LintStarted {
+        iteration: u64,
+        commands: Vec<String>,
+    },
+    /// Lint phase completed.
+    LintCompleted {
+        iteration: u64,
+        success: bool,
+        fixed: u32,
+        remaining: u32,
+    },
     /// Verify phase started.
     VerifyStarted {
         iteration: u64,
@@ -1177,6 +1189,13 @@ pub enum StreamChunk {
         verify_status: String,
         suggested_message: String,
     },
+    /// Commit completed (user accepted the proposal).
+    CommitCompleted {
+        sha: String,
+        message: String,
+    },
+    /// Commit skipped by user choice.
+    CommitSkipped,
     /// A tool call has started execution.
     ToolCallStart {
         tool_name: String,
@@ -1277,6 +1296,28 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "success": success,
             "summary": summary,
         }),
+        StreamChunk::LintStarted {
+            iteration,
+            commands,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "lint_started",
+            "iteration": iteration,
+            "commands": commands,
+        }),
+        StreamChunk::LintCompleted {
+            iteration,
+            success,
+            fixed,
+            remaining,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "lint_completed",
+            "iteration": iteration,
+            "success": success,
+            "fixed": fixed,
+            "remaining": remaining,
+        }),
         StreamChunk::VerifyStarted {
             iteration,
             commands,
@@ -1312,6 +1353,14 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "verify_commands": verify_commands,
             "verify_status": verify_status,
             "suggested_message": suggested_message,
+        }),
+        StreamChunk::CommitCompleted { sha, message } => serde_json::json!({
+            "type": "commit_completed",
+            "sha": sha,
+            "message": message,
+        }),
+        StreamChunk::CommitSkipped => serde_json::json!({
+            "type": "commit_skipped",
         }),
         StreamChunk::ToolCallStart {
             tool_name,
@@ -1887,6 +1936,8 @@ pub struct AgentLoopConfig {
     pub apply_strategy: ApplyStrategy,
     #[serde(default)]
     pub team: TeamOrchestrationConfig,
+    #[serde(default)]
+    pub lint: LintConfig,
 }
 
 impl Default for AgentLoopConfig {
@@ -1917,6 +1968,7 @@ impl Default for AgentLoopConfig {
             safety_gate: SafetyGateConfig::default(),
             apply_strategy: ApplyStrategy::default(),
             team: TeamOrchestrationConfig::default(),
+            lint: LintConfig::default(),
         }
     }
 }
@@ -1980,6 +2032,42 @@ impl Default for SafetyGateConfig {
         Self {
             max_files_without_approval: default_safety_gate_max_files_without_approval(),
             max_loc_without_approval: default_safety_gate_max_loc_without_approval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LintConfig {
+    /// Whether to run lint automatically after apply, before verify.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-language lint commands. Key = language/glob, value = command.
+    /// Example: `{"rust": "cargo clippy --fix --allow-dirty", "python": "ruff check --fix"}`
+    #[serde(default)]
+    pub commands: std::collections::BTreeMap<String, String>,
+    /// Maximum lint-fix iterations before giving up.
+    #[serde(default = "default_lint_max_iterations")]
+    pub max_iterations: u64,
+    /// Timeout in seconds for each lint command.
+    #[serde(default = "default_lint_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_lint_max_iterations() -> u64 {
+    3
+}
+fn default_lint_timeout_seconds() -> u64 {
+    30
+}
+
+impl Default for LintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            commands: std::collections::BTreeMap::new(),
+            max_iterations: default_lint_max_iterations(),
+            timeout_seconds: default_lint_timeout_seconds(),
         }
     }
 }

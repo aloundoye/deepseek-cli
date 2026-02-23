@@ -1,8 +1,10 @@
 use deepseek_context::ContextManager;
+use deepseek_context::tags::{TagExtractor, tags_to_symbol_hints};
 use deepseek_index::IndexService;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct RepoMapEntry {
@@ -141,7 +143,43 @@ fn make_relative(workspace: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Global tag extractor with SQLite cache, lazily initialized.
+/// Wrapped in Mutex because rusqlite::Connection is not Sync.
+fn with_tag_extractor<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&TagExtractor) -> R,
+{
+    static EXTRACTOR: OnceLock<Mutex<Option<TagExtractor>>> = OnceLock::new();
+    let mutex = EXTRACTOR.get_or_init(|| {
+        let cache_dir = dirs_cache().unwrap_or_else(|| PathBuf::from(".deepseek/cache"));
+        Mutex::new(TagExtractor::new(&cache_dir).ok())
+    });
+    let guard = mutex.lock().ok()?;
+    let extractor = guard.as_ref()?;
+    Some(f(extractor))
+}
+
+fn dirs_cache() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".deepseek").join("cache"))
+}
+
 fn symbol_hints_for_file(path: &Path) -> Vec<String> {
+    // Try tree-sitter extraction first (supports 6 languages with caching)
+    if let Some(hints) = with_tag_extractor(|extractor| {
+        extractor
+            .extract_tags(path)
+            .ok()
+            .filter(|tags| !tags.is_empty())
+            .map(|tags| tags_to_symbol_hints(&tags, 8))
+    })
+        .flatten()
+    {
+        return hints;
+    }
+
+    // Fallback to naive regex extraction for unsupported languages
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };

@@ -208,6 +208,15 @@ struct Cli {
     #[arg(long = "detect-urls", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
     detect_urls: bool,
 
+    /// Lint command to run after apply, before verify. Format: "lang:command".
+    /// Example: --lint-cmd "rust:cargo clippy --fix --allow-dirty"
+    #[arg(long = "lint-cmd", global = true)]
+    lint_cmd: Vec<String>,
+
+    /// Enable auto-lint with workspace-derived commands (uses config defaults).
+    #[arg(long = "auto-lint", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    auto_lint: bool,
+
     /// Flag form for teleport handoff.
     #[arg(long = "teleport", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
     teleport_flag: bool,

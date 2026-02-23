@@ -25,6 +25,14 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
     }
     engine.set_max_turns(cli.max_turns);
     engine.set_max_budget_usd(cli.max_budget_usd);
+    if cli.auto_lint {
+        engine.enable_lint();
+    }
+    for entry in &cli.lint_cmd {
+        if let Some((lang, cmd)) = entry.split_once(':') {
+            engine.set_lint_command(lang.trim(), cmd.trim());
+        }
+    }
 }
 
 /// Subagent orchestration is disabled in the Architect->Editor->Apply->Verify core loop.

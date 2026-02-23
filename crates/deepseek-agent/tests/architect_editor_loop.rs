@@ -336,3 +336,315 @@ fn no_edit_response_exits_early() -> Result<()> {
     );
     Ok(())
 }
+
+/// Golden cassette #7: Lint auto-fix loop runs between Apply and Verify.
+/// When lint is enabled and configured, the LintStarted/LintCompleted events
+/// are emitted during the pipeline.
+#[test]
+fn lint_loop_runs_when_configured() -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.rs"), "fn main() {}\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.rs", "fn main() { println!(\"hello\"); }\n")])?;
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo.rs\nFILE|demo.rs|Add hello print\nVERIFY|git status --short\nACCEPT|updated\nARCHITECT_PLAN_END\n".to_string();
+
+    let llm = Box::new(ScriptedLlm::new(vec![plan, good_diff]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    // Enable lint with a command that will pass (git status always succeeds)
+    engine.set_lint_command("rust", "git status --short");
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        let label = match &chunk {
+            StreamChunk::LintStarted { iteration, .. } => {
+                format!("LintStarted(iter={})", iteration)
+            }
+            StreamChunk::LintCompleted {
+                iteration, success, ..
+            } => format!("LintCompleted(iter={},success={})", iteration, success),
+            StreamChunk::ArchitectStarted { .. } => "ArchitectStarted".to_string(),
+            StreamChunk::Done => "Done".to_string(),
+            _ => return,
+        };
+        if let Ok(mut guard) = events_clone.lock() {
+            guard.push(label);
+        }
+    }));
+
+    let output = engine.chat_with_options(
+        "Add hello to demo.rs",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Implemented"));
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.contains(&"LintStarted(iter=1)".to_string()),
+        "lint should have started; events: {:?}",
+        *captured
+    );
+    assert!(
+        captured.contains(&"LintCompleted(iter=1,success=true)".to_string()),
+        "lint should have completed successfully; events: {:?}",
+        *captured
+    );
+    Ok(())
+}
+
+/// Golden cassette #8: Lint is skipped when not enabled.
+#[test]
+fn lint_skipped_when_disabled() -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo file\nFILE|demo.txt|Replace old with new\nVERIFY|git status --short\nACCEPT|demo updated\nARCHITECT_PLAN_END\n".to_string();
+
+    let llm = Box::new(ScriptedLlm::new(vec![plan, good_diff]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    // Do NOT enable lint
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        let label = match &chunk {
+            StreamChunk::LintStarted { .. } => "LintStarted".to_string(),
+            StreamChunk::LintCompleted { .. } => "LintCompleted".to_string(),
+            _ => return,
+        };
+        if let Ok(mut guard) = events_clone.lock() {
+            guard.push(label);
+        }
+    }));
+
+    let _ = engine.chat_with_options(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let captured = events.lock().unwrap();
+    assert!(
+        !captured.contains(&"LintStarted".to_string()),
+        "lint should NOT have started when disabled; events: {:?}",
+        *captured
+    );
+    assert!(
+        !captured.contains(&"LintCompleted".to_string()),
+        "lint should NOT have completed when disabled; events: {:?}",
+        *captured
+    );
+    Ok(())
+}
+
+/// Golden cassette #9: Commit proposal asks user and commits when accepted.
+#[test]
+fn commit_proposal_accepted() -> Result<()> {
+    use deepseek_core::{StreamChunk, UserQuestion};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo file\nFILE|demo.txt|Replace old with new\nVERIFY|git status --short\nACCEPT|demo updated\nARCHITECT_PLAN_END\n".to_string();
+    let llm = Box::new(ScriptedLlm::new(vec![plan, good_diff]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    // Set user question handler that always accepts
+    engine.set_user_question_handler(Arc::new(|_q: UserQuestion| Some("yes".to_string())));
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        let label = match &chunk {
+            StreamChunk::CommitCompleted { sha, message } => {
+                format!("CommitCompleted(sha={},msg={})", sha, message)
+            }
+            StreamChunk::CommitSkipped => "CommitSkipped".to_string(),
+            StreamChunk::CommitProposal { .. } => "CommitProposal".to_string(),
+            _ => return,
+        };
+        if let Ok(mut guard) = events_clone.lock() {
+            guard.push(label);
+        }
+    }));
+
+    let output = engine.chat_with_options(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Implemented"));
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| e.starts_with("CommitCompleted")),
+        "commit should have completed; events: {:?}",
+        *captured
+    );
+    assert!(
+        !captured.contains(&"CommitSkipped".to_string()),
+        "commit should not have been skipped; events: {:?}",
+        *captured
+    );
+
+    // Verify git log shows the commit
+    let log = Command::new("git")
+        .args(["log", "--oneline", "-1"])
+        .current_dir(dir.path())
+        .output()?;
+    let log_str = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log_str.contains("deepseek:"),
+        "commit message should contain template; got: {}",
+        log_str
+    );
+    Ok(())
+}
+
+/// Golden cassette #10: Commit proposal skipped when user declines.
+#[test]
+fn commit_proposal_declined() -> Result<()> {
+    use deepseek_core::{StreamChunk, UserQuestion};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo file\nFILE|demo.txt|Replace old with new\nVERIFY|git status --short\nACCEPT|demo updated\nARCHITECT_PLAN_END\n".to_string();
+    let llm = Box::new(ScriptedLlm::new(vec![plan, good_diff]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    // Set user question handler that always declines
+    engine.set_user_question_handler(Arc::new(|_q: UserQuestion| Some("no".to_string())));
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        let label = match &chunk {
+            StreamChunk::CommitCompleted { .. } => "CommitCompleted".to_string(),
+            StreamChunk::CommitSkipped => "CommitSkipped".to_string(),
+            _ => return,
+        };
+        if let Ok(mut guard) = events_clone.lock() {
+            guard.push(label);
+        }
+    }));
+
+    let _ = engine.chat_with_options(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.contains(&"CommitSkipped".to_string()),
+        "commit should have been skipped; events: {:?}",
+        *captured
+    );
+    assert!(
+        !captured.contains(&"CommitCompleted".to_string()),
+        "commit should NOT have completed; events: {:?}",
+        *captured
+    );
+
+    // File should still be modified (not committed)
+    assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+    Ok(())
+}
+
+/// Golden cassette #11: Commit proposal with custom message.
+#[test]
+fn commit_proposal_custom_message() -> Result<()> {
+    use deepseek_core::{StreamChunk, UserQuestion};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo file\nFILE|demo.txt|Replace old with new\nVERIFY|git status --short\nACCEPT|demo updated\nARCHITECT_PLAN_END\n".to_string();
+    let llm = Box::new(ScriptedLlm::new(vec![plan, good_diff]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    // User provides a custom commit message
+    engine.set_user_question_handler(Arc::new(|_q: UserQuestion| {
+        Some("fix: update demo file content".to_string())
+    }));
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        let label = match &chunk {
+            StreamChunk::CommitCompleted { message, .. } => {
+                format!("CommitCompleted(msg={})", message)
+            }
+            _ => return,
+        };
+        if let Ok(mut guard) = events_clone.lock() {
+            guard.push(label);
+        }
+    }));
+
+    let _ = engine.chat_with_options(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| e.contains("fix: update demo file content")),
+        "commit should use custom message; events: {:?}",
+        *captured
+    );
+
+    // Verify git log shows custom message
+    let log = Command::new("git")
+        .args(["log", "--oneline", "-1"])
+        .current_dir(dir.path())
+        .output()?;
+    let log_str = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log_str.contains("fix: update demo file content"),
+        "git log should contain custom message; got: {}",
+        log_str
+    );
+    Ok(())
+}
