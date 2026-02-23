@@ -234,7 +234,7 @@ pub(crate) fn read_session_events(cwd: &Path, session_id: Uuid) -> Result<Vec<Ev
     };
     let mut out = Vec::new();
     for line in raw.lines() {
-        let Ok(event) = serde_json::from_str::<EventEnvelope>(line) else {
+        let Ok(event) = deepseek_core::parse_event_envelope_compat(line) else {
             continue;
         };
         if event.session_id == session_id {

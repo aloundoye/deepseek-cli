@@ -2,6 +2,7 @@ mod analysis;
 mod apply;
 mod architect;
 mod editor;
+mod gather_context;
 mod r#loop;
 mod team;
 mod verify;
@@ -230,7 +231,13 @@ impl AgentEngine {
     }
 
     pub fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
-        let response = analysis::analyze(self.llm.as_ref(), &self.cfg, prompt, &options)?;
+        let response = analysis::analyze(
+            self.llm.as_ref(),
+            &self.cfg,
+            &self.workspace,
+            prompt,
+            &options,
+        )?;
         self.stream(StreamChunk::ContentDelta(response.clone()));
         self.stream(StreamChunk::Done);
         Ok(response)

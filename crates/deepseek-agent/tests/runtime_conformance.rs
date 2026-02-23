@@ -19,15 +19,23 @@ fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[test]
 fn legacy_runtime_symbols_are_not_present_in_agent_runtime() -> Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let agent_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let llm_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../deepseek-llm")
+        .join("src");
     let mut files = Vec::new();
-    collect_rs_files(&root, &mut files)?;
+    collect_rs_files(&agent_root, &mut files)?;
+    collect_rs_files(&llm_root, &mut files)?;
 
     // Conformance deny-list for old runtime paths.
     let forbidden = [
         "mode_router",
         "r1_drive_tools",
         "dsml_rescue",
+        "contains_dsml_markup",
+        "DSML_MARKERS",
+        "dsml_buffering",
+        "deepseek-router",
         "RouterEscalation",
         "R1DriveTools",
     ];

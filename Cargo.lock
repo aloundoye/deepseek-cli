@@ -712,7 +712,6 @@ dependencies = [
  "deepseek-mcp",
  "deepseek-memory",
  "deepseek-policy",
- "deepseek-router",
  "deepseek-skills",
  "deepseek-store",
  "deepseek-subagent",
@@ -892,15 +891,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "deepseek-router"
-version = "0.2.0"
-dependencies = [
- "deepseek-core",
- "serde",
- "uuid",
 ]
 
 [[package]]

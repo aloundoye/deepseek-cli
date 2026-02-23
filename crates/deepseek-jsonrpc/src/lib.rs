@@ -473,7 +473,6 @@ impl IdeRpcHandler {
             "chat_messages": projection.chat_messages,
             "transcript": projection.transcript,
             "step_status": projection.step_status,
-            "router_models": projection.router_models,
         });
         fs::write(&output_path, serde_json::to_vec_pretty(&payload)?)?;
         let seq = self.store.next_seq_no(session_id)?;

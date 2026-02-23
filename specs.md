@@ -1,6 +1,6 @@
 # DeepSeek CLI Architecture Spec
 
-Updated: 2026-02-24
+Updated: 2026-02-23
 
 ## 1. Scope
 This spec defines the production agent architecture for edit-execution flows in DeepSeek CLI.
@@ -138,6 +138,26 @@ Non-edit commands (for example `deepseek review`) use a separate analysis API:
 - No verify step
 - No filesystem mutation side effects
 
+### 5.1 Auto Context Bootstrap (repo-ish prompts)
+Before model analysis on non-execution prompts, the harness runs a deterministic gather stage:
+- Triggered for `Ask`/`Context` profile prompts by default, and for repo-ish prompt patterns (`project|repo|repository|codebase`, analyze/audit/check current code).
+- Injects `AUTO_CONTEXT_BOOTSTRAP_V1` into model input with bounded:
+  - `git status --porcelain -b` snapshot (or non-git fallback note)
+  - root tree snapshot
+  - README excerpt
+  - manifest discovery + inferred project type
+  - repository map summary
+- For vague prompts like “check the codebase”, adds a deterministic baseline audit:
+  - TODO/FIXME scan
+  - dependency inventory summary
+  - test-surface summary
+  - risk-hotspot summary
+- Ask/context profile output is hardened to:
+  - provide initial analysis first
+  - ask at most 1–2 targeted follow-ups
+  - ask exactly one focused follow-up for vague “check codebase” style prompts
+  - use one bounded repair reprompt on shape/follow-up violations
+
 ## 6. Streaming Contract
 Execution emits phase lifecycle chunks:
 - `ArchitectStarted`, `ArchitectCompleted`
@@ -162,15 +182,7 @@ Core modules:
 - architect-only plan path when mode is `architect` and execution is not forced
 
 ## 8. Configuration
-### 8.1 Router config (`[router]`)
-Router remains available for model selection heuristics in non-loop contexts:
-- `auto_max_think`
-- `threshold_high`
-- `w1..w6`
-
-Legacy escalation keys are removed.
-
-### 8.2 Agent loop config (`[agent_loop]`)
+### 8.1 Agent loop config (`[agent_loop]`)
 - `max_iterations`
 - `architect_parse_retries`
 - `editor_parse_retries`
@@ -180,6 +192,12 @@ Legacy escalation keys are removed.
 - `verify_timeout_seconds`
 - `max_context_requests_per_iteration`
 - `max_context_range_lines`
+- `context_bootstrap_enabled`
+- `context_bootstrap_max_tree_entries`
+- `context_bootstrap_max_readme_bytes`
+- `context_bootstrap_max_manifest_bytes`
+- `context_bootstrap_max_repo_map_lines`
+- `context_bootstrap_max_audit_findings`
 - `failure_classifier.repeat_threshold`
 - `failure_classifier.similarity_threshold`
 - `failure_classifier.fingerprint_lines`
@@ -210,6 +228,18 @@ Required integration scenarios for `deepseek-agent`:
 - multi file edit succeeds
 - patch apply failure recovers
 - verification failure recovers
-- runtime conformance denies legacy runtime symbols
+- teammate-mode deterministic fallback to single runtime
+- repo-ish analysis prompts inject `AUTO_CONTEXT_BOOTSTRAP_V1`
+- vague codebase prompts trigger baseline audit + bounded follow-up repair
+- runtime conformance denies legacy router/DSML symbols
 
-These scenarios are implemented under `crates/deepseek-agent/tests/architect_editor_loop.rs`.
+These scenarios are implemented under:
+- `crates/deepseek-agent/tests/architect_editor_loop.rs`
+- `crates/deepseek-agent/tests/team_orchestration.rs`
+- `crates/deepseek-agent/tests/analysis_bootstrap.rs`
+- `crates/deepseek-agent/tests/runtime_conformance.rs`
+
+## 12. CI Closure Gates
+- `scripts/runtime_conformance_scan.sh` enforces deny-listed legacy symbols (router/escalation/DSML paths).
+- `.github/workflows/parity-nightly.yml` runs nightly closure journeys and publishes `parity_journey_report.json`.
+- `scripts/parity_streak_gate.py` enforces PR gate requirement for a 3-night successful parity streak.

@@ -4,7 +4,6 @@ members = [
   "crates/deepseek-core",
   "crates/deepseek-agent",
   "crates/deepseek-llm",
-  "crates/deepseek-router",
   "crates/deepseek-tools",
   "crates/deepseek-diff",
   "crates/deepseek-index",

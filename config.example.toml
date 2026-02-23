@@ -18,17 +18,6 @@ max_retries = 3
 retry_base_ms = 400
 stream = true
 
-[router]
-# Lightweight model selection for non-edit analysis/planning requests.
-auto_max_think = true
-threshold_high = 0.72
-w1 = 0.2
-w2 = 0.15
-w3 = 0.2
-w4 = 0.15
-w5 = 0.2
-w6 = 0.1
-
 [agent_loop]
 # Deterministic Architect -> Editor -> Apply -> Verify loop controls.
 max_iterations = 6
@@ -40,6 +29,12 @@ max_diff_bytes = 400000
 verify_timeout_seconds = 60
 max_context_requests_per_iteration = 3
 max_context_range_lines = 400
+context_bootstrap_enabled = true
+context_bootstrap_max_tree_entries = 120
+context_bootstrap_max_readme_bytes = 24000
+context_bootstrap_max_manifest_bytes = 16000
+context_bootstrap_max_repo_map_lines = 80
+context_bootstrap_max_audit_findings = 20
 apply_strategy = "auto" # auto | three_way
 
 [agent_loop.failure_classifier]

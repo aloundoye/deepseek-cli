@@ -166,6 +166,7 @@ Notable architecture/runtime defaults:
 - Optional team-lane composition (`--teammate-mode`) runs lane pipelines in isolated worktrees and merges lane patches deterministically.
 - Tool/function-calling orchestration is not used as the core execution backbone.
 - Analysis/review commands use a separate non-edit path and do not mutate files.
+- Ask/context analysis prompts use deterministic `AUTO_CONTEXT_BOOTSTRAP_V1` repo context and return initial analysis before limited follow-up questions.
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
 - Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).
 - Teleport link base URL is configurable (`ui.handoff_base_url`).
@@ -236,6 +237,8 @@ Additional production/CI gates used by this repo:
 cargo run --bin deepseek -- --json replay list --limit 20
 cargo run --bin deepseek -- --json profile --benchmark --benchmark-suite .github/benchmark/slo-suite.json --benchmark-cases 3 --benchmark-min-success-rate 1.0 --benchmark-min-quality-rate 1.0 --benchmark-max-p95-ms 2000
 cargo run --bin deepseek -- --json benchmark run-matrix .github/benchmark/slo-matrix.json --strict
+bash scripts/runtime_conformance_scan.sh
+bash scripts/parity_regression_check.sh
 ```
 
 ## Docs

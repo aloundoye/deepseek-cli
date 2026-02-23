@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use deepseek_core::{EventEnvelope, RouterDecision, TelemetryConfig, runtime_dir};
+use deepseek_core::{EventEnvelope, TelemetryConfig, runtime_dir};
 use reqwest::blocking::Client;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -43,28 +43,6 @@ impl Observer {
                 "session_id": event.session_id,
                 "seq_no": event.seq_no,
                 "kind": event.kind,
-            }),
-        )
-    }
-
-    pub fn record_router_decision(&self, decision: &RouterDecision) -> Result<()> {
-        self.append_log_line(&format!(
-            "{} ROUTER model={} thinking={} score={} reasons={}",
-            Utc::now().to_rfc3339(),
-            decision.selected_model,
-            decision.thinking_enabled,
-            decision.score,
-            decision.reason_codes.join(",")
-        ))?;
-        self.emit_telemetry(
-            "telemetry.router_decision",
-            json!({
-                "decision_id": decision.decision_id,
-                "model": decision.selected_model,
-                "thinking_enabled": decision.thinking_enabled,
-                "score": decision.score,
-                "reason_codes": decision.reason_codes,
-                "confidence": decision.confidence,
             }),
         )
     }
