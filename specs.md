@@ -1,735 +1,166 @@
-# RFC (Comprehensive): DeepSeek CLI Agent in Rust – A Full-Featured Coding Assistant to Match and Surpass Claude Code use DeepSeek API
+# DeepSeek CLI Architecture Spec
 
-**Status:** Completed
-**Date:** 2026-02-22
-**Goal:** A production-grade, open-source coding agent CLI powered by DeepSeek, designed to **match and surpass Claude Code** in feature completeness, developer experience, safety, and cost-effectiveness. Incorporates best features from Claude Code, OpenAI Codex CLI, and Google Antigravity. This RFC defines the complete feature set, system architecture, and implementation roadmap.
+Updated: 2026-02-23
 
----
+## 1. Scope
+This spec defines the production agent architecture for edit-execution flows in DeepSeek CLI.
 
-## 1. Introduction
+The runtime uses one deterministic pipeline:
 
-Claude Code has set a high bar for terminal-based AI coding assistants. DeepSeek’s models offer compelling advantages: significantly lower cost, a dedicated reasoning model (`deepseek-reasoner`), and an open ecosystem. The key practical constraint is a capability split: `deepseek-chat` supports function-calling tools, while `deepseek-reasoner` does not. The architecture therefore optimizes for a stable execution loop (V3 tool-driving), with R1 used as a reasoning copilot and explicit break-glass path.
+`Architect (R1) -> Editor (V3) -> Apply -> Verify`
 
-This RFC outlines the complete feature set, system design, and incremental implementation plan for the **DeepSeek CLI Agent** (codename: `deepseek`). It incorporates every feature from Claude Code as of February 2026, plus DeepSeek-specific enhancements, ensuring a truly competitive offering.
+There is no legacy dual-mode routing/escalation path in the execution loop.
 
-### 1.1 Current Architecture Decision (Runtime Baseline)
+## 2. Why This Architecture
+DeepSeek provides a capability split:
+- `deepseek-reasoner` (R1): stronger reasoning, no tool calling.
+- `deepseek-chat` (V3): better structured code-edit output and general execution support.
 
-Current production tradeoff for the two-model DeepSeek split:
+To avoid fragile tool-intent orchestration, DeepSeek CLI uses a deterministic edit contract. The models produce plans and diffs; the local harness owns filesystem mutation and verification.
 
-- **Single execution owner:** `deepseek-chat` (V3.2) remains the default tool executor.
-- **R1 as copilot by default:** `deepseek-reasoner` is used at checkpoints (planning/diagnostics/review), not as default tool driver.
-- **R1DriveTools is break-glass:** full R1 JSON-intent tool-driving is disabled by default and requires explicit opt-in (`router.r1_drive_auto_escalation=true` or `--allow-r1-drive-tools`).
-- **Deterministic completion gate:** when files changed, final responses are verification-gated even without a formal plan.
-- **Complex-task subagents:** deterministic complexity scoring controls autospawn; lifecycle is streamed to CLI/TUI and surfaced in Mission Control.
+## 3. Execution Model
+### 3.1 Architect (R1)
+Model: `llm.max_think_model`
 
-### 1.2 2026-02-22 Parity Hardening Patch Train (P0-P6)
+Input:
+- User request
+- Minimal repository map
+- Prior apply/verify failure feedback
 
-This RFC now reflects the implemented hardening set that closed the six parity gaps identified in the prior audit:
+Output contract (strict, line-oriented):
 
-- **P0 MCP stdio resources:** `@server:uri` now executes real stdio `resources/read` requests (no stub path), with bounded parsing for text/blob payloads and explicit prompt markers on failure (`[resource-unavailable: ...]`).
-- **P1 Chrome strict-live default:** Chrome automation no longer returns fake success payloads by default. `tools.chrome.allow_stub_fallback=false` is now the default runtime behavior.
-- **P2 Structured review + publish loop:** `deepseek review` defaults to strict schema parsing (`deepseek.review.findings.v1`), persists structured findings, and supports publish workflows via `gh` (`--publish`, `--pr`, `--max-comments`, `--dry-run`).
-- **P3 Remote orchestration over SSH:** `remote-env` now supports execution orchestration (`exec`, `run-agent`, `logs`) with SSH profile metadata and background job integration.
-- **P4 Teleport secure handoff lifecycle:** `teleport link` and `teleport consume` now implement one-time tokenized handoff descriptors with expiry/one-time-use validation, plus JSON-RPC equivalents for desktop/web clients.
-- **P5 Terminal image fallback parity:** `visual show` now provides deterministic display fallback behavior (`inline|external|path-only|none`) driven by `ui.image_fallback`.
-- **P6 KPI instrumentation hooks:** telemetry events now capture key reliability signals for MCP resource resolution, Chrome live-connect failures, strict review parse/publish outcomes, remote exec outcomes/durations, teleport link consume outcomes, and visual display mode distribution.
-
----
-
-## 2. Complete Feature Set
-
-The following features are derived from Claude Code’s current (2026) capabilities, extended with DeepSeek-specific improvements.
-
-### 2.1 Core Runtime & Environment
-
-| Feature | Description |
-|---------|-------------|
-| **Terminal-native CLI** | Full shell integration, interactive REPL with rich TUI with Ratatui. |
-| **Cross-platform** | macOS 13.0+, Ubuntu 20.04+/Debian 10+, Windows 10+ (WSL/Git Bash). |
-| **Multiple installation methods** | Native binary, Homebrew, Winget, direct download. |
-| **Session persistence** | Resume sessions with `deepseek run`; checkpointing via event log. |
-| **Large context** | 128K token default window (configurable up to 1M via `context_window_tokens`), automatic context compression when nearing threshold. |
-| **Project-wide awareness** | Indexes entire codebase; understands file structure and dependencies. |
-| **Checkpointing** | Auto-saves file edits; reversible via `/rewind` or keyboard shortcut. |
-| **Fast Mode** | Optimized API parameters for lower latency (configurable). |
-| **Parallel tool calls** | Execute multiple independent tool calls in a single LLM response. |
-| **Background execution** | Long-running tasks can be backgrounded (Ctrl+B) and resumed. |
-| **Print mode (`-p`)** | Non-interactive headless mode for CI/CD and scripting. Reads prompt from arg or stdin pipe. Supports `--output-format` (text/json/stream-json). |
-| **Session continue** | `--continue` resumes last session; `--resume <ID>` resumes a specific session. Full conversation context is restored. |
-| **Model override** | `--model` flag for per-invocation model override. Use `--model max` or `--model high` to force thinking mode on `deepseek-chat`. |
-
-### 2.2 File System Operations
-
-| Tool | Description |
-|------|-------------|
-| `fs.read` | View file contents with line numbers; supports images/PDFs. |
-| `fs.write` | Create/overwrite files (safer than bash redirection; checkpointed). |
-| `fs.edit` | Targeted modifications (string replacement, line edits). |
-| `fs.glob` | Pattern-based file search. |
-| `fs.grep` | Content search with regex. |
-| `web.fetch` | Fetch URL content, auto-extract text from HTML. Configurable timeout and max_bytes. |
-| `web.search` | Web search returning structured results (title, URL, snippet, provenance). Cached with TTL. |
-| `@file` references | Mention files directly: `@src/auth.ts:42-58`. |
-| `@dir` references | Include whole directories. |
-
-### 2.3 Git Integration
-
-- Commit creation, branch management, pull requests from CLI.
-- Git history search.
-- Merge conflict resolution assistance.
-- **Code review**: `deepseek review` analyzes diffs (`--diff`, `--staged`, `--pr NUMBER`) and provides structured feedback with severity levels (critical/warning/suggestion). Inspired by Codex CLI's `/review`.
-- Checkpointing note: Only file edits (via dedicated tools) are auto-checkpointed; bash operations are not tracked.
-
-### 2.4 Slash Commands (REPL)
-
-| Command | Purpose |
-|---------|---------|
-| `/help` | Show all commands. |
-| `/init` | Scan project and create `DEEPSEEK.md` (memory file). |
-| `/clear` | Clear conversation history. |
-| `/compact` | Summarize conversation to save context. |
-| `/memory` | Edit `DEEPSEEK.md` memory files. |
-| `/config` | Open configuration interface. |
-| `/model` | Toggle thinking mode on `deepseek-chat`. |
-| `/cost` | Show token usage and estimated cost. |
-| `/mcp` | Manage MCP server connections. |
-| `/rewind` | Rewind to previous checkpoint. |
-| `/export` | Export conversation to file. |
-| `/plan` | Enable plan mode for complex tasks. |
-| `/teleport` | Export/import session bundles for handoff and replay. |
-| `/remote-env` | Configure remote environment profiles and run endpoint health checks. |
-| `/status` | Current model, mode, and configuration. |
-| `/effort` | Control thinking depth (low/medium/high/max). |
-| `/context` | Inspect context window: token breakdown by source (system prompt, conversation, tools, memory). |
-| `/permissions` | View/change permission mode (ask/auto/locked). Dry-run evaluator shows what a tool call would produce under current mode. |
-| `/sandbox` | View/configure sandbox mode (allowlist/isolated/off/workspace-write/read-only). |
-| `/agents` | List running and completed subagents with status and output summaries. |
-| `/tasks` | Open Mission Control snapshot: task queue + subagent lane status. |
-| `/review` | Start a read-only code review pipeline. Presets: security, perf, style, PR-ready. Accepts `--diff`, `--staged`, `--pr N`, `--path P`, `--focus F`. |
-| `/search` | Web search: query the web and include results as context. Cached with TTL. Provenance metadata attached to results. |
-| `/terminal-setup` | Configure shell integration, prompt markers, and terminal capabilities. |
-| `/keybindings` | Edit keyboard shortcuts interactively; opens `~/.deepseek/keybindings.json`. |
-| `/doctor` | Run diagnostics: check API connectivity, config validity, tool availability, index health, disk space. |
-
-### 2.5 MCP (Model Context Protocol) Extensibility
-
-- **Transports:** HTTP (remote servers), Stdio (local processes).
-- **Installation scopes:** user (`~/.deepseek/mcp.json`), project (`.mcp.json`), local (`~/.deepseek/mcp.local.json`).
-- **Management commands:** `deepseek mcp add/list/get/remove`.
-- **Dynamic updates:** Servers can notify of tool changes.
-- **Community integrations:** GitHub, Notion, PostgreSQL, Sentry, Slack, etc.
-- **Xcode integration (future):** Capture previews for visual verification.
-
-### 2.6 Subagent System
-
-- **Parallel agents:** Up to 7 subagents running simultaneously.
-- **Agent types:**
-  - *Explore*: Research and gather information.
-  - *Plan*: Break down tasks into steps.
-  - *Task*: Execute specific subtasks (e.g., refactor a module).
-- **Isolated contexts:** Subagents operate in clean contexts, preventing state pollution.
-- **Agent Teams:** Multiple agents coordinate on different components (frontend, backend, testing).
-- **Resilience:** Agents continue after permission denials, trying alternative approaches.
-
-### 2.7 User Experience & Keyboard Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| Escape | Stop current response. |
-| Escape + Escape | Open rewind menu. |
-| ↑ | Navigate past commands. |
-| Ctrl+V | Paste images (where supported). |
-| Tab | Autocomplete file paths and commands. |
-| Shift+Enter | Multi-line input. |
-| Ctrl+B | Background agents and shell commands. |
-| Ctrl+O | Toggle transcript mode (show raw thinking). |
-| Ctrl+C | Cancel current operation. |
-| Shift+Tab | Cycle permission mode (ask → auto → locked). |
-| Ctrl+T | Toggle Mission Control pane (tasks/subagents). |
-| Ctrl+A | Toggle Artifacts pane. |
-
-### 2.8 Configuration System
-
-| File | Purpose |
-|------|---------|
-| `~/.deepseek/settings.json` | User-level settings. |
-| `.deepseek/settings.json` | Project-specific settings (shared). |
-| `.deepseek/settings.local.json` | Per-machine overrides (gitignored). |
-| `~/.deepseek/mcp.json` | MCP server configurations. |
-| `.mcp.json` | Project-scoped MCP servers. |
-| `~/.deepseek/keybindings.json` | Custom keyboard shortcuts. |
-| `DEEPSEEK.md` | Project memory, conventions, workflows. |
-
-### 2.9 Customization & Skills
-
-- **Skills:** Reusable prompt templates stored in `~/.deepseek/skills/` or `.deepseek/skills/`; appear in slash command menu.
-- **Hot reload:** Skills available immediately without restart.
-- **Hooks:** Extended lifecycle hooks for fine-grained control:
-  - `SessionStart` — fired when a session begins or resumes.
-  - `PreToolUse` — fired before tool execution (can block).
-  - `PostToolUse` — fired after successful tool execution.
-  - `PostToolUseFailure` — fired after tool execution fails.
-  - `Stop` — fired when the agent completes a run (success or failure).
-- **Wildcard permissions:** e.g., `Bash(npm *)` to allow any npm command without approval.
-- **`respectGitignore`:** Control @-mention file picker behavior.
-
-### 2.10 Advanced Capabilities
-
-| Feature | Description |
-|---------|-------------|
-| **Visual verification** | Capture and analyze UI previews (Xcode, Flutter, etc.) – *future*. |
-| **Multilingual output** | `language` setting for responses in Japanese, Spanish, etc. |
-| **Adaptive thinking** | Model adjusts reasoning depth based on complexity. |
-| **max effort parameter** | Highest level of reasoning for complex tasks. |
-| **Terminal command sandboxing** | Experimental safety for command execution. |
-| **Auto-approval rules** | Configurable permissions to reduce prompts. |
-| **Memory across projects** | Enterprise-wide `DEEPSEEK.md` for consistent conventions. |
-| **Auto-lint after edit** | Inspired by Aider: optional `lint_after_edit` config runs a linter automatically after `fs.edit`, including diagnostics in the tool result for self-healing. |
-| **Web content fetching** | `web.fetch` tool retrieves URL content with HTML-to-text extraction, enabling documentation lookup and API exploration. |
-
-### 2.11 Permission & Safety System
-
-- **User approval:** Destructive operations require confirmation (delete, force-push, etc.).
-- **Scope awareness:** Authorization matches requested scope only.
-- **Blast radius consideration:** Checks reversibility before acting.
-- **Security hardening:** No command injection, XSS, SQL injection.
-- **Team permissions:** Managed permissions that cannot be overwritten locally.
-
-### 2.12 Permission Modes
-
-The CLI supports three runtime permission modes that govern how tool calls are authorized:
-
-| Mode | Behavior |
-|------|----------|
-| **ask** (default) | Prompt the user for approval on each tool call that matches the policy gate (edits, bash, etc.). Read-only tools (fs.read, fs.glob, fs.grep, index.query) always pass. |
-| **auto** | Auto-approve tool calls that match the allowlist. Calls not on the allowlist still prompt for approval. Ideal for workflows where the user trusts a known set of commands. |
-| **locked** | Deny all non-read operations. No writes, no edits, no bash, no patch apply. Useful for review-only sessions or when exploring a codebase. |
-
-**UX:**
-- **Shift+Tab** cycles between modes at the REPL prompt: ask → auto → locked → ask.
-- **Status bar** shows current mode as a colored indicator: `[ASK]` (yellow), `[AUTO]` (green), `[LOCKED]` (red).
-- **Event log:** Every mode change is recorded as `PermissionModeChangedV1 { from, to }` in the event stream.
-- **`/permissions` command:** Displays current mode, lists what each tool would do under the active mode (dry-run evaluator), and allows switching modes interactively.
-- **Team policy override:** If `team-policy.json` sets `permission_mode`, it cannot be overridden locally.
-- **Configuration:** `policy.permission_mode` in settings (default: `"ask"`).
-
-### 2.13 DeepSeek-Specific Enhancements
-
-| Enhancement | Description |
-|--------------|-------------|
-| **Cost efficiency** | ~16–20x cheaper than Claude; highlight in `/cost` command. |
-| **Automatic “max thinking”** | Seamlessly enable thinking mode on `deepseek-chat` when complexity requires it. |
-| **Prompt caching** | 90% discount on repeated input tokens; implement aggressive caching. |
-| **Off-peak scheduling** | Option to defer non-urgent tasks to cheaper rate periods. |
-| **DeepSeek-only provider** | Single-provider design: all API calls go to DeepSeek (`deepseek-chat` with optional thinking mode). No multi-LLM abstraction layer. Configuration knob `llm.provider` is reserved for future extensibility but currently only accepts `"deepseek"`. |
-| **Performance monitoring** | `/profile` command showing time breakdown. |
-| **Integration marketplace** | Community repository of MCP plugins. |
-
-### 2.14 How to Build Your "Claude Code" Clone
-
-For the best results, use a Hybrid Approach with thinking mode on `deepseek-chat`:
-
-- **Complex tasks (thinking enabled):** Use `deepseek-chat` with `thinking: {"type": "enabled", "budget_tokens": N}` for codebase analysis, multi-step planning, and debugging. This gives chain-of-thought reasoning + function calling simultaneously.
-- **Simple tasks (thinking off):** Use `deepseek-chat` without thinking mode for routine completions, boilerplate, and docs to save token costs.
-- **Note:** `deepseek-reasoner` does NOT support function calling (tools). Always use `deepseek-chat` for the agentic tool-calling loop.
-
----
-
-## 3. System Architecture
-
-The architecture is a modular monolith with clear separation of concerns, designed to support the above features while remaining maintainable and testable.
-
-```
-crates/
-  cli/          # Entry point, command parsing, print mode, review subcommand
-  ui/           # TUI (ratatui + crossterm), theme, layout, keybindings
-  core/         # Shared config types, session loop, scheduling
-  agent/        # Planner, Executor, Subagent orchestration, session hooks
-  llm/          # DeepSeek API client, streaming, retries, caching
-  router/       # Model routing + auto thinking-mode policy
-  tools/        # Tool registry, sandboxed execution, web.fetch, auto-lint
-  mcp/          # MCP server management and protocol handling
-  subagent/     # Parallel subagent lifecycle and communication
-  diff/         # Patch staging, application, conflict resolution
-  index/        # Tantivy code index + manifest + file watcher
-  store/        # SQLite + event log; projections; session queries
-  policy/       # Approvals, allowlists, redaction, sandbox enforcement
-  observe/      # Logs, metrics, tracing, cost tracking
-  memory/       # DEEPSEEK.md management, project memory, cross-project conventions
-  testkit/      # Replay harness, fake LLM, golden tests
-  skills/       # Skill management and execution
-  hooks/        # Extended lifecycle hooks (5 phases)
+```text
+ARCHITECT_PLAN_V1
+PLAN|<step text>
+FILE|<path>|<intent>
+VERIFY|<command>
+ACCEPT|<criterion>
+NO_EDIT|true|<reason>        # optional
+ARCHITECT_PLAN_END
 ```
 
-### 3.1 Core Components
-
-| Component | Responsibility |
-|-----------|----------------|
-| **Agent Runtime** | Owns the session loop, manages state machine, persists events. |
-| **Planner** | Creates/revises plans using LLM; may spawn subagents for exploration. |
-| **Executor** | Executes plan steps via tools; requests plan refinement when needed. |
-| **Subagent Manager** | Spawns, monitors, and communicates with parallel subagents. |
-| **Model Router** | Decides whether to enable thinking mode per call; logs decisions. |
-| **Tool Host** | Executes tools with policy enforcement, journaling, and sandboxing. |
-| **MCP Client** | Discovers and invokes tools from MCP servers. |
-| **Index Service** | Provides deterministic code search and repo snapshots. |
-| **Event Store** | Append-only log of all events; source of truth for replay. |
-| **Policy Engine** | Evaluates tool calls against allowlists, redaction rules, and user approvals. |
-
----
-
-## 4. Detailed Design
-
-### 4.1 Session Lifecycle and State Machine
-
-The session state machine (as defined in the revised RFC) governs the overall flow. States: `Idle`, `Planning`, `ExecutingStep`, `AwaitingApproval`, `Verifying`, `Completed`, `Paused`, `Failed`. All transitions are recorded as events.
-
-### 4.2 Planner and Executor
-
-- **Planner** generates a JSON plan (see Section 3.2 of revised RFC). It may use thinking mode for complex planning tasks.
-- **Executor** follows the plan, but can request **refinement** mid-step if ambiguity arises (e.g., search returns multiple candidates). Refinement requests go back to the planner with current context.
-
-### 4.3 Subagent System
-
-Subagents are lightweight agent instances running in parallel. Each has its own context fork (isolated from the main session). Communication happens via the subagent manager, which can merge results back into the main plan.
-
-**Design:**
-
-- Subagents are spawned with a specific goal (e.g., “explore API usage in module X”).
-- They execute using the same tool set but with a clean context.
-- Results are returned as structured data (e.g., findings, plan fragments).
-- The main agent can incorporate these results into the next planning step.
-
-**Agent Teams:** Multiple subagents can be coordinated as a team (e.g., frontend, backend, testing agents working on different parts of a feature). The manager ensures they don’t step on each other’s toes.
-
-### 4.4 Model Router with Auto Max-Think
-
-The **WeightedRouter** (`deepseek-router`) computes a complexity score based on:
-
-- Prompt complexity (length, keywords).
-- Repo complexity (touched files, index breadth).
-- Failure history (consecutive tool failures, test failures).
-- Planner confidence (self-reported).
-- User intent hints (`/plan`, `/effort high`).
-- Latency budget (interactive vs batch).
-
-Thresholds and weights are configurable. The router logs each decision (including the feature vector snapshot) to the event log, enabling post-hoc analysis and tuning.
-
-**Escalation retry:** If the chat model produces an invalid plan or stalls, the router automatically retries with thinking mode enabled once.
-
-### 4.4.1 DeepSeek Model Strategy: Thinking Mode on `deepseek-chat`
-
-DeepSeek offers two model endpoints, but only `deepseek-chat` supports function calling (tools):
-
-| Feature | `deepseek-chat` | `deepseek-reasoner` |
-|---------|-----------------|---------------------|
-| Primary Mode | Non-thinking (Direct output) | Thinking (Chain-of-Thought, always-on) |
-| Thinking Mode | Yes (via `thinking` param) | Always-on |
-| Function Calling | **Yes** | **No** |
-| Best For | All agentic tasks (with thinking toggle) | Copilot checkpoints (plan/diagnose/review), break-glass reasoning |
-| Context Window | 128K | 128K |
-
-**Key insight:** `deepseek-reasoner` does NOT support function calling. When tools are needed (the common case for an agentic coding assistant), we MUST use `deepseek-chat`. The DeepSeek API (V3.2) supports thinking mode on `deepseek-chat` via `thinking: {"type": "enabled", "budget_tokens": N}`, which gives us reasoning + function calling simultaneously.
-
-### 4.4.2 Two-Mode Execution Architecture (Mode Router)
-
-The **Mode Router** (`deepseek-agent::mode_router`) evaluates risk/failure signals each turn. Runtime policy keeps **V3Autopilot** as the stable default executor. **R1DriveTools** is available as break-glass only:
-
-| Mode | Model | How Tools Are Called | When Used |
-|------|-------|---------------------|-----------|
-| **V3Autopilot** (default) | `deepseek-chat` | API function calling (thinking + tools unified) | Most tasks; fast, single-call |
-| **R1DriveTools** (break-glass) | `deepseek-reasoner` | R1 emits JSON intents, orchestrator executes via ToolHost | Explicitly enabled only (`router.r1_drive_auto_escalation=true` or `--allow-r1-drive-tools`) |
-
-**Escalation triggers** (signals computed by `decide_mode()` after each tool execution batch):
-1. **Doom-loop** (highest priority) — same tool signature (name + normalized args + exit code bucket) fails ≥ `doom_loop_threshold` (default 2) times
-2. **Repeated step failures** — consecutive failures ≥ `v3_max_step_failures` (effective default 2) times
-3. **Blast radius exceeded** — ≥ `blast_radius_threshold` (effective default 5) files changed without verification
-4. **Cross-module failures** — errors span 2+ distinct modules
-5. **Ambiguous errors** — latest `ObservationPack` classifies the failure as `ErrorClass::Ambiguous`
-
-When break-glass is disabled, these triggers are still evaluated but escalation is suppressed. The agent records suppression reason codes/events and injects an R1 consultation checkpoint while keeping V3 in control.
-
-**Mechanical recovery**: V3 has a bounded recovery mechanism (`v3_mechanical_recovery = true`) for mechanical errors (compile/lint/missing dependency) based on the latest `ObservationPack`, allowing one recovery attempt before escalation.
-
-**Policy doom-loop breaker**: When doom-loop detection fires and all failing signatures are `bash.run` policy errors (forbidden shell metacharacters, command not allowlisted), the agent injects a guidance message redirecting the model to built-in tools (`fs.glob`, `fs.grep`, `fs.read`) and resets failure trackers instead of escalating to R1 (which faces the same policy restrictions). This prevents infinite loops where V3 and R1 both repeatedly fail against the same policy barrier.
-
-**Hysteresis**: once escalated to R1 (break-glass enabled), stay there until verification passes (`verify_passed_since_r1`), R1 returns `done`/`abort`, or R1 budget is exhausted (forced return to V3). This prevents ping-ponging between modes.
-
-**R1 consultation** (`deepseek-agent::consultation`): Lightweight alternative to full R1DriveTools escalation. V3 asks R1 for targeted advice on a specific subproblem — error analysis, architecture advice, plan review, or task decomposition. R1 returns text-only advice (no JSON intents, no tool execution). Advice is injected into V3's conversation as a tool result. V3 keeps control and tools throughout. `think_deeply` is in the core tier.
-
-**R1 drive-tools loop** (`deepseek-agent::r1_drive`):
-1. R1 receives an `ObservationPack` (actions, errors, diffs, test results, repo facts)
-2. R1 responds with one JSON envelope: `tool_intent`, `delegate_patch`, `done`, or `abort`
-3. Orchestrator validates JSON via `protocol::parse_r1_response()`, executes via `ToolHost`
-4. Orchestrator builds new `ObservationPack`, sends back to R1
-5. Loop until R1 returns `delegate_patch` (hand off to V3 patch writer), `done`, or `abort`
-6. R1 budget capped at `r1_max_steps` (default 30) to limit token cost
-
-**V3 patch writer** (`deepseek-agent::v3_patch`): When R1 issues `delegate_patch`, V3 is called with a focused prompt to produce a unified diff. Handles `need_more_context` requests by reading additional files. Max context requests configurable via `v3_patch_max_context_requests`.
-
-**Plan → Execute → Verify discipline** (`deepseek-agent::plan_discipline`): For complex prompts (detected via keyword triggers like "implement", "refactor", "add feature"), the agent generates a step-by-step plan before executing. `PlanState` tracks progress through `NotPlanned → Planned → Executing → Verifying → Completed`. Steps auto-advance when declared files are touched. Exit is gated by verification checkpoints (diagnostics, tests), and final completion is verification-gated when files changed even without a formal plan. Verification failures feed back into the loop. Verification pass always resets failure/blast-radius tracker state via `record_verify_pass()`. In chat mode, a scored complexity decision triggers bounded automatic subagent orchestration before the main execution loop, and summarized subagent findings are injected back into context.
-
-**Key modules:**
-- `mode_router.rs` — `AgentMode`, `ModeRouterConfig`, `FailureTracker`, `ToolSignature`, `decide_mode()`, escalation + hysteresis logic
-- `protocol.rs` — `R1Response` JSON envelope types, parsing + validation, V3 patch response parsing
-- `observation.rs` — `ObservationPack`, `ErrorClass`, error classification, compact R1 context serialization
-- `r1_drive.rs` — R1 drive-tools loop implementation
-- `v3_patch.rs` — V3 as focused patch-only code writer
-- `consultation.rs` — R1 consultation: lightweight text-only advice without full escalation
-- `plan_discipline.rs` — Plan state machine, trigger detection, step tracking, verification gating
-
-**Streaming text suppression** (`deepseek-llm`): When the model's streaming response contains both content text deltas and structured `tool_calls`, text fragments are suppressed from the TUI once the first tool call delta arrives. After streaming completes, a `ClearStreamingText` signal removes pre-tool-call text noise from the transcript. This prevents choppy interleaved text between tool calls.
-
-**Configuration** (all in `[router]` section):
-```toml
-mode_router_enabled = true          # Enable mode routing (false = always V3Autopilot)
-r1_drive_auto_escalation = false    # Break-glass: allow automatic R1DriveTools escalation
-v3_max_step_failures = 2            # Consecutive failures before escalation
-blast_radius_threshold = 5          # Files changed without verify before escalation
-v3_mechanical_recovery = true       # Allow V3 one recovery attempt for compile/lint errors
-r1_max_steps = 30                   # Max R1 drive-tools steps per task
-r1_max_parse_retries = 2            # Max retries when R1 JSON fails validation
-v3_patch_max_context_requests = 3   # Max context requests from V3 patch writer
-```
-`doom_loop_threshold` is currently fixed at `2` in `ModeRouterConfig::from_router_config()` (not user-configurable in `[router]` yet).
-
-### 4.5 Tool System
-
-Tools are categorized as:
-
-- **Built-in Rust tools:** `fs.read`, `fs.write`, `fs.edit`, `fs.glob`, `fs.grep`, `web.fetch`, `git.*`, `index.query`, etc.
-- **MCP tools:** Dynamically loaded from MCP servers.
-- **Shell commands:** Restricted via `bash.run` with allowlist and approval.
-
-All tool calls are journaled (proposal, approval, result) in the event log. For `fs.edit`, we provide a high-level interface that accepts search/replace pairs and generates a unified diff internally using an LCS-based algorithm.
-
-**`web.fetch`:** Fetches URL content via HTTP GET, strips HTML tags to plain text, and truncates to a configurable max byte limit. Useful for documentation lookup, API exploration, and web content analysis.
-
-**`web.search`:** Performs a web search query and returns structured results with title, URL, snippet, and provenance metadata (source, timestamp). Results are cached with a configurable TTL (default 15 minutes) to avoid redundant queries. Distinct from `web.fetch`: search returns a list of results for discovery, while fetch retrieves a single URL's content. The `/search` slash command provides interactive access.
-
-**Review pipeline constraints:** When `/review` or `deepseek review` is active, the tool host enters **read-only mode**: `fs.write`, `fs.edit`, `patch.stage`, `patch.apply`, `bash.run`, and `web.fetch` are all forbidden. Only read tools (`fs.read`, `fs.glob`, `fs.grep`, `index.query`, `git.diff`, `git.log`, `git.show`) are permitted. This ensures the review pipeline cannot modify the codebase.
-
-**Auto-lint after edit:** When `policy.lint_after_edit` is configured (e.g., `"cargo fmt --check"`), the tool host automatically runs the linter after every `fs.edit` and includes diagnostics in the tool result JSON. This enables the LLM to self-heal formatting/lint issues without a separate tool call.
-
-### 4.6 Patch Staging and Application
-
-- Model never writes files directly.
-- All edits go through `patch.stage` (or `fs.edit` which calls it).
-- Staged patches are stored as unified diffs against a known file SHA.
-- Applying a patch requires SHA match or merge strategy (3-way merge if git repo).
-- Conflicts are presented to the user for resolution.
-
-### 4.7 Indexing and Deterministic Snapshots
-
-- Uses Tantivy for fast search.
-- Manifest stores baseline commit (if git) or list of file SHAs.
-- For non-git projects, initial index is built by walking the FS; a file watcher (`notify`) can incrementally update the index.
-- Queries are tagged `fresh` or `stale` based on manifest staleness.
-
-### 4.8 Event Store and Deterministic Replay
-
-- All session events are appended to `events.jsonl` (canonical log).
-- SQLite stores projections for fast querying (current state, conversation, etc.).
-- **Replay mode:** Given a session ID, the system reads the event log and replays all LLM calls and tool results from stored events, **without re-executing** tools or calling the LLM again. This enables deterministic testing and debugging.
-
-### 4.9 Permission and Policy Engine
-
-- Policy rules are defined in TOML (see config example).
-- For each tool call, the policy engine checks:
-  - Is the tool allowed? (allowlist)
-  - Are the arguments safe? (path traversal checks, secret patterns)
-  - Does the tool require approval? (ask/allow/deny)
-- Approvals are collected via TUI prompts (or auto-approved if configured).
-- Redaction: before sending prompts to LLM, the system scans for secrets (API keys, tokens) based on regex patterns and redacts them (configurable).
-
-### 4.10 Skills and Hooks
-
-- Skills are stored as Markdown files with frontmatter (similar to Claude Code). They can include tool usage patterns.
-- Hooks provide extended lifecycle control at five phases:
-  - **SessionStart** — fired when a session begins or resumes. Useful for environment setup.
-  - **PreToolUse** — fired before tool execution; can block the call (e.g., for custom approval logic).
-  - **PostToolUse** — fired after successful tool execution; receives tool result.
-  - **PostToolUseFailure** — fired after tool execution fails; receives error details. Enables custom error recovery or alerting.
-  - **Stop** — fired when the agent completes a run (success or failure). Useful for cleanup, notifications, or metrics.
-- Hooks can be written in Rust or via WASM (future, behind `experiments.wasm_hooks` flag).
-
-### 4.11 MCP Integration
-
-- MCP servers are managed via `deepseek mcp` commands.
-- The MCP client discovers tools from servers and makes them available in the tool registry.
-- Supports stdio and HTTP transports.
-- Dynamic tool list updates via server notifications.
-
-### 4.12 User Interface (TUI)
-
-- **Real-time streaming:** LLM responses are streamed token-by-token to the terminal via SSE parsing. The `LlmClient::complete_streaming()` method reads the HTTP response line-by-line, invoking a callback for each `content` or `reasoning_content` delta. In print mode (`-p`), tokens are flushed to stdout immediately. In `--output-format stream-json`, each chunk is emitted as a JSON line (`{"type":"content","text":"..."}`) for programmatic consumption. The `AgentEngine` holds an optional `StreamCallback` that, when set, is used for the first LLM call in the run.
-- **Subagent lifecycle stream:** Subagent spawn/completion/failure is streamed as typed chunks and surfaced live in transcript + Mission Control (`SubagentSpawned`, `SubagentCompleted`, `SubagentFailed`).
-- Built with `ratatui` and `crossterm`.
-- Layout:
-  - Main conversation pane (scrollable, syntax highlighting).
-  - Plan pane (collapsible) showing current plan and step progress.
-  - Tool output pane (real-time logs from subagents or tool executions).
-  - **Mission Control pane** (toggle via `/tasks` or Ctrl+T): task queue with status indicators and subagent swimlanes. Live subagent lifecycle events stream into this pane.
-  - **Artifacts pane** (toggle via Ctrl+A): displays task artifacts from `.deepseek/artifacts/<task-id>/`. Each task bundle contains `plan.md`, `diff.patch`, `verification.md`. Artifacts are browsable and diffable inline.
-  - Status bar: model, cost, pending approvals, background jobs, **permission mode indicator** (`[ASK]`/`[AUTO]`/`[LOCKED]`).
-- Keyboard shortcuts as listed in section 2.7.
-- Multi-line input with Shift+Enter.
-- Autocomplete for commands and file paths.
-
-### 4.13 CLI Commands (Non-Interactive)
-
-In addition to the REPL, the CLI supports one-shot commands:
-
-- `deepseek ask "<prompt>" [--tools=true|false]` – single response (tools enabled by default; disable with `--tools=false`).
-- `deepseek chat [--tools=true|false] [--tui]` – interactive chat (tools enabled by default; disable with `--tools=false`).
-- `deepseek plan "<prompt>"` – generate a plan and exit.
-- `deepseek autopilot "<prompt>"` – run autonomous mode (may continue in background).
-- `deepseek run <session-id>` – resume a session.
-- `deepseek diff` – show staged changes.
-- `deepseek apply` – apply staged patches.
-- `deepseek index build|update|status|query` – manage index.
-- `deepseek config edit|show` – edit configuration.
-- `deepseek review [--diff|--staged|--pr N|--path P] [--focus F]` – structured code review with severity levels.
-- `deepseek exec "<command>"` – execute a shell command under policy enforcement (allowlist, sandbox, approval) and print structured output.
-- `deepseek tasks [list|show <id>|cancel <id>]` – manage the task queue from the command line.
-- `deepseek doctor` – run diagnostics (API connectivity, config validation, tool/binary availability, index health, disk space, sandbox integrity).
-- `deepseek search "<query>"` – web search from CLI, returns results with provenance metadata.
-
-**Print mode (`-p`):** Any command can be run non-interactively with the `-p` flag. Reads prompt from trailing arguments or stdin pipe. Supports `--output-format` (`text`, `json`, `stream-json`). Designed for CI/CD pipelines, scripting, and integration with other tools.
-
-**Session continuation:**
-- `--continue` / `-c` resumes the most recent session, restoring full conversation context.
-- `--resume <UUID>` / `-r <UUID>` resumes a specific session by ID.
-- `--fork-session <UUID>` forks an existing session: clones conversation + state into a new session with a fresh event stream. The original session is untouched. File locking prevents concurrent writes to the same session.
-
-**Per-invocation overrides:**
-- `--model <name>` overrides `llm.base_model` for this run.
-- `--allow-r1-drive-tools` enables break-glass automatic transition into R1DriveTools for the current run.
-- `llm.provider` is reserved but must be `"deepseek"` (the only supported provider).
-
----
-
-## 5. Implementation Milestones
-
-### M1: Core REPL + Basic Tools (Weeks 1–4)
-- Project setup, workspace structure.
-- Basic REPL with chat (no tools) using `deepseek-chat` (with thinking mode support).
-- Session persistence (event log, SQLite).
-- Read-only tools: `fs.list`, `fs.read`, `git.status`.
-- Manual model switching via `/model`.
-
-### M2: Plan-First Mode + Patch Staging (Weeks 5–8)
-- Planner generates JSON plans (using chat model).
-- Patch staging with `fs.edit` and `patch.apply`.
-- Approval flow for writes.
-- Simple router with fixed thresholds.
-- Add `/plan`, `/clear`, `/help` commands.
-
-### M3: Verification Loops & Subagents (Weeks 9–12)
-- Integration with test/lint tools (`run_tests`, `run_linter`).
-- Verification step in plan execution.
-- Basic subagent support: spawn, isolate, collect results.
-- `/compact` command to summarize conversation.
-- Background execution (Ctrl+B).
-
-### M4: Auto Max-Think & Router Tuning (Weeks 13–16)
-- Full router with feature vector and escalation logic.
-- Router event logging and `/cost` command.
-- Configurable thresholds; feedback collection.
-- Add `/effort` command to influence router.
-
-### M5: MCP Integration (Weeks 17–20)
-- MCP client with stdio and HTTP support.
-- `deepseek mcp` commands for server management.
-- Dynamic tool discovery.
-- Example MCP servers (GitHub, filesystem).
-
-### M6: Skills, Hooks & Advanced Features (Weeks 21–24)
-- Skill loading and execution.
-- Pre/Post tool hooks.
-- Wildcard permissions.
-- `/memory` and `DEEPSEEK.md` support.
-- Deterministic replay test harness.
-- Performance monitoring (`/profile`).
-
-### M7: Polishing & Ecosystem (Weeks 25–28)
-- Cross-platform testing and packaging.
-- Community plugin registry website.
-- Documentation and tutorials.
-- Auto-approval rules and team permissions.
-- Visual verification (experimental).
-
----
-
-## 6. Configuration Example (TOML)
-
-```toml
-[llm]
-base_model = "deepseek-chat"
-max_think_model = "deepseek-reasoner"  # Legacy; thinking mode on deepseek-chat is used instead
-provider = "deepseek"              # Only "deepseek" is supported
-profile = "v3_2"
-context_window_tokens = 128000
-temperature = 0.2
-endpoint = "https://api.deepseek.com/chat/completions"
-api_key_env = "DEEPSEEK_API_KEY"
-fast_mode = false
-language = "en"
-prompt_cache_enabled = true
-timeout_seconds = 60
-max_retries = 3
-retry_base_ms = 400
-stream = true
-
-[router]
-auto_max_think = true              # Enables automatic thinking mode escalation
-threshold_high = 0.72
-escalate_on_invalid_plan = true
-max_escalations_per_unit = 1
-unified_thinking_tools = true      # Use deepseek-chat thinking+tools in one call
-mode_router_enabled = true         # Enable V3Autopilot/R1DriveTools routing
-r1_drive_auto_escalation = false   # Break-glass only by default
-v3_max_step_failures = 2
-blast_radius_threshold = 5
-v3_mechanical_recovery = true
-r1_max_steps = 30
-r1_max_parse_retries = 2
-v3_patch_max_context_requests = 3
-w1 = 0.2    # prompt_complexity
-w2 = 0.15   # repo_complexity
-w3 = 0.2    # failure_streak
-w4 = 0.15   # planner_confidence
-w5 = 0.2    # user_intent
-w6 = 0.1    # latency_budget
-
-[policy]
-approve_edits = "ask"          # ask, allow, deny
-approve_bash = "ask"
-allowlist = ["rg", "git status", "git diff", "git show", "cargo test", "cargo fmt --check", "cargo clippy"]
-block_paths = [".env", ".ssh", ".aws", ".gnupg", "**/id_*", "**/secret"]
-redact_patterns = [
-    '(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[''"]?[a-z0-9_\-]{8,}[''"]?',
-    '\b\d{3}-\d{2}-\d{4}\b',
-    '(?i)\b(mrn|medical_record_number|patient_id)\s*[:=]\s*[a-z0-9\-]{4,}\b',
-]
-sandbox_mode = "allowlist"     # allowlist | isolated | off
-permission_mode = "ask"        # ask | auto | locked
-# lint_after_edit = "cargo fmt --check"  # auto-lint after fs.edit
-
-[plugins]
-enabled = true
-search_paths = [".deepseek/plugins", ".plugins"]
-enable_hooks = false
-
-[plugins.catalog]
-enabled = true
-index_url = ".deepseek/plugins/catalog.json"
-signature_key = "deepseek-local-dev-key"
-refresh_hours = 24
-
-[skills]
-paths = [".deepseek/skills", "~/.deepseek/skills"]
-hot_reload = true
-
-[usage]
-show_statusline = true
-cost_per_million_input = 0.27
-cost_per_million_output = 1.10
-
-[context]
-auto_compact_threshold = 0.86
-compact_preview = true
-
-[autopilot]
-default_max_consecutive_failures = 10
-heartbeat_interval_seconds = 5
-persist_checkpoints = true
-
-[scheduling]
-off_peak = false
-off_peak_start_hour = 0
-off_peak_end_hour = 6
-defer_non_urgent = false
-max_defer_seconds = 0
-
-[replay]
-strict_mode = true
-
-[ui]
-enable_tui = true
-keybindings_path = "~/.deepseek/keybindings.json"
-reduced_motion = false
-statusline_mode = "minimal"
-
-[experiments]
-visual_verification = false
-wasm_hooks = false
-
-[telemetry]
-enabled = false
-
-[index]
-enabled = true
-engine = "tantivy"
-watch_files = true
-
-[budgets]
-max_reasoner_tokens_per_session = 1000000
-max_turn_duration_secs = 300
-
-[theme]
-primary = "Cyan"
-secondary = "Yellow"
-error = "Red"
-```
-
----
-
-## 7. Testing Strategy
-
-### 7.1 Unit & Integration Tests
-- Test each crate in isolation.
-- Integration tests for end-to-end flows using fake LLM and tool mocks.
-
-### 7.2 Deterministic Replay Tests
-- Record real sessions (with user permission) into cassettes.
-- Replay cassettes in CI to ensure changes don't break existing behavior.
-- Golden files for expected plans and diffs.
-
-### 7.3 Property-Based Testing
-- Use `proptest` to generate sequences of user inputs and tool responses; verify state machine invariants.
-
-### 7.4 Performance Benchmarks
-- Benchmark index queries, tool execution, and LLM streaming latency.
-- Set performance targets: p95 index query < 50ms, first token < 2s.
-
----
-
-## 8. Remaining Parity Work (OpenCode / Aider / Claude Code)
-
-The current architecture is the best tradeoff for DeepSeek’s split capabilities, but full behavioral parity still requires targeted work:
-
-1. **MCP stdio resources are not fully resolved yet**  
-Current stdio `resources/read` path returns a stub marker instead of full resource transport handling.
-
-2. **Browser automation still has deterministic fallback stubs outside strict mode**  
-Live CDP flows are available, but non-strict paths can still fall back to placeholders when no live endpoint exists.
-
-3. **Teleport is bundle export/import, not full web handoff workflow**  
-Current implementation focuses on local/session bundle transfer semantics.
-
-4. **Remote environment support is profile + connectivity checks, not remote execution orchestration**  
-Current commands configure profiles and run health probes; task execution remains local.
-
-5. **Review pipeline output is prompt-structured text, not a strict machine-checked issue schema with first-class PR comment publishing loop**  
-This limits deterministic post-processing and automated review publishing workflows.
-
-6. **Terminal image UX is protocol-limited**  
-Inline rendering is available for supported protocols (iTerm2/Kitty), with fallback behavior elsewhere.
-
-7. **KPI-driven auto-tuning loop is still manual**  
-Metrics exist, but closed-loop threshold/prompt auto-calibration is not yet formalized as an always-on controller.
-
-## 9. Conclusion
-
-This RFC now reflects the production architecture baseline: stable V3 tool execution, R1 copilot checkpoints by default, explicit break-glass R1DriveTools, deterministic completion gating, and visible complex-task subagent orchestration.
+Rules:
+- No tool calls
+- No JSON
+- No diffs
+- File paths must be workspace-relative
+
+### 3.2 Editor (V3)
+Model: `llm.base_model`
+
+Input:
+- Architect plan
+- Exact content of architect-declared files only
+- Prior apply/verify feedback
+
+Output contract (strict):
+- Unified diff payload only, or
+- `NEED_FILE|path[:start-end]` lines
+
+Rules:
+- No commentary outside the diff/NEED_FILE contract
+- No edits outside architect-declared files
+
+### 3.3 Apply (deterministic local)
+- Validate unified diff structure and size
+- Enforce path safety:
+  - no absolute paths
+  - no `.git/` mutation
+  - targets must be subset of architect file list
+- Stage/apply via `deepseek-diff::PatchStore` (`git apply --3way`)
+- Return structured apply failures for retry
+
+### 3.4 Verify (deterministic local)
+- Run architect-provided `VERIFY|` commands first
+- Fallback to derived commands by project type when none are provided
+- Verification success is based on command exit status (`status == 0`) and timeout checks
+- On failure, summarize output and feed back into next architect pass
+
+## 4. Loop Policy
+Implemented in `crates/deepseek-agent/src/loop.rs`.
+
+Per iteration:
+1. Architect
+2. Editor (with optional `NEED_FILE` round trips)
+3. Apply
+4. Verify
+
+Defaults:
+- `max_iterations = 6`
+- `architect_parse_retries = 2`
+- `editor_parse_retries = 2`
+- `max_files_per_iteration = 12`
+- `max_file_bytes = 200000`
+- `max_diff_bytes = 400000`
+- `verify_timeout_seconds = 60`
+
+No hidden escalation path is used.
+
+## 5. Analysis-Only Path
+Non-edit commands (for example `deepseek review`) use a separate analysis API:
+- `AgentEngine::analyze_with_options(...)`
+- No apply step
+- No verify step
+- No filesystem mutation side effects
+
+## 6. Streaming Contract
+Execution emits phase lifecycle chunks:
+- `ArchitectStarted`, `ArchitectCompleted`
+- `EditorStarted`, `EditorCompleted`
+- `ApplyStarted`, `ApplyCompleted`
+- `VerifyStarted`, `VerifyCompleted`
+
+These are consumed by CLI and TUI for real-time visibility.
+
+## 7. Module Boundaries
+Core modules:
+- `crates/deepseek-agent/src/architect.rs`
+- `crates/deepseek-agent/src/editor.rs`
+- `crates/deepseek-agent/src/apply.rs`
+- `crates/deepseek-agent/src/verify.rs`
+- `crates/deepseek-agent/src/loop.rs`
+- `crates/deepseek-agent/src/analysis.rs`
+
+`chat_with_options` remains the compatibility entry point and dispatches to:
+- loop execution when `tools=true`
+- analysis path when `tools=false`
+
+## 8. Configuration
+### 8.1 Router config (`[router]`)
+Router remains available for model selection heuristics in non-loop contexts:
+- `auto_max_think`
+- `threshold_high`
+- `w1..w6`
+
+Legacy escalation keys are removed.
+
+### 8.2 Agent loop config (`[agent_loop]`)
+- `max_iterations`
+- `architect_parse_retries`
+- `editor_parse_retries`
+- `max_files_per_iteration`
+- `max_file_bytes`
+- `max_diff_bytes`
+- `verify_timeout_seconds`
+
+## 9. CLI Behavior
+- `chat` and `ask` default to `--tools=true`.
+- `--tools=false` forces analysis-only behavior.
+- No `--allow-r1-drive-tools` flag exists in this architecture.
+
+## 10. Removed Legacy Paths
+Removed from execution path:
+- Mode router/escalation loop
+- R1 JSON-intent drive-tools flow
+- DSML rescue parser used for tool-call salvage
+- Legacy doom-loop rescue logic
+- Legacy tool-call orchestration loop as primary execution mechanism
+
+## 11. Test Requirements
+Required integration scenarios for `deepseek-agent`:
+- single file edit succeeds
+- multi file edit succeeds
+- patch apply failure recovers
+- verification failure recovers
+
+These scenarios are implemented under `crates/deepseek-agent/tests/architect_editor_loop.rs`.

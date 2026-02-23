@@ -58,6 +58,37 @@ pub enum TuiStreamEvent {
     ContentDelta(String),
     /// Incremental reasoning/thinking text from the LLM.
     ReasoningDelta(String),
+    /// Architect phase started.
+    ArchitectStarted { iteration: u64 },
+    /// Architect phase completed.
+    ArchitectCompleted {
+        iteration: u64,
+        files: u32,
+        no_edit: bool,
+    },
+    /// Editor phase started.
+    EditorStarted { iteration: u64, files: u32 },
+    /// Editor phase completed.
+    EditorCompleted { iteration: u64, status: String },
+    /// Apply phase started.
+    ApplyStarted { iteration: u64 },
+    /// Apply phase completed.
+    ApplyCompleted {
+        iteration: u64,
+        success: bool,
+        summary: String,
+    },
+    /// Verify phase started.
+    VerifyStarted {
+        iteration: u64,
+        commands: Vec<String>,
+    },
+    /// Verify phase completed.
+    VerifyCompleted {
+        iteration: u64,
+        success: bool,
+        summary: String,
+    },
     /// A tool is now actively executing.
     ToolActive(String),
     /// A tool call has started — pushed to transcript.
@@ -77,7 +108,7 @@ pub enum TuiStreamEvent {
         args_summary: String,
         response_tx: mpsc::Sender<bool>,
     },
-    /// The agent switched execution modes (e.g. V3Autopilot → R1DriveTools).
+    /// The agent switched execution modes.
     ModeTransition {
         from: String,
         to: String,
@@ -265,7 +296,7 @@ pub struct UiStatus {
     pub working_directory: String,
     #[serde(default)]
     pub pr_review_status: Option<String>,
-    /// Current agent execution mode (e.g. "V3Autopilot", "R1DriveTools").
+    /// Current agent execution mode label.
     #[serde(default)]
     pub agent_mode: String,
 }
@@ -306,7 +337,8 @@ pub fn render_statusline(status: &UiStatus) -> String {
         .as_deref()
         .map(|value| format!(" review={value}"))
         .unwrap_or_default();
-    let agent_part = if !status.agent_mode.is_empty() && status.agent_mode != "V3Autopilot" {
+    let agent_part = if !status.agent_mode.is_empty() && status.agent_mode != "ArchitectEditorLoop"
+    {
         format!(" agent={}", status.agent_mode)
     } else {
         String::new()
@@ -434,14 +466,14 @@ fn render_statusline_spans(
         ));
     }
 
-    // Agent mode badge — only shown when not in default V3Autopilot mode
-    if status.agent_mode == "R1DriveTools" {
+    // Agent mode badge — only shown when not in default loop mode.
+    if !status.agent_mode.is_empty() && status.agent_mode != "ArchitectEditorLoop" {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            " R1 ".to_string(),
+            format!(" {} ", status.agent_mode),
             Style::default()
                 .fg(Color::White)
-                .bg(Color::Red)
+                .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1679,7 +1711,7 @@ pub struct ChatShell {
     pub is_thinking: bool,
     /// Accumulated thinking text for the current reasoning block.
     pub thinking_buffer: String,
-    /// Current agent execution mode (e.g. "V3Autopilot", "R1DriveTools").
+    /// Current agent execution mode label.
     pub agent_mode: String,
     /// When true, disable spinner animations (accessibility/reduced-motion).
     pub reduced_motion: bool,
@@ -2215,7 +2247,7 @@ where
     )?;
 
     let mut shell = ChatShell {
-        agent_mode: "V3Autopilot".to_string(),
+        agent_mode: "ArchitectEditorLoop".to_string(),
         reduced_motion,
         ..Default::default()
     };
@@ -2656,6 +2688,76 @@ where
                     }
                     shell.thinking_buffer.push_str(&text);
                 }
+                TuiStreamEvent::ArchitectStarted { iteration } => {
+                    shell.push_mission_control(format!("iteration {iteration}: architect started"));
+                    info_line = format!("iter {iteration} architect");
+                }
+                TuiStreamEvent::ArchitectCompleted {
+                    iteration,
+                    files,
+                    no_edit,
+                } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: architect completed files={files} no_edit={no_edit}"
+                    ));
+                    info_line = format!("iter {iteration} architect done");
+                }
+                TuiStreamEvent::EditorStarted { iteration, files } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: editor started files={files}"
+                    ));
+                    info_line = format!("iter {iteration} editor");
+                }
+                TuiStreamEvent::EditorCompleted { iteration, status } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: editor completed status={status}"
+                    ));
+                    info_line = format!("iter {iteration} editor {status}");
+                }
+                TuiStreamEvent::ApplyStarted { iteration } => {
+                    shell.push_mission_control(format!("iteration {iteration}: apply started"));
+                    info_line = format!("iter {iteration} apply");
+                }
+                TuiStreamEvent::ApplyCompleted {
+                    iteration,
+                    success,
+                    summary,
+                } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: apply {} {}",
+                        if success { "ok" } else { "failed" },
+                        truncate_inline(&summary.replace('\n', " "), 120)
+                    ));
+                    info_line = format!(
+                        "iter {iteration} apply {}",
+                        if success { "ok" } else { "failed" }
+                    );
+                }
+                TuiStreamEvent::VerifyStarted {
+                    iteration,
+                    commands,
+                } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: verify started commands={}",
+                        commands.join(" | ")
+                    ));
+                    info_line = format!("iter {iteration} verify");
+                }
+                TuiStreamEvent::VerifyCompleted {
+                    iteration,
+                    success,
+                    summary,
+                } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: verify {} {}",
+                        if success { "ok" } else { "failed" },
+                        truncate_inline(&summary.replace('\n', " "), 120)
+                    ));
+                    info_line = format!(
+                        "iter {iteration} verify {}",
+                        if success { "ok" } else { "failed" }
+                    );
+                }
                 TuiStreamEvent::ToolActive(name) => {
                     shell.is_thinking = false;
                     shell.active_tool = Some(name);
@@ -2678,11 +2780,7 @@ where
                 }
                 TuiStreamEvent::ModeTransition { from, to, reason } => {
                     shell.agent_mode = to.clone();
-                    let label = if to == "R1DriveTools" {
-                        format!("Escalating to R1 ({})", reason)
-                    } else {
-                        format!("Returning to V3 ({})", reason)
-                    };
+                    let label = format!("mode transition {from} -> {to} ({reason})");
                     shell.push_system(label);
                     info_line = format!("mode: {from} -> {to}");
                 }
@@ -5111,75 +5209,76 @@ mod tests {
     #[test]
     fn mode_transition_updates_shell_and_transcript() {
         let mut shell = ChatShell {
-            agent_mode: "V3Autopilot".to_string(),
+            agent_mode: "ArchitectEditorLoop".to_string(),
             ..Default::default()
         };
-        // Simulate escalation to R1
-        shell.agent_mode = "R1DriveTools".to_string();
-        shell.push_system("Escalating to R1 (repeated step failures)");
+        shell.agent_mode = "VerifyRetry".to_string();
+        shell.push_system("mode transition ArchitectEditorLoop -> VerifyRetry (verify failure)");
 
-        assert_eq!(shell.agent_mode, "R1DriveTools");
+        assert_eq!(shell.agent_mode, "VerifyRetry");
         assert_eq!(shell.transcript.len(), 1);
         assert_eq!(shell.transcript[0].kind, MessageKind::System);
-        assert!(shell.transcript[0].text.contains("Escalating to R1"));
+        assert!(shell.transcript[0].text.contains("mode transition"));
 
-        // Simulate return to V3
-        shell.agent_mode = "V3Autopilot".to_string();
-        shell.push_system("Returning to V3 (R1 completed)");
-        assert_eq!(shell.agent_mode, "V3Autopilot");
+        shell.agent_mode = "ArchitectEditorLoop".to_string();
+        shell.push_system("mode transition VerifyRetry -> ArchitectEditorLoop (recovered)");
+        assert_eq!(shell.agent_mode, "ArchitectEditorLoop");
         assert_eq!(shell.transcript.len(), 2);
-        assert!(shell.transcript[1].text.contains("Returning to V3"));
+        assert!(shell.transcript[1].text.contains("mode transition"));
     }
 
     #[test]
-    fn statusline_shows_r1_badge_when_active() {
+    fn statusline_shows_mode_badge_when_non_default() {
         let status = UiStatus {
             model: "deepseek-chat".to_string(),
-            agent_mode: "R1DriveTools".to_string(),
-            ..Default::default()
-        };
-        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains(" R1 "), "status bar should show R1 badge");
-    }
-
-    #[test]
-    fn statusline_hides_r1_badge_in_v3_mode() {
-        let status = UiStatus {
-            model: "deepseek-chat".to_string(),
-            agent_mode: "V3Autopilot".to_string(),
+            agent_mode: "VerifyRetry".to_string(),
             ..Default::default()
         };
         let spans = render_statusline_spans(&status, None, "", None, None, false, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(
-            !text.contains(" R1 "),
-            "status bar should not show R1 badge in V3 mode"
+            text.contains(" VerifyRetry "),
+            "status bar should show non-default mode badge"
         );
     }
 
     #[test]
-    fn plain_statusline_shows_agent_mode_when_r1() {
+    fn statusline_hides_mode_badge_in_default_mode() {
         let status = UiStatus {
             model: "deepseek-chat".to_string(),
-            agent_mode: "R1DriveTools".to_string(),
+            agent_mode: "ArchitectEditorLoop".to_string(),
             ..Default::default()
         };
-        let line = render_statusline(&status);
-        assert!(line.contains("agent=R1DriveTools"));
+        let spans = render_statusline_spans(&status, None, "", None, None, false, false);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            !text.contains(" ArchitectEditorLoop "),
+            "status bar should not show mode badge in default mode"
+        );
     }
 
     #[test]
-    fn plain_statusline_hides_agent_mode_when_v3() {
+    fn plain_statusline_shows_agent_mode_when_non_default() {
         let status = UiStatus {
             model: "deepseek-chat".to_string(),
-            agent_mode: "V3Autopilot".to_string(),
+            agent_mode: "VerifyRetry".to_string(),
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(line.contains("agent=VerifyRetry"));
+    }
+
+    #[test]
+    fn plain_statusline_hides_agent_mode_when_default() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            agent_mode: "ArchitectEditorLoop".to_string(),
             ..Default::default()
         };
         let line = render_statusline(&status);
         assert!(
             !line.contains("agent="),
-            "V3 mode should not show agent= in statusline"
+            "default loop mode should not show agent= in statusline"
         );
     }
 

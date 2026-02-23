@@ -90,7 +90,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
 
     let prompt = build_strict_review_prompt(focus, &diff_content);
     let engine = AgentEngine::new(cwd)?;
-    let output = engine.chat_with_options(
+    let output = engine.analyze_with_options(
         &prompt,
         ChatOptions {
             tools: false,

@@ -19,38 +19,25 @@ retry_base_ms = 400
 stream = true
 
 [router]
+# Lightweight model selection for non-edit analysis/planning requests.
 auto_max_think = true
 threshold_high = 0.72
-escalate_on_invalid_plan = true
-max_escalations_per_unit = 1
-# Unified thinking + tools (DeepSeek V3.2): use deepseek-chat with thinking
-# mode enabled alongside tools in a single API call.
-unified_thinking_tools = true
-# Mode router: selects between V3_AUTOPILOT and R1_DRIVE_TOOLS.
-# V3_AUTOPILOT is the default (deepseek-chat with unified thinking + tools).
-# R1_DRIVE_TOOLS escalates to deepseek-reasoner driving tools via JSON intents.
-mode_router_enabled = true
-# Break-glass toggle: allow automatic R1DriveTools escalation.
-# Default false keeps R1 in consultation mode unless explicitly enabled.
-r1_drive_auto_escalation = false
-# Max consecutive step failures before escalating from V3 to R1.
-v3_max_step_failures = 2
-# Max files changed without verification before escalating.
-blast_radius_threshold = 5
-# Allow V3 one recovery attempt for compile/lint/dependency errors.
-v3_mechanical_recovery = true
-# Max R1 drive-tools steps per task.
-r1_max_steps = 30
-# Max retries when R1 output fails JSON schema validation.
-r1_max_parse_retries = 2
-# Max context requests from V3 patch writer.
-v3_patch_max_context_requests = 3
 w1 = 0.2
 w2 = 0.15
 w3 = 0.2
 w4 = 0.15
 w5 = 0.2
 w6 = 0.1
+
+[agent_loop]
+# Deterministic Architect -> Editor -> Apply -> Verify loop controls.
+max_iterations = 6
+architect_parse_retries = 2
+editor_parse_retries = 2
+max_files_per_iteration = 12
+max_file_bytes = 200000
+max_diff_bytes = 400000
+verify_timeout_seconds = 60
 
 [policy]
 approve_edits = "ask"

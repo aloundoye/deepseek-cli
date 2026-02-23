@@ -204,15 +204,6 @@ struct Cli {
     #[arg(long = "disable-slash-commands")]
     disable_slash_commands: bool,
 
-    /// Allow automatic escalation into R1DriveTools for this run (break-glass).
-    #[arg(
-        long = "allow-r1-drive-tools",
-        global = true,
-        default_value_t = false,
-        action = clap::ArgAction::SetTrue
-    )]
-    allow_r1_drive_tools: bool,
-
     /// Fallback model when primary is overloaded.
     #[arg(long = "fallback-model")]
     fallback_model: Option<String>,

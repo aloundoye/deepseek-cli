@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use deepseek_core::{
     ChatMessage, EventEnvelope, EventKind, Plan, Session, SessionState, runtime_dir,
@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -606,6 +607,9 @@ impl Store {
     }
 
     pub fn append_event(&self, event: &EventEnvelope) -> Result<()> {
+        let _append_guard = append_lock()
+            .lock()
+            .map_err(|_| anyhow!("event append lock poisoned"))?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -2725,6 +2729,11 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn append_lock() -> &'static Mutex<()> {
+    static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    APPEND_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Default, Clone)]

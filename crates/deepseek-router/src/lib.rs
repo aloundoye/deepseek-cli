@@ -9,7 +9,6 @@ pub struct RouterConfig {
     pub base_model: String,
     pub max_think_model: String,
     pub threshold_high: f32,
-    pub max_escalations_per_unit: u8,
 }
 
 impl Default for RouterConfig {
@@ -18,7 +17,6 @@ impl Default for RouterConfig {
             base_model: DEEPSEEK_V32_CHAT_MODEL.to_string(),
             max_think_model: DEEPSEEK_V32_REASONER_MODEL.to_string(),
             threshold_high: 0.72,
-            max_escalations_per_unit: 1,
         }
     }
 }
@@ -42,7 +40,6 @@ impl WeightedRouter {
                 base_model: llm.base_model.clone(),
                 max_think_model: llm.max_think_model.clone(),
                 threshold_high: router.threshold_high,
-                max_escalations_per_unit: router.max_escalations_per_unit,
             },
             weights: RouterWeights {
                 w1: router.w1,
@@ -63,17 +60,6 @@ impl WeightedRouter {
             + self.weights.w4 * s.verification_failures
             + self.weights.w5 * s.low_confidence
             + self.weights.w6 * s.ambiguity_flags
-    }
-
-    #[must_use]
-    pub fn should_escalate_retry(&self, unit: &LlmUnit, invalid_output: bool, retries: u8) -> bool {
-        if retries >= self.cfg.max_escalations_per_unit || !invalid_output {
-            return false;
-        }
-        match unit {
-            LlmUnit::Planner => true,
-            LlmUnit::Executor => true,
-        }
     }
 }
 
@@ -279,17 +265,6 @@ mod tests {
         );
         assert!(!decision.escalated);
         assert_eq!(decision.selected_model, "deepseek-chat");
-    }
-
-    #[test]
-    fn should_escalate_retry_respects_max() {
-        let router = WeightedRouter::new(RouterConfig {
-            max_escalations_per_unit: 1,
-            ..RouterConfig::default()
-        });
-        assert!(router.should_escalate_retry(&LlmUnit::Planner, true, 0));
-        assert!(!router.should_escalate_retry(&LlmUnit::Planner, true, 1));
-        assert!(!router.should_escalate_retry(&LlmUnit::Planner, false, 0));
     }
 
     #[test]
