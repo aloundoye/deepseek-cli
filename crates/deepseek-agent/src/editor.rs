@@ -266,4 +266,122 @@ mod tests {
             _ => panic!("expected diff"),
         }
     }
+
+    #[test]
+    fn parse_need_context_without_range() {
+        let parsed =
+            parse_editor_response("NEED_CONTEXT|src/main.rs", 1024).expect("parse");
+        match parsed {
+            EditorResponse::NeedContext(reqs) => {
+                assert_eq!(reqs.len(), 1);
+                assert_eq!(reqs[0].path, "src/main.rs");
+                assert_eq!(reqs[0].range, None);
+            }
+            _ => panic!("expected NeedContext"),
+        }
+    }
+
+    #[test]
+    fn parse_need_context_multi_file() {
+        let input = "NEED_CONTEXT|src/lib.rs:1-50\nNEED_CONTEXT|src/util.rs\nNEED_CONTEXT|tests/main.rs:10-20";
+        let parsed = parse_editor_response(input, 1024).expect("parse");
+        match parsed {
+            EditorResponse::NeedContext(reqs) => {
+                assert_eq!(reqs.len(), 3);
+                assert_eq!(reqs[0].path, "src/lib.rs");
+                assert_eq!(reqs[0].range, Some((1, 50)));
+                assert_eq!(reqs[1].path, "src/util.rs");
+                assert_eq!(reqs[1].range, None);
+                assert_eq!(reqs[2].path, "tests/main.rs");
+                assert_eq!(reqs[2].range, Some((10, 20)));
+            }
+            _ => panic!("expected NeedContext"),
+        }
+    }
+
+    #[test]
+    fn parse_empty_response_rejected() {
+        let err = parse_editor_response("", 4096).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_whitespace_only_rejected() {
+        let err = parse_editor_response("   \n  \n  ", 4096).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_diff_rejects_missing_markers() {
+        let err = parse_editor_response("just some plain text output", 4096).unwrap_err();
+        assert!(err.to_string().contains("not a valid unified diff"));
+    }
+
+    #[test]
+    fn parse_diff_rejects_oversized() {
+        let diff = format!(
+            "--- a/big.rs\n+++ b/big.rs\n@@ -1 +1 @@\n-old\n+{}\n",
+            "x".repeat(5000)
+        );
+        let err = parse_editor_response(&diff, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds max size"));
+    }
+
+    #[test]
+    fn strip_fences_removes_markdown() {
+        let input = "```diff\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-a\n+b\n```\n";
+        let stripped = strip_fences(input);
+        assert!(stripped.starts_with("--- a/f.rs"));
+        assert!(!stripped.contains("```"));
+    }
+
+    #[test]
+    fn strip_fences_noop_for_plain_diff() {
+        let input = "--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let stripped = strip_fences(input);
+        assert_eq!(stripped, input);
+    }
+
+    #[test]
+    fn parse_diff_with_fences_accepted() {
+        let input = "```diff\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-a\n+b\n```\n";
+        let parsed = parse_editor_response(input, 4096).expect("parse");
+        match parsed {
+            EditorResponse::Diff(value) => {
+                assert!(value.contains("@@"));
+                assert!(!value.contains("```"));
+            }
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_appends_trailing_newline() {
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-old\n+new";
+        let parsed = parse_editor_response(diff, 4096).expect("parse");
+        match parsed {
+            EditorResponse::Diff(value) => assert!(value.ends_with('\n')),
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn parse_file_request_with_range() {
+        let req = parse_file_request("src/lib.rs:10-50").expect("parse");
+        assert_eq!(req.path, "src/lib.rs");
+        assert_eq!(req.range, Some((10, 50)));
+    }
+
+    #[test]
+    fn parse_file_request_without_range() {
+        let req = parse_file_request("src/lib.rs").expect("parse");
+        assert_eq!(req.path, "src/lib.rs");
+        assert_eq!(req.range, None);
+    }
+
+    #[test]
+    fn parse_file_request_empty_rejected() {
+        let err = parse_file_request("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
 }

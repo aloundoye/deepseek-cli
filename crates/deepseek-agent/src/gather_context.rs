@@ -398,7 +398,7 @@ fn collect_tree_recursive(
         return;
     };
     let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     for entry in entries {
         if out.len() >= max_entries {
@@ -472,7 +472,7 @@ fn discover_manifests_recursive(
         return;
     };
     let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     for entry in entries {
         let path = entry.path();
@@ -659,11 +659,9 @@ fn parse_cargo_dependencies(content: &str) -> Vec<String> {
             .split('=')
             .next()
             .unwrap_or_default()
-            .trim()
             .split_whitespace()
             .next()
-            .unwrap_or_default()
-            .trim();
+            .unwrap_or_default();
         if !name.is_empty() {
             deps.insert(name.to_string());
         }
@@ -721,7 +719,6 @@ fn parse_go_mod_dependencies(content: &str) -> Vec<String> {
         if trimmed.starts_with("require ") {
             let name = trimmed
                 .trim_start_matches("require")
-                .trim()
                 .split_whitespace()
                 .next()
                 .unwrap_or_default();
@@ -897,7 +894,7 @@ fn collect_text_files_recursive(
         return;
     };
     let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     for entry in entries {
         if out.len() >= max_files {

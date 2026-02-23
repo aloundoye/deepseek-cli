@@ -1222,6 +1222,162 @@ pub enum StreamChunk {
     Done,
 }
 
+/// Canonical stream-json event representation used across CLI/TUI/RPC adapters.
+pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
+    match chunk {
+        StreamChunk::ContentDelta(text) => serde_json::json!({
+            "type": "content_delta",
+            "text": text,
+        }),
+        StreamChunk::ReasoningDelta(text) => serde_json::json!({
+            "type": "reasoning_delta",
+            "text": text,
+        }),
+        StreamChunk::ArchitectStarted { iteration } => serde_json::json!({
+            "type": "phase",
+            "phase": "architect_started",
+            "iteration": iteration,
+        }),
+        StreamChunk::ArchitectCompleted {
+            iteration,
+            files,
+            no_edit,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "architect_completed",
+            "iteration": iteration,
+            "files": files,
+            "no_edit": no_edit,
+        }),
+        StreamChunk::EditorStarted { iteration, files } => serde_json::json!({
+            "type": "phase",
+            "phase": "editor_started",
+            "iteration": iteration,
+            "files": files,
+        }),
+        StreamChunk::EditorCompleted { iteration, status } => serde_json::json!({
+            "type": "phase",
+            "phase": "editor_completed",
+            "iteration": iteration,
+            "status": status,
+        }),
+        StreamChunk::ApplyStarted { iteration } => serde_json::json!({
+            "type": "phase",
+            "phase": "apply_started",
+            "iteration": iteration,
+        }),
+        StreamChunk::ApplyCompleted {
+            iteration,
+            success,
+            summary,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "apply_completed",
+            "iteration": iteration,
+            "success": success,
+            "summary": summary,
+        }),
+        StreamChunk::VerifyStarted {
+            iteration,
+            commands,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "verify_started",
+            "iteration": iteration,
+            "commands": commands,
+        }),
+        StreamChunk::VerifyCompleted {
+            iteration,
+            success,
+            summary,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "verify_completed",
+            "iteration": iteration,
+            "success": success,
+            "summary": summary,
+        }),
+        StreamChunk::CommitProposal {
+            files,
+            touched_files,
+            loc_delta,
+            verify_commands,
+            verify_status,
+            suggested_message,
+        } => serde_json::json!({
+            "type": "commit_proposal",
+            "files": files,
+            "touched_files": touched_files,
+            "loc_delta": loc_delta,
+            "verify_commands": verify_commands,
+            "verify_status": verify_status,
+            "suggested_message": suggested_message,
+        }),
+        StreamChunk::ToolCallStart {
+            tool_name,
+            args_summary,
+        } => serde_json::json!({
+            "type": "tool_start",
+            "tool_name": tool_name,
+            "args_summary": args_summary,
+        }),
+        StreamChunk::ToolCallEnd {
+            tool_name,
+            duration_ms,
+            success,
+            summary,
+        } => serde_json::json!({
+            "type": "tool_end",
+            "tool_name": tool_name,
+            "duration_ms": duration_ms,
+            "success": success,
+            "summary": summary,
+        }),
+        StreamChunk::ModeTransition { from, to, reason } => serde_json::json!({
+            "type": "mode_transition",
+            "from": from,
+            "to": to,
+            "reason": reason,
+        }),
+        StreamChunk::SubagentSpawned { run_id, name, goal } => serde_json::json!({
+            "type": "subagent_spawned",
+            "run_id": run_id,
+            "name": name,
+            "goal": goal,
+        }),
+        StreamChunk::SubagentCompleted {
+            run_id,
+            name,
+            summary,
+        } => serde_json::json!({
+            "type": "subagent_completed",
+            "run_id": run_id,
+            "name": name,
+            "summary": summary,
+        }),
+        StreamChunk::SubagentFailed {
+            run_id,
+            name,
+            error,
+        } => serde_json::json!({
+            "type": "subagent_failed",
+            "run_id": run_id,
+            "name": name,
+            "error": error,
+        }),
+        StreamChunk::ImageData { label, .. } => serde_json::json!({
+            "type": "image",
+            "label": label,
+        }),
+        StreamChunk::ClearStreamingText => serde_json::json!({
+            "type": "clear_streaming_text",
+        }),
+        StreamChunk::Done => serde_json::json!({
+            "type": "done",
+        }),
+    }
+}
+
 /// Callback type for receiving streaming chunks.
 /// Uses `Arc<dyn Fn>` so it can be cloned across multiple turns in a chat loop.
 pub type StreamCallback = std::sync::Arc<dyn Fn(StreamChunk) + Send + Sync>;
@@ -2285,20 +2441,12 @@ pub struct ToolsConfig {
     pub chrome: ChromeToolsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChromeToolsConfig {
     /// Keep deterministic placeholder fallbacks when live Chrome websocket
     /// is unavailable. Defaults to false (strict-live behavior).
     pub allow_stub_fallback: bool,
-}
-
-impl Default for ChromeToolsConfig {
-    fn default() -> Self {
-        Self {
-            allow_stub_fallback: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

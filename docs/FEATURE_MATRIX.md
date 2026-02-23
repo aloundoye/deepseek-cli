@@ -54,7 +54,8 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Explicit no-repo error for repo-ish inspect | DONE | Returns `No repository detected. Run from project root or pass --repo <path>.` instead of generic clarification loops. |
 | Ask/context follow-up hardening | DONE | Ask/context responses provide initial analysis first and enforce max 1–2 targeted follow-ups (1 for vague codebase checks). |
 | Explicit commit intent workflow | DONE | Verify-pass never auto-commits; user commits explicitly via `/commit` or git subcommands. |
-| Workflow parity slash commands | DONE | `/add /drop /read-only /map /map-refresh /run /test /lint /web` are supported in chat surfaces. |
+| Workflow parity slash commands | DONE | `/ask /code /architect /chat-mode /add /drop /read-only /map /map-refresh /run /test /lint /web /git /settings /load /save /paste /voice` are supported in chat surfaces. |
+| Watch + URL assist flags | DONE | `--watch-files` injects bounded repo marker hints; `--detect-urls` enriches prompt context with bounded URL extracts. |
 
 ## 5. Reliability and Integrations
 

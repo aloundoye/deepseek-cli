@@ -240,3 +240,99 @@ fn tests_fail_then_recovers() -> Result<()> {
     assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "final\n");
     Ok(())
 }
+
+/// Golden cassette #5: Editor requests NEED_CONTEXT, context is merged,
+/// and the subsequent editor call emits a successful diff.
+#[test]
+fn need_context_round_trip_succeeds() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("app.txt"), "line_one\nline_two\nline_three\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("app.txt", "line_one\nline_two_edited\nline_three\n")])?;
+
+    // Architect declares the file
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Edit app.txt middle line\nFILE|app.txt|Update line two\nVERIFY|git status --short\nACCEPT|line two changed\nARCHITECT_PLAN_END\n".to_string();
+
+    // Editor first responds with NEED_CONTEXT for the whole file
+    let need_context = "NEED_CONTEXT|app.txt:1-3".to_string();
+
+    // After context is provided, editor responds with a valid diff
+    let engine = build_engine(dir.path(), vec![plan, need_context, good_diff])?;
+
+    let output = engine.chat_with_options(
+        "Update middle line of app.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Implemented"));
+    let content = fs::read_to_string(dir.path().join("app.txt"))?;
+    assert!(content.contains("line_two_edited"));
+    Ok(())
+}
+
+/// Golden cassette #6: Architect returns NO_EDIT, loop exits early without
+/// entering editor/apply/verify. Stream events are captured to verify the
+/// early-exit path.
+#[test]
+fn no_edit_response_exits_early() -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "content\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Explain the situation\nNO_EDIT|true|Code is already correct, no changes needed\nARCHITECT_PLAN_END\n".to_string();
+    let llm = Box::new(ScriptedLlm::new(vec![plan]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        let label = match &chunk {
+            StreamChunk::ArchitectStarted { .. } => "ArchitectStarted".to_string(),
+            StreamChunk::ArchitectCompleted { no_edit, .. } => {
+                format!("ArchitectCompleted(no_edit={})", no_edit)
+            }
+            StreamChunk::EditorStarted { .. } => "EditorStarted".to_string(),
+            StreamChunk::Done => "Done".to_string(),
+            _ => return,
+        };
+        if let Ok(mut guard) = events_clone.lock() {
+            guard.push(label);
+        }
+    }));
+
+    let output = engine.chat_with_options(
+        "Check if demo.txt needs changes",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("already correct"));
+    // File unchanged
+    assert_eq!(
+        fs::read_to_string(dir.path().join("demo.txt"))?,
+        "content\n"
+    );
+
+    let captured = events.lock().unwrap();
+    assert!(captured.contains(&"ArchitectStarted".to_string()));
+    assert!(captured.contains(&"ArchitectCompleted(no_edit=true)".to_string()));
+    assert!(captured.contains(&"Done".to_string()));
+    // Editor should never have started
+    assert!(
+        !captured.contains(&"EditorStarted".to_string()),
+        "editor should not start on NO_EDIT path"
+    );
+    Ok(())
+}

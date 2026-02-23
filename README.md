@@ -180,6 +180,8 @@ Common execution control flags:
 - `--plan-only` (architect plan output only, no apply/verify)
 - `--repo <path>` (override repository root for bootstrap/context)
 - `--debug-context` (print deterministic pre-model context digest; also available via `DEEPSEEK_DEBUG_CONTEXT=1`)
+- `--watch-files` (inject deterministic TODO/FIXME/AI marker hints when repo comment markers change)
+- `--detect-urls` (augment prompts with bounded URL extracts before model call)
 
 Explicit commit workflow:
 - `/stage`, `/unstage`, `/diff`, `/commit`, `/undo` are available in chat/TUI.
@@ -187,9 +189,11 @@ Explicit commit workflow:
 - `deepseek git commit --message "..."` also commits staged-only by default.
 
 Workflow parity slash commands:
+- Mode/profile controls: `/ask`, `/code`, `/architect`, `/chat-mode`
+- Session/profile helpers: `/load`, `/save`, `/paste`, `/settings`
 - Context/workspace controls: `/add`, `/drop`, `/read-only`, `/map`, `/map-refresh`
 - Deterministic command helpers: `/run`, `/test`, `/lint`
-- Web research helper: `/web`
+- Web + shell helpers: `/web`, `/git`, `/voice`
 
 Default model/profile behavior:
 - `llm.provider = "deepseek"`

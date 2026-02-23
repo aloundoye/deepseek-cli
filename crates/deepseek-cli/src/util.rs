@@ -40,6 +40,33 @@ pub(crate) fn copy_to_clipboard(text: &str) {
     }
 }
 
+pub(crate) fn read_from_clipboard() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return run_capture("pbpaste", &[]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(value) = run_capture("xclip", &["-selection", "clipboard", "-o"]) {
+            return Some(value);
+        }
+        return run_capture("wl-paste", &[]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Clipboard -Raw | Out-String"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 pub(crate) fn run_process(cwd: &Path, program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program).current_dir(cwd).args(args).output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
