@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use deepseek_agent::{AgentEngine, ChatOptions};
+use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
 use deepseek_core::{
     AppConfig, DEEPSEEK_PROFILE_V32_SPECIALE, DEEPSEEK_V32_SPECIALE_END_DATE, EventEnvelope,
     EventKind, Session, SessionBudgets, SessionState, normalize_deepseek_model,
@@ -33,7 +33,7 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
 }
 
 /// Build ChatOptions from CLI flags.
-pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
+pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> ChatOptions {
     // --system-prompt-file overrides --system-prompt
     let sys_override = if let Some(ref path) = cli.system_prompt_file {
         fs::read_to_string(path).ok()
@@ -60,6 +60,11 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
         system_prompt_override: sys_override,
         system_prompt_append: sys_append,
         additional_dirs: cli.add_dir.clone(),
+        mode,
+        force_execute: cli.force_execute,
+        force_plan_only: cli.plan_only,
+        teammate_mode: cli.teammate_mode.clone(),
+        disable_team_orchestration: false,
     }
 }
 

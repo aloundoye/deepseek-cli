@@ -1,6 +1,6 @@
 # DeepSeek CLI Feature Matrix
 
-Updated: 2026-02-23
+Updated: 2026-02-24
 
 This matrix reflects runtime behavior after the full Architect->Editor->Apply->Verify migration.
 
@@ -11,20 +11,23 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Single execution path | DONE | Edit-execution uses only `Architect (R1) -> Editor (V3) -> Apply -> Verify`. |
 | Legacy mode router in execution loop | REMOVED | No runtime fallback/escalation path is used for edit execution. |
 | Legacy R1 tool-driving mode | REMOVED | No R1 JSON-intent drive-tools path in the execution loop. |
-| Deterministic edit contract | DONE | Unified diff is the only accepted edit payload from Editor (with `NEED_FILE|...` requests). |
+| Deterministic edit contract | DONE | Unified diff is the only accepted edit payload from Editor (with bounded `NEED_CONTEXT|...` requests). |
 | Deterministic local apply | DONE | Diffs are validated and applied through `PatchStore` with path and scope checks. |
 | Deterministic local verify | DONE | Verify success depends on actual command exit status and timeout checks. |
 | Analysis-only non-edit path | DONE | `analyze_with_options` is used for review and no-edit workflows. |
-| Core-loop subagent orchestration | DISABLED | Subagents are not spawned by the core Architect->Editor->Apply->Verify loop. |
+| Core-loop subagent orchestration | DISABLED | Subagents are not spawned automatically inside the default single-lane core loop. |
+| Team-lane orchestration (`--teammate-mode`) | DONE | Optional deterministic lane composition uses isolated worktrees, patch artifacts, ordered merge, and global verify. |
 
 ## 2. Contracts and Safety
 
 | Area | Status | Runtime Truth |
 |---|---|---|
 | Architect contract enforcement | DONE | Strict `ARCHITECT_PLAN_V1` parsing with bounded repair retries. |
-| Editor contract enforcement | DONE | Strict unified-diff or `NEED_FILE` parsing with bounded repair retries. |
+| Editor contract enforcement | DONE | Strict unified-diff or `NEED_CONTEXT` parsing with bounded repair retries. |
 | File scope bounds | DONE | Max files/bytes per iteration and architect-file whitelist enforcement. |
-| Path safety | DONE | Absolute paths and `.git/` mutations are rejected at apply phase. |
+| Path safety | DONE | Absolute paths, repo-root escapes, and `.git/` mutations are rejected at apply phase. |
+| Failure classification | DONE | Verify failures are classified deterministically (`Mechanical`, `Repeated`, `DesignMismatch`) and routed accordingly. |
+| Safety gate | DONE | Large patches require explicit approval before apply; checkpoints are created around apply. |
 | Verification command policy | DONE | Verification commands run through policy + tool host; failures fed back into loop. |
 
 ## 3. Streaming and UI
@@ -40,8 +43,9 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Area | Status | Runtime Truth |
 |---|---|---|
 | `chat/ask` tool default | DONE | `--tools=true` by default; `--tools=false` forces analysis path. |
+| Execution overrides | DONE | `--force-execute` and `--plan-only` are available and mutually exclusive. |
 | Removed legacy break-glass flag | DONE | `--allow-r1-drive-tools` is not part of current CLI behavior. |
-| Loop configuration | DONE | `[agent_loop]` controls iteration/retry/bounds/verify timeout. |
+| Loop configuration | DONE | `[agent_loop]` controls iteration/retry/bounds/verify timeout + classifier/context/safety knobs. |
 | Router configuration cleanup | DONE | `[router]` retains model-selection weights/threshold; escalation keys removed. |
 
 ## 5. Reliability and Integrations
@@ -62,4 +66,3 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Aider-style parity | Achieved for core edit execution model (architect/editor split + deterministic apply/verify). |
 | Claude-like unified reasoning+tools in one model | Not applicable with DeepSeek split; runtime uses explicit two-role pipeline instead. |
 | Tool-calling as execution backbone | Intentionally not used in core edit loop. |
-

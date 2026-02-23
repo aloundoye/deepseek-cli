@@ -160,12 +160,19 @@ Reference files:
 
 Notable architecture/runtime defaults:
 - Edit execution uses a deterministic loop: Architect (`deepseek-reasoner`) -> Editor (`deepseek-chat`) -> Apply -> Verify.
-- Unified diff is the only edit contract in the execution loop.
+- Unified diff is the only edit contract in the execution loop (`NEED_CONTEXT|path[:start-end]` is used when Editor needs more file context).
+- Verify failures are classified deterministically (mechanical/repeated/design-mismatch) to decide Editor-first vs Architect-first retry.
+- Apply safety gates require approval for oversized patches and create checkpoints around patch apply.
+- Optional team-lane composition (`--teammate-mode`) runs lane pipelines in isolated worktrees and merges lane patches deterministically.
 - Tool/function-calling orchestration is not used as the core execution backbone.
 - Analysis/review commands use a separate non-edit path and do not mutate files.
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
 - Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).
 - Teleport link base URL is configurable (`ui.handoff_base_url`).
+
+Common execution control flags:
+- `--force-execute` (force full Architect->Editor->Apply->Verify loop)
+- `--plan-only` (architect plan output only, no apply/verify)
 
 Default model/profile behavior:
 - `llm.provider = "deepseek"`

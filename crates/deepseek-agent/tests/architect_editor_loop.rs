@@ -215,7 +215,10 @@ fn tests_fail_then_recovers() -> Result<()> {
     commit_all(dir.path(), "seed")?;
 
     let first_diff = generate_diff(dir.path(), &[("demo.txt", "interim\n")])?;
-    let second_diff =
+    let retry_diff =
+        "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-interim\n+interim_retry\n"
+            .to_string();
+    let final_diff =
         "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-interim\n+final\n"
             .to_string();
     let plan_one = "ARCHITECT_PLAN_V1\nPLAN|First attempt\nFILE|demo.txt|set interim value\nVERIFY|cargo test -q\nACCEPT|passes\nARCHITECT_PLAN_END\n".to_string();
@@ -223,7 +226,7 @@ fn tests_fail_then_recovers() -> Result<()> {
 
     let engine = build_engine(
         dir.path(),
-        vec![plan_one, first_diff, plan_two, second_diff],
+        vec![plan_one, first_diff, retry_diff, plan_two, final_diff],
     )?;
 
     let _ = engine.chat_with_options(

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use base64::Engine;
 use chrono::Utc;
-use deepseek_agent::{AgentEngine, ChatOptions};
+use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
 use deepseek_chrome::{ChromeSession, ScreenshotFormat};
 use deepseek_core::{AppConfig, EventKind, StreamChunk, runtime_dir};
 use deepseek_mcp::McpManager;
@@ -214,9 +214,20 @@ pub(crate) fn run_chat(
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
         .unwrap_or(false);
+    let force_execute = cli.map(|v| v.force_execute).unwrap_or(false);
+    let force_plan_only = cli.map(|v| v.plan_only).unwrap_or(false);
+    let teammate_mode = cli.and_then(|v| v.teammate_mode.clone());
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
-        return run_chat_tui(cwd, allow_tools, &cfg, force_max_think);
+        return run_chat_tui(
+            cwd,
+            allow_tools,
+            &cfg,
+            force_max_think,
+            force_execute,
+            force_plan_only,
+            teammate_mode.clone(),
+        );
     }
     if force_tui && !interactive_tty {
         return Err(anyhow!("--tui requires an interactive terminal"));
@@ -971,6 +982,10 @@ pub(crate) fn run_chat(
                                     tools: allow_tools,
                                     force_max_think,
                                     additional_dirs: additional_dirs.clone(),
+                                    mode: ChatMode::Code,
+                                    force_execute,
+                                    force_plan_only,
+                                    teammate_mode: teammate_mode.clone(),
                                     ..Default::default()
                                 },
                             )?;
@@ -1134,6 +1149,10 @@ pub(crate) fn run_chat(
                 tools: allow_tools,
                 force_max_think,
                 additional_dirs: additional_dirs.clone(),
+                mode: ChatMode::Code,
+                force_execute,
+                force_plan_only,
+                teammate_mode: teammate_mode.clone(),
                 ..Default::default()
             },
         )?;
@@ -1153,6 +1172,9 @@ pub(crate) fn run_chat_tui(
     allow_tools: bool,
     cfg: &AppConfig,
     initial_force_max_think: bool,
+    force_execute: bool,
+    force_plan_only: bool,
+    teammate_mode: Option<String>,
 ) -> Result<()> {
     let engine = Arc::new(AgentEngine::new(cwd)?);
     wire_subagent_worker(&engine, cwd);
@@ -1638,6 +1660,7 @@ pub(crate) fn run_chat_tui(
                 .lock()
                 .map(|dirs| dirs.clone())
                 .unwrap_or_default();
+            let teammate_mode_for_turn = teammate_mode.clone();
 
             engine.set_stream_callback(std::sync::Arc::new(move |chunk| match chunk {
                 StreamChunk::ContentDelta(s) => {
@@ -1766,6 +1789,10 @@ pub(crate) fn run_chat_tui(
                             tools: allow_tools,
                             force_max_think: max_think,
                             additional_dirs: prompt_additional_dirs,
+                            mode: ChatMode::Code,
+                            force_execute,
+                            force_plan_only,
+                            teammate_mode: teammate_mode_for_turn.clone(),
                             ..Default::default()
                         },
                     )
@@ -2921,7 +2948,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
         }));
     }
 
-    let options = chat_options_from_cli(cli, true);
+    let options = chat_options_from_cli(cli, true, ChatMode::Code);
     let output = engine.chat_with_options(&prompt, options)?;
 
     match cli.output_format.as_str() {

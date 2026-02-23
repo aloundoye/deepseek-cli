@@ -8,6 +8,7 @@ pub struct EditorFileContext {
     pub path: String,
     pub content: String,
     pub partial: bool,
+    pub base_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -19,7 +20,7 @@ pub struct FileRequest {
 #[derive(Debug, Clone)]
 pub enum EditorResponse {
     Diff(String),
-    NeedFile(Vec<FileRequest>),
+    NeedContext(Vec<FileRequest>),
 }
 
 pub struct EditorInput<'a> {
@@ -36,7 +37,7 @@ const EDITOR_SYSTEM_PROMPT: &str = r#"You are Editor (code writer).
 
 Return ONLY one of:
 1) A unified diff payload.
-2) NEED_FILE|path[:start-end] lines when required context is missing.
+2) NEED_CONTEXT|path[:start-end] lines when required context is missing.
 
 Rules:
 - Never output commentary, markdown, JSON, or tool calls.
@@ -83,7 +84,7 @@ pub fn run_editor(
                     tool_calls: vec![],
                 });
                 messages.push(ChatMessage::User {
-                    content: "Output invalid. Return ONLY unified diff OR NEED_FILE lines."
+                    content: "Output invalid. Return ONLY unified diff OR NEED_CONTEXT lines."
                         .to_string(),
                 });
             }
@@ -101,20 +102,20 @@ pub fn parse_editor_response(text: &str, max_diff_bytes: usize) -> Result<Editor
 
     if normalized
         .lines()
-        .all(|line| line.trim().starts_with("NEED_FILE|"))
+        .all(|line| line.trim().starts_with("NEED_CONTEXT|"))
     {
         let mut requests = Vec::new();
         for line in normalized.lines() {
             let body = line
                 .trim()
-                .strip_prefix("NEED_FILE|")
-                .ok_or_else(|| anyhow!("invalid NEED_FILE line"))?;
+                .strip_prefix("NEED_CONTEXT|")
+                .ok_or_else(|| anyhow!("invalid NEED_CONTEXT line"))?;
             requests.push(parse_file_request(body)?);
         }
         if requests.is_empty() {
-            return Err(anyhow!("editor returned empty NEED_FILE request"));
+            return Err(anyhow!("editor returned empty NEED_CONTEXT request"));
         }
-        return Ok(EditorResponse::NeedFile(requests));
+        return Ok(EditorResponse::NeedContext(requests));
     }
 
     let mut diff = strip_fences(text);
@@ -138,7 +139,7 @@ pub fn parse_editor_response(text: &str, max_diff_bytes: usize) -> Result<Editor
 fn parse_file_request(body: &str) -> Result<FileRequest> {
     let body = body.trim();
     if body.is_empty() {
-        return Err(anyhow!("empty NEED_FILE path"));
+        return Err(anyhow!("empty NEED_CONTEXT path"));
     }
     if let Some((path, range)) = body.rsplit_once(':')
         && let Some((start, end)) = range.split_once('-')
@@ -217,7 +218,7 @@ fn build_editor_prompt(input: &EditorInput<'_>) -> String {
         out.push_str("```\n");
     }
 
-    out.push_str("\nNow return unified diff OR NEED_FILE lines.");
+    out.push_str("\nNow return unified diff OR NEED_CONTEXT lines.");
     out
 }
 
@@ -227,9 +228,9 @@ mod tests {
 
     #[test]
     fn parse_need_file() {
-        let parsed = parse_editor_response("NEED_FILE|src/lib.rs:1-40", 1024).expect("parse");
+        let parsed = parse_editor_response("NEED_CONTEXT|src/lib.rs:1-40", 1024).expect("parse");
         match parsed {
-            EditorResponse::NeedFile(reqs) => {
+            EditorResponse::NeedContext(reqs) => {
                 assert_eq!(reqs.len(), 1);
                 assert_eq!(reqs[0].path, "src/lib.rs");
                 assert_eq!(reqs[0].range, Some((1, 40)));

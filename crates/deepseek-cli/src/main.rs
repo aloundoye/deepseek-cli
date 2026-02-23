@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
-use deepseek_agent::AgentEngine;
+use deepseek_agent::{AgentEngine, ChatMode};
 use deepseek_core::AppConfig;
 use deepseek_mcp::McpTransport;
 use deepseek_memory::MemoryManager;
@@ -167,6 +167,14 @@ struct Cli {
     /// Enable teammate orchestration mode (compatibility flag).
     #[arg(long = "teammate-mode", global = true)]
     teammate_mode: Option<String>,
+
+    /// Force execution through Architect->Editor->Apply->Verify even for non-edit prompts.
+    #[arg(long = "force-execute", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    force_execute: bool,
+
+    /// Return architect plan only (no apply/verify execution).
+    #[arg(long = "plan-only", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    plan_only: bool,
 
     /// Enable beta features by name.
     #[arg(long = "betas", global = true, value_delimiter = ',')]
@@ -1355,6 +1363,12 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
         )
         .into_error());
     }
+    if cli.force_execute && cli.plan_only {
+        return Err(enhanced_errors::config_error(
+            "--force-execute and --plan-only are mutually exclusive",
+        )
+        .into_error());
+    }
     if cli.dangerously_skip_permissions && !cli.allow_dangerously_skip_permissions {
         return Err(enhanced_errors::config_error(
             "--dangerously-skip-permissions requires --allow-dangerously-skip-permissions to confirm intent"
@@ -1503,7 +1517,7 @@ fn run() -> Result<()> {
             let mut engine = AgentEngine::new(&cwd)?;
             apply_cli_flags(&mut engine, &cli);
             wire_subagent_worker(&engine, &cwd);
-            let options = chat_options_from_cli(&cli, args.tools);
+            let options = chat_options_from_cli(&cli, args.tools, ChatMode::Ask);
             let output = engine.chat_with_options(&args.prompt, options)?;
             if cli.json {
                 print_json(&json!({"output": output}))?;
