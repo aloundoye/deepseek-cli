@@ -3,11 +3,16 @@ use base64::Engine;
 use chrono::Utc;
 use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
 use deepseek_chrome::{ChromeSession, ScreenshotFormat};
-use deepseek_core::{AppConfig, EventKind, StreamChunk, runtime_dir};
+use deepseek_context::ContextManager;
+use deepseek_core::{
+    AppConfig, ApprovedToolCall, EventKind, StreamChunk, ToolCall, ToolHost, runtime_dir,
+};
 use deepseek_mcp::McpManager;
 use deepseek_memory::{ExportFormat, MemoryManager};
+use deepseek_policy::PolicyEngine;
 use deepseek_skills::SkillManager;
 use deepseek_store::{Store, SubagentRunRecord};
+use deepseek_tools::LocalToolHost;
 use deepseek_ui::{
     KeyBindings, SlashCommand, TuiStreamEvent, TuiTheme, load_keybindings, render_statusline,
     run_tui_shell_with_bindings,
@@ -146,6 +151,245 @@ fn slash_commit_output(cwd: &Path, cfg: &AppConfig, args: &[String]) -> Result<S
     }
     git_commit_interactive(cwd, cfg)?;
     Ok("committed staged changes".to_string())
+}
+
+fn slash_add_dirs(cwd: &Path, dirs: &mut Vec<PathBuf>, args: &[String]) -> Result<String> {
+    if args.is_empty() {
+        return Err(anyhow!("usage: /add <path> [path ...]"));
+    }
+    let mut added = Vec::new();
+    for raw in args {
+        let path = resolve_additional_dir(cwd, raw);
+        if path.exists() && path.is_dir() && !dirs.contains(&path) {
+            dirs.push(path.clone());
+            added.push(path);
+        }
+    }
+    if added.is_empty() {
+        return Ok("no new directories added".to_string());
+    }
+    Ok(format!(
+        "added: {}",
+        added
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn slash_drop_dirs(cwd: &Path, dirs: &mut Vec<PathBuf>, args: &[String]) -> Result<String> {
+    if args.is_empty() {
+        return Err(anyhow!("usage: /drop <path> [path ...]"));
+    }
+    let mut removed = Vec::new();
+    for raw in args {
+        let target = resolve_additional_dir(cwd, raw);
+        if let Some(pos) = dirs.iter().position(|dir| dir == &target) {
+            removed.push(dirs.remove(pos));
+        }
+    }
+    if removed.is_empty() {
+        return Ok("no matching directories were active".to_string());
+    }
+    Ok(format!(
+        "dropped: {}",
+        removed
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn local_tool_output(cwd: &Path, call: ToolCall) -> Result<serde_json::Value> {
+    let cfg = AppConfig::load(cwd).unwrap_or_default();
+    let policy = PolicyEngine::from_app_config(&cfg.policy);
+    let tool_host = LocalToolHost::new(cwd, policy)?;
+    let proposal = tool_host.propose(call);
+    let result = tool_host.execute(ApprovedToolCall {
+        invocation_id: proposal.invocation_id,
+        call: proposal.call,
+    });
+    if !result.success {
+        return Err(anyhow!(
+            "{}",
+            result
+                .output
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool execution failed")
+        ));
+    }
+    Ok(result.output)
+}
+
+fn slash_run_output(cwd: &Path, args: &[String]) -> Result<String> {
+    if args.is_empty() {
+        return Err(anyhow!("usage: /run <command>"));
+    }
+    let command = args.join(" ");
+    let output = local_tool_output(
+        cwd,
+        ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({
+                "cmd": command,
+                "timeout": 120,
+            }),
+            requires_approval: false,
+        },
+    )?;
+    let stdout = output
+        .get("stdout")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let stderr = output
+        .get("stderr")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let mut out = String::new();
+    if !stdout.trim().is_empty() {
+        out.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(stderr.trim());
+    }
+    if out.is_empty() {
+        Ok("command completed with no output".to_string())
+    } else {
+        Ok(out)
+    }
+}
+
+fn inferred_test_command(cwd: &Path) -> Option<String> {
+    if cwd.join("Cargo.toml").exists() {
+        return Some("cargo test -q".to_string());
+    }
+    if cwd.join("package.json").exists() {
+        return Some("npm test -- --runInBand".to_string());
+    }
+    if cwd.join("pyproject.toml").exists() || cwd.join("requirements.txt").exists() {
+        return Some("pytest -q".to_string());
+    }
+    None
+}
+
+fn inferred_lint_command(cwd: &Path) -> Option<String> {
+    if cwd.join("Cargo.toml").exists() {
+        return Some("cargo clippy --all-targets -- -D warnings".to_string());
+    }
+    if cwd.join("package.json").exists() {
+        return Some("npm run lint".to_string());
+    }
+    if cwd.join("pyproject.toml").exists() {
+        return Some("ruff check .".to_string());
+    }
+    None
+}
+
+fn slash_test_output(cwd: &Path, args: &[String]) -> Result<String> {
+    let command = if args.is_empty() {
+        inferred_test_command(cwd).ok_or_else(|| {
+            anyhow!("could not infer a test command for this repo; pass one: /test <command>")
+        })?
+    } else {
+        args.join(" ")
+    };
+    slash_run_output(cwd, &[command])
+}
+
+fn slash_lint_output(cwd: &Path, args: &[String]) -> Result<String> {
+    let command = if args.is_empty() {
+        inferred_lint_command(cwd).ok_or_else(|| {
+            anyhow!("could not infer a lint command for this repo; pass one: /lint <command>")
+        })?
+    } else {
+        args.join(" ")
+    };
+    slash_run_output(cwd, &[command])
+}
+
+fn slash_web_output(cwd: &Path, args: &[String]) -> Result<String> {
+    if args.is_empty() {
+        return Err(anyhow!("usage: /web <query>"));
+    }
+    let query = args.join(" ");
+    let output = local_tool_output(
+        cwd,
+        ToolCall {
+            name: "web.search".to_string(),
+            args: json!({
+                "query": query,
+                "max_results": 5,
+            }),
+            requires_approval: false,
+        },
+    )?;
+    let Some(results) = output.get("results").and_then(|v| v.as_array()) else {
+        return Ok("no web results".to_string());
+    };
+    if results.is_empty() {
+        return Ok("no web results".to_string());
+    }
+    let mut lines = Vec::new();
+    for (idx, row) in results.iter().enumerate() {
+        let title = row
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("untitled");
+        let url = row.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+        let snippet = row
+            .get("snippet")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        lines.push(format!("{}. {}", idx + 1, title));
+        if !url.is_empty() {
+            lines.push(format!("   {url}"));
+        }
+        if !snippet.is_empty() {
+            lines.push(format!("   {}", truncate_inline(snippet, 220)));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn slash_map_output(cwd: &Path, args: &[String], additional_dirs: &[PathBuf]) -> Result<String> {
+    let query = if args.is_empty() {
+        "project map".to_string()
+    } else {
+        args.join(" ")
+    };
+    let mut manager = ContextManager::new(cwd)?;
+    manager.analyze_workspace()?;
+    let suggestions = manager.suggest_relevant_files(&query, 20);
+    let mut lines = vec![format!(
+        "repo map: indexed_files={} query=\"{}\"",
+        manager.file_count(),
+        query
+    )];
+    if suggestions.is_empty() {
+        lines.push("(no scored files)".to_string());
+    } else {
+        for item in suggestions {
+            lines.push(format!(
+                "- {} score={:.2} {}",
+                item.path.strip_prefix(cwd).unwrap_or(&item.path).display(),
+                item.score,
+                truncate_inline(&item.reasons.join(" | "), 120)
+            ));
+        }
+    }
+    if !additional_dirs.is_empty() {
+        lines.push("additional dirs:".to_string());
+        for dir in additional_dirs {
+            lines.push(format!("- {}", dir.display()));
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 fn agents_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
@@ -333,6 +577,7 @@ pub(crate) fn run_chat(
     }
     let mut last_assistant_response: Option<String> = None;
     let mut additional_dirs = cli.map(|value| value.add_dir.clone()).unwrap_or_default();
+    let mut read_only_mode = false;
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -386,6 +631,15 @@ pub(crate) fn run_chat(
                             "/teleport",
                             "/remote-env",
                             "/status",
+                            "/add",
+                            "/drop",
+                            "/read-only",
+                            "/map",
+                            "/map-refresh",
+                            "/run",
+                            "/test",
+                            "/lint",
+                            "/web",
                             "/diff",
                             "/stage",
                             "/unstage",
@@ -590,6 +844,87 @@ pub(crate) fn run_chat(
                         }
                     }
                 },
+                SlashCommand::Add(args) => {
+                    let output = slash_add_dirs(cwd, &mut additional_dirs, &args)?;
+                    if json_mode {
+                        print_json(&json!({"add": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Drop(args) => {
+                    let output = slash_drop_dirs(cwd, &mut additional_dirs, &args)?;
+                    if json_mode {
+                        print_json(&json!({"drop": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::ReadOnly(args) => {
+                    let action = args
+                        .first()
+                        .map(|v| v.to_ascii_lowercase())
+                        .unwrap_or_else(|| "toggle".to_string());
+                    match action.as_str() {
+                        "on" | "true" | "1" => read_only_mode = true,
+                        "off" | "false" | "0" => read_only_mode = false,
+                        "status" => {}
+                        _ => read_only_mode = !read_only_mode,
+                    }
+                    let output = format!(
+                        "read-only mode: {}",
+                        if read_only_mode {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    if json_mode {
+                        print_json(&json!({"read_only": read_only_mode, "message": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Map(args) | SlashCommand::MapRefresh(args) => {
+                    let output = slash_map_output(cwd, &args, &additional_dirs)?;
+                    if json_mode {
+                        print_json(&json!({"map": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Run(args) => {
+                    let output = slash_run_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"run": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Test(args) => {
+                    let output = slash_test_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"test": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Lint(args) => {
+                    let output = slash_lint_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"lint": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Web(args) => {
+                    let output = slash_web_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"web": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
                 SlashCommand::Diff(args) => {
                     let output = slash_diff_output(cwd, &args)?;
                     if json_mode {
@@ -954,41 +1289,25 @@ pub(crate) fn run_chat(
                     )?;
                 }
                 SlashCommand::AddDir(args) => {
-                    if args.is_empty() {
-                        if json_mode {
-                            print_json(&json!({"error":"usage: /add-dir <path>"}))?;
-                        } else {
-                            println!("Usage: /add-dir <path>");
-                        }
-                    } else {
-                        let mut added = Vec::new();
-                        for raw in &args {
-                            let path = resolve_additional_dir(cwd, raw);
-                            if !path.exists() || !path.is_dir() {
-                                if json_mode {
-                                    print_json(&json!({
-                                        "error": format!("directory does not exist: {}", path.display())
-                                    }))?;
-                                } else {
-                                    println!("Directory does not exist: {}", path.display());
-                                }
-                                continue;
-                            }
-                            if !additional_dirs.contains(&path) {
-                                additional_dirs.push(path.clone());
-                                added.push(path);
+                    match slash_add_dirs(cwd, &mut additional_dirs, &args) {
+                        Ok(message) => {
+                            if json_mode {
+                                print_json(&json!({
+                                    "message": message,
+                                    "active": additional_dirs
+                                        .iter()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .collect::<Vec<_>>(),
+                                }))?;
+                            } else {
+                                println!("{message}");
                             }
                         }
-                        if json_mode {
-                            print_json(&json!({
-                                "added": added.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
-                                "active": additional_dirs.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
-                            }))?;
-                        } else if added.is_empty() {
-                            println!("No new directories added.");
-                        } else {
-                            for dir in &added {
-                                println!("Added directory: {}", dir.display());
+                        Err(err) => {
+                            if json_mode {
+                                print_json(&json!({"error": err.to_string()}))?;
+                            } else {
+                                println!("{err}");
                             }
                         }
                     }
@@ -1131,7 +1450,7 @@ pub(crate) fn run_chat(
                             let output = engine.chat_with_options(
                                 &rendered,
                                 ChatOptions {
-                                    tools: allow_tools,
+                                    tools: allow_tools && !read_only_mode,
                                     force_max_think,
                                     additional_dirs: additional_dirs.clone(),
                                     repo_root_override: repo_root_override.clone(),
@@ -1320,7 +1639,7 @@ pub(crate) fn run_chat(
         let output = engine.chat_with_options(
             prompt,
             ChatOptions {
-                tools: allow_tools,
+                tools: allow_tools && !read_only_mode,
                 force_max_think,
                 additional_dirs: additional_dirs.clone(),
                 repo_root_override: repo_root_override.clone(),
@@ -1358,6 +1677,7 @@ pub(crate) fn run_chat_tui(
     wire_subagent_worker(&engine, cwd);
     let force_max_think = Arc::new(AtomicBool::new(initial_force_max_think));
     let additional_dirs = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+    let read_only_mode = Arc::new(AtomicBool::new(false));
 
     // Create the channel for TUI stream events.
     let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
@@ -1386,6 +1706,7 @@ pub(crate) fn run_chat_tui(
     let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
     let fmt_refresh = Arc::clone(&force_max_think);
     let additional_dirs_for_closure = Arc::clone(&additional_dirs);
+    let read_only_for_closure = Arc::clone(&read_only_mode);
     run_tui_shell_with_bindings(
         status,
         bindings,
@@ -1397,7 +1718,7 @@ pub(crate) fn run_chat_tui(
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /desktop /todos /chrome /vim".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -1567,6 +1888,55 @@ pub(crate) fn run_chat_tui(
                         Err(err) => format!("remote-env parse error: {err}"),
                     }
                 }
+                SlashCommand::Add(args) => {
+                    let mut guard = additional_dirs_for_closure
+                        .lock()
+                        .map_err(|_| anyhow!("failed to access additional dir state"))?;
+                    slash_add_dirs(cwd, &mut guard, &args)?
+                }
+                SlashCommand::Drop(args) => {
+                    let mut guard = additional_dirs_for_closure
+                        .lock()
+                        .map_err(|_| anyhow!("failed to access additional dir state"))?;
+                    slash_drop_dirs(cwd, &mut guard, &args)?
+                }
+                SlashCommand::ReadOnly(args) => {
+                    let action = args
+                        .first()
+                        .map(|v| v.to_ascii_lowercase())
+                        .unwrap_or_else(|| "toggle".to_string());
+                    match action.as_str() {
+                        "on" | "true" | "1" => {
+                            read_only_for_closure.store(true, Ordering::Relaxed);
+                        }
+                        "off" | "false" | "0" => {
+                            read_only_for_closure.store(false, Ordering::Relaxed);
+                        }
+                        "status" => {}
+                        _ => {
+                            let next = !read_only_for_closure.load(Ordering::Relaxed);
+                            read_only_for_closure.store(next, Ordering::Relaxed);
+                        }
+                    }
+                    format!(
+                        "read-only mode: {}",
+                        if read_only_for_closure.load(Ordering::Relaxed) {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    )
+                }
+                SlashCommand::Map(args) | SlashCommand::MapRefresh(args) => {
+                    let guard = additional_dirs_for_closure
+                        .lock()
+                        .map_err(|_| anyhow!("failed to access additional dir state"))?;
+                    slash_map_output(cwd, &args, &guard)?
+                }
+                SlashCommand::Run(args) => slash_run_output(cwd, &args)?,
+                SlashCommand::Test(args) => slash_test_output(cwd, &args)?,
+                SlashCommand::Lint(args) => slash_lint_output(cwd, &args)?,
+                SlashCommand::Web(args) => slash_web_output(cwd, &args)?,
                 SlashCommand::Diff(args) => slash_diff_output(cwd, &args)?,
                 SlashCommand::Stage(args) => slash_stage_output(cwd, &args)?,
                 SlashCommand::Unstage(args) => slash_unstage_output(cwd, &args)?,
@@ -1749,33 +2119,10 @@ pub(crate) fn run_chat_tui(
                     format!("Usage: input={} output={}", usage.input_tokens, usage.output_tokens)
                 }
                 SlashCommand::AddDir(args) => {
-                    if args.is_empty() {
-                        "Usage: /add-dir <path>".to_string()
-                    } else {
-                        let mut added = Vec::new();
-                        let mut guard = additional_dirs_for_closure
-                            .lock()
-                            .map_err(|_| anyhow!("failed to access additional dir state"))?;
-                        for raw in &args {
-                            let path = resolve_additional_dir(cwd, raw);
-                            if path.exists() && path.is_dir() && !guard.contains(&path) {
-                                guard.push(path.clone());
-                                added.push(path);
-                            }
-                        }
-                        if added.is_empty() {
-                            "No new directories added.".to_string()
-                        } else {
-                            format!(
-                                "Added: {}",
-                                added
-                                    .iter()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        }
-                    }
+                    let mut guard = additional_dirs_for_closure
+                        .lock()
+                        .map_err(|_| anyhow!("failed to access additional dir state"))?;
+                    slash_add_dirs(cwd, &mut guard, &args)?
                 }
                 SlashCommand::Bug => format!("Report bugs at https://github.com/anthropics/deepseek-cli/issues\nLogs: {}", deepseek_core::runtime_dir(cwd).join("logs").display()),
                 SlashCommand::PrComments(args) => {
@@ -1845,6 +2192,7 @@ pub(crate) fn run_chat_tui(
             let max_think = force_max_think.load(Ordering::Relaxed);
             let tx_stream = tx.clone();
             let tx_done = tx.clone();
+            let read_only_for_turn = read_only_for_closure.load(Ordering::Relaxed);
             let prompt_additional_dirs = additional_dirs_for_closure
                 .lock()
                 .map(|dirs| dirs.clone())
@@ -1993,7 +2341,7 @@ pub(crate) fn run_chat_tui(
                     engine_clone.chat_with_options(
                         &prompt,
                         ChatOptions {
-                            tools: allow_tools,
+                            tools: allow_tools && !read_only_for_turn,
                             force_max_think: max_think,
                             additional_dirs: prompt_additional_dirs,
                             repo_root_override: prompt_repo_root_override.clone(),

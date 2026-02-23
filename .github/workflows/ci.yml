@@ -41,6 +41,10 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/parity_regression_check.sh
 
+      - name: parity contract check
+        if: runner.os == 'Linux'
+        run: bash scripts/parity_contract_check.sh
+
       - name: runtime conformance scan
         if: runner.os == 'Linux'
         run: bash scripts/runtime_conformance_scan.sh

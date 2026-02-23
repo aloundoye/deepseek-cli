@@ -125,6 +125,12 @@ enable_tui = true
 keybindings_path = "~/.deepseek/keybindings.json"
 reduced_motion = false
 statusline_mode = "minimal"
+# Thinking display mode in TUI: concise | raw
+thinking_visibility = "concise"
+# Progress heartbeat interval while a phase is active (milliseconds)
+phase_heartbeat_ms = 5000
+# Maximum mission-control timeline lines retained
+mission_control_max_events = 400
 # Fallback mode when terminal cannot render inline images: open | path | none
 image_fallback = "open"
 # Optional base URL for teleport handoff links (used by `teleport link`)

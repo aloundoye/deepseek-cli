@@ -250,6 +250,30 @@ impl AgentEngine {
         Ok(response)
     }
 
+    pub fn context_debug_preview(&self, prompt: &str, options: &ChatOptions) -> String {
+        let task_intent = intent::classify_intent(&intent::IntentInput {
+            prompt,
+            mode: options.mode,
+            tools: options.tools,
+            force_execute: options.force_execute,
+            force_plan_only: options.force_plan_only,
+        });
+        let intent_label = match task_intent {
+            intent::TaskIntent::InspectRepo => "InspectRepo",
+            intent::TaskIntent::EditCode => "EditCode",
+            intent::TaskIntent::ArchitectOnly => "ArchitectOnly",
+        };
+        let bootstrap = gather_context::gather_for_prompt(
+            &self.workspace,
+            &self.cfg,
+            prompt,
+            options.mode,
+            &options.additional_dirs,
+            options.repo_root_override.as_deref(),
+        );
+        bootstrap.debug_digest(intent_label, options.mode)
+    }
+
     pub fn plan_only(&self, prompt: &str) -> Result<deepseek_core::Plan> {
         let feedback = architect::ArchitectFeedback::default();
         let input = architect::ArchitectInput {

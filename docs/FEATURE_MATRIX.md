@@ -37,6 +37,8 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Phase streaming | DONE | Emits `Architect*`, `Editor*`, `Apply*`, `Verify*` stream chunks. |
 | Verify-pass commit proposal | DONE | Emits `CommitProposal` stream/event payload with diffstat, verify status, and suggested message. |
 | TUI phase visibility | DONE | TUI shows live per-iteration phase transitions and outcomes. |
+| UI heartbeat progress | DONE | Active execution phases emit periodic in-progress heartbeat lines in mission control/status without layout changes. |
+| Thinking visibility default | DONE | TUI defaults to concise phase summaries (`ui.thinking_visibility = concise`) rather than raw reasoning dumps. |
 | stream-json phase visibility | DONE | `--output-format stream-json` emits phase events. |
 
 ## 4. CLI and Config
@@ -52,6 +54,7 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Explicit no-repo error for repo-ish inspect | DONE | Returns `No repository detected. Run from project root or pass --repo <path>.` instead of generic clarification loops. |
 | Ask/context follow-up hardening | DONE | Ask/context responses provide initial analysis first and enforce max 1–2 targeted follow-ups (1 for vague codebase checks). |
 | Explicit commit intent workflow | DONE | Verify-pass never auto-commits; user commits explicitly via `/commit` or git subcommands. |
+| Workflow parity slash commands | DONE | `/add /drop /read-only /map /map-refresh /run /test /lint /web` are supported in chat surfaces. |
 
 ## 5. Reliability and Integrations
 

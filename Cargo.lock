@@ -816,6 +816,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "deepseek-agent",
  "deepseek-context",
  "deepseek-core",
  "deepseek-errors",
@@ -984,6 +985,7 @@ dependencies = [
  "anyhow",
  "base64",
  "crossterm",
+ "deepseek-core",
  "ratatui",
  "serde",
  "serde_json",

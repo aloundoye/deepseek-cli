@@ -213,6 +213,15 @@ pub enum SlashCommand {
     Statusline(Vec<String>),
     Theme(Option<String>),
     Usage,
+    Add(Vec<String>),
+    Drop(Vec<String>),
+    ReadOnly(Vec<String>),
+    Map(Vec<String>),
+    MapRefresh(Vec<String>),
+    Run(Vec<String>),
+    Test(Vec<String>),
+    Lint(Vec<String>),
+    Web(Vec<String>),
     AddDir(Vec<String>),
     Bug,
     PrComments(Vec<String>),
@@ -281,6 +290,15 @@ impl SlashCommand {
             "statusline" => Self::Statusline(args),
             "theme" => Self::Theme(args.first().cloned()),
             "usage" => Self::Usage,
+            "add" => Self::Add(args),
+            "drop" => Self::Drop(args),
+            "read-only" | "readonly" => Self::ReadOnly(args),
+            "map" => Self::Map(args),
+            "map-refresh" | "map_refresh" => Self::MapRefresh(args),
+            "run" => Self::Run(args),
+            "test" => Self::Test(args),
+            "lint" => Self::Lint(args),
+            "web" => Self::Web(args),
             "add-dir" => Self::AddDir(args),
             "bug" => Self::Bug,
             "pr_comments" | "pr-comments" => Self::PrComments(args),
@@ -2000,6 +2018,10 @@ pub struct ChatShell {
     pub agent_mode: String,
     /// When true, disable spinner animations (accessibility/reduced-motion).
     pub reduced_motion: bool,
+    /// Maximum retained mission-control lines.
+    pub mission_control_max_events: usize,
+    /// Thinking visibility mode (`concise` or `raw`).
+    pub thinking_visibility: String,
 }
 
 impl ChatShell {
@@ -2067,6 +2089,17 @@ impl ChatShell {
 
     pub fn push_mission_control(&mut self, line: impl Into<String>) {
         self.mission_control_lines.push(line.into());
+        if self.mission_control_max_events > 0
+            && self.mission_control_lines.len() > self.mission_control_max_events
+        {
+            let over = self
+                .mission_control_lines
+                .len()
+                .saturating_sub(self.mission_control_max_events);
+            if over > 0 {
+                self.mission_control_lines.drain(0..over);
+            }
+        }
     }
 
     pub fn push_artifact(&mut self, line: impl Into<String>) {
@@ -2531,9 +2564,23 @@ where
         },
     )?;
 
+    let workspace_path = PathBuf::from(status.working_directory.clone());
+    let ui_cfg = deepseek_core::AppConfig::load(&workspace_path)
+        .unwrap_or_default()
+        .ui;
+    let thinking_visibility = if ui_cfg.thinking_visibility.trim().is_empty() {
+        "concise".to_string()
+    } else {
+        ui_cfg.thinking_visibility.to_ascii_lowercase()
+    };
+    let phase_heartbeat_ms = ui_cfg.phase_heartbeat_ms.max(1000);
+    let mission_control_max_events = ui_cfg.mission_control_max_events.max(50) as usize;
+
     let mut shell = ChatShell {
         agent_mode: "ArchitectEditorLoop".to_string(),
         reduced_motion,
+        mission_control_max_events,
+        thinking_visibility: thinking_visibility.clone(),
         ..Default::default()
     };
     let mut input = String::new();
@@ -2570,7 +2617,9 @@ where
     let mut reverse_search_active = false;
     let mut reverse_search_query = String::new();
     let mut reverse_search_index: Option<usize> = None;
-    let workspace_path = PathBuf::from(status.working_directory.clone());
+    let mut active_phase: Option<(u64, String)> = None;
+    let mut last_phase_event_at = Instant::now();
+    let mut last_phase_heartbeat_at = Instant::now();
 
     loop {
         tick_count = tick_count.wrapping_add(1);
@@ -2578,6 +2627,17 @@ where
         cursor_visible = tick_count % 16 < 8;
         let approval_alert_active = pending_approval.is_some();
         let approval_flash_on = tick_count % 12 < 6;
+        if let Some((iteration, phase)) = active_phase.as_ref() {
+            if last_phase_event_at.elapsed() >= Duration::from_millis(phase_heartbeat_ms)
+                && last_phase_heartbeat_at.elapsed() >= Duration::from_millis(phase_heartbeat_ms)
+            {
+                info_line = format!("iter {iteration} {phase} in progress...");
+                shell.push_mission_control(format!(
+                    "iteration {iteration}: {phase} in progress (heartbeat)"
+                ));
+                last_phase_heartbeat_at = Instant::now();
+            }
+        }
 
         // Print any new transcript entries above the inline viewport
         // so they go into native terminal scrollback.
@@ -3014,15 +3074,34 @@ where
                     shell.append_streaming(&text);
                 }
                 TuiStreamEvent::ReasoningDelta(text) => {
-                    if !shell.is_thinking {
+                    if shell.thinking_visibility == "raw" {
+                        if !shell.is_thinking {
+                            shell.is_thinking = true;
+                            shell.thinking_buffer.clear();
+                        }
+                        shell.thinking_buffer.push_str(&text);
+                    } else {
                         shell.is_thinking = true;
-                        shell.thinking_buffer.clear();
+                        if shell.thinking_buffer.is_empty() {
+                            let label = active_phase
+                                .as_ref()
+                                .map(|(_, phase)| phase.as_str())
+                                .unwrap_or("reasoning");
+                            shell.thinking_buffer = format!("{label}: analyzing...");
+                        }
                     }
-                    shell.thinking_buffer.push_str(&text);
                 }
                 TuiStreamEvent::ArchitectStarted { iteration } => {
                     shell.push_mission_control(format!("iteration {iteration}: architect started"));
                     info_line = format!("iter {iteration} architect");
+                    active_phase = Some((iteration, "planning".to_string()));
+                    last_phase_event_at = Instant::now();
+                    last_phase_heartbeat_at = Instant::now();
+                    if shell.thinking_visibility != "raw" {
+                        shell.is_thinking = true;
+                        shell.thinking_buffer =
+                            "planning: building a deterministic plan".to_string();
+                    }
                 }
                 TuiStreamEvent::ArchitectCompleted {
                     iteration,
@@ -3033,22 +3112,41 @@ where
                         "iteration {iteration}: architect completed files={files} no_edit={no_edit}"
                     ));
                     info_line = format!("iter {iteration} architect done");
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
                 }
                 TuiStreamEvent::EditorStarted { iteration, files } => {
                     shell.push_mission_control(format!(
                         "iteration {iteration}: editor started files={files}"
                     ));
                     info_line = format!("iter {iteration} editor");
+                    active_phase = Some((iteration, "editing".to_string()));
+                    last_phase_event_at = Instant::now();
+                    last_phase_heartbeat_at = Instant::now();
+                    if shell.thinking_visibility != "raw" {
+                        shell.is_thinking = true;
+                        shell.thinking_buffer = "editing: generating unified diff".to_string();
+                    }
                 }
                 TuiStreamEvent::EditorCompleted { iteration, status } => {
                     shell.push_mission_control(format!(
                         "iteration {iteration}: editor completed status={status}"
                     ));
                     info_line = format!("iter {iteration} editor {status}");
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
                 }
                 TuiStreamEvent::ApplyStarted { iteration } => {
                     shell.push_mission_control(format!("iteration {iteration}: apply started"));
                     info_line = format!("iter {iteration} apply");
+                    active_phase = Some((iteration, "applying".to_string()));
+                    last_phase_event_at = Instant::now();
+                    last_phase_heartbeat_at = Instant::now();
+                    if shell.thinking_visibility != "raw" {
+                        shell.is_thinking = true;
+                        shell.thinking_buffer =
+                            "applying: validating and applying patch".to_string();
+                    }
                 }
                 TuiStreamEvent::ApplyCompleted {
                     iteration,
@@ -3064,6 +3162,8 @@ where
                         "iter {iteration} apply {}",
                         if success { "ok" } else { "failed" }
                     );
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
                 }
                 TuiStreamEvent::VerifyStarted {
                     iteration,
@@ -3074,6 +3174,14 @@ where
                         commands.join(" | ")
                     ));
                     info_line = format!("iter {iteration} verify");
+                    active_phase = Some((iteration, "verifying".to_string()));
+                    last_phase_event_at = Instant::now();
+                    last_phase_heartbeat_at = Instant::now();
+                    if shell.thinking_visibility != "raw" {
+                        shell.is_thinking = true;
+                        shell.thinking_buffer =
+                            "verifying: running deterministic checks".to_string();
+                    }
                 }
                 TuiStreamEvent::VerifyCompleted {
                     iteration,
@@ -3089,6 +3197,8 @@ where
                         "iter {iteration} verify {}",
                         if success { "ok" } else { "failed" }
                     );
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
                 }
                 TuiStreamEvent::CommitProposal {
                     files,
@@ -3213,6 +3323,7 @@ where
                     streaming_in_code_block = false;
                     streaming_in_diff_block = false;
                     streaming_code_block_lang.clear();
+                    active_phase = None;
                     shell.is_thinking = false;
                     shell.thinking_buffer.clear();
                     shell.push_error(&msg);
@@ -3259,6 +3370,7 @@ where
                     streaming_in_code_block = false;
                     streaming_in_diff_block = false;
                     streaming_code_block_lang.clear();
+                    active_phase = None;
                     info_line = "ok".to_string();
                     is_processing = false;
                     shell.active_tool = None;
@@ -3284,6 +3396,7 @@ where
                 cancelled = true;
                 streaming_buffer.clear();
                 shell.active_tool = None;
+                active_phase = None;
                 shell.is_thinking = false;
                 shell.thinking_buffer.clear();
                 if let Some((_, _, response_tx)) = pending_approval.take() {
@@ -3908,6 +4021,9 @@ where
             cursor_pos = 0;
             is_processing = true;
             cancelled = false;
+            active_phase = None;
+            last_phase_event_at = Instant::now();
+            last_phase_heartbeat_at = Instant::now();
             shell.active_tool = Some("processing...".to_string());
             on_submit(&background_cmd);
             continue;
@@ -4150,6 +4266,9 @@ where
             history_cursor = None;
             is_processing = true;
             cancelled = false;
+            active_phase = None;
+            last_phase_event_at = Instant::now();
+            last_phase_heartbeat_at = Instant::now();
             shell.active_tool = Some("processing...".to_string());
             on_submit(&effective_prompt);
             if vim_quit_after_submit {
@@ -4767,6 +4886,35 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/undo"),
             Some(SlashCommand::Undo(vec![]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/add src tests"),
+            Some(SlashCommand::Add(vec![
+                "src".to_string(),
+                "tests".to_string()
+            ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/drop tests"),
+            Some(SlashCommand::Drop(vec!["tests".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/read-only on"),
+            Some(SlashCommand::ReadOnly(vec!["on".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/map-refresh auth flow"),
+            Some(SlashCommand::MapRefresh(vec![
+                "auth".to_string(),
+                "flow".to_string()
+            ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/web deepseek cli"),
+            Some(SlashCommand::Web(vec![
+                "deepseek".to_string(),
+                "cli".to_string()
+            ]))
         );
     }
 

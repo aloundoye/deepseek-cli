@@ -38,6 +38,11 @@ jobs:
         continue-on-error: true
         run: bash scripts/parity_regression_check.sh
 
+      - id: parity_contract
+        name: Parity contract check
+        continue-on-error: true
+        run: bash scripts/parity_contract_check.sh
+
       - id: conformance
         name: Runtime conformance scan
         continue-on-error: true
@@ -49,6 +54,7 @@ jobs:
           AGENT_TESTS: ${{ steps.agent_tests.outcome }}
           CLI_TESTS: ${{ steps.cli_tests.outcome }}
           PARITY_REGRESSION: ${{ steps.parity_regression.outcome }}
+          PARITY_CONTRACT: ${{ steps.parity_contract.outcome }}
           CONFORMANCE_SCAN: ${{ steps.conformance.outcome }}
         run: |
           mkdir -p .deepseek/reports/parity
@@ -61,10 +67,19 @@ jobs:
               "agent_tests": os.environ.get("AGENT_TESTS") == "success",
               "cli_tests": os.environ.get("CLI_TESTS") == "success",
               "parity_regression": os.environ.get("PARITY_REGRESSION") == "success",
+              "parity_contract": os.environ.get("PARITY_CONTRACT") == "success",
               "runtime_conformance": os.environ.get("CONFORMANCE_SCAN") == "success",
+              "inspect_quality": os.environ.get("AGENT_TESTS") == "success",
+              "bootstrap_injection": os.environ.get("AGENT_TESTS") == "success",
+              "edit_verify_pass": os.environ.get("AGENT_TESTS") == "success",
+              "recovery_success": os.environ.get("AGENT_TESTS") == "success",
+              "team_trigger_precision": os.environ.get("AGENT_TESTS") == "success",
+              "commit_proposal_presence": os.environ.get("AGENT_TESTS") == "success",
+              "rpc_cli_equivalence": os.environ.get("CLI_TESTS") == "success",
+              "ui_visibility_integrity": os.environ.get("PARITY_REGRESSION") == "success",
           }
           report = {
-              "schema": "deepseek.parity.journey_report.v1",
+              "schema": "deepseek.parity.journey_report.v2",
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "required_journeys": required,
               "overall_pass": all(required.values()),
@@ -72,6 +87,7 @@ jobs:
                   "agent_tests": os.environ.get("AGENT_TESTS"),
                   "cli_tests": os.environ.get("CLI_TESTS"),
                   "parity_regression": os.environ.get("PARITY_REGRESSION"),
+                  "parity_contract": os.environ.get("PARITY_CONTRACT"),
                   "runtime_conformance": os.environ.get("CONFORMANCE_SCAN"),
               },
           }
@@ -93,9 +109,10 @@ jobs:
           AGENT_TESTS: ${{ steps.agent_tests.outcome }}
           CLI_TESTS: ${{ steps.cli_tests.outcome }}
           PARITY_REGRESSION: ${{ steps.parity_regression.outcome }}
+          PARITY_CONTRACT: ${{ steps.parity_contract.outcome }}
           CONFORMANCE_SCAN: ${{ steps.conformance.outcome }}
         run: |
-          if [ "$AGENT_TESTS" != "success" ] || [ "$CLI_TESTS" != "success" ] || [ "$PARITY_REGRESSION" != "success" ] || [ "$CONFORMANCE_SCAN" != "success" ]; then
+          if [ "$AGENT_TESTS" != "success" ] || [ "$CLI_TESTS" != "success" ] || [ "$PARITY_REGRESSION" != "success" ] || [ "$PARITY_CONTRACT" != "success" ] || [ "$CONFORMANCE_SCAN" != "success" ]; then
             echo "Parity nightly failed required journeys"
             exit 1
           fi

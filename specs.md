@@ -186,6 +186,11 @@ These are consumed by CLI and TUI for real-time visibility.
 Additional execution chunk:
 - `CommitProposal` on verify-pass.
 
+RPC execution parity:
+- `prompt/execute` runs the same runtime path as CLI/TUI (no queued placeholder mode in production path).
+- `prompt/stream_next` returns typed event chunks derived from real stream lifecycle.
+- `context/debug` returns a deterministic context digest for Inspect/Edit intent debugging.
+
 ## 7. Module Boundaries
 Core modules:
 - `crates/deepseek-agent/src/architect.rs`
@@ -235,6 +240,11 @@ Core modules:
 - `--debug-context` (or `DEEPSEEK_DEBUG_CONTEXT=1`) prints deterministic pre-model context digest.
 - No `--allow-r1-drive-tools` flag exists in this architecture.
 - Verify-pass never commits automatically; commit is explicit (`/commit`, `deepseek git commit`).
+- Workflow parity slash commands include `/add`, `/drop`, `/read-only`, `/map`, `/map-refresh`, `/run`, `/test`, `/lint`, `/web`.
+- UI transparency defaults are configurable under `[ui]`:
+  - `thinking_visibility = "concise"` (default)
+  - `phase_heartbeat_ms = 5000`
+  - `mission_control_max_events = 400`
 
 ## 10. Removed Legacy Paths
 Removed from execution path:

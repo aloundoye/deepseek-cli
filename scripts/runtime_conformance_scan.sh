@@ -38,6 +38,8 @@ check_forbidden_symbol "contains_dsml_markup"
 check_forbidden_symbol "DSML_MARKERS"
 check_forbidden_symbol "dsml_buffering"
 check_forbidden_symbol "deepseek-router"
+check_forbidden_symbol "\"status\": \"queued\""
+check_forbidden_symbol "Processing prompt:"
 
 # Router event symbols are allowed only in deepseek-core compat parser.
 router_matches=$(rg -n --hidden --glob '!target/**' --glob '!.git/**' "RouterDecisionV1|RouterEscalationV1" crates || true)
