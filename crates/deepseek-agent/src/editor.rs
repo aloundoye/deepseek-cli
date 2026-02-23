@@ -31,6 +31,7 @@ pub struct EditorInput<'a> {
     pub verify_feedback: Option<&'a str>,
     pub apply_feedback: Option<&'a str>,
     pub max_diff_bytes: usize,
+    pub debug_context: bool,
 }
 
 const EDITOR_SYSTEM_PROMPT: &str = r#"You are Editor (code writer).
@@ -51,6 +52,23 @@ pub fn run_editor(
     input: &EditorInput<'_>,
     retries: usize,
 ) -> Result<EditorResponse> {
+    if input.debug_context {
+        let total_bytes = input
+            .files
+            .iter()
+            .map(|file| file.content.len())
+            .sum::<usize>();
+        let partial_files = input.files.iter().filter(|file| file.partial).count();
+        eprintln!(
+            "[debug-context] intent=EditCode phase=Editor mode=Code iteration={} files={} total_bytes={} partial_files={} verify_feedback={} apply_feedback={}",
+            input.iteration,
+            input.files.len(),
+            total_bytes,
+            partial_files,
+            input.verify_feedback.is_some(),
+            input.apply_feedback.is_some()
+        );
+    }
     let mut messages = vec![
         ChatMessage::System {
             content: EDITOR_SYSTEM_PROMPT.to_string(),

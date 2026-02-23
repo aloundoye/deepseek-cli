@@ -60,6 +60,16 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         system_prompt_override: sys_override,
         system_prompt_append: sys_append,
         additional_dirs: cli.add_dir.clone(),
+        repo_root_override: cli.repo.clone(),
+        debug_context: cli.debug_context
+            || std::env::var("DEEPSEEK_DEBUG_CONTEXT")
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false),
         mode,
         force_execute: cli.force_execute,
         force_plan_only: cli.plan_only,

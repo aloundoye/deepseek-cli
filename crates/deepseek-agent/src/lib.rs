@@ -1,9 +1,12 @@
 mod analysis;
 mod apply;
 mod architect;
+mod complexity;
 mod editor;
 mod gather_context;
+mod intent;
 mod r#loop;
+mod repo_map_v2;
 mod team;
 mod verify;
 
@@ -50,6 +53,10 @@ pub struct ChatOptions {
     pub system_prompt_append: Option<String>,
     /// Additional directories for repository context lookup.
     pub additional_dirs: Vec<PathBuf>,
+    /// Optional repository root override for context bootstrap/analysis.
+    pub repo_root_override: Option<PathBuf>,
+    /// Emit deterministic pre-model context digest before LLM calls.
+    pub debug_context: bool,
     /// UX-mode profile. Execution engine remains deterministic when enabled.
     pub mode: ChatMode,
     /// Force execution through the edit loop even when heuristics would not.
@@ -251,6 +258,7 @@ impl AgentEngine {
             feedback: &feedback,
             max_files: self.cfg.agent_loop.max_files_per_iteration as usize,
             additional_dirs: &[],
+            debug_context: false,
         };
         let plan = architect::run_architect(
             self.llm.as_ref(),
@@ -283,9 +291,15 @@ impl AgentEngine {
     }
 
     pub fn chat_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
-        if options.force_plan_only
-            || (options.mode == ChatMode::Architect && !options.force_execute)
-        {
+        let task_intent = intent::classify_intent(&intent::IntentInput {
+            prompt,
+            mode: options.mode,
+            tools: options.tools,
+            force_execute: options.force_execute,
+            force_plan_only: options.force_plan_only,
+        });
+
+        if task_intent == intent::TaskIntent::ArchitectOnly {
             let plan = self.plan_only(prompt)?;
             let mut out = String::new();
             out.push_str("Architect plan (no execution):\n");
@@ -304,19 +318,15 @@ impl AgentEngine {
             return Ok(rendered);
         }
 
-        if !options.tools {
+        if task_intent == intent::TaskIntent::InspectRepo {
             return self.analyze_with_options(prompt, options);
         }
 
-        let should_execute = options.force_execute || is_code_changing_prompt(prompt, &options);
-        if should_execute {
-            if should_run_team_orchestration(&options) {
-                return team::run(self, prompt, &options);
-            }
-            return r#loop::run(self, prompt, &options);
+        if should_run_team_orchestration(self, prompt, &options) {
+            return team::run(self, prompt, &options);
         }
 
-        self.analyze_with_options(prompt, options)
+        r#loop::run(self, prompt, &options)
     }
 
     pub(crate) fn append_event_best_effort(&self, kind: EventKind) {
@@ -360,35 +370,11 @@ impl AgentEngine {
     }
 }
 
-fn is_code_changing_prompt(prompt: &str, options: &ChatOptions) -> bool {
-    if matches!(options.mode, ChatMode::Code) {
-        return true;
-    }
-
-    let lower = prompt.to_ascii_lowercase();
-    let explicit_edit_intent = [
-        "add ",
-        "implement",
-        "refactor",
-        "fix ",
-        "patch ",
-        "update ",
-        "rename ",
-        "remove ",
-        "create file",
-        "edit ",
-        "failing test",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if explicit_edit_intent {
-        return true;
-    }
-
-    !options.additional_dirs.is_empty() && lower.contains("implement")
-}
-
-fn should_run_team_orchestration(options: &ChatOptions) -> bool {
+fn should_run_team_orchestration(
+    engine: &AgentEngine,
+    prompt: &str,
+    options: &ChatOptions,
+) -> bool {
     if options.disable_team_orchestration {
         return false;
     }
@@ -405,7 +391,14 @@ fn should_run_team_orchestration(options: &ChatOptions) -> bool {
         });
 
     match value.as_deref() {
-        Some("") | Some("0") | Some("false") | Some("off") | Some("none") | None => false,
+        Some("") | Some("0") | Some("false") | Some("off") | Some("none") => false,
         Some(_) => true,
+        None => {
+            if !engine.cfg.agent_loop.team.auto_enabled {
+                return false;
+            }
+            crate::complexity::score_prompt(prompt)
+                >= engine.cfg.agent_loop.team.complexity_threshold
+        }
     }
 }

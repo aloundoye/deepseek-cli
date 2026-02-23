@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use deepseek_core::{AppConfig, ChatMessage, ChatRequest, ToolChoice};
 use deepseek_llm::LlmClient;
 use std::path::Path;
@@ -13,13 +13,29 @@ pub fn analyze(
     prompt: &str,
     options: &ChatOptions,
 ) -> Result<String> {
+    let workspace = options.repo_root_override.as_deref().unwrap_or(workspace);
     let bootstrap = gather_context::gather_for_prompt(
         workspace,
         cfg,
         prompt,
         options.mode,
         &options.additional_dirs,
+        options.repo_root_override.as_deref(),
     );
+
+    if bootstrap.repoish && bootstrap.repo_root.is_none() {
+        return Err(anyhow!(
+            "{}",
+            bootstrap
+                .unavailable_reason
+                .as_deref()
+                .unwrap_or("No repository detected. Run from project root or pass --repo <path>.")
+        ));
+    }
+
+    if gather_context::debug_context_enabled(options.debug_context) {
+        eprintln!("{}", bootstrap.debug_digest("InspectRepo", options.mode));
+    }
 
     let system_prompt =
         build_system_prompt(options, bootstrap.repoish, bootstrap.vague_codebase_prompt);

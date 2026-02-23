@@ -35,6 +35,7 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Area | Status | Runtime Truth |
 |---|---|---|
 | Phase streaming | DONE | Emits `Architect*`, `Editor*`, `Apply*`, `Verify*` stream chunks. |
+| Verify-pass commit proposal | DONE | Emits `CommitProposal` stream/event payload with diffstat, verify status, and suggested message. |
 | TUI phase visibility | DONE | TUI shows live per-iteration phase transitions and outcomes. |
 | stream-json phase visibility | DONE | `--output-format stream-json` emits phase events. |
 
@@ -48,7 +49,9 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 | Loop configuration | DONE | `[agent_loop]` controls iteration/retry/bounds/verify timeout + classifier/context/safety knobs. |
 | Router configuration cleanup | DONE | Active runtime/router config removed; only legacy read-compat event decode remains for historical logs. |
 | Auto context bootstrap for ask/context | DONE | Repo-ish prompts inject deterministic `AUTO_CONTEXT_BOOTSTRAP_V1` packet, plus baseline audit for vague codebase checks. |
+| Explicit no-repo error for repo-ish inspect | DONE | Returns `No repository detected. Run from project root or pass --repo <path>.` instead of generic clarification loops. |
 | Ask/context follow-up hardening | DONE | Ask/context responses provide initial analysis first and enforce max 1–2 targeted follow-ups (1 for vague codebase checks). |
+| Explicit commit intent workflow | DONE | Verify-pass never auto-commits; user commits explicitly via `/commit` or git subcommands. |
 
 ## 5. Reliability and Integrations
 

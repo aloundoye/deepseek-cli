@@ -163,10 +163,12 @@ Notable architecture/runtime defaults:
 - Unified diff is the only edit contract in the execution loop (`NEED_CONTEXT|path[:start-end]` is used when Editor needs more file context).
 - Verify failures are classified deterministically (mechanical/repeated/design-mismatch) to decide Editor-first vs Architect-first retry.
 - Apply safety gates require approval for oversized patches and create checkpoints around patch apply.
+- Verify-pass emits a commit proposal and next actions; it never auto-commits.
 - Optional team-lane composition (`--teammate-mode`) runs lane pipelines in isolated worktrees and merges lane patches deterministically.
 - Tool/function-calling orchestration is not used as the core execution backbone.
 - Analysis/review commands use a separate non-edit path and do not mutate files.
 - Ask/context analysis prompts use deterministic `AUTO_CONTEXT_BOOTSTRAP_V1` repo context and return initial analysis before limited follow-up questions.
+- Repo-oriented prompts without a detected repository return: `No repository detected. Run from project root or pass --repo <path>.`
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
 - Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).
 - Teleport link base URL is configurable (`ui.handoff_base_url`).
@@ -174,6 +176,13 @@ Notable architecture/runtime defaults:
 Common execution control flags:
 - `--force-execute` (force full Architect->Editor->Apply->Verify loop)
 - `--plan-only` (architect plan output only, no apply/verify)
+- `--repo <path>` (override repository root for bootstrap/context)
+- `--debug-context` (print deterministic pre-model context digest; also available via `DEEPSEEK_DEBUG_CONTEXT=1`)
+
+Explicit commit workflow:
+- `/stage`, `/unstage`, `/diff`, `/commit`, `/undo` are available in chat/TUI.
+- `/commit` commits staged changes only (no implicit staging).
+- `deepseek git commit --message "..."` also commits staged-only by default.
 
 Default model/profile behavior:
 - `llm.provider = "deepseek"`

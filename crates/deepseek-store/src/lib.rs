@@ -2814,6 +2814,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::PatchStagedV1 { .. } => "PatchStaged@v1",
         EventKind::PatchAppliedV1 { .. } => "PatchApplied@v1",
         EventKind::VerificationRunV1 { .. } => "VerificationRun@v1",
+        EventKind::CommitProposalV1 { .. } => "CommitProposal@v1",
         EventKind::PluginInstalledV1 { .. } => "PluginInstalled@v1",
         EventKind::PluginRemovedV1 { .. } => "PluginRemoved@v1",
         EventKind::PluginEnabledV1 { .. } => "PluginEnabled@v1",

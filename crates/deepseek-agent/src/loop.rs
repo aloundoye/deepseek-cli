@@ -4,7 +4,7 @@ use crate::editor::{EditorFileContext, EditorInput, EditorResponse, FileRequest,
 use crate::verify::{derive_verify_commands, run_verify};
 use crate::{AgentEngine, ChatOptions};
 use anyhow::{Result, anyhow};
-use deepseek_core::{FailureClassifierConfig, StreamChunk, ToolCall};
+use deepseek_core::{EventKind, FailureClassifierConfig, StreamChunk, ToolCall};
 use deepseek_memory::MemoryManager;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +51,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             feedback: &feedback,
             max_files: cfg.max_files_per_iteration as usize,
             additional_dirs: &options.additional_dirs,
+            debug_context: options.debug_context,
         };
         let plan = run_architect(
             engine.llm.as_ref(),
@@ -103,6 +104,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                 verify_feedback: feedback.verify_feedback.as_deref(),
                 apply_feedback: feedback.apply_feedback.as_deref(),
                 max_diff_bytes: cfg.max_diff_bytes as usize,
+                debug_context: options.debug_context,
             };
 
             let response = run_editor(
@@ -233,6 +235,25 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                             iteration,
                             success: true,
                             summary: verify_result.summary.clone(),
+                        });
+                        let stats = diff_stats(&diff);
+                        let suggested_message =
+                            build_commit_message(&engine.cfg.git.commit_message_template, prompt);
+                        engine.stream(StreamChunk::CommitProposal {
+                            files: success.changed_files.clone(),
+                            touched_files: stats.touched_files as u32,
+                            loc_delta: stats.loc_delta as u32,
+                            verify_commands: verify_commands.clone(),
+                            verify_status: verify_result.summary.clone(),
+                            suggested_message: suggested_message.clone(),
+                        });
+                        engine.append_event_best_effort(EventKind::CommitProposalV1 {
+                            files: success.changed_files.clone(),
+                            touched_files: stats.touched_files as u64,
+                            loc_delta: stats.loc_delta as u64,
+                            verify_commands: verify_commands.clone(),
+                            verify_status: verify_result.summary.clone(),
+                            suggested_message,
                         });
                         let response = format_success_response(&plan, &verify_commands);
                         engine.stream(StreamChunk::ContentDelta(response.clone()));
@@ -560,6 +581,9 @@ fn format_success_response(plan: &ArchitectPlan, verify_commands: &[String]) -> 
             out.push_str(&format!("- `{}`\n", command));
         }
     }
+    out.push_str(
+        "\n✅ Verify passed. Run `/commit` to save changes, `/diff` to review, `/undo` to revert.",
+    );
     out.trim_end().to_string()
 }
 
@@ -585,4 +609,15 @@ fn format_no_edit_response(plan: &ArchitectPlan, reason: &str) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+fn build_commit_message(template: &str, prompt: &str) -> String {
+    let mut goal = prompt.trim().replace('\n', " ");
+    if goal.len() > 72 {
+        goal.truncate(goal.floor_char_boundary(72));
+    }
+    if goal.is_empty() {
+        goal = "apply verified changes".to_string();
+    }
+    template.replace("{goal}", goal.trim())
 }

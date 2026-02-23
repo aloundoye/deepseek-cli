@@ -89,6 +89,15 @@ pub enum TuiStreamEvent {
         success: bool,
         summary: String,
     },
+    /// Verify passed and user can explicitly commit.
+    CommitProposal {
+        files: Vec<String>,
+        touched_files: u32,
+        loc_delta: u32,
+        verify_commands: Vec<String>,
+        verify_status: String,
+        suggested_message: String,
+    },
     /// A tool is now actively executing.
     ToolActive(String),
     /// A tool call has started — pushed to transcript.
@@ -176,6 +185,11 @@ pub enum SlashCommand {
     Permissions(Vec<String>),
     Background(Vec<String>),
     Visual(Vec<String>),
+    Commit(Vec<String>),
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
+    Diff(Vec<String>),
+    Undo(Vec<String>),
     Context,
     Sandbox(Vec<String>),
     Agents,
@@ -239,6 +253,11 @@ impl SlashCommand {
             "permissions" => Self::Permissions(args),
             "background" => Self::Background(args),
             "visual" => Self::Visual(args),
+            "commit" => Self::Commit(args),
+            "stage" => Self::Stage(args),
+            "unstage" => Self::Unstage(args),
+            "diff" => Self::Diff(args),
+            "undo" => Self::Undo(args),
             "context" => Self::Context,
             "sandbox" => Self::Sandbox(args),
             "agents" => Self::Agents,
@@ -1479,15 +1498,17 @@ fn split_inline_markdown_blocks(text: &str) -> Vec<String> {
                 j += 1;
             }
             let run_len = j.saturating_sub(idx);
-            if (2..=6).contains(&run_len)
-                && let Some(next) = text[j..].chars().next()
-                && (next == ' ' || next.is_alphanumeric())
-            {
-                let prefix = text[..idx].trim_end();
-                let inline_code_ticks = text[..idx].chars().filter(|c| *c == '`').count();
-                if !prefix.is_empty() && inline_code_ticks % 2 == 0 {
-                    breakpoints.push(idx);
-                    continue;
+            if (2..=6).contains(&run_len) {
+                let next = text[j..].chars().next();
+                let heading_like =
+                    next.is_none_or(|value| value.is_whitespace() || value.is_alphanumeric());
+                if heading_like {
+                    let prefix = text[..idx].trim_end();
+                    let inline_code_ticks = text[..idx].chars().filter(|c| *c == '`').count();
+                    if !prefix.is_empty() && inline_code_ticks % 2 == 0 {
+                        breakpoints.push(idx);
+                        continue;
+                    }
                 }
             }
         }
@@ -1552,6 +1573,18 @@ fn split_inline_markdown_blocks(text: &str) -> Vec<String> {
                 }
             }
         }
+
+        if text[idx..].starts_with("deepseek-")
+            && outside_inline_code(text, idx)
+            && let Some(prev) = text[..idx].chars().next_back()
+            && prev.is_ascii_lowercase()
+        {
+            let prefix = text[..idx].trim_end();
+            if is_run_on_section_boundary(prefix) {
+                breakpoints.push(idx);
+                continue;
+            }
+        }
     }
 
     breakpoints.sort_unstable();
@@ -1610,12 +1643,12 @@ fn is_run_on_section_boundary(prefix: &str) -> bool {
             | "architecture"
             | "features"
             | "infrastructure"
+            | "structure"
             | "stack"
             | "focus"
             | "highlights"
             | "summary"
             | "findings"
-            | "structure"
             | "modifications"
             | "indicators"
             | "scope"
@@ -3056,6 +3089,34 @@ where
                         "iter {iteration} verify {}",
                         if success { "ok" } else { "failed" }
                     );
+                }
+                TuiStreamEvent::CommitProposal {
+                    files,
+                    touched_files,
+                    loc_delta,
+                    verify_commands,
+                    verify_status,
+                    suggested_message,
+                } => {
+                    shell.push_mission_control(format!(
+                        "commit proposal files={} touched={} loc={} verify={} msg={}",
+                        files.join(","),
+                        touched_files,
+                        loc_delta,
+                        truncate_inline(&verify_status.replace('\n', " "), 90),
+                        truncate_inline(&suggested_message, 90)
+                    ));
+                    shell.push_system(
+                        "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
+                            .to_string(),
+                    );
+                    if !verify_commands.is_empty() {
+                        shell.push_system(format!(
+                            "verify commands: {}",
+                            verify_commands.join(" | ")
+                        ));
+                    }
+                    info_line = "ready to commit".to_string();
                 }
                 TuiStreamEvent::ToolActive(name) => {
                     shell.is_thinking = false;
@@ -4681,6 +4742,32 @@ mod tests {
                 "--strict".to_string()
             ]))
         );
+        assert_eq!(
+            SlashCommand::parse("/commit -m \"checkpoint\""),
+            Some(SlashCommand::Commit(vec![
+                "-m".to_string(),
+                "\"checkpoint\"".to_string()
+            ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/stage src/main.rs"),
+            Some(SlashCommand::Stage(vec!["src/main.rs".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/unstage --all"),
+            Some(SlashCommand::Unstage(vec!["--all".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/diff --staged --stat"),
+            Some(SlashCommand::Diff(vec![
+                "--staged".to_string(),
+                "--stat".to_string()
+            ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/undo"),
+            Some(SlashCommand::Undo(vec![]))
+        );
     }
 
     #[test]
@@ -5729,7 +5816,10 @@ mod tests {
             split_inline_markdown_blocks("Project OverviewDeepSeek CLI is a terminal-native tool.");
         assert_eq!(
             parts,
-            vec!["Project Overview", "DeepSeek CLI is a terminal-native tool."]
+            vec![
+                "Project Overview",
+                "DeepSeek CLI is a terminal-native tool."
+            ]
         );
     }
 
@@ -5743,6 +5833,35 @@ mod tests {
             vec![
                 "2. Current Modifications (Git Status)",
                 "The project shows updates."
+            ]
+        );
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_handles_repo_analysis_run_on_sample() {
+        let parts = split_inline_markdown_blocks(
+            "Key Components### 1. Architecture- Workspace Structure:  - deepseek-cli: Main CLI application  - deepseek-agent: Core agent logic",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                "Key Components",
+                "###",
+                "1. Architecture",
+                "- Workspace Structure:",
+                "- deepseek-cli: Main CLI application",
+                "- deepseek-agent: Core agent logic"
+            ]
+        );
+
+        let project_parts = split_inline_markdown_blocks(
+            "Project Structure Highlightsdeepseek-cli/├── crates/           # Rust workspace crates",
+        );
+        assert_eq!(
+            project_parts,
+            vec![
+                "Project Structure Highlights",
+                "deepseek-cli/├── crates/           # Rust workspace crates"
             ]
         );
     }

@@ -1,4 +1,6 @@
 use anyhow::{Result, anyhow};
+use deepseek_core::AppConfig;
+use glob::Pattern;
 use serde::Serialize;
 use serde_json::json;
 use std::path::Path;
@@ -18,11 +20,89 @@ pub(crate) struct GitStatusSummary {
     pub(crate) conflicts: u64,
 }
 
+pub(crate) fn git_status_summary(cwd: &Path) -> Result<GitStatusSummary> {
+    let porcelain = run_process(cwd, "git", &["status", "--porcelain=2", "--branch"])?;
+    Ok(parse_git_status_summary(&porcelain))
+}
+
+pub(crate) fn git_stage(cwd: &Path, all: bool, files: &[String]) -> Result<GitStatusSummary> {
+    if all || files.is_empty() {
+        run_process(cwd, "git", &["add", "-A"])?;
+    } else {
+        let mut command = vec!["add", "--"];
+        for file in files {
+            command.push(file.as_str());
+        }
+        run_process(cwd, "git", &command)?;
+    }
+    git_status_summary(cwd)
+}
+
+pub(crate) fn git_unstage(cwd: &Path, all: bool, files: &[String]) -> Result<GitStatusSummary> {
+    if all || files.is_empty() {
+        run_process(cwd, "git", &["reset"])?;
+    } else {
+        let mut command = vec!["reset", "HEAD", "--"];
+        for file in files {
+            command.push(file.as_str());
+        }
+        run_process(cwd, "git", &command)?;
+    }
+    git_status_summary(cwd)
+}
+
+pub(crate) fn git_diff(cwd: &Path, staged: bool, stat: bool) -> Result<String> {
+    let mut command = vec!["diff"];
+    if staged {
+        command.push("--cached");
+    }
+    if stat {
+        command.push("--stat");
+    }
+    run_process(cwd, "git", &command)
+}
+
+pub(crate) fn git_commit_staged(cwd: &Path, cfg: &AppConfig, message: &str) -> Result<String> {
+    let summary = git_status_summary(cwd)?;
+    if summary.staged == 0 {
+        return Err(anyhow!(
+            "no staged changes to commit. Run `deepseek git stage --all` or `/stage` first."
+        ));
+    }
+    validate_commit_policy(cwd, cfg, &summary, Some(message))?;
+    let mut commit_cmd = vec!["commit"];
+    if cfg.git.require_signing {
+        commit_cmd.push("-S");
+    }
+    commit_cmd.push("-m");
+    commit_cmd.push(message);
+    run_process(cwd, "git", &commit_cmd)
+}
+
+pub(crate) fn git_commit_interactive(cwd: &Path, cfg: &AppConfig) -> Result<()> {
+    let summary = git_status_summary(cwd)?;
+    if summary.staged == 0 {
+        return Err(anyhow!(
+            "no staged changes to commit. Run `deepseek git stage --all` or `/stage` first."
+        ));
+    }
+    validate_commit_policy(cwd, cfg, &summary, None)?;
+    let mut command = std::process::Command::new("git");
+    command.current_dir(cwd).arg("commit");
+    if cfg.git.require_signing {
+        command.arg("-S");
+    }
+    let status = command.status()?;
+    if !status.success() {
+        return Err(anyhow!("git commit failed with status {}", status));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
     match cmd {
         GitCmd::Status => {
-            let porcelain = run_process(cwd, "git", &["status", "--porcelain=2", "--branch"])?;
-            let summary = parse_git_status_summary(&porcelain);
+            let summary = git_status_summary(cwd)?;
             let output = run_process(cwd, "git", &["status", "--short"])?;
             if json_mode {
                 print_json(&json!({
@@ -41,6 +121,21 @@ pub(crate) fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
                     summary.untracked,
                     summary.conflicts
                 );
+                println!("{output}");
+            }
+        }
+        GitCmd::Diff(args) => {
+            let output = git_diff(cwd, args.staged, args.stat)?;
+            if json_mode {
+                print_json(&json!({
+                    "command": format!(
+                        "git diff{}{}",
+                        if args.staged { " --cached" } else { "" },
+                        if args.stat { " --stat" } else { "" }
+                    ),
+                    "output": output
+                }))?;
+            } else {
                 println!("{output}");
             }
         }
@@ -72,16 +167,44 @@ pub(crate) fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
                 println!("{output}");
             }
         }
-        GitCmd::Commit(args) => {
-            let mut logs = Vec::new();
-            if args.all {
-                logs.push(run_process(cwd, "git", &["add", "-A"])?);
-            }
-            logs.push(run_process(cwd, "git", &["commit", "-m", &args.message])?);
+        GitCmd::Stage(args) => {
+            let summary = git_stage(cwd, args.all, &args.files)?;
             if json_mode {
-                print_json(&json!({"message": args.message, "output": logs}))?;
+                print_json(&json!({
+                    "action": "stage",
+                    "summary": summary
+                }))?;
             } else {
-                println!("{}", logs.join("\n"));
+                println!(
+                    "staged changes: staged={} unstaged={} untracked={}",
+                    summary.staged, summary.unstaged, summary.untracked
+                );
+            }
+        }
+        GitCmd::Unstage(args) => {
+            let summary = git_unstage(cwd, args.all, &args.files)?;
+            if json_mode {
+                print_json(&json!({
+                    "action": "unstage",
+                    "summary": summary
+                }))?;
+            } else {
+                println!(
+                    "unstaged changes: staged={} unstaged={} untracked={}",
+                    summary.staged, summary.unstaged, summary.untracked
+                );
+            }
+        }
+        GitCmd::Commit(args) => {
+            let cfg = AppConfig::ensure(cwd).unwrap_or_default();
+            if args.all {
+                git_stage(cwd, true, &[])?;
+            }
+            let output = git_commit_staged(cwd, &cfg, &args.message)?;
+            if json_mode {
+                print_json(&json!({"message": args.message, "output": output}))?;
+            } else {
+                println!("{output}");
             }
         }
         GitCmd::Pr(args) => {
@@ -237,6 +360,52 @@ pub(crate) fn run_git(cwd: &Path, cmd: GitCmd, json_mode: bool) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn validate_commit_policy(
+    cwd: &Path,
+    cfg: &AppConfig,
+    summary: &GitStatusSummary,
+    message: Option<&str>,
+) -> Result<()> {
+    if !cfg.git.allowed_branch_patterns.is_empty() {
+        let current = summary
+            .branch
+            .clone()
+            .unwrap_or_else(|| "detached".to_string());
+        let allowed = cfg.git.allowed_branch_patterns.iter().any(|raw| {
+            Pattern::new(raw)
+                .map(|pattern| pattern.matches(&current))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            return Err(anyhow!(
+                "commit blocked by branch policy: branch `{}` does not match allowed patterns {}",
+                current,
+                cfg.git.allowed_branch_patterns.join(", ")
+            ));
+        }
+    }
+
+    if let Some(pattern) = cfg.git.commit_message_regex.as_deref()
+        && let Ok(re) = regex::Regex::new(pattern)
+    {
+        if let Some(msg) = message {
+            if !re.is_match(msg) {
+                return Err(anyhow!(
+                    "commit message does not satisfy policy regex `{}`",
+                    pattern
+                ));
+            }
+        } else {
+            return Err(anyhow!(
+                "interactive commit is disabled by policy: commit_message_regex is configured; use /commit -m \"...\""
+            ));
+        }
+    }
+
+    let _ = cwd;
     Ok(())
 }
 
