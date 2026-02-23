@@ -1981,6 +1981,28 @@ pub(crate) fn run_chat(
                             summary.replace('\n', " ")
                         );
                     }
+                    deepseek_core::StreamChunk::LintStarted {
+                        iteration,
+                        commands,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] lint started (iter {iteration}) {}",
+                            commands.join(" | ")
+                        );
+                    }
+                    deepseek_core::StreamChunk::LintCompleted {
+                        iteration,
+                        success,
+                        fixed,
+                        remaining,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] lint {} (iter {iteration}) fixed={fixed} remaining={remaining}",
+                            if success { "ok" } else { "failed" },
+                        );
+                    }
                     deepseek_core::StreamChunk::CommitProposal {
                         files,
                         touched_files,
@@ -2000,6 +2022,14 @@ pub(crate) fn run_chat(
                             handle,
                             "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
                         );
+                    }
+                    deepseek_core::StreamChunk::CommitCompleted { sha, message } => {
+                        let _ = writeln!(handle, "[commit] completed sha={sha} message=\"{message}\"");
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::CommitSkipped => {
+                        let _ = writeln!(handle, "[commit] skipped by user");
+                        let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ToolCallStart {
                         tool_name,
@@ -2796,6 +2826,28 @@ pub(crate) fn run_chat_tui(
                         summary,
                     });
                 }
+                StreamChunk::LintStarted {
+                    iteration,
+                    commands,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::LintStarted {
+                        iteration,
+                        commands,
+                    });
+                }
+                StreamChunk::LintCompleted {
+                    iteration,
+                    success,
+                    fixed,
+                    remaining,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::LintCompleted {
+                        iteration,
+                        success,
+                        fixed,
+                        remaining,
+                    });
+                }
                 StreamChunk::CommitProposal {
                     files,
                     touched_files,
@@ -2812,6 +2864,12 @@ pub(crate) fn run_chat_tui(
                         verify_status,
                         suggested_message,
                     });
+                }
+                StreamChunk::CommitCompleted { sha, message } => {
+                    let _ = tx_stream.send(TuiStreamEvent::CommitCompleted { sha, message });
+                }
+                StreamChunk::CommitSkipped => {
+                    let _ = tx_stream.send(TuiStreamEvent::CommitSkipped);
                 }
                 StreamChunk::ToolCallStart {
                     tool_name,
@@ -3850,6 +3908,30 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     );
                     let _ = handle.flush();
                 }
+                StreamChunk::LintStarted {
+                    iteration,
+                    commands,
+                } => {
+                    let _ = writeln!(
+                        handle,
+                        "[phase] lint started (iter {iteration}) {}",
+                        commands.join(" | ")
+                    );
+                    let _ = handle.flush();
+                }
+                StreamChunk::LintCompleted {
+                    iteration,
+                    success,
+                    fixed,
+                    remaining,
+                } => {
+                    let _ = writeln!(
+                        handle,
+                        "[phase] lint {} (iter {iteration}) fixed={fixed} remaining={remaining}",
+                        if success { "ok" } else { "failed" },
+                    );
+                    let _ = handle.flush();
+                }
                 StreamChunk::CommitProposal {
                     files,
                     touched_files,
@@ -3872,6 +3954,14 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                         handle,
                         "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
                     );
+                    let _ = handle.flush();
+                }
+                StreamChunk::CommitCompleted { sha, message } => {
+                    let _ = writeln!(handle, "[commit] completed sha={sha} message=\"{message}\"");
+                    let _ = handle.flush();
+                }
+                StreamChunk::CommitSkipped => {
+                    let _ = writeln!(handle, "[commit] skipped by user");
                     let _ = handle.flush();
                 }
                 StreamChunk::ToolCallStart {

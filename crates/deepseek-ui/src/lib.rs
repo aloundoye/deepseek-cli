@@ -89,6 +89,22 @@ pub enum TuiStreamEvent {
         success: bool,
         summary: String,
     },
+    /// Lint auto-fix phase started.
+    LintStarted {
+        iteration: u64,
+        commands: Vec<String>,
+    },
+    /// Lint auto-fix phase completed.
+    LintCompleted {
+        iteration: u64,
+        success: bool,
+        fixed: u32,
+        remaining: u32,
+    },
+    /// Commit completed successfully.
+    CommitCompleted { sha: String, message: String },
+    /// Commit skipped by user.
+    CommitSkipped,
     /// Verify passed and user can explicitly commit.
     CommitProposal {
         files: Vec<String>,
@@ -3217,6 +3233,41 @@ where
                     active_phase = None;
                     last_phase_event_at = Instant::now();
                 }
+                TuiStreamEvent::LintStarted {
+                    iteration,
+                    commands,
+                } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: lint started commands={}",
+                        commands.join(" | ")
+                    ));
+                    info_line = format!("iter {iteration} lint");
+                    active_phase = Some((iteration, "linting".to_string()));
+                    last_phase_event_at = Instant::now();
+                    last_phase_heartbeat_at = Instant::now();
+                    if shell.thinking_visibility != "raw" {
+                        shell.is_thinking = true;
+                        shell.thinking_buffer =
+                            "linting: running auto-fix checks".to_string();
+                    }
+                }
+                TuiStreamEvent::LintCompleted {
+                    iteration,
+                    success,
+                    fixed,
+                    remaining,
+                } => {
+                    shell.push_mission_control(format!(
+                        "iteration {iteration}: lint {} fixed={fixed} remaining={remaining}",
+                        if success { "ok" } else { "failed" },
+                    ));
+                    info_line = format!(
+                        "iter {iteration} lint {} fixed={fixed} remaining={remaining}",
+                        if success { "ok" } else { "failed" }
+                    );
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
+                }
                 TuiStreamEvent::CommitProposal {
                     files,
                     touched_files,
@@ -3244,6 +3295,18 @@ where
                         ));
                     }
                     info_line = "ready to commit".to_string();
+                }
+                TuiStreamEvent::CommitCompleted { sha, message } => {
+                    shell.push_mission_control(format!("commit completed sha={sha} msg={}", truncate_inline(&message, 90)));
+                    info_line = format!("committed {}", &sha[..sha.len().min(8)]);
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
+                }
+                TuiStreamEvent::CommitSkipped => {
+                    shell.push_mission_control("commit skipped by user".to_string());
+                    info_line = "commit skipped".to_string();
+                    active_phase = None;
+                    last_phase_event_at = Instant::now();
                 }
                 TuiStreamEvent::ToolActive(name) => {
                     shell.is_thinking = false;

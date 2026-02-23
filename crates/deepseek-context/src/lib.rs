@@ -4,6 +4,9 @@
 //! - Automatic relevant file detection based on imports and dependencies
 //! - Context window optimization and compression
 //! - File relationship analysis and dependency graph building
+//! - Tree-sitter based tag extraction for repo maps
+
+pub mod tags;
 
 use anyhow::Result;
 use ignore::WalkBuilder;
