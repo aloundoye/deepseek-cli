@@ -918,6 +918,9 @@ fn render_assistant_markdown(text: &str) -> Line<'static> {
 
     // Headings — strip `#` prefix and render with level-appropriate styling.
     // Handles `# H1`, `## H2`, `### H3`, `#### H4+` (with or without space).
+    if !text.is_empty() && text.chars().all(|c| c == '#') && text.len() <= 6 {
+        return Line::from(vec![Span::raw("")]);
+    }
     if text.starts_with("# ") || (text.starts_with('#') && !text.starts_with("#!")) {
         let trimmed = text.trim_start_matches('#');
         let level = text.len() - trimmed.len();
@@ -1507,6 +1510,48 @@ fn split_inline_markdown_blocks(text: &str) -> Vec<String> {
                 }
             }
         }
+
+        // Split inline unordered/task list starts:
+        // "Architecture- Detail", "areas:- Item", or "...  - Item".
+        if ch == '-' {
+            let next_char = text[idx + 1..].chars().next();
+            if next_char == Some(' ') && outside_inline_code(text, idx) {
+                let prefix_raw = &text[..idx];
+                let prefix = prefix_raw.trim_end();
+                if !prefix.is_empty() {
+                    let prev = prefix_raw.chars().next_back();
+                    let looks_inline_list = prev.is_some_and(|p| !p.is_whitespace())
+                        || prefix_raw.ends_with("  ")
+                        || prefix_raw.ends_with(':')
+                        || prefix_raw.ends_with(')');
+                    if looks_inline_list {
+                        breakpoints.push(idx);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Split run-on section boundaries like:
+        // "Project OverviewDeepSeek ...", "(Git Status)The ...".
+        if ch.is_ascii_uppercase()
+            && outside_inline_code(text, idx)
+            && let Some(prev) = text[..idx].chars().next_back()
+        {
+            if prev == ')' {
+                let prefix = text[..idx].trim_end();
+                if !prefix.is_empty() {
+                    breakpoints.push(idx);
+                    continue;
+                }
+            } else if prev.is_ascii_lowercase() {
+                let prefix = text[..idx].trim_end();
+                if is_run_on_section_boundary(prefix) {
+                    breakpoints.push(idx);
+                    continue;
+                }
+            }
+        }
     }
 
     breakpoints.sort_unstable();
@@ -1537,6 +1582,44 @@ fn split_inline_markdown_blocks(text: &str) -> Vec<String> {
     } else {
         out
     }
+}
+
+fn outside_inline_code(text: &str, idx: usize) -> bool {
+    text[..idx].chars().filter(|c| *c == '`').count() % 2 == 0
+}
+
+fn is_run_on_section_boundary(prefix: &str) -> bool {
+    let words = prefix
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>();
+    if words.len() < 2 || words.len() > 8 {
+        return false;
+    }
+    let last = words
+        .last()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    matches!(
+        last.as_str(),
+        "overview"
+            | "components"
+            | "architecture"
+            | "features"
+            | "infrastructure"
+            | "stack"
+            | "focus"
+            | "highlights"
+            | "summary"
+            | "findings"
+            | "structure"
+            | "modifications"
+            | "indicators"
+            | "scope"
+    )
 }
 
 fn is_plan_list_line(line: &str) -> bool {
@@ -5622,6 +5705,53 @@ mod tests {
     fn split_inline_markdown_blocks_splits_inline_numbered_list() {
         let parts = split_inline_markdown_blocks("### Strengths ✅ 1. Clean separation");
         assert_eq!(parts, vec!["### Strengths ✅", "1. Clean separation"]);
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_splits_inline_unordered_list_runs() {
+        let parts = split_inline_markdown_blocks(
+            "1. Architecture- Workspace Structure:  - deepseek-cli: main app  - deepseek-agent: core runtime",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                "1. Architecture",
+                "- Workspace Structure:",
+                "- deepseek-cli: main app",
+                "- deepseek-agent: core runtime"
+            ]
+        );
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_splits_run_on_section_boundary() {
+        let parts =
+            split_inline_markdown_blocks("Project OverviewDeepSeek CLI is a terminal-native tool.");
+        assert_eq!(
+            parts,
+            vec!["Project Overview", "DeepSeek CLI is a terminal-native tool."]
+        );
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_splits_parenthetical_run_on_boundary() {
+        let parts = split_inline_markdown_blocks(
+            "2. Current Modifications (Git Status)The project shows updates.",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                "2. Current Modifications (Git Status)",
+                "The project shows updates."
+            ]
+        );
+    }
+
+    #[test]
+    fn render_bare_heading_markers_as_spacer_line() {
+        let line = render_assistant_markdown("###");
+        let text: String = line.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.trim().is_empty());
     }
 
     #[test]

@@ -8,6 +8,9 @@ jobs:
   quality:
     name: quality (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +40,19 @@ jobs:
       - name: parity regression checklist
         if: runner.os == 'Linux'
         run: bash scripts/parity_regression_check.sh
+
+      - name: runtime conformance scan
+        if: runner.os == 'Linux'
+        run: bash scripts/runtime_conformance_scan.sh
+
+      - name: parity nightly streak gate
+        if: runner.os == 'Linux' && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PARITY_WORKFLOW_FILE: parity-nightly.yml
+          PARITY_REQUIRED_STREAK: "3"
+        run: python3 scripts/parity_streak_gate.py
 
       - name: build
         run: cargo build --workspace

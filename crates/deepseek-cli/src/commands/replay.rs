@@ -52,7 +52,6 @@ pub(crate) fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<
                 "tool_results_replayed": tool_results_replayed,
                 "turns": projection.transcript.len(),
                 "steps": projection.step_status.len(),
-                "router_models": projection.router_models,
                 "validation": validation,
             });
             store.insert_replay_cassette(&ReplayCassetteRecord {

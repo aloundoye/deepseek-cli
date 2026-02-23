@@ -29,7 +29,7 @@ This document records the release checklist and verification results for DeepSee
 | deepseek-memory | 1 | |
 | deepseek-observe | 1 | |
 | deepseek-policy | 19 | Includes `team_policy_locks_permission_mode`, `team_policy_permission_mode_locked_flag` |
-| deepseek-router | 1 | |
+| deepseek-router | removed | Legacy router crate removed from runtime/workspace |
 | deepseek-skills | 1 | |
 | deepseek-store | 2 | |
 | deepseek-subagent | 4 | |

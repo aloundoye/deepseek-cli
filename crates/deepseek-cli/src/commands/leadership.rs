@@ -1070,7 +1070,7 @@ fn collect_audit_summary(cwd: &Path, audit_window_hours: u64) -> AuditSummary {
                 continue;
             }
         };
-        let envelope: EventEnvelope = match serde_json::from_str(&line) {
+        let envelope: EventEnvelope = match deepseek_core::parse_event_envelope_compat(&line) {
             Ok(value) => value,
             Err(_) => {
                 summary.parse_errors = summary.parse_errors.saturating_add(1);

@@ -1,0 +1,101 @@
+name: Parity Nightly
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  parity-nightly:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - id: agent_tests
+        name: Agent tests
+        continue-on-error: true
+        run: cargo test -p deepseek-agent
+
+      - id: cli_tests
+        name: CLI tests
+        continue-on-error: true
+        run: cargo test -p deepseek-cli
+
+      - id: parity_regression
+        name: Parity regression checklist
+        continue-on-error: true
+        run: bash scripts/parity_regression_check.sh
+
+      - id: conformance
+        name: Runtime conformance scan
+        continue-on-error: true
+        run: bash scripts/runtime_conformance_scan.sh
+
+      - name: Build parity journey report
+        if: always()
+        env:
+          AGENT_TESTS: ${{ steps.agent_tests.outcome }}
+          CLI_TESTS: ${{ steps.cli_tests.outcome }}
+          PARITY_REGRESSION: ${{ steps.parity_regression.outcome }}
+          CONFORMANCE_SCAN: ${{ steps.conformance.outcome }}
+        run: |
+          mkdir -p .deepseek/reports/parity
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          required = {
+              "agent_tests": os.environ.get("AGENT_TESTS") == "success",
+              "cli_tests": os.environ.get("CLI_TESTS") == "success",
+              "parity_regression": os.environ.get("PARITY_REGRESSION") == "success",
+              "runtime_conformance": os.environ.get("CONFORMANCE_SCAN") == "success",
+          }
+          report = {
+              "schema": "deepseek.parity.journey_report.v1",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "required_journeys": required,
+              "overall_pass": all(required.values()),
+              "step_outcomes": {
+                  "agent_tests": os.environ.get("AGENT_TESTS"),
+                  "cli_tests": os.environ.get("CLI_TESTS"),
+                  "parity_regression": os.environ.get("PARITY_REGRESSION"),
+                  "runtime_conformance": os.environ.get("CONFORMANCE_SCAN"),
+              },
+          }
+          with open(".deepseek/reports/parity/parity_journey_report.json", "w", encoding="utf-8") as fh:
+              json.dump(report, fh, indent=2)
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload parity journey report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-journey-report
+          path: .deepseek/reports/parity/parity_journey_report.json
+
+      - name: Enforce nightly journey pass
+        if: always()
+        env:
+          AGENT_TESTS: ${{ steps.agent_tests.outcome }}
+          CLI_TESTS: ${{ steps.cli_tests.outcome }}
+          PARITY_REGRESSION: ${{ steps.parity_regression.outcome }}
+          CONFORMANCE_SCAN: ${{ steps.conformance.outcome }}
+        run: |
+          if [ "$AGENT_TESTS" != "success" ] || [ "$CLI_TESTS" != "success" ] || [ "$PARITY_REGRESSION" != "success" ] || [ "$CONFORMANCE_SCAN" != "success" ]; then
+            echo "Parity nightly failed required journeys"
+            exit 1
+          fi

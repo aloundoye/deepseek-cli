@@ -1,4 +1,4 @@
-use crate::apply::diff_stats;
+use crate::apply::{diff_stats, ensure_repo_relative_path, extract_target_files};
 use crate::r#loop;
 use crate::verify::{derive_verify_commands, run_verify};
 use crate::{AgentEngine, ChatMode, ChatOptions};
@@ -104,6 +104,8 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         if lane.patch.trim().is_empty() {
             continue;
         }
+        validate_lane_patch_artifact(&lane.patch)
+            .with_context(|| format!("invalid lane patch artifact for {}", lane.lane.id))?;
         if !require_patch_approval(engine, &lane.patch, &lane.lane)? {
             return Err(anyhow!("patch approval denied for lane {}", lane.lane.id));
         }
@@ -206,31 +208,34 @@ fn apply_lane_patch(
 }
 
 fn emit_spawned(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec) {
+    let lane_name = format!("{}:{}", lane.id, lane.name);
+    let lane_goal = format!("[lane={}] {}", lane.id, lane.goal);
     engine.stream(StreamChunk::SubagentSpawned {
         run_id: run_id.to_string(),
-        name: lane.name.clone(),
-        goal: lane.goal.clone(),
+        name: lane_name.clone(),
+        goal: lane_goal.clone(),
     });
     engine.append_event_best_effort(EventKind::SubagentSpawnedV1 {
         run_id,
-        name: lane.name.clone(),
-        goal: lane.goal.clone(),
+        name: lane_name,
+        goal: lane_goal,
     });
 }
 
 fn emit_completed(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec, patch: &str) {
+    let lane_name = format!("{}:{}", lane.id, lane.name);
     let summary = if patch.trim().is_empty() {
-        "no patch generated".to_string()
+        format!("[lane={}] no patch generated", lane.id)
     } else {
         let stats = diff_stats(patch);
         format!(
-            "patch files={} loc={}",
-            stats.touched_files, stats.loc_delta
+            "[lane={}] patch files={} loc={}",
+            lane.id, stats.touched_files, stats.loc_delta
         )
     };
     engine.stream(StreamChunk::SubagentCompleted {
         run_id: run_id.to_string(),
-        name: lane.name.clone(),
+        name: lane_name.clone(),
         summary: summary.clone(),
     });
     engine.append_event_best_effort(EventKind::SubagentCompletedV1 {
@@ -240,15 +245,34 @@ fn emit_completed(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec, patch: &s
 }
 
 fn emit_failed(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec, error: &str) {
+    let lane_name = format!("{}:{}", lane.id, lane.name);
+    let lane_error = format!("[lane={}] {error}", lane.id);
     engine.stream(StreamChunk::SubagentFailed {
         run_id: run_id.to_string(),
-        name: lane.name.clone(),
-        error: error.to_string(),
+        name: lane_name.clone(),
+        error: lane_error.clone(),
     });
     engine.append_event_best_effort(EventKind::SubagentFailedV1 {
         run_id,
-        error: error.to_string(),
+        error: lane_error,
     });
+}
+
+fn validate_lane_patch_artifact(patch: &str) -> Result<()> {
+    if patch.trim().is_empty() {
+        return Ok(());
+    }
+    let files = extract_target_files(patch);
+    if files.is_empty() {
+        return Err(anyhow!("lane patch artifact contains no target files"));
+    }
+    for file in files {
+        ensure_repo_relative_path(&file).map_err(|err| anyhow!(err.reason))?;
+        if file == ".git" || file.starts_with(".git/") {
+            return Err(anyhow!(".git mutation forbidden in lane patch: {file}"));
+        }
+    }
+    Ok(())
 }
 
 fn plan_lanes(prompt: &str) -> Vec<LaneSpec> {
@@ -396,6 +420,39 @@ fn sanitize_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    fn git(workspace: &Path, args: &[&str]) -> Result<()> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    fn init_git(workspace: &Path) -> Result<()> {
+        git(workspace, &["init"])?;
+        git(
+            workspace,
+            &["config", "user.email", "deepseek@example.test"],
+        )?;
+        git(workspace, &["config", "user.name", "DeepSeek Test"])?;
+        Ok(())
+    }
+
+    fn commit_all(workspace: &Path, message: &str) -> Result<()> {
+        git(workspace, &["add", "."])?;
+        git(workspace, &["commit", "-m", message])?;
+        Ok(())
+    }
 
     #[test]
     fn lane_planning_is_deterministic() {
@@ -413,5 +470,31 @@ mod tests {
         let lanes = plan_lanes("minor tweak");
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].name, "core");
+    }
+
+    #[test]
+    fn lane_patch_validation_rejects_git_mutation() {
+        let patch = "--- a/.git/config\n+++ b/.git/config\n@@ -1 +1 @@\n-a\n+b\n";
+        let err = validate_lane_patch_artifact(patch).expect_err("must reject .git patch");
+        assert!(err.to_string().contains(".git mutation forbidden"));
+    }
+
+    #[test]
+    fn lane_patch_validation_accepts_repo_relative_targets() {
+        let patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        validate_lane_patch_artifact(patch).expect("repo-relative patch should pass");
+    }
+
+    #[test]
+    fn apply_lane_patch_reports_conflict_on_context_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        init_git(temp.path()).expect("init git");
+        fs::write(temp.path().join("demo.txt"), "old\n").expect("seed file");
+        commit_all(temp.path(), "seed").expect("seed commit");
+
+        let patch = "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-missing\n+new\n";
+        let (applied, _conflicts) =
+            apply_lane_patch(temp.path(), patch, ApplyStrategy::Auto).expect("apply lane patch");
+        assert!(!applied, "mismatched context should not apply");
     }
 }

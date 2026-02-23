@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use deepseek_core::{
-    ChatMessage, EventEnvelope, EventKind, Plan, Session, SessionState, runtime_dir,
+    ChatMessage, EventEnvelope, EventKind, Plan, Session, SessionState,
+    parse_event_envelope_compat, parse_event_kind_compat, runtime_dir,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -1283,7 +1284,7 @@ impl Store {
             let mut session_run_ids = HashSet::new();
             for payload_row in event_rows {
                 let payload = payload_row?;
-                let Ok(kind) = serde_json::from_str::<EventKind>(&payload) else {
+                let Ok(kind) = parse_event_kind_compat(&payload) else {
                     continue;
                 };
                 match kind {
@@ -2151,7 +2152,7 @@ impl Store {
         let mut projection = RebuildProjection::default();
         for line in reader.lines() {
             let line = line?;
-            let event: EventEnvelope = serde_json::from_str(&line)?;
+            let event = parse_event_envelope_compat(&line)?;
             if event.session_id != session_id {
                 continue;
             }
@@ -2225,19 +2226,6 @@ impl Store {
                         command,
                         if *success { 1 } else { 0 },
                         output,
-                        Utc::now().to_rfc3339(),
-                    ],
-                )?;
-            }
-            EventKind::RouterDecisionV1 { decision } => {
-                conn.execute(
-                    "INSERT INTO router_stats (session_id, decision_id, selected_model, score, reasons, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        event.session_id.to_string(),
-                        decision.decision_id.to_string(),
-                        decision.selected_model,
-                        decision.score,
-                        decision.reason_codes.join(","),
                         Utc::now().to_rfc3339(),
                     ],
                 )?;
@@ -2743,7 +2731,6 @@ pub struct RebuildProjection {
     pub chat_messages: Vec<ChatMessage>,
     pub latest_plan: Option<Plan>,
     pub step_status: Vec<(Uuid, bool, String)>,
-    pub router_models: Vec<String>,
     pub staged_patches: Vec<Uuid>,
     pub applied_patches: Vec<Uuid>,
     pub tool_invocations: Vec<Uuid>,
@@ -2775,9 +2762,6 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             done,
             note,
         } => proj.step_status.push((*step_id, *done, note.clone())),
-        EventKind::RouterDecisionV1 { decision } => {
-            proj.router_models.push(decision.selected_model.clone())
-        }
         EventKind::PatchStagedV1 { patch_id, .. } => proj.staged_patches.push(*patch_id),
         EventKind::PatchAppliedV1 {
             patch_id, applied, ..
@@ -2824,8 +2808,6 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::PlanCreatedV1 { .. } => "PlanCreated@v1",
         EventKind::PlanRevisedV1 { .. } => "PlanRevised@v1",
         EventKind::StepMarkedV1 { .. } => "StepMarked@v1",
-        EventKind::RouterDecisionV1 { .. } => "RouterDecision@v1",
-        EventKind::RouterEscalationV1 { .. } => "RouterEscalation@v1",
         EventKind::ToolProposedV1 { .. } => "ToolProposed@v1",
         EventKind::ToolApprovedV1 { .. } => "ToolApproved@v1",
         EventKind::ToolResultV1 { .. } => "ToolResult@v1",

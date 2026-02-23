@@ -17,17 +17,32 @@
     "retry_base_ms": 400,
     "stream": true
   },
-  "router": {
-    "auto_max_think": true,
-    "threshold_high": 0.72,
-    "escalate_on_invalid_plan": true,
-    "max_escalations_per_unit": 1,
-    "w1": 0.2,
-    "w2": 0.15,
-    "w3": 0.2,
-    "w4": 0.15,
-    "w5": 0.2,
-    "w6": 0.1
+  "agent_loop": {
+    "max_iterations": 6,
+    "architect_parse_retries": 2,
+    "editor_parse_retries": 2,
+    "max_files_per_iteration": 12,
+    "max_file_bytes": 200000,
+    "max_diff_bytes": 400000,
+    "verify_timeout_seconds": 60,
+    "max_context_requests_per_iteration": 3,
+    "max_context_range_lines": 400,
+    "context_bootstrap_enabled": true,
+    "context_bootstrap_max_tree_entries": 120,
+    "context_bootstrap_max_readme_bytes": 24000,
+    "context_bootstrap_max_manifest_bytes": 16000,
+    "context_bootstrap_max_repo_map_lines": 80,
+    "context_bootstrap_max_audit_findings": 20,
+    "apply_strategy": "auto",
+    "failure_classifier": {
+      "repeat_threshold": 2,
+      "similarity_threshold": 0.8,
+      "fingerprint_lines": 40
+    },
+    "safety_gate": {
+      "max_files_without_approval": 8,
+      "max_loc_without_approval": 600
+    }
   },
   "policy": {
     "approve_edits": "ask",
@@ -107,7 +122,9 @@
     "enable_tui": true,
     "keybindings_path": "~/.deepseek/keybindings.json",
     "reduced_motion": false,
-    "statusline_mode": "minimal"
+    "statusline_mode": "minimal",
+    "image_fallback": "open",
+    "handoff_base_url": null
   },
   "experiments": {
     "visual_verification": false,

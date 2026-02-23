@@ -28,7 +28,6 @@ deepseek-core = { path = "../deepseek-core" }
 deepseek-diff = { path = "../deepseek-diff" }
 deepseek-index = { path = "../deepseek-index" }
 deepseek-policy = { path = "../deepseek-policy" }
-deepseek-router = { path = "../deepseek-router" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-tools = { path = "../deepseek-tools" }
 deepseek-ui = { path = "../deepseek-ui" }

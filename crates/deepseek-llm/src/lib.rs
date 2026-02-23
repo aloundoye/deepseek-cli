@@ -343,10 +343,6 @@ impl DeepSeekClient {
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
                         let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
-                        // Track whether we're inside a DSML markup block or a
-                        // plain-text tool call so we can buffer instead of emitting
-                        // to the TUI.
-                        let mut dsml_buffering = false;
                         // Suppress text display once structured tool_calls
                         // deltas arrive — the text fragments between tool calls
                         // are noise that confuses the TUI display.
@@ -390,19 +386,8 @@ impl DeepSeekClient {
                                 if let Some(content) = delta.get("content").and_then(|v| v.as_str())
                                 {
                                     content_out.push_str(content);
-                                    // Suppress DSML markup from the streaming
-                                    // display — buffer it instead of emitting.
-                                    if !dsml_buffering && contains_dsml_markup(content) {
-                                        dsml_buffering = true;
-                                    }
-                                    if !dsml_buffering && !has_structured_tool_calls {
-                                        // Check if accumulated content started
-                                        // a DSML block we missed on earlier chunks.
-                                        if contains_dsml_markup(&content_out) {
-                                            dsml_buffering = true;
-                                        } else {
-                                            cb(StreamChunk::ContentDelta(content.to_string()));
-                                        }
+                                    if !has_structured_tool_calls {
+                                        cb(StreamChunk::ContentDelta(content.to_string()));
                                     }
                                 }
                                 if let Some(reasoning) =
@@ -1181,18 +1166,6 @@ fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
             })
         })
         .collect()
-}
-
-/// Marker substrings for DSML-style raw markup in streamed content. We suppress
-/// these fragments from text streaming output instead of attempting tool rescue.
-const DSML_MARKERS: &[&str] = &[
-    "\u{ff5c}DSML\u{ff5c}",                           // ｜DSML｜
-    "\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}", // ｜tool▁calls▁begin｜
-];
-
-/// Returns `true` when a stream chunk appears to contain raw DSML markup.
-fn contains_dsml_markup(content: &str) -> bool {
-    DSML_MARKERS.iter().any(|marker| content.contains(marker))
 }
 
 #[cfg(test)]

@@ -144,58 +144,10 @@ pub struct PlanStep {
     pub done: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouterSignals {
-    pub prompt_complexity: f32,
-    pub repo_breadth: f32,
-    pub failure_streak: f32,
-    pub verification_failures: f32,
-    pub low_confidence: f32,
-    pub ambiguity_flags: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouterWeights {
-    pub w1: f32,
-    pub w2: f32,
-    pub w3: f32,
-    pub w4: f32,
-    pub w5: f32,
-    pub w6: f32,
-}
-
-impl Default for RouterWeights {
-    fn default() -> Self {
-        Self {
-            w1: 0.2,
-            w2: 0.15,
-            w3: 0.2,
-            w4: 0.15,
-            w5: 0.2,
-            w6: 0.1,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmUnit {
     Planner,
     Executor,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouterDecision {
-    pub decision_id: Uuid,
-    pub reason_codes: Vec<String>,
-    pub selected_model: String,
-    pub confidence: f32,
-    pub score: f32,
-    pub escalated: bool,
-    /// When true, thinking mode should be enabled on the chat model.
-    /// This replaces routing to `deepseek-reasoner` — instead we use
-    /// `deepseek-chat` with `thinking: {type: "enabled", budget_tokens: N}`.
-    #[serde(default)]
-    pub thinking_enabled: bool,
 }
 
 /// Type-safe tool name enum covering all built-in tools.
@@ -573,6 +525,59 @@ pub struct EventEnvelope {
     pub kind: EventKind,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RawEventEnvelope {
+    seq_no: u64,
+    at: DateTime<Utc>,
+    session_id: Uuid,
+    kind: serde_json::Value,
+}
+
+fn parse_event_kind_compat_value(kind_value: serde_json::Value) -> Result<EventKind> {
+    if let Ok(kind) = serde_json::from_value::<EventKind>(kind_value.clone()) {
+        return Ok(kind);
+    }
+    let kind_obj = kind_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid event kind shape"))?;
+    let kind_type = kind_obj
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let payload = kind_obj
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    match kind_type {
+        "RouterDecisionV1" => Ok(EventKind::TelemetryEventV1 {
+            name: "legacy.router_decision".to_string(),
+            properties: payload,
+        }),
+        "RouterEscalationV1" => Ok(EventKind::TelemetryEventV1 {
+            name: "legacy.router_escalation".to_string(),
+            properties: payload,
+        }),
+        _ => Err(anyhow::anyhow!("unknown event kind type: {kind_type}")),
+    }
+}
+
+/// Parse an `EventKind` payload with read compatibility for removed router events.
+pub fn parse_event_kind_compat(raw: &str) -> Result<EventKind> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    parse_event_kind_compat_value(value)
+}
+
+/// Parse an `EventEnvelope` line with read compatibility for removed router events.
+pub fn parse_event_envelope_compat(raw: &str) -> Result<EventEnvelope> {
+    let envelope: RawEventEnvelope = serde_json::from_str(raw)?;
+    Ok(EventEnvelope {
+        seq_no: envelope.seq_no,
+        at: envelope.at,
+        session_id: envelope.session_id,
+        kind: parse_event_kind_compat_value(envelope.kind)?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
@@ -598,12 +603,6 @@ pub enum EventKind {
         step_id: Uuid,
         done: bool,
         note: String,
-    },
-    RouterDecisionV1 {
-        decision: RouterDecision,
-    },
-    RouterEscalationV1 {
-        reason_codes: Vec<String>,
     },
     ToolProposedV1 {
         proposal: ToolProposal,
@@ -958,10 +957,8 @@ impl EventKind {
             | Self::TaskUpdatedV1 { .. }
             | Self::TaskDeletedV1 { .. } => "task",
 
-            // Routing / model selection
-            Self::RouterDecisionV1 { .. }
-            | Self::RouterEscalationV1 { .. }
-            | Self::ProviderSelectedV1 { .. } => "router",
+            // Model/provider selection
+            Self::ProviderSelectedV1 { .. } => "model",
 
             // Patches (diff/apply)
             Self::PatchStagedV1 { .. } | Self::PatchAppliedV1 { .. } => "patch",
@@ -1075,10 +1072,6 @@ impl EventKind {
     pub fn is_session_event(&self) -> bool {
         self.category() == "session"
     }
-}
-
-pub trait ModelRouter {
-    fn select(&self, unit: LlmUnit, signals: RouterSignals) -> RouterDecision;
 }
 
 pub trait ToolHost {
@@ -1356,7 +1349,6 @@ pub struct ChatRequest {
 #[serde(default)]
 pub struct AppConfig {
     pub llm: LlmConfig,
-    pub router: RouterConfig,
     pub agent_loop: AgentLoopConfig,
     pub policy: PolicyConfig,
     pub tools: ToolsConfig,
@@ -1447,6 +1439,24 @@ fn default_agent_loop_max_context_requests_per_iteration() -> u64 {
 }
 fn default_agent_loop_max_context_range_lines() -> u64 {
     400
+}
+fn default_agent_loop_context_bootstrap_enabled() -> bool {
+    true
+}
+fn default_agent_loop_context_bootstrap_max_tree_entries() -> u64 {
+    120
+}
+fn default_agent_loop_context_bootstrap_max_readme_bytes() -> u64 {
+    24_000
+}
+fn default_agent_loop_context_bootstrap_max_manifest_bytes() -> u64 {
+    16_000
+}
+fn default_agent_loop_context_bootstrap_max_repo_map_lines() -> u64 {
+    80
+}
+fn default_agent_loop_context_bootstrap_max_audit_findings() -> u64 {
+    20
 }
 fn default_failure_classifier_repeat_threshold() -> u64 {
     2
@@ -1631,34 +1641,6 @@ impl Default for LlmConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RouterConfig {
-    pub auto_max_think: bool,
-    pub threshold_high: f32,
-    pub w1: f32,
-    pub w2: f32,
-    pub w3: f32,
-    pub w4: f32,
-    pub w5: f32,
-    pub w6: f32,
-}
-
-impl Default for RouterConfig {
-    fn default() -> Self {
-        Self {
-            auto_max_think: true,
-            threshold_high: 0.72,
-            w1: 0.2,
-            w2: 0.15,
-            w3: 0.2,
-            w4: 0.15,
-            w5: 0.2,
-            w6: 0.1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AgentLoopConfig {
     #[serde(default = "default_agent_loop_max_iterations")]
     pub max_iterations: u64,
@@ -1678,6 +1660,18 @@ pub struct AgentLoopConfig {
     pub max_context_requests_per_iteration: u64,
     #[serde(default = "default_agent_loop_max_context_range_lines")]
     pub max_context_range_lines: u64,
+    #[serde(default = "default_agent_loop_context_bootstrap_enabled")]
+    pub context_bootstrap_enabled: bool,
+    #[serde(default = "default_agent_loop_context_bootstrap_max_tree_entries")]
+    pub context_bootstrap_max_tree_entries: u64,
+    #[serde(default = "default_agent_loop_context_bootstrap_max_readme_bytes")]
+    pub context_bootstrap_max_readme_bytes: u64,
+    #[serde(default = "default_agent_loop_context_bootstrap_max_manifest_bytes")]
+    pub context_bootstrap_max_manifest_bytes: u64,
+    #[serde(default = "default_agent_loop_context_bootstrap_max_repo_map_lines")]
+    pub context_bootstrap_max_repo_map_lines: u64,
+    #[serde(default = "default_agent_loop_context_bootstrap_max_audit_findings")]
+    pub context_bootstrap_max_audit_findings: u64,
     #[serde(default)]
     pub failure_classifier: FailureClassifierConfig,
     #[serde(default)]
@@ -1699,6 +1693,17 @@ impl Default for AgentLoopConfig {
             max_context_requests_per_iteration:
                 default_agent_loop_max_context_requests_per_iteration(),
             max_context_range_lines: default_agent_loop_max_context_range_lines(),
+            context_bootstrap_enabled: default_agent_loop_context_bootstrap_enabled(),
+            context_bootstrap_max_tree_entries:
+                default_agent_loop_context_bootstrap_max_tree_entries(),
+            context_bootstrap_max_readme_bytes:
+                default_agent_loop_context_bootstrap_max_readme_bytes(),
+            context_bootstrap_max_manifest_bytes:
+                default_agent_loop_context_bootstrap_max_manifest_bytes(),
+            context_bootstrap_max_repo_map_lines:
+                default_agent_loop_context_bootstrap_max_repo_map_lines(),
+            context_bootstrap_max_audit_findings:
+                default_agent_loop_context_bootstrap_max_audit_findings(),
             failure_classifier: FailureClassifierConfig::default(),
             safety_gate: SafetyGateConfig::default(),
             apply_strategy: ApplyStrategy::default(),
@@ -2566,5 +2571,36 @@ mod tests {
         assert!(!events[0].is_tool_event());
         assert!(events[2].is_tool_event());
         assert!(!events[2].is_session_event());
+    }
+
+    #[test]
+    fn parse_event_kind_compat_maps_legacy_router_event() {
+        let raw = r#"{"type":"RouterDecisionV1","payload":{"decision":"v3","score":0.91}}"#;
+        let kind = parse_event_kind_compat(raw).expect("compat parse");
+        match kind {
+            EventKind::TelemetryEventV1 { name, properties } => {
+                assert_eq!(name, "legacy.router_decision");
+                assert_eq!(properties["decision"], "v3");
+                assert_eq!(properties["score"], 0.91);
+            }
+            other => panic!("unexpected mapped kind: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_event_envelope_compat_maps_legacy_router_event() {
+        let session_id = Uuid::now_v7();
+        let raw = format!(
+            r#"{{"seq_no":7,"at":"2026-02-23T00:00:00Z","session_id":"{}","kind":{{"type":"RouterEscalationV1","payload":{{"reason":"repeat failures"}}}}}}"#,
+            session_id
+        );
+        let envelope = parse_event_envelope_compat(&raw).expect("compat envelope parse");
+        match envelope.kind {
+            EventKind::TelemetryEventV1 { name, properties } => {
+                assert_eq!(name, "legacy.router_escalation");
+                assert_eq!(properties["reason"], "repeat failures");
+            }
+            other => panic!("unexpected mapped kind: {:?}", other),
+        }
     }
 }
