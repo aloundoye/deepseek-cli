@@ -35,6 +35,14 @@ pub struct PatchStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitApplyStrategy {
+    /// Try plain apply first, then fallback to 3-way merge.
+    Auto,
+    /// Use git's 3-way strategy directly.
+    ThreeWay,
+}
+
 impl PatchStore {
     pub fn new(workspace: &Path) -> Result<Self> {
         let root = runtime_dir(workspace).join("patches");
@@ -84,6 +92,15 @@ impl PatchStore {
     }
 
     pub fn apply(&self, workspace: &Path, patch_id: Uuid) -> Result<(bool, Vec<String>)> {
+        self.apply_with_strategy(workspace, patch_id, GitApplyStrategy::ThreeWay)
+    }
+
+    pub fn apply_with_strategy(
+        &self,
+        workspace: &Path,
+        patch_id: Uuid,
+        strategy: GitApplyStrategy,
+    ) -> Result<(bool, Vec<String>)> {
         let mut patch = self.read_patch(patch_id)?;
         patch.apply_attempts = patch.apply_attempts.saturating_add(1);
         let current_base_sha = hash_workspace_state(workspace, &patch.target_files)?;
@@ -93,13 +110,43 @@ impl PatchStore {
 
         let diff_path = self.root.join(format!("{}.diff", patch_id));
 
-        let output = Command::new("git")
-            .arg("apply")
-            .arg("--3way")
-            .arg(&diff_path)
-            .current_dir(workspace)
-            .output()
-            .context("failed to execute git apply")?;
+        let run_apply = |use_three_way: bool| -> Result<std::process::Output> {
+            let mut cmd = Command::new("git");
+            cmd.arg("apply");
+            if use_three_way {
+                cmd.arg("--3way");
+            }
+            cmd.arg(&diff_path);
+            cmd.current_dir(workspace);
+            cmd.output().context("failed to execute git apply")
+        };
+
+        let output = match strategy {
+            GitApplyStrategy::ThreeWay => run_apply(true)?,
+            GitApplyStrategy::Auto => {
+                let plain = run_apply(false)?;
+                if plain.status.success() {
+                    plain
+                } else {
+                    let fallback = run_apply(true)?;
+                    if fallback.status.success() {
+                        fallback
+                    } else {
+                        let mut merged = fallback;
+                        if !plain.stderr.is_empty() {
+                            let mut stderr = String::from_utf8_lossy(&plain.stderr).to_string();
+                            if !stderr.ends_with('\n') {
+                                stderr.push('\n');
+                            }
+                            stderr.push_str("--- fallback --3way failed ---\n");
+                            stderr.push_str(&String::from_utf8_lossy(&merged.stderr));
+                            merged.stderr = stderr.into_bytes();
+                        }
+                        merged
+                    }
+                }
+            }
+        };
 
         if output.status.success() {
             patch.applied = true;

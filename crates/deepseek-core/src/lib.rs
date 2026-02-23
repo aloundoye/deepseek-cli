@@ -1442,6 +1442,27 @@ fn default_agent_loop_max_diff_bytes() -> u64 {
 fn default_agent_loop_verify_timeout_seconds() -> u64 {
     60
 }
+fn default_agent_loop_max_context_requests_per_iteration() -> u64 {
+    3
+}
+fn default_agent_loop_max_context_range_lines() -> u64 {
+    400
+}
+fn default_failure_classifier_repeat_threshold() -> u64 {
+    2
+}
+fn default_failure_classifier_similarity_threshold() -> f32 {
+    0.8
+}
+fn default_failure_classifier_fingerprint_lines() -> u64 {
+    40
+}
+fn default_safety_gate_max_files_without_approval() -> u64 {
+    8
+}
+fn default_safety_gate_max_loc_without_approval() -> u64 {
+    600
+}
 
 impl AppConfig {
     pub fn user_settings_path() -> Option<PathBuf> {
@@ -1653,6 +1674,16 @@ pub struct AgentLoopConfig {
     pub max_diff_bytes: u64,
     #[serde(default = "default_agent_loop_verify_timeout_seconds")]
     pub verify_timeout_seconds: u64,
+    #[serde(default = "default_agent_loop_max_context_requests_per_iteration")]
+    pub max_context_requests_per_iteration: u64,
+    #[serde(default = "default_agent_loop_max_context_range_lines")]
+    pub max_context_range_lines: u64,
+    #[serde(default)]
+    pub failure_classifier: FailureClassifierConfig,
+    #[serde(default)]
+    pub safety_gate: SafetyGateConfig,
+    #[serde(default)]
+    pub apply_strategy: ApplyStrategy,
 }
 
 impl Default for AgentLoopConfig {
@@ -1665,8 +1696,61 @@ impl Default for AgentLoopConfig {
             max_file_bytes: default_agent_loop_max_file_bytes(),
             max_diff_bytes: default_agent_loop_max_diff_bytes(),
             verify_timeout_seconds: default_agent_loop_verify_timeout_seconds(),
+            max_context_requests_per_iteration:
+                default_agent_loop_max_context_requests_per_iteration(),
+            max_context_range_lines: default_agent_loop_max_context_range_lines(),
+            failure_classifier: FailureClassifierConfig::default(),
+            safety_gate: SafetyGateConfig::default(),
+            apply_strategy: ApplyStrategy::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FailureClassifierConfig {
+    #[serde(default = "default_failure_classifier_repeat_threshold")]
+    pub repeat_threshold: u64,
+    #[serde(default = "default_failure_classifier_similarity_threshold")]
+    pub similarity_threshold: f32,
+    #[serde(default = "default_failure_classifier_fingerprint_lines")]
+    pub fingerprint_lines: u64,
+}
+
+impl Default for FailureClassifierConfig {
+    fn default() -> Self {
+        Self {
+            repeat_threshold: default_failure_classifier_repeat_threshold(),
+            similarity_threshold: default_failure_classifier_similarity_threshold(),
+            fingerprint_lines: default_failure_classifier_fingerprint_lines(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SafetyGateConfig {
+    #[serde(default = "default_safety_gate_max_files_without_approval")]
+    pub max_files_without_approval: u64,
+    #[serde(default = "default_safety_gate_max_loc_without_approval")]
+    pub max_loc_without_approval: u64,
+}
+
+impl Default for SafetyGateConfig {
+    fn default() -> Self {
+        Self {
+            max_files_without_approval: default_safety_gate_max_files_without_approval(),
+            max_loc_without_approval: default_safety_gate_max_loc_without_approval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStrategy {
+    #[default]
+    Auto,
+    ThreeWay,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

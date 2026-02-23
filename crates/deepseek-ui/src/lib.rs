@@ -5,7 +5,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -1135,6 +1135,10 @@ fn render_diff_line(line: &str) -> Line<'static> {
 const DIFF_CONTEXT_COLLAPSE_THRESHOLD: usize = 12;
 const DIFF_CONTEXT_KEEP_HEAD: usize = 2;
 const DIFF_CONTEXT_KEEP_TAIL: usize = 2;
+const INPUT_MIN_HEIGHT: u16 = 1;
+const INPUT_MAX_HEIGHT: u16 = 4;
+const STREAM_MIN_HEIGHT: u16 = 1;
+const INLINE_VIEWPORT_HEIGHT: u16 = INPUT_MAX_HEIGHT + STREAM_MIN_HEIGHT + 3;
 
 fn flush_diff_context_run(
     run: &mut Vec<String>,
@@ -1168,6 +1172,57 @@ fn flush_diff_context_run(
         }
     }
     run.clear();
+}
+
+fn wrapped_line_height(line: &Line<'_>, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let width = width as usize;
+    let content_width = line.width().max(1);
+    let rows = (content_width.saturating_sub(1) / width) + 1;
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+fn wrapped_text_rows(text: &str, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let width = width as usize;
+    let mut rows = 0usize;
+    for segment in text.split('\n') {
+        let len = segment.chars().count();
+        rows = rows.saturating_add((len.saturating_sub(1) / width) + 1);
+    }
+    rows.max(1)
+}
+
+fn scroll_to_keep_row_visible(row: usize, viewport_rows: u16) -> u16 {
+    if viewport_rows == 0 {
+        return 0;
+    }
+    row.saturating_sub(viewport_rows.saturating_sub(1) as usize)
+        .min(u16::MAX as usize) as u16
+}
+
+fn compute_inline_heights(total_height: u16, desired_input_rows: usize) -> (u16, u16) {
+    // Reserve 3 fixed rows: separator above input, separator below input, and status line.
+    let dynamic_rows = total_height.saturating_sub(3);
+    if dynamic_rows == 0 {
+        return (0, 0);
+    }
+    if dynamic_rows == 1 {
+        return (1, 0);
+    }
+
+    let desired_input =
+        desired_input_rows.clamp(INPUT_MIN_HEIGHT as usize, INPUT_MAX_HEIGHT as usize) as u16;
+    let max_input_by_space = dynamic_rows.saturating_sub(STREAM_MIN_HEIGHT);
+    let input_height = desired_input.min(max_input_by_space).max(INPUT_MIN_HEIGHT);
+    let stream_height = dynamic_rows
+        .saturating_sub(input_height)
+        .max(STREAM_MIN_HEIGHT);
+    (stream_height, input_height)
 }
 
 fn truncate_inline(text: &str, max_chars: usize) -> String {
@@ -1398,6 +1453,92 @@ fn style_continuation_line(
     Line::from(vec![Span::styled(format!("  {text}"), body_style)])
 }
 
+fn split_inline_markdown_blocks(text: &str) -> Vec<String> {
+    if text.is_empty() || text.starts_with("```") {
+        return vec![text.to_string()];
+    }
+
+    let mut breakpoints: Vec<usize> = Vec::new();
+    let bytes = text.as_bytes();
+
+    for (idx, ch) in text.char_indices() {
+        if idx == 0 {
+            continue;
+        }
+
+        // Split inline headings like "intro:## Heading" into two logical lines.
+        if ch == '#' {
+            if bytes.get(idx.saturating_sub(1)) == Some(&b'#') {
+                continue;
+            }
+            let mut j = idx;
+            while j < bytes.len() && bytes[j] == b'#' && (j - idx) < 6 {
+                j += 1;
+            }
+            let run_len = j.saturating_sub(idx);
+            if (2..=6).contains(&run_len)
+                && let Some(next) = text[j..].chars().next()
+                && (next == ' ' || next.is_alphanumeric())
+            {
+                let prefix = text[..idx].trim_end();
+                let inline_code_ticks = text[..idx].chars().filter(|c| *c == '`').count();
+                if !prefix.is_empty() && inline_code_ticks % 2 == 0 {
+                    breakpoints.push(idx);
+                    continue;
+                }
+            }
+        }
+
+        // Split inline ordered list starts like "Strengths ✅ 1. Item".
+        if ch.is_ascii_digit() {
+            let mut j = idx;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && (j - idx) < 3 {
+                j += 1;
+            }
+            if j > idx
+                && bytes.get(j) == Some(&b'.')
+                && bytes.get(j + 1) == Some(&b' ')
+                && let Some(prev) = text[..idx].chars().next_back()
+                && (prev.is_whitespace() || "✅✔☑☐•-".contains(prev))
+            {
+                let prefix = text[..idx].trim_end();
+                if !prefix.is_empty() {
+                    breakpoints.push(idx);
+                }
+            }
+        }
+    }
+
+    breakpoints.sort_unstable();
+    breakpoints.dedup();
+    if breakpoints.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut out = Vec::with_capacity(breakpoints.len() + 1);
+    let mut start = 0usize;
+    for bp in breakpoints {
+        if bp <= start || bp >= text.len() {
+            continue;
+        }
+        let segment = text[start..bp].trim_end();
+        if !segment.is_empty() {
+            out.push(segment.to_string());
+        }
+        start = bp;
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+
+    if out.is_empty() {
+        vec![text.to_string()]
+    } else {
+        out
+    }
+}
+
 fn is_plan_list_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
@@ -1415,6 +1556,46 @@ fn is_plan_list_line(line: &str) -> bool {
         break;
     }
     false
+}
+
+fn insert_wrapped_lines_above(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    lines: &[Line<'static>],
+) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let viewport_width = terminal.size()?.width.max(1);
+    let height = lines
+        .iter()
+        .map(|line| wrapped_line_height(line, viewport_width) as u32)
+        .sum::<u32>()
+        .min(u16::MAX as u32) as u16;
+    if height == 0 {
+        return Ok(());
+    }
+    terminal.insert_before(height, |buf| {
+        let area = buf.area;
+        let bottom = area.y.saturating_add(area.height);
+        let mut y = area.y;
+        for line in lines {
+            if y >= bottom {
+                break;
+            }
+            let logical_height = wrapped_line_height(line, area.width).max(1);
+            let remaining = bottom.saturating_sub(y);
+            let render_height = logical_height.min(remaining);
+            if render_height == 0 {
+                break;
+            }
+            let line_area = Rect::new(area.x, y, area.width, render_height);
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .render(line_area, buf);
+            y = y.saturating_add(logical_height);
+        }
+    })?;
+    Ok(())
 }
 
 /// Flush new transcript entries above the inline viewport into native terminal scrollback.
@@ -1452,68 +1633,77 @@ fn flush_transcript_above(
         }
     }
     for entry in new_entries {
-        for (i, sub_text) in entry.text.split('\n').enumerate() {
-            let sub_entry = TranscriptEntry {
-                kind: entry.kind,
-                text: sub_text.to_string(),
-            };
-            if collapse_plan
-                && sub_entry.kind == MessageKind::Assistant
-                && !in_code_block
-                && is_plan_list_line(&sub_entry.text)
-            {
-                collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
-                continue;
-            }
-            let is_fence =
-                sub_entry.kind == MessageKind::Assistant && sub_entry.text.starts_with("```");
-            if is_fence
-                || sub_entry.kind != MessageKind::Assistant
-                || !in_code_block
-                || !in_diff_block
-            {
-                flush_diff_context_run(
-                    &mut diff_context_run,
-                    &mut lines,
-                    DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-                    DIFF_CONTEXT_KEEP_HEAD,
-                    DIFF_CONTEXT_KEEP_TAIL,
-                );
-            }
-            if sub_entry.kind == MessageKind::Assistant
-                && in_code_block
-                && in_diff_block
-                && sub_entry.text.starts_with(' ')
-                && !is_fence
-            {
-                diff_context_run.push(sub_entry.text.clone());
-                continue;
-            }
-            if sub_entry.kind == MessageKind::Assistant && is_fence {
-                if !in_code_block {
-                    in_code_block = true;
-                    in_diff_block = code_fence_starts_diff(&sub_entry.text);
-                    code_block_lang = extract_fence_lang(&sub_entry.text).to_string();
-                } else {
-                    in_code_block = false;
-                    in_diff_block = false;
-                    code_block_lang.clear();
-                }
-            }
-            if i == 0 {
-                lines.push(style_transcript_line(
-                    &sub_entry,
-                    in_code_block,
-                    in_diff_block,
-                    &code_block_lang,
-                ));
+        let mut rendered_first_line = false;
+        for sub_text in entry.text.split('\n') {
+            let logical_lines = if entry.kind == MessageKind::Assistant && !in_code_block {
+                split_inline_markdown_blocks(sub_text)
             } else {
-                lines.push(style_continuation_line(
-                    &sub_entry,
-                    in_code_block,
-                    in_diff_block,
-                    &code_block_lang,
-                ));
+                vec![sub_text.to_string()]
+            };
+            for logical_text in logical_lines {
+                let sub_entry = TranscriptEntry {
+                    kind: entry.kind,
+                    text: logical_text,
+                };
+                if collapse_plan
+                    && sub_entry.kind == MessageKind::Assistant
+                    && !in_code_block
+                    && is_plan_list_line(&sub_entry.text)
+                {
+                    collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
+                    continue;
+                }
+                let is_fence =
+                    sub_entry.kind == MessageKind::Assistant && sub_entry.text.starts_with("```");
+                if is_fence
+                    || sub_entry.kind != MessageKind::Assistant
+                    || !in_code_block
+                    || !in_diff_block
+                {
+                    flush_diff_context_run(
+                        &mut diff_context_run,
+                        &mut lines,
+                        DIFF_CONTEXT_COLLAPSE_THRESHOLD,
+                        DIFF_CONTEXT_KEEP_HEAD,
+                        DIFF_CONTEXT_KEEP_TAIL,
+                    );
+                }
+                if sub_entry.kind == MessageKind::Assistant
+                    && in_code_block
+                    && in_diff_block
+                    && sub_entry.text.starts_with(' ')
+                    && !is_fence
+                {
+                    diff_context_run.push(sub_entry.text.clone());
+                    continue;
+                }
+                if sub_entry.kind == MessageKind::Assistant && is_fence {
+                    if !in_code_block {
+                        in_code_block = true;
+                        in_diff_block = code_fence_starts_diff(&sub_entry.text);
+                        code_block_lang = extract_fence_lang(&sub_entry.text).to_string();
+                    } else {
+                        in_code_block = false;
+                        in_diff_block = false;
+                        code_block_lang.clear();
+                    }
+                }
+                if !rendered_first_line {
+                    lines.push(style_transcript_line(
+                        &sub_entry,
+                        in_code_block,
+                        in_diff_block,
+                        &code_block_lang,
+                    ));
+                    rendered_first_line = true;
+                } else {
+                    lines.push(style_continuation_line(
+                        &sub_entry,
+                        in_code_block,
+                        in_diff_block,
+                        &code_block_lang,
+                    ));
+                }
             }
         }
     }
@@ -1536,21 +1726,7 @@ fn flush_transcript_above(
         )]));
     }
     *last_printed_idx = shell.transcript.len();
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let height = lines.len() as u16;
-    terminal.insert_before(height, |buf| {
-        let area = buf.area;
-        for (i, line) in lines.iter().enumerate() {
-            if i as u16 >= area.height {
-                break;
-            }
-            let line_area = Rect::new(area.x, area.y + i as u16, area.width, 1);
-            Paragraph::new(line.clone()).render(line_area, buf);
-        }
-    })?;
-    Ok(())
+    insert_wrapped_lines_above(terminal, &lines)
 }
 
 /// Flush complete lines from the streaming buffer into native scrollback.
@@ -1576,56 +1752,63 @@ fn flush_streaming_lines(
     let mut diff_context_run: Vec<String> = Vec::new();
     let mut collapsed_plan_lines = 0usize;
     for line_text in &lines_text {
-        if collapse_plan && !*in_code_block && is_plan_list_line(line_text) {
-            collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
-            continue;
-        }
-        let is_fence = line_text.starts_with("```");
-        if is_fence || !*in_code_block || !*in_diff_block {
-            flush_diff_context_run(
-                &mut diff_context_run,
-                &mut styled_lines,
-                DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-                DIFF_CONTEXT_KEEP_HEAD,
-                DIFF_CONTEXT_KEEP_TAIL,
-            );
-        }
-        if *in_code_block && *in_diff_block && line_text.starts_with(' ') && !is_fence {
-            diff_context_run.push((*line_text).to_string());
-            continue;
-        }
-        if let Some(entry) = parse_stream_meta_entry(line_text) {
-            flush_diff_context_run(
-                &mut diff_context_run,
-                &mut styled_lines,
-                DIFF_CONTEXT_COLLAPSE_THRESHOLD,
-                DIFF_CONTEXT_KEEP_HEAD,
-                DIFF_CONTEXT_KEEP_TAIL,
-            );
-            styled_lines.push(style_transcript_line(&entry, false, false, ""));
-            continue;
-        }
-        let entry = TranscriptEntry {
-            kind: MessageKind::Assistant,
-            text: line_text.to_string(),
+        let logical_lines = if !*in_code_block {
+            split_inline_markdown_blocks(line_text)
+        } else {
+            vec![(*line_text).to_string()]
         };
-        if entry.text.starts_with("```") {
-            if !*in_code_block {
-                *in_code_block = true;
-                *in_diff_block = code_fence_starts_diff(&entry.text);
-                *code_block_lang = extract_fence_lang(&entry.text).to_string();
-            } else {
-                *in_code_block = false;
-                *in_diff_block = false;
-                code_block_lang.clear();
+        for logical_text in logical_lines {
+            if collapse_plan && !*in_code_block && is_plan_list_line(&logical_text) {
+                collapsed_plan_lines = collapsed_plan_lines.saturating_add(1);
+                continue;
             }
+            let is_fence = logical_text.starts_with("```");
+            if is_fence || !*in_code_block || !*in_diff_block {
+                flush_diff_context_run(
+                    &mut diff_context_run,
+                    &mut styled_lines,
+                    DIFF_CONTEXT_COLLAPSE_THRESHOLD,
+                    DIFF_CONTEXT_KEEP_HEAD,
+                    DIFF_CONTEXT_KEEP_TAIL,
+                );
+            }
+            if *in_code_block && *in_diff_block && logical_text.starts_with(' ') && !is_fence {
+                diff_context_run.push(logical_text);
+                continue;
+            }
+            if let Some(entry) = parse_stream_meta_entry(&logical_text) {
+                flush_diff_context_run(
+                    &mut diff_context_run,
+                    &mut styled_lines,
+                    DIFF_CONTEXT_COLLAPSE_THRESHOLD,
+                    DIFF_CONTEXT_KEEP_HEAD,
+                    DIFF_CONTEXT_KEEP_TAIL,
+                );
+                styled_lines.push(style_transcript_line(&entry, false, false, ""));
+                continue;
+            }
+            let entry = TranscriptEntry {
+                kind: MessageKind::Assistant,
+                text: logical_text,
+            };
+            if entry.text.starts_with("```") {
+                if !*in_code_block {
+                    *in_code_block = true;
+                    *in_diff_block = code_fence_starts_diff(&entry.text);
+                    *code_block_lang = extract_fence_lang(&entry.text).to_string();
+                } else {
+                    *in_code_block = false;
+                    *in_diff_block = false;
+                    code_block_lang.clear();
+                }
+            }
+            styled_lines.push(style_transcript_line(
+                &entry,
+                *in_code_block,
+                *in_diff_block,
+                code_block_lang,
+            ));
         }
-        styled_lines.push(style_transcript_line(
-            &entry,
-            *in_code_block,
-            *in_diff_block,
-            code_block_lang,
-        ));
     }
     flush_diff_context_run(
         &mut diff_context_run,
@@ -1645,21 +1828,7 @@ fn flush_streaming_lines(
                 .add_modifier(Modifier::ITALIC),
         )]));
     }
-    if styled_lines.is_empty() {
-        return Ok(());
-    }
-    let height = styled_lines.len() as u16;
-    terminal.insert_before(height, |buf| {
-        let area = buf.area;
-        for (i, line) in styled_lines.iter().enumerate() {
-            if i as u16 >= area.height {
-                break;
-            }
-            let line_area = Rect::new(area.x, area.y + i as u16, area.width, 1);
-            Paragraph::new(line.clone()).render(line_area, buf);
-        }
-    })?;
-    Ok(())
+    insert_wrapped_lines_above(terminal, &styled_lines)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2236,13 +2405,13 @@ where
     let _guard = TerminalGuard;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
-    // Inline viewport: only the bottom 5 lines are managed by ratatui
-    // (streaming partial line + separator + input + separator + status).
+    // Inline viewport: bottom rows managed by ratatui
+    // (streaming partial line + separator + multi-line input + separator + status).
     // Everything above is native terminal scrollback.
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(5),
+            viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
         },
     )?;
 
@@ -2309,16 +2478,71 @@ where
 
         terminal.draw(|frame| {
             let area = frame.area();
-            // Inline viewport is 5 lines:
-            //   Row 0: streaming partial line (current incomplete line being received)
-            //   Row 1: separator ─────
-            //   Row 2: input prompt "> ..."
-            //   Row 3: separator ─────
-            //   Row 4: status bar
+            if area.width == 0 || area.height < 3 {
+                return;
+            }
+            // Inline viewport rows:
+            //   Row 0..A: stream partial output
+            //   Row A+1: separator ─────
+            //   Row A+2..B: multi-line input prompt
+            //   Row B+1: separator ─────
+            //   Row B+2: status bar
             let width = area.width;
+            let (prompt_str, prompt_style) = if vim_enabled {
+                match vim_mode {
+                    VimMode::Normal => (
+                        ": ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    VimMode::Visual => (
+                        ": ",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    VimMode::Command => (
+                        ": ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    VimMode::Insert => (
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                }
+            } else {
+                (
+                    "> ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
+            let desired_input_rows = if pending_approval.is_some() || reverse_search_active {
+                INPUT_MIN_HEIGHT as usize
+            } else if vim_enabled && vim_mode == VimMode::Command {
+                wrapped_text_rows(
+                    &format!("{prompt_str}:{}{}", vim_command_buffer, cursor_ch),
+                    width,
+                )
+            } else {
+                let before = &input[..cursor_pos.min(input.len())];
+                wrapped_text_rows(&format!("{prompt_str}{before}{cursor_ch}"), width)
+            };
+            let (stream_height, input_height) = compute_inline_heights(area.height, desired_input_rows);
+            let stream_area = Rect::new(area.x, area.y, width, stream_height);
+            let sep_area = Rect::new(area.x, area.y + stream_height, width, 1);
+            let input_area = Rect::new(area.x, sep_area.y + 1, width, input_height);
+            let sep2_y = input_area.y + input_area.height;
+            let status_y = sep2_y + 1;
 
-            // Row 0: current streaming partial line (or blank when idle)
-            let stream_area = Rect::new(area.x, area.y, width, 1);
+            // Row 0..A: current streaming partial line(s) (or blank when idle)
             if let Some((tool_name, args_summary, _)) = pending_approval.as_ref() {
                 let compact_args = truncate_inline(&args_summary.replace('\n', " "), 72);
                 let banner = format!(
@@ -2331,12 +2555,13 @@ where
                 };
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![Span::styled(
-                        truncate_inline(&banner, width.saturating_sub(1) as usize),
+                        banner,
                         Style::default()
                             .fg(Color::Black)
                             .bg(bg)
                             .add_modifier(Modifier::BOLD),
-                    )])),
+                    )]))
+                    .wrap(Wrap { trim: false }),
                     stream_area,
                 );
             } else if !streaming_buffer.is_empty() {
@@ -2353,17 +2578,24 @@ where
                         render_assistant_markdown(&partial_entry.text)
                     }
                 };
-                frame.render_widget(Paragraph::new(styled), stream_area);
+                let scroll_y = scroll_to_keep_row_visible(
+                    wrapped_text_rows(&streaming_buffer, stream_area.width).saturating_sub(1),
+                    stream_area.height,
+                );
+                frame.render_widget(
+                    Paragraph::new(styled)
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll_y, 0)),
+                    stream_area,
+                );
             } else if shell.is_thinking && !shell.thinking_buffer.is_empty() {
                 // Show the tail of the thinking buffer in the streaming area,
                 // styled as dimmed italic to distinguish from normal output.
-                let last_line = shell
-                    .thinking_buffer
-                    .lines()
-                    .next_back()
-                    .unwrap_or(&shell.thinking_buffer);
-                let display =
-                    truncate_inline(last_line, width.saturating_sub(6) as usize);
+                let display = shell.thinking_buffer.clone();
+                let scroll_y = scroll_to_keep_row_visible(
+                    wrapped_text_rows(&display, stream_area.width).saturating_sub(1),
+                    stream_area.height,
+                );
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::styled(
@@ -2378,15 +2610,16 @@ where
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::ITALIC),
                         ),
-                    ])),
+                    ]))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_y, 0)),
                     stream_area,
                 );
             } else {
                 frame.render_widget(Paragraph::new(Span::raw("")), stream_area);
             }
 
-            // Row 1: thin separator line
-            let sep_area = Rect::new(area.x, area.y + 1, width, 1);
+            // Row A+1: thin separator line
             let sep_style = if approval_alert_active {
                 Style::default()
                     .fg(if approval_flash_on {
@@ -2410,8 +2643,7 @@ where
                 sep_area,
             );
 
-            // Row 2: input prompt
-            let input_area = Rect::new(area.x, area.y + 2, width, 1);
+            // Row A+2..B: input prompt
             if let Some((tool_name, args_summary, _)) = pending_approval.as_ref() {
                 let compact_args = truncate_inline(&args_summary.replace('\n', " "), 56);
                 let prompt = format!(
@@ -2429,7 +2661,8 @@ where
                             .fg(Color::Black)
                             .bg(bg)
                             .add_modifier(Modifier::BOLD),
-                    )])),
+                    )]))
+                    .wrap(Wrap { trim: false }),
                     input_area,
                 );
             } else if reverse_search_active {
@@ -2448,65 +2681,43 @@ where
                         Style::default()
                             .fg(Color::LightYellow)
                             .add_modifier(Modifier::BOLD),
-                    )])),
+                    )]))
+                    .wrap(Wrap { trim: false }),
                     input_area,
                 );
             } else {
-                let (prompt_str, prompt_style) = if vim_enabled {
-                    match vim_mode {
-                        VimMode::Normal => (
-                            ": ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        VimMode::Visual => (
-                            ": ",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        VimMode::Command => (
-                            ": ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        VimMode::Insert => (
-                            "> ",
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    }
-                } else {
-                    (
-                        "> ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                };
-
                 if vim_enabled && vim_mode == VimMode::Command {
-                    let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
-                    let input_text = format!(":{}{}", vim_command_buffer, cursor_ch);
+                    let body = format!(":{}{}", vim_command_buffer, cursor_ch);
+                    let cursor_anchor = format!("{prompt_str}:{}{}", vim_command_buffer, cursor_ch);
+                    let scroll_y = scroll_to_keep_row_visible(
+                        wrapped_text_rows(&cursor_anchor, input_area.width).saturating_sub(1),
+                        input_area.height,
+                    );
                     frame.render_widget(
                         Paragraph::new(Line::from(vec![
                             Span::styled(prompt_str.to_string(), prompt_style),
-                            Span::raw(input_text),
-                        ])),
+                            Span::raw(body),
+                        ]))
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll_y, 0)),
                         input_area,
                     );
                 } else {
                     let before = &input[..cursor_pos.min(input.len())];
                     let after = &input[cursor_pos.min(input.len())..];
-                    let cursor_ch = if cursor_visible { "\u{2588}" } else { " " };
+                    let cursor_anchor = format!("{prompt_str}{before}{cursor_ch}");
+                    let scroll_y = scroll_to_keep_row_visible(
+                        wrapped_text_rows(&cursor_anchor, input_area.width).saturating_sub(1),
+                        input_area.height,
+                    );
                     let mut spans = vec![
                         Span::styled(prompt_str.to_string(), prompt_style),
-                        Span::raw(format!("{}{}{}", before, cursor_ch, after)),
+                        Span::raw(before.to_string()),
+                        Span::raw(cursor_ch.to_string()),
+                        Span::raw(after.to_string()),
                     ];
-                    if cursor_pos >= input.len()
+                    if scroll_y == 0
+                        && cursor_pos >= input.len()
                         && let Some(ghost) = history_ghost_suffix(&history, &input)
                     {
                         spans.push(Span::styled(
@@ -2516,11 +2727,16 @@ where
                                 .add_modifier(Modifier::ITALIC),
                         ));
                     }
-                    frame.render_widget(Paragraph::new(Line::from(spans)), input_area);
+                    frame.render_widget(
+                        Paragraph::new(Line::from(spans))
+                            .wrap(Wrap { trim: false })
+                            .scroll((scroll_y, 0)),
+                        input_area,
+                    );
                 }
             }
-            // Row 3: thin separator line below input
-            let sep2_area = Rect::new(area.x, area.y + 3, width, 1);
+            // Row N+1: thin separator line below input
+            let sep2_area = Rect::new(area.x, sep2_y, width, 1);
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     if approval_alert_active {
@@ -2533,8 +2749,8 @@ where
                 sep2_area,
             );
 
-            // Row 4: status bar (compact inline — model, active tool spinner, info)
-            let status_area = Rect::new(area.x, area.y + 4, width, 1);
+            // Row N+2: status bar (compact inline — model, active tool spinner, info)
+            let status_area = Rect::new(area.x, status_y, width, 1);
             let mut status_spans: Vec<Span<'static>> = Vec::new();
             if shell.is_thinking {
                 status_spans.push(Span::styled(
@@ -2872,15 +3088,26 @@ where
                     // Flush any remaining partial streaming line to scrollback.
                     if !streaming_buffer.is_empty() {
                         let remaining = std::mem::take(&mut streaming_buffer);
-                        let entry = TranscriptEntry {
-                            kind: MessageKind::Assistant,
-                            text: remaining,
+                        let logical_lines = if streaming_in_code_block {
+                            vec![remaining]
+                        } else {
+                            split_inline_markdown_blocks(&remaining)
                         };
-                        let styled = render_assistant_markdown(&entry.text);
-                        let _ = terminal.insert_before(1, |buf| {
-                            let a = buf.area;
-                            Paragraph::new(styled).render(a, buf);
-                        });
+                        let mut styled_lines: Vec<Line<'static>> =
+                            Vec::with_capacity(logical_lines.len().max(1));
+                        for text in logical_lines {
+                            let entry = TranscriptEntry {
+                                kind: MessageKind::Assistant,
+                                text,
+                            };
+                            styled_lines.push(style_transcript_line(
+                                &entry,
+                                streaming_in_code_block,
+                                streaming_in_diff_block,
+                                &streaming_code_block_lang,
+                            ));
+                        }
+                        let _ = insert_wrapped_lines_above(&mut terminal, &styled_lines);
                     }
                     shell.finalize_streaming(&output);
                     // Skip re-printing entries that were already streamed.
@@ -2927,15 +3154,19 @@ where
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
-        let input_event = event::read()?;
-        if let Event::Paste(pasted) = &input_event {
-            input.insert_str(cursor_pos.min(input.len()), pasted);
-            cursor_pos = (cursor_pos + pasted.len()).min(input.len());
-            info_line = "pasted input".to_string();
-            continue;
-        }
-        let Event::Key(mut key) = input_event else {
-            continue;
+        let mut key = match event::read()? {
+            Event::Resize(_, _) => {
+                // Let the next draw pass recompute viewport partitions immediately.
+                continue;
+            }
+            Event::Paste(pasted) => {
+                input.insert_str(cursor_pos.min(input.len()), &pasted);
+                cursor_pos = (cursor_pos + pasted.len()).min(input.len());
+                info_line = "pasted input".to_string();
+                continue;
+            }
+            Event::Key(key) => key,
+            _ => continue,
         };
         // Only handle key press events (ignore release/repeat on platforms that send them)
         if key.kind != KeyEventKind::Press {
@@ -5320,6 +5551,77 @@ mod tests {
         assert_eq!(extract_fence_lang("```python"), "python");
         assert_eq!(extract_fence_lang("```"), "");
         assert_eq!(extract_fence_lang("```js "), "js");
+    }
+
+    #[test]
+    fn wrapped_line_height_tracks_soft_wrapping() {
+        let line = Line::from("abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(wrapped_line_height(&line, 10), 3);
+        assert_eq!(wrapped_line_height(&Line::from(""), 10), 1);
+        assert_eq!(wrapped_line_height(&line, 0), 0);
+    }
+
+    #[test]
+    fn wrapped_text_rows_counts_soft_wrap_and_newlines() {
+        assert_eq!(wrapped_text_rows("abcdefghij", 10), 1);
+        assert_eq!(wrapped_text_rows("abcdefghijk", 10), 2);
+        assert_eq!(wrapped_text_rows("abc\ndef", 10), 2);
+    }
+
+    #[test]
+    fn scroll_to_keep_row_visible_tracks_cursor_row() {
+        assert_eq!(scroll_to_keep_row_visible(0, 3), 0);
+        assert_eq!(scroll_to_keep_row_visible(2, 3), 0);
+        assert_eq!(scroll_to_keep_row_visible(3, 3), 1);
+        assert_eq!(scroll_to_keep_row_visible(5, 3), 3);
+    }
+
+    #[test]
+    fn compute_inline_heights_supports_input_growth() {
+        assert_eq!(
+            compute_inline_heights(INLINE_VIEWPORT_HEIGHT, 1),
+            (4, 1),
+            "empty/short input should keep a compact 1-line input area"
+        );
+        assert_eq!(
+            compute_inline_heights(INLINE_VIEWPORT_HEIGHT, 99),
+            (1, 4),
+            "long input should grow up to 4 lines while preserving stream minimum"
+        );
+    }
+
+    #[test]
+    fn compute_inline_heights_handles_small_terminal_heights() {
+        assert_eq!(compute_inline_heights(5, 4), (1, 1));
+        assert_eq!(compute_inline_heights(4, 4), (1, 0));
+        assert_eq!(compute_inline_heights(3, 4), (0, 0));
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_preserves_normal_text() {
+        let parts = split_inline_markdown_blocks("simple sentence with no markdown breaks");
+        assert_eq!(parts, vec!["simple sentence with no markdown breaks"]);
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_splits_compact_headings() {
+        let parts = split_inline_markdown_blocks(
+            "Here's my assessment:## Overall Architecture Assessment### Strengths",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                "Here's my assessment:",
+                "## Overall Architecture Assessment",
+                "### Strengths"
+            ]
+        );
+    }
+
+    #[test]
+    fn split_inline_markdown_blocks_splits_inline_numbered_list() {
+        let parts = split_inline_markdown_blocks("### Strengths ✅ 1. Clean separation");
+        assert_eq!(parts, vec!["### Strengths ✅", "1. Clean separation"]);
     }
 
     #[test]

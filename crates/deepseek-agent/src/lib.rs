@@ -3,11 +3,14 @@ mod apply;
 mod architect;
 mod editor;
 mod r#loop;
+mod team;
 mod verify;
 
 use anyhow::{Result, anyhow};
+use chrono::Utc;
 use deepseek_core::{
-    AppConfig, ChatMessage, ChatRequest, StreamChunk, ToolCall, ToolChoice, UserQuestionHandler,
+    AppConfig, ChatMessage, ChatRequest, EventEnvelope, EventKind, StreamChunk, ToolCall,
+    ToolChoice, UserQuestionHandler,
 };
 use deepseek_hooks::{HookRuntime, HooksConfig};
 use deepseek_llm::{DeepSeekClient, LlmClient};
@@ -25,6 +28,15 @@ use std::sync::{Arc, Mutex};
 type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatMode {
+    Ask,
+    #[default]
+    Code,
+    Architect,
+    Context,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
     /// When false, run analysis-only response path (no edit/apply/verify loop).
@@ -37,6 +49,16 @@ pub struct ChatOptions {
     pub system_prompt_append: Option<String>,
     /// Additional directories for repository context lookup.
     pub additional_dirs: Vec<PathBuf>,
+    /// UX-mode profile. Execution engine remains deterministic when enabled.
+    pub mode: ChatMode,
+    /// Force execution through the edit loop even when heuristics would not.
+    pub force_execute: bool,
+    /// Force plan-only behavior and skip execution/apply/verify.
+    pub force_plan_only: bool,
+    /// Optional teammate mode hint. Non-empty enables lane orchestration.
+    pub teammate_mode: Option<String>,
+    /// Internal guard for isolated lane runs so they do not recursively spawn lanes.
+    pub disable_team_orchestration: bool,
 }
 
 pub struct AgentEngine {
@@ -254,11 +276,65 @@ impl AgentEngine {
     }
 
     pub fn chat_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        if options.force_plan_only
+            || (options.mode == ChatMode::Architect && !options.force_execute)
+        {
+            let plan = self.plan_only(prompt)?;
+            let mut out = String::new();
+            out.push_str("Architect plan (no execution):\n");
+            for (idx, step) in plan.steps.iter().enumerate() {
+                out.push_str(&format!("{}. {}\n", idx + 1, step.intent));
+            }
+            if !plan.verification.is_empty() {
+                out.push_str("\nVerify commands:\n");
+                for command in &plan.verification {
+                    out.push_str(&format!("- `{}`\n", command));
+                }
+            }
+            let rendered = out.trim_end().to_string();
+            self.stream(StreamChunk::ContentDelta(rendered.clone()));
+            self.stream(StreamChunk::Done);
+            return Ok(rendered);
+        }
+
         if !options.tools {
             return self.analyze_with_options(prompt, options);
         }
 
-        r#loop::run(self, prompt, &options)
+        let should_execute = options.force_execute || is_code_changing_prompt(prompt, &options);
+        if should_execute {
+            if should_run_team_orchestration(&options) {
+                return team::run(self, prompt, &options);
+            }
+            return r#loop::run(self, prompt, &options);
+        }
+
+        self.analyze_with_options(prompt, options)
+    }
+
+    pub(crate) fn append_event_best_effort(&self, kind: EventKind) {
+        let Ok(Some(session)) = self.store.load_latest_session() else {
+            return;
+        };
+        let Ok(seq_no) = self.store.next_seq_no(session.session_id) else {
+            return;
+        };
+        let event = EventEnvelope {
+            seq_no,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind,
+        };
+        let _ = self.store.append_event(&event);
+    }
+
+    pub(crate) fn request_approval(&self, call: &ToolCall) -> Result<bool> {
+        if let Ok(mut guard) = self.approval_handler.lock()
+            && let Some(handler) = guard.as_mut()
+        {
+            return handler(call);
+        }
+        Ok(false)
     }
 
     #[deprecated(note = "resume returns a session summary only")]
@@ -274,5 +350,55 @@ impl AgentEngine {
             projection.transcript.len(),
             projection.step_status.len()
         ))
+    }
+}
+
+fn is_code_changing_prompt(prompt: &str, options: &ChatOptions) -> bool {
+    if matches!(options.mode, ChatMode::Code) {
+        return true;
+    }
+
+    let lower = prompt.to_ascii_lowercase();
+    let explicit_edit_intent = [
+        "add ",
+        "implement",
+        "refactor",
+        "fix ",
+        "patch ",
+        "update ",
+        "rename ",
+        "remove ",
+        "create file",
+        "edit ",
+        "failing test",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if explicit_edit_intent {
+        return true;
+    }
+
+    !options.additional_dirs.is_empty() && lower.contains("implement")
+}
+
+fn should_run_team_orchestration(options: &ChatOptions) -> bool {
+    if options.disable_team_orchestration {
+        return false;
+    }
+
+    let value = options
+        .teammate_mode
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            std::env::var("DEEPSEEK_TEAMMATE_MODE")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+        });
+
+    match value.as_deref() {
+        Some("") | Some("0") | Some("false") | Some("off") | Some("none") | None => false,
+        Some(_) => true,
     }
 }

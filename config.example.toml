@@ -38,6 +38,18 @@ max_files_per_iteration = 12
 max_file_bytes = 200000
 max_diff_bytes = 400000
 verify_timeout_seconds = 60
+max_context_requests_per_iteration = 3
+max_context_range_lines = 400
+apply_strategy = "auto" # auto | three_way
+
+[agent_loop.failure_classifier]
+repeat_threshold = 2
+similarity_threshold = 0.8
+fingerprint_lines = 40
+
+[agent_loop.safety_gate]
+max_files_without_approval = 8
+max_loc_without_approval = 600
 
 [policy]
 approve_edits = "ask"

@@ -21,8 +21,10 @@ deepseek-subagent = { path = "../deepseek-subagent" }
 deepseek-hooks = { path = "../deepseek-hooks" }
 deepseek-mcp = { path = "../deepseek-mcp" }
 deepseek-diff = { path = "../deepseek-diff" }
+deepseek-memory = { path = "../deepseek-memory" }
 reqwest.workspace = true
 base64.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
