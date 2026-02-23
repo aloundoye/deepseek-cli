@@ -238,9 +238,11 @@ Core modules:
 - `--teammate-mode <mode>` enables deterministic team-lane orchestration on top of the same runtime.
 - `--repo <path>` overrides repository root for context/bootstrap.
 - `--debug-context` (or `DEEPSEEK_DEBUG_CONTEXT=1`) prints deterministic pre-model context digest.
+- `--watch-files` injects bounded comment-marker hints (`TODO(ai)`, `FIXME(ai)`, `AI:`) when marker digest changes.
+- `--detect-urls` augments prompt context with bounded web extracts for inline URLs.
 - No `--allow-r1-drive-tools` flag exists in this architecture.
 - Verify-pass never commits automatically; commit is explicit (`/commit`, `deepseek git commit`).
-- Workflow parity slash commands include `/add`, `/drop`, `/read-only`, `/map`, `/map-refresh`, `/run`, `/test`, `/lint`, `/web`.
+- Workflow parity slash commands include `/ask`, `/code`, `/architect`, `/chat-mode`, `/add`, `/drop`, `/read-only`, `/map`, `/map-refresh`, `/run`, `/test`, `/lint`, `/web`, `/git`, `/settings`, `/load`, `/save`, `/paste`, `/voice`.
 - UI transparency defaults are configurable under `[ui]`:
   - `thinking_visibility = "concise"` (default)
   - `phase_heartbeat_ms = 5000`

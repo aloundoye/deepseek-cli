@@ -26,6 +26,7 @@ use deepseek_subagent::SubagentTask;
 use deepseek_tools::LocalToolHost;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Handler for spawn_task subagent workers. Retained for API compatibility,
 /// but the core loop does not dispatch subagents in this architecture.
@@ -67,6 +68,10 @@ pub struct ChatOptions {
     pub teammate_mode: Option<String>,
     /// Internal guard for isolated lane runs so they do not recursively spawn lanes.
     pub disable_team_orchestration: bool,
+    /// Detect URLs in prompts and enrich context with bounded web extracts.
+    pub detect_urls: bool,
+    /// Watch mode hint (CLI handles filesystem watch orchestration).
+    pub watch_files: bool,
 }
 
 pub struct AgentEngine {
@@ -315,8 +320,9 @@ impl AgentEngine {
     }
 
     pub fn chat_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let prompt = enrich_prompt_with_urls(prompt, options.detect_urls);
         let task_intent = intent::classify_intent(&intent::IntentInput {
-            prompt,
+            prompt: &prompt,
             mode: options.mode,
             tools: options.tools,
             force_execute: options.force_execute,
@@ -324,7 +330,7 @@ impl AgentEngine {
         });
 
         if task_intent == intent::TaskIntent::ArchitectOnly {
-            let plan = self.plan_only(prompt)?;
+            let plan = self.plan_only(&prompt)?;
             let mut out = String::new();
             out.push_str("Architect plan (no execution):\n");
             for (idx, step) in plan.steps.iter().enumerate() {
@@ -343,14 +349,14 @@ impl AgentEngine {
         }
 
         if task_intent == intent::TaskIntent::InspectRepo {
-            return self.analyze_with_options(prompt, options);
+            return self.analyze_with_options(&prompt, options);
         }
 
-        if should_run_team_orchestration(self, prompt, &options) {
-            return team::run(self, prompt, &options);
+        if should_run_team_orchestration(self, &prompt, &options) {
+            return team::run(self, &prompt, &options);
         }
 
-        r#loop::run(self, prompt, &options)
+        r#loop::run(self, &prompt, &options)
     }
 
     pub(crate) fn append_event_best_effort(&self, kind: EventKind) {
@@ -424,5 +430,144 @@ fn should_run_team_orchestration(
             crate::complexity::score_prompt(prompt)
                 >= engine.cfg.agent_loop.team.complexity_threshold
         }
+    }
+}
+
+fn enrich_prompt_with_urls(prompt: &str, enabled: bool) -> String {
+    if !enabled {
+        return prompt.to_string();
+    }
+    let urls = extract_urls(prompt, 3);
+    if urls.is_empty() {
+        return prompt.to_string();
+    }
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("deepseek-cli/0.2")
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return prompt.to_string(),
+    };
+
+    let mut rows = Vec::new();
+    for url in urls {
+        let Ok(resp) = client.get(&url).send() else {
+            continue;
+        };
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let Ok(body) = resp.text() else {
+            continue;
+        };
+        let max_bytes = 24_000usize;
+        let truncated = body.len() > max_bytes;
+        let clipped = if truncated {
+            body[..body.floor_char_boundary(max_bytes)].to_string()
+        } else {
+            body
+        };
+        let extracted = if content_type.contains("html") {
+            naive_strip_html(&clipped)
+        } else {
+            clipped
+        };
+        if extracted.trim().is_empty() {
+            continue;
+        }
+        rows.push(format!(
+            "URL|{}\nSTATUS|{}\nCONTENT_TYPE|{}\nTRUNCATED|{}\nEXTRACT|\n{}",
+            url,
+            status,
+            content_type,
+            truncated,
+            truncate_text(&extracted, 8_000)
+        ));
+    }
+
+    if rows.is_empty() {
+        return prompt.to_string();
+    }
+
+    format!(
+        "{prompt}\n\nAUTO_URL_CONTEXT_V1\n{}\nAUTO_URL_CONTEXT_END",
+        rows.join("\n---\n")
+    )
+}
+
+fn extract_urls(prompt: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in prompt.split_whitespace() {
+        let trimmed = token
+            .trim_matches(|c: char| {
+                c == ','
+                    || c == ';'
+                    || c == ')'
+                    || c == '('
+                    || c == ']'
+                    || c == '['
+                    || c == '"'
+                    || c == '\''
+            })
+            .trim_end_matches('.');
+        if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+            && !out.iter().any(|row| row == trimmed)
+        {
+            out.push(trimmed.to_string());
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn naive_strip_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push('\n');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    format!("{}...", &text[..text.floor_char_boundary(max_chars)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_urls_handles_punctuation_and_dedup() {
+        let prompt = "check https://example.com, then (https://example.com) and https://a.dev.";
+        let urls = extract_urls(prompt, 5);
+        assert_eq!(urls, vec!["https://example.com", "https://a.dev"]);
+    }
+
+    #[test]
+    fn html_strip_removes_tags() {
+        let html = "<html><body><h1>Title</h1><p>Hello world</p></body></html>";
+        let stripped = naive_strip_html(html);
+        assert!(stripped.contains("Title"));
+        assert!(stripped.contains("Hello world"));
+        assert!(!stripped.contains("<h1>"));
     }
 }

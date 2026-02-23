@@ -200,6 +200,14 @@ struct Cli {
     #[arg(long = "include-partial-messages", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
     include_partial_messages: bool,
 
+    /// Enable deterministic watch mode for comment-triggered task hints.
+    #[arg(long = "watch-files", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    watch_files: bool,
+
+    /// Detect URLs in prompts and include bounded extracted context.
+    #[arg(long = "detect-urls", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    detect_urls: bool,
+
     /// Flag form for teleport handoff.
     #[arg(long = "teleport", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
     teleport_flag: bool,

@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
-use deepseek_core::{ChatMessage, EventKind, Session, SessionBudgets, SessionState, StreamChunk};
+use deepseek_core::{
+    ChatMessage, EventKind, Session, SessionBudgets, SessionState, StreamChunk,
+    stream_chunk_to_event_json,
+};
 use deepseek_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -409,17 +412,17 @@ impl IdeRpcHandler {
         let (status, output, error_message) =
             if let Some(mock_output) = params.get("mock_output").and_then(|v| v.as_str()) {
                 if let Ok(mut guard) = stream_rows.lock() {
-                    guard.push(stream_chunk_to_json(&StreamChunk::ContentDelta(
+                    guard.push(stream_chunk_to_event_json(&StreamChunk::ContentDelta(
                         mock_output.to_string(),
                     )));
-                    guard.push(stream_chunk_to_json(&StreamChunk::Done));
+                    guard.push(stream_chunk_to_event_json(&StreamChunk::Done));
                 }
                 ("completed".to_string(), mock_output.to_string(), None)
             } else {
                 let engine = AgentEngine::new(&workspace_root)?;
                 let stream_rows_cb = Arc::clone(&stream_rows);
                 engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
-                    let row = stream_chunk_to_json(&chunk);
+                    let row = stream_chunk_to_event_json(&chunk);
                     if let Ok(mut guard) = stream_rows_cb.lock() {
                         guard.push(row);
                     }
@@ -1443,161 +1446,6 @@ fn parse_chat_mode(value: &str) -> ChatMode {
         "architect" => ChatMode::Architect,
         "context" => ChatMode::Context,
         _ => ChatMode::Code,
-    }
-}
-
-fn stream_chunk_to_json(chunk: &StreamChunk) -> Value {
-    match chunk {
-        StreamChunk::ContentDelta(text) => serde_json::json!({
-            "type": "content_delta",
-            "text": text,
-        }),
-        StreamChunk::ReasoningDelta(text) => serde_json::json!({
-            "type": "reasoning_delta",
-            "text": text,
-        }),
-        StreamChunk::ArchitectStarted { iteration } => serde_json::json!({
-            "type": "phase",
-            "phase": "architect_started",
-            "iteration": iteration,
-        }),
-        StreamChunk::ArchitectCompleted {
-            iteration,
-            files,
-            no_edit,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "architect_completed",
-            "iteration": iteration,
-            "files": files,
-            "no_edit": no_edit,
-        }),
-        StreamChunk::EditorStarted { iteration, files } => serde_json::json!({
-            "type": "phase",
-            "phase": "editor_started",
-            "iteration": iteration,
-            "files": files,
-        }),
-        StreamChunk::EditorCompleted { iteration, status } => serde_json::json!({
-            "type": "phase",
-            "phase": "editor_completed",
-            "iteration": iteration,
-            "status": status,
-        }),
-        StreamChunk::ApplyStarted { iteration } => serde_json::json!({
-            "type": "phase",
-            "phase": "apply_started",
-            "iteration": iteration,
-        }),
-        StreamChunk::ApplyCompleted {
-            iteration,
-            success,
-            summary,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "apply_completed",
-            "iteration": iteration,
-            "success": success,
-            "summary": summary,
-        }),
-        StreamChunk::VerifyStarted {
-            iteration,
-            commands,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "verify_started",
-            "iteration": iteration,
-            "commands": commands,
-        }),
-        StreamChunk::VerifyCompleted {
-            iteration,
-            success,
-            summary,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "verify_completed",
-            "iteration": iteration,
-            "success": success,
-            "summary": summary,
-        }),
-        StreamChunk::CommitProposal {
-            files,
-            touched_files,
-            loc_delta,
-            verify_commands,
-            verify_status,
-            suggested_message,
-        } => serde_json::json!({
-            "type": "commit_proposal",
-            "files": files,
-            "touched_files": touched_files,
-            "loc_delta": loc_delta,
-            "verify_commands": verify_commands,
-            "verify_status": verify_status,
-            "suggested_message": suggested_message,
-        }),
-        StreamChunk::ToolCallStart {
-            tool_name,
-            args_summary,
-        } => serde_json::json!({
-            "type": "tool_start",
-            "tool_name": tool_name,
-            "args_summary": args_summary,
-        }),
-        StreamChunk::ToolCallEnd {
-            tool_name,
-            duration_ms,
-            success,
-            summary,
-        } => serde_json::json!({
-            "type": "tool_end",
-            "tool_name": tool_name,
-            "duration_ms": duration_ms,
-            "success": success,
-            "summary": summary,
-        }),
-        StreamChunk::ModeTransition { from, to, reason } => serde_json::json!({
-            "type": "mode_transition",
-            "from": from,
-            "to": to,
-            "reason": reason,
-        }),
-        StreamChunk::SubagentSpawned { run_id, name, goal } => serde_json::json!({
-            "type": "subagent_spawned",
-            "run_id": run_id,
-            "name": name,
-            "goal": goal,
-        }),
-        StreamChunk::SubagentCompleted {
-            run_id,
-            name,
-            summary,
-        } => serde_json::json!({
-            "type": "subagent_completed",
-            "run_id": run_id,
-            "name": name,
-            "summary": summary,
-        }),
-        StreamChunk::SubagentFailed {
-            run_id,
-            name,
-            error,
-        } => serde_json::json!({
-            "type": "subagent_failed",
-            "run_id": run_id,
-            "name": name,
-            "error": error,
-        }),
-        StreamChunk::ImageData { label, .. } => serde_json::json!({
-            "type": "image",
-            "label": label,
-        }),
-        StreamChunk::ClearStreamingText => serde_json::json!({
-            "type": "clear_streaming_text",
-        }),
-        StreamChunk::Done => serde_json::json!({
-            "type": "done",
-        }),
     }
 }
 

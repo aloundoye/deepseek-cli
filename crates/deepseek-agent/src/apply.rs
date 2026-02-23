@@ -302,4 +302,155 @@ mod tests {
             .expect_err("must reject stale mismatch");
         assert!(err.reason.contains("stale editor context hash mismatch"));
     }
+
+    #[test]
+    fn diff_stats_counts_lines_and_files() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n context\n";
+        let stats = diff_stats(diff);
+        assert_eq!(stats.touched_files, 1);
+        assert_eq!(stats.loc_delta, 2); // one - and one +
+    }
+
+    #[test]
+    fn diff_stats_multi_file() {
+        let diff = "\
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-old_a
++new_a
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-old_b
++new_b
+";
+        let stats = diff_stats(diff);
+        assert_eq!(stats.touched_files, 2);
+        assert_eq!(stats.loc_delta, 4);
+    }
+
+    #[test]
+    fn diff_stats_empty_diff() {
+        let stats = diff_stats("");
+        assert_eq!(stats.touched_files, 0);
+        assert_eq!(stats.loc_delta, 0);
+    }
+
+    #[test]
+    fn hash_text_deterministic() {
+        let a = hash_text("hello world");
+        let b = hash_text("hello world");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16); // 16 hex chars
+    }
+
+    #[test]
+    fn hash_text_differs_for_different_input() {
+        let a = hash_text("hello");
+        let b = hash_text("world");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn extract_target_files_deduplicates() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let files = extract_target_files(diff);
+        assert_eq!(files, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn extract_target_files_handles_dev_null() {
+        let diff = "--- /dev/null\n+++ b/new_file.rs\n@@ -0,0 +1 @@\n+content\n";
+        let files = extract_target_files(diff);
+        assert_eq!(files, vec!["new_file.rs"]);
+    }
+
+    #[test]
+    fn ensure_repo_relative_accepts_normal_paths() {
+        assert!(ensure_repo_relative_path("src/lib.rs").is_ok());
+        assert!(ensure_repo_relative_path("nested/deep/file.txt").is_ok());
+    }
+
+    #[test]
+    fn ensure_repo_relative_rejects_absolute() {
+        let err = ensure_repo_relative_path("/etc/passwd").unwrap_err();
+        assert!(err.reason.contains("absolute"));
+    }
+
+    #[test]
+    fn ensure_repo_relative_rejects_parent_traversal() {
+        let err = ensure_repo_relative_path("foo/../../etc/passwd").unwrap_err();
+        assert!(err.reason.contains("repository root"));
+    }
+
+    #[test]
+    fn rejects_empty_diff() {
+        let allowed = HashSet::new();
+        let err =
+            apply_unified_diff(Path::new("/tmp"), "", &allowed, &HashMap::new(), ApplyStrategy::Auto)
+                .unwrap_err();
+        assert!(err.reason.contains("empty diff"));
+    }
+
+    #[test]
+    fn rejects_invalid_diff_markers() {
+        let allowed = HashSet::new();
+        let err = apply_unified_diff(
+            Path::new("/tmp"),
+            "not a diff at all",
+            &allowed,
+            &HashMap::new(),
+            ApplyStrategy::Auto,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("invalid unified diff markers"));
+    }
+
+    #[test]
+    fn rejects_undeclared_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let diff = "--- a/secret.rs\n+++ b/secret.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let allowed = HashSet::from(["other.rs".to_string()]);
+        let err = apply_unified_diff(
+            temp.path(),
+            diff,
+            &allowed,
+            &HashMap::new(),
+            ApplyStrategy::Auto,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("undeclared file"));
+    }
+
+    #[test]
+    fn rejects_git_dir_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let diff = "--- a/.git/config\n+++ b/.git/config\n@@ -1 +1 @@\n-a\n+b\n";
+        let allowed = HashSet::from([".git/config".to_string()]);
+        let err = apply_unified_diff(
+            temp.path(),
+            diff,
+            &allowed,
+            &HashMap::new(),
+            ApplyStrategy::Auto,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains(".git mutation forbidden"));
+    }
+
+    #[test]
+    fn apply_failure_to_feedback_format() {
+        let failure = ApplyFailure {
+            class: ApplyFailureClass::PatchMismatch,
+            reason: "test reason".to_string(),
+            conflicts: vec!["conflict1".to_string()],
+            changed_files: vec!["file.rs".to_string()],
+        };
+        let feedback = failure.to_feedback();
+        assert!(feedback.contains("PatchMismatch"));
+        assert!(feedback.contains("test reason"));
+        assert!(feedback.contains("conflict1"));
+        assert!(feedback.contains("file.rs"));
+    }
 }

@@ -302,8 +302,7 @@ pub fn build_repo_map(
     scored.sort_by(|a, b| b.cmp(a));
 
     let mut lines = Vec::new();
-    let mut count = 0usize;
-    for (score, path) in scored {
+    for (count, (score, path)) in scored.into_iter().enumerate() {
         if count >= max_files.max(1) {
             break;
         }
@@ -317,7 +316,6 @@ pub fn build_repo_map(
             .map(|m| m.len())
             .unwrap_or(0);
         lines.push(format!("- {path} ({size} bytes) score={score}"));
-        count += 1;
     }
 
     lines.join("\n")
@@ -412,5 +410,117 @@ mod tests {
     fn parse_architect_requires_markers() {
         let err = parse_architect_plan("PLAN|x").unwrap_err();
         assert!(err.to_string().contains("ARCHITECT_PLAN_V1"));
+    }
+
+    #[test]
+    fn parse_architect_missing_end_marker() {
+        let input = "ARCHITECT_PLAN_V1\nPLAN|Step one\nFILE|src/lib.rs|Edit fn\n";
+        let err = parse_architect_plan(input).unwrap_err();
+        assert!(err.to_string().contains("ARCHITECT_PLAN_END"));
+    }
+
+    #[test]
+    fn parse_architect_no_edit() {
+        let input = "ARCHITECT_PLAN_V1\nPLAN|Explain issue\nNO_EDIT|true|Already correct\nARCHITECT_PLAN_END\n";
+        let plan = parse_architect_plan(input).expect("parse");
+        assert_eq!(plan.no_edit_reason, Some("Already correct".to_string()));
+        assert!(plan.files.is_empty());
+    }
+
+    #[test]
+    fn parse_architect_no_edit_default_reason() {
+        let input = "ARCHITECT_PLAN_V1\nNO_EDIT|true|\nARCHITECT_PLAN_END\n";
+        let plan = parse_architect_plan(input).expect("parse");
+        assert_eq!(
+            plan.no_edit_reason,
+            Some("No file edits required".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_architect_deduplicates_files() {
+        let input = "ARCHITECT_PLAN_V1\nFILE|src/lib.rs|First edit\nFILE|src/lib.rs|Second edit\nFILE|src/main.rs|Entry\nARCHITECT_PLAN_END\n";
+        let plan = parse_architect_plan(input).expect("parse");
+        assert_eq!(plan.files.len(), 2);
+        assert_eq!(plan.files[0].path, "src/lib.rs");
+        assert_eq!(plan.files[0].intent, "First edit");
+        assert_eq!(plan.files[1].path, "src/main.rs");
+    }
+
+    #[test]
+    fn parse_architect_rejects_absolute_path() {
+        let input = "ARCHITECT_PLAN_V1\nFILE|/etc/passwd|Read secrets\nARCHITECT_PLAN_END\n";
+        let err = parse_architect_plan(input).unwrap_err();
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn parse_architect_rejects_invalid_file_line() {
+        let input = "ARCHITECT_PLAN_V1\nFILE||\nARCHITECT_PLAN_END\n";
+        let err = parse_architect_plan(input).unwrap_err();
+        assert!(err.to_string().contains("invalid FILE line"));
+    }
+
+    #[test]
+    fn parse_architect_rejects_unknown_line() {
+        let input = "ARCHITECT_PLAN_V1\nFOO|bar\nARCHITECT_PLAN_END\n";
+        let err = parse_architect_plan(input).unwrap_err();
+        assert!(err.to_string().contains("unknown architect line"));
+    }
+
+    #[test]
+    fn parse_architect_multi_step_multi_file() {
+        let input = "\
+ARCHITECT_PLAN_V1
+PLAN|Add error handling module
+PLAN|Wire error types into handler
+PLAN|Add unit tests
+FILE|src/errors.rs|Create error enum
+FILE|src/handler.rs|Import and use error types
+FILE|tests/error_tests.rs|Add regression tests
+VERIFY|cargo test -q
+VERIFY|cargo clippy -- -D warnings
+ACCEPT|All tests pass
+ACCEPT|No clippy warnings
+ARCHITECT_PLAN_END
+";
+        let plan = parse_architect_plan(input).expect("parse");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.files.len(), 3);
+        assert_eq!(plan.verify_commands.len(), 2);
+        assert_eq!(plan.acceptance.len(), 2);
+        assert!(plan.no_edit_reason.is_none());
+    }
+
+    #[test]
+    fn parse_architect_tolerates_blank_lines() {
+        let input = "ARCHITECT_PLAN_V1\n\nPLAN|Do thing\n\nFILE|src/lib.rs|Edit\n\nARCHITECT_PLAN_END\n";
+        let plan = parse_architect_plan(input).expect("parse");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.files.len(), 1);
+    }
+
+    #[test]
+    fn parse_architect_skips_empty_plan_values() {
+        let input = "ARCHITECT_PLAN_V1\nPLAN|\nPLAN|Real step\nVERIFY|\nVERIFY|cargo test\nACCEPT|\nARCHITECT_PLAN_END\n";
+        let plan = parse_architect_plan(input).expect("parse");
+        assert_eq!(plan.steps, vec!["Real step"]);
+        assert_eq!(plan.verify_commands, vec!["cargo test"]);
+        assert!(plan.acceptance.is_empty());
+    }
+
+    #[test]
+    fn prompt_tokens_extracts_relevant_words() {
+        let tokens = prompt_tokens("Fix the Parser bug in main.rs");
+        assert!(tokens.contains("fix"));
+        assert!(tokens.contains("parser"));
+        assert!(tokens.contains("bug"));
+        assert!(tokens.contains("main"));
+        // Short words (< 3 chars) excluded
+        assert!(!tokens.contains("in"));
+        // "the" is 3 chars, so it passes the >= 3 filter
+        assert!(tokens.contains("the"));
+        // Single char / 2 char tokens excluded
+        assert!(!tokens.contains("rs"));
     }
 }

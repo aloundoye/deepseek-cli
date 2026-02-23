@@ -6,6 +6,7 @@ use deepseek_chrome::{ChromeSession, ScreenshotFormat};
 use deepseek_context::ContextManager;
 use deepseek_core::{
     AppConfig, ApprovedToolCall, EventKind, StreamChunk, ToolCall, ToolHost, runtime_dir,
+    stream_chunk_to_event_json,
 };
 use deepseek_mcp::McpManager;
 use deepseek_memory::{ExportFormat, MemoryManager};
@@ -18,6 +19,8 @@ use deepseek_ui::{
     run_tui_shell_with_bindings,
 };
 use serde_json::json;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -106,6 +109,149 @@ fn parse_diff_args(args: &[String]) -> (bool, bool) {
         .any(|arg| matches!(arg.as_str(), "--staged" | "--cached" | "-s"));
     let stat = args.iter().any(|arg| arg == "--stat");
     (staged, stat)
+}
+
+fn parse_chat_mode_name(raw: &str) -> Option<ChatMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ask" => Some(ChatMode::Ask),
+        "code" => Some(ChatMode::Code),
+        "architect" | "plan" => Some(ChatMode::Architect),
+        "context" => Some(ChatMode::Context),
+        _ => None,
+    }
+}
+
+fn chat_mode_name(mode: ChatMode) -> &'static str {
+    match mode {
+        ChatMode::Ask => "ask",
+        ChatMode::Code => "code",
+        ChatMode::Architect => "architect",
+        ChatMode::Context => "context",
+    }
+}
+
+fn resolve_chat_profile_path(cwd: &Path, args: &[String]) -> PathBuf {
+    if let Some(first) = args.first() {
+        resolve_additional_dir(cwd, first)
+    } else {
+        runtime_dir(cwd).join("chat_profile.json")
+    }
+}
+
+fn slash_save_profile_output(
+    cwd: &Path,
+    args: &[String],
+    mode: ChatMode,
+    read_only: bool,
+    thinking_enabled: bool,
+    additional_dirs: &[PathBuf],
+) -> Result<String> {
+    let path = resolve_chat_profile_path(cwd, args);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = json!({
+        "schema": "deepseek.chat_profile.v1",
+        "mode": chat_mode_name(mode),
+        "read_only": read_only,
+        "thinking_enabled": thinking_enabled,
+        "additional_dirs": additional_dirs.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(format!("saved chat profile: {}", path.display()))
+}
+
+fn slash_load_profile_output(
+    cwd: &Path,
+    args: &[String],
+) -> Result<(ChatMode, bool, bool, Vec<PathBuf>, String)> {
+    let path = resolve_chat_profile_path(cwd, args);
+    let raw = std::fs::read_to_string(&path)?;
+    let payload: serde_json::Value = serde_json::from_str(&raw)?;
+    let mode = payload
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .and_then(parse_chat_mode_name)
+        .unwrap_or(ChatMode::Code);
+    let read_only = payload
+        .get("read_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let thinking_enabled = payload
+        .get("thinking_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let additional_dirs = payload
+        .get("additional_dirs")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let output = format!(
+        "loaded chat profile: {} mode={} read_only={} thinking={}",
+        path.display(),
+        chat_mode_name(mode),
+        read_only,
+        if thinking_enabled { "enabled" } else { "auto" }
+    );
+    Ok((mode, read_only, thinking_enabled, additional_dirs, output))
+}
+
+fn slash_git_output(cwd: &Path, args: &[String]) -> Result<String> {
+    if args.is_empty() {
+        return run_process(cwd, "git", &["status", "--short"]);
+    }
+    let command = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_process(cwd, "git", &command)
+}
+
+fn slash_voice_output(args: &[String]) -> Result<String> {
+    if args.first().is_some_and(|v| v == "status") {
+        return Ok(format!(
+            "voice status: ffmpeg={} sox={} arecord={}",
+            command_exists("ffmpeg"),
+            command_exists("sox"),
+            command_exists("arecord")
+        ));
+    }
+    Ok(
+        "voice scaffold: not configured for capture in this build. Use text input or `/voice status` for capability checks."
+            .to_string(),
+    )
+}
+
+fn scan_watch_comment_payload(cwd: &Path) -> Option<(u64, String)> {
+    let output = run_process(
+        cwd,
+        "rg",
+        &[
+            "-n",
+            "--hidden",
+            "--glob",
+            "!.git/**",
+            "--glob",
+            "!target/**",
+            "--glob",
+            "!.deepseek/**",
+            "TODO\\(ai\\)|FIXME\\(ai\\)|AI:",
+            ".",
+        ],
+    )
+    .ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    trimmed.hash(&mut hasher);
+    let digest = hasher.finish();
+    Some((digest, trimmed.to_string()))
 }
 
 fn slash_stage_output(cwd: &Path, args: &[String]) -> Result<String> {
@@ -315,8 +461,26 @@ fn slash_lint_output(cwd: &Path, args: &[String]) -> Result<String> {
 
 fn slash_web_output(cwd: &Path, args: &[String]) -> Result<String> {
     if args.is_empty() {
-        return Err(anyhow!("usage: /web <query>"));
+        return Err(anyhow!("usage: /web <query|url>"));
     }
+
+    let first = args.first().map(String::as_str).unwrap_or_default();
+    if first.starts_with("http://") || first.starts_with("https://") {
+        let output = local_tool_output(
+            cwd,
+            ToolCall {
+                name: "web.fetch".to_string(),
+                args: json!({
+                    "url": first,
+                    "max_bytes": 120000,
+                    "timeout": 20,
+                }),
+                requires_approval: false,
+            },
+        )?;
+        return Ok(render_web_fetch_markdown(first, &output, 140));
+    }
+
     let query = args.join(" ");
     let output = local_tool_output(
         cwd,
@@ -329,32 +493,153 @@ fn slash_web_output(cwd: &Path, args: &[String]) -> Result<String> {
             requires_approval: false,
         },
     )?;
-    let Some(results) = output.get("results").and_then(|v| v.as_array()) else {
-        return Ok("no web results".to_string());
-    };
-    if results.is_empty() {
-        return Ok("no web results".to_string());
-    }
-    let mut lines = Vec::new();
-    for (idx, row) in results.iter().enumerate() {
-        let title = row
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("untitled");
+    let results = output
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut top_extract = None;
+    for row in results.iter().take(3) {
         let url = row.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-        let snippet = row
-            .get("snippet")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        lines.push(format!("{}. {}", idx + 1, title));
-        if !url.is_empty() {
-            lines.push(format!("   {url}"));
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
         }
-        if !snippet.is_empty() {
-            lines.push(format!("   {}", truncate_inline(snippet, 220)));
+        if let Ok(fetch) = local_tool_output(
+            cwd,
+            ToolCall {
+                name: "web.fetch".to_string(),
+                args: json!({
+                    "url": url,
+                    "max_bytes": 64000,
+                    "timeout": 18,
+                }),
+                requires_approval: false,
+            },
+        ) {
+            let preview = fetch_preview_text(&fetch, 28);
+            if !preview.is_empty() {
+                top_extract = Some((url.to_string(), preview));
+                break;
+            }
         }
     }
-    Ok(lines.join("\n"))
+
+    Ok(render_web_search_markdown(&query, &results, top_extract))
+}
+
+fn render_web_fetch_markdown(url: &str, output: &serde_json::Value, max_lines: usize) -> String {
+    let status = output.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+    let content_type = output
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let truncated = output
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let bytes = output.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let preview = fetch_preview_text(output, max_lines);
+
+    let mut lines = vec![
+        "# Web Fetch".to_string(),
+        format!("- URL: {url}"),
+        format!("- Status: {status}"),
+        format!("- Content-Type: {content_type}"),
+        format!("- Bytes: {bytes}"),
+        format!("- Truncated: {truncated}"),
+        String::new(),
+        "## Extract".to_string(),
+    ];
+
+    if preview.is_empty() {
+        lines.push("(empty)".to_string());
+    } else {
+        lines.push("```text".to_string());
+        lines.push(preview);
+        lines.push("```".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn render_web_search_markdown(
+    query: &str,
+    results: &[serde_json::Value],
+    top_extract: Option<(String, String)>,
+) -> String {
+    let mut lines = vec![
+        "# Web Search".to_string(),
+        format!("- Query: {query}"),
+        format!("- Results: {}", results.len()),
+        String::new(),
+        "## Top Results".to_string(),
+    ];
+
+    if results.is_empty() {
+        lines.push("(no results)".to_string());
+    } else {
+        for (idx, row) in results.iter().enumerate() {
+            let title = row
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("untitled");
+            let url = row.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+            let snippet = row
+                .get("snippet")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            lines.push(format!("{}. {}", idx + 1, title));
+            if !url.is_empty() {
+                lines.push(format!("   - {url}"));
+            }
+            if !snippet.is_empty() {
+                let compact = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+                lines.push(format!("   - {}", truncate_inline(&compact, 220)));
+            }
+        }
+    }
+
+    if let Some((url, preview)) = top_extract {
+        lines.push(String::new());
+        lines.push(format!("## Extract ({url})"));
+        lines.push("```text".to_string());
+        lines.push(preview);
+        lines.push("```".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn fetch_preview_text(output: &serde_json::Value, max_lines: usize) -> String {
+    let content = output
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    normalize_web_content(content, max_lines)
+}
+
+fn normalize_web_content(content: &str, max_lines: usize) -> String {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cleaned = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+        if cleaned.is_empty() {
+            continue;
+        }
+        out.push(cleaned);
+        if out.len() >= max_lines {
+            break;
+        }
+    }
+    let mut joined = out.join("\n");
+    if joined.len() > 12000 {
+        joined.truncate(joined.floor_char_boundary(12000));
+    }
+    joined
 }
 
 fn slash_map_output(cwd: &Path, args: &[String], additional_dirs: &[PathBuf]) -> Result<String> {
@@ -549,6 +834,8 @@ pub(crate) fn run_chat(
     let force_plan_only = cli.map(|v| v.plan_only).unwrap_or(false);
     let teammate_mode = cli.and_then(|v| v.teammate_mode.clone());
     let repo_root_override = cli.and_then(|v| v.repo.clone());
+    let watch_files_enabled = cli.map(|value| value.watch_files).unwrap_or(false);
+    let detect_urls = cli.map(|value| value.detect_urls).unwrap_or(false);
     let debug_context = cli.map(|v| v.debug_context).unwrap_or(false)
         || std::env::var("DEEPSEEK_DEBUG_CONTEXT")
             .map(|value| {
@@ -570,6 +857,8 @@ pub(crate) fn run_chat(
             teammate_mode.clone(),
             repo_root_override.clone(),
             debug_context,
+            detect_urls,
+            watch_files_enabled,
         );
     }
     if force_tui && !interactive_tty {
@@ -578,6 +867,8 @@ pub(crate) fn run_chat(
     let mut last_assistant_response: Option<String> = None;
     let mut additional_dirs = cli.map(|value| value.add_dir.clone()).unwrap_or_default();
     let mut read_only_mode = false;
+    let mut active_chat_mode = ChatMode::Code;
+    let mut last_watch_digest: Option<u64> = None;
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -591,6 +882,9 @@ pub(crate) fn run_chat(
                 "approval-gated"
             }
         );
+        if watch_files_enabled {
+            println!("watch mode: enabled (scans TODO(ai)/FIXME(ai)/AI: hints each turn)");
+        }
     }
     loop {
         if !json_mode {
@@ -608,7 +902,17 @@ pub(crate) fn run_chat(
         }
 
         // Expand @file mentions into inline file content
-        let prompt_owned = deepseek_ui::expand_at_mentions(raw_prompt);
+        let mut prompt_owned = deepseek_ui::expand_at_mentions(raw_prompt);
+        if watch_files_enabled
+            && let Some((digest, hints)) = scan_watch_comment_payload(cwd)
+            && last_watch_digest != Some(digest)
+        {
+            last_watch_digest = Some(digest);
+            prompt_owned
+                .push_str("\n\nAUTO_WATCH_CONTEXT_V1\nDetected comment hints in workspace:\n");
+            prompt_owned.push_str(&hints);
+            prompt_owned.push_str("\nAUTO_WATCH_CONTEXT_END");
+        }
         let prompt = prompt_owned.as_str();
 
         if let Some(cmd) = SlashCommand::parse(prompt) {
@@ -617,6 +921,10 @@ pub(crate) fn run_chat(
                     let message = json!({
                         "commands": [
                             "/help",
+                            "/ask",
+                            "/code",
+                            "/architect",
+                            "/chat-mode",
                             "/init",
                             "/clear",
                             "/compact",
@@ -652,6 +960,12 @@ pub(crate) fn run_chat(
                             "/visual",
                             "/vim",
                             "/copy",
+                            "/paste",
+                            "/git",
+                            "/settings",
+                            "/load",
+                            "/save",
+                            "/voice",
                             "/debug",
                             "/desktop",
                             "/todos",
@@ -681,6 +995,56 @@ pub(crate) fn run_chat(
                                 println!("- {name}");
                             }
                         }
+                    }
+                }
+                SlashCommand::Ask(_args) => {
+                    active_chat_mode = ChatMode::Ask;
+                    if json_mode {
+                        print_json(&json!({"mode": "ask"}))?;
+                    } else {
+                        println!("chat mode set to ask");
+                    }
+                }
+                SlashCommand::Code(_args) => {
+                    active_chat_mode = ChatMode::Code;
+                    if json_mode {
+                        print_json(&json!({"mode": "code"}))?;
+                    } else {
+                        println!("chat mode set to code");
+                    }
+                }
+                SlashCommand::Architect(_args) => {
+                    active_chat_mode = ChatMode::Architect;
+                    if json_mode {
+                        print_json(&json!({"mode": "architect"}))?;
+                    } else {
+                        println!("chat mode set to architect");
+                    }
+                }
+                SlashCommand::ChatMode(mode) => {
+                    let Some(raw_mode) = mode else {
+                        if json_mode {
+                            print_json(&json!({"mode": chat_mode_name(active_chat_mode)}))?;
+                        } else {
+                            println!("current chat mode: {}", chat_mode_name(active_chat_mode));
+                        }
+                        continue;
+                    };
+                    if let Some(parsed) = parse_chat_mode_name(&raw_mode) {
+                        active_chat_mode = parsed;
+                        if json_mode {
+                            print_json(&json!({"mode": chat_mode_name(active_chat_mode)}))?;
+                        } else {
+                            println!("chat mode set to {}", chat_mode_name(active_chat_mode));
+                        }
+                    } else if json_mode {
+                        print_json(
+                            &json!({"error": format!("unsupported chat mode: {raw_mode}")}),
+                        )?;
+                    } else {
+                        println!(
+                            "unsupported chat mode: {raw_mode} (use ask|code|architect|context)"
+                        );
                     }
                 }
                 SlashCommand::Init => {
@@ -1184,6 +1548,73 @@ pub(crate) fn run_chat(
                         println!("No assistant response to copy.");
                     }
                 }
+                SlashCommand::Paste => {
+                    let pasted = read_from_clipboard().unwrap_or_default();
+                    if pasted.trim().is_empty() {
+                        if json_mode {
+                            print_json(&json!({"pasted": "", "empty": true}))?;
+                        } else {
+                            println!("clipboard is empty or unavailable");
+                        }
+                    } else if json_mode {
+                        print_json(&json!({"pasted": pasted}))?;
+                    } else {
+                        println!("{pasted}");
+                    }
+                }
+                SlashCommand::Git(args) => {
+                    let output = slash_git_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"git": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Settings => {
+                    run_config(cwd, ConfigCmd::Show, json_mode)?;
+                }
+                SlashCommand::Load(args) => {
+                    let (mode, read_only, thinking, dirs, output) =
+                        slash_load_profile_output(cwd, &args)?;
+                    active_chat_mode = mode;
+                    read_only_mode = read_only;
+                    force_max_think = thinking;
+                    additional_dirs = dirs;
+                    if json_mode {
+                        print_json(&json!({
+                            "loaded": true,
+                            "mode": chat_mode_name(active_chat_mode),
+                            "read_only": read_only_mode,
+                            "thinking_enabled": force_max_think,
+                            "additional_dirs": additional_dirs.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>()
+                        }))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Save(args) => {
+                    let output = slash_save_profile_output(
+                        cwd,
+                        &args,
+                        active_chat_mode,
+                        read_only_mode,
+                        force_max_think,
+                        &additional_dirs,
+                    )?;
+                    if json_mode {
+                        print_json(&json!({"saved": true, "message": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Voice(args) => {
+                    let output = slash_voice_output(&args)?;
+                    if json_mode {
+                        print_json(&json!({"voice": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
                 SlashCommand::Debug(args) => match parse_debug_analysis_args(&args)? {
                     Some(doctor_args) => {
                         run_doctor(cwd, doctor_args, json_mode)?;
@@ -1455,10 +1886,12 @@ pub(crate) fn run_chat(
                                     additional_dirs: additional_dirs.clone(),
                                     repo_root_override: repo_root_override.clone(),
                                     debug_context,
-                                    mode: ChatMode::Code,
+                                    mode: active_chat_mode,
                                     force_execute,
                                     force_plan_only,
                                     teammate_mode: teammate_mode.clone(),
+                                    detect_urls,
+                                    watch_files: watch_files_enabled,
                                     ..Default::default()
                                 },
                             )?;
@@ -1644,10 +2077,12 @@ pub(crate) fn run_chat(
                 additional_dirs: additional_dirs.clone(),
                 repo_root_override: repo_root_override.clone(),
                 debug_context,
-                mode: ChatMode::Code,
+                mode: active_chat_mode,
                 force_execute,
                 force_plan_only,
                 teammate_mode: teammate_mode.clone(),
+                detect_urls,
+                watch_files: watch_files_enabled,
                 ..Default::default()
             },
         )?;
@@ -1662,6 +2097,7 @@ pub(crate) fn run_chat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_chat_tui(
     cwd: &Path,
     allow_tools: bool,
@@ -1672,12 +2108,16 @@ pub(crate) fn run_chat_tui(
     teammate_mode: Option<String>,
     repo_root_override: Option<PathBuf>,
     debug_context: bool,
+    detect_urls: bool,
+    watch_files_enabled: bool,
 ) -> Result<()> {
     let engine = Arc::new(AgentEngine::new(cwd)?);
     wire_subagent_worker(&engine, cwd);
     let force_max_think = Arc::new(AtomicBool::new(initial_force_max_think));
     let additional_dirs = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
     let read_only_mode = Arc::new(AtomicBool::new(false));
+    let active_chat_mode = Arc::new(std::sync::Mutex::new(ChatMode::Code));
+    let last_watch_digest = Arc::new(std::sync::Mutex::new(None::<u64>));
 
     // Create the channel for TUI stream events.
     let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
@@ -1707,6 +2147,8 @@ pub(crate) fn run_chat_tui(
     let fmt_refresh = Arc::clone(&force_max_think);
     let additional_dirs_for_closure = Arc::clone(&additional_dirs);
     let read_only_for_closure = Arc::clone(&read_only_mode);
+    let active_mode_for_closure = Arc::clone(&active_chat_mode);
+    let watch_digest_for_closure = Arc::clone(&last_watch_digest);
     run_tui_shell_with_bindings(
         status,
         bindings,
@@ -1718,7 +2160,41 @@ pub(crate) fn run_chat_tui(
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Help => "commands: /help /ask /code /architect /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /git /settings /load /save /paste /voice /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Ask(_) => {
+                    if let Ok(mut guard) = active_mode_for_closure.lock() {
+                        *guard = ChatMode::Ask;
+                    }
+                    "chat mode set to ask".to_string()
+                }
+                SlashCommand::Code(_) => {
+                    if let Ok(mut guard) = active_mode_for_closure.lock() {
+                        *guard = ChatMode::Code;
+                    }
+                    "chat mode set to code".to_string()
+                }
+                SlashCommand::Architect(_) => {
+                    if let Ok(mut guard) = active_mode_for_closure.lock() {
+                        *guard = ChatMode::Architect;
+                    }
+                    "chat mode set to architect".to_string()
+                }
+                SlashCommand::ChatMode(mode) => {
+                    if let Some(raw_mode) = mode {
+                        if let Some(parsed) = parse_chat_mode_name(&raw_mode) {
+                            if let Ok(mut guard) = active_mode_for_closure.lock() {
+                                *guard = parsed;
+                            }
+                            format!("chat mode set to {}", chat_mode_name(parsed))
+                        } else {
+                            format!("unsupported chat mode: {raw_mode} (ask|code|architect|context)")
+                        }
+                    } else if let Ok(guard) = active_mode_for_closure.lock() {
+                        format!("current chat mode: {}", chat_mode_name(*guard))
+                    } else {
+                        "current chat mode: code".to_string()
+                    }
+                }
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -2015,6 +2491,42 @@ pub(crate) fn run_chat_tui(
                     Ok(cmd) => serde_json::to_string_pretty(&visual_payload(cwd, cmd)?)?,
                     Err(err) => format!("visual parse error: {err}"),
                 },
+                SlashCommand::Git(args) => slash_git_output(cwd, &args)?,
+                SlashCommand::Settings => format!(
+                    "config file: {}",
+                    AppConfig::project_settings_path(cwd).display()
+                ),
+                SlashCommand::Load(args) => {
+                    let (mode, read_only, thinking, dirs, output) =
+                        slash_load_profile_output(cwd, &args)?;
+                    if let Ok(mut guard) = active_mode_for_closure.lock() {
+                        *guard = mode;
+                    }
+                    read_only_for_closure.store(read_only, Ordering::Relaxed);
+                    force_max_think.store(thinking, Ordering::Relaxed);
+                    if let Ok(mut guard) = additional_dirs_for_closure.lock() {
+                        *guard = dirs;
+                    }
+                    output
+                }
+                SlashCommand::Save(args) => {
+                    let mode = active_mode_for_closure
+                        .lock()
+                        .map(|g| *g)
+                        .unwrap_or(ChatMode::Code);
+                    let dirs = additional_dirs_for_closure
+                        .lock()
+                        .map(|d| d.clone())
+                        .unwrap_or_default();
+                    slash_save_profile_output(
+                        cwd,
+                        &args,
+                        mode,
+                        read_only_for_closure.load(Ordering::Relaxed),
+                        force_max_think.load(Ordering::Relaxed),
+                        &dirs,
+                    )?
+                }
                 SlashCommand::Context => {
                     let ctx_cfg = AppConfig::load(cwd).unwrap_or_default();
                     let ctx_store = Store::new(cwd)?;
@@ -2080,6 +2592,15 @@ pub(crate) fn run_chat_tui(
                 }
                 SlashCommand::Doctor => serde_json::to_string_pretty(&doctor_payload(cwd, &DoctorArgs::default())?)?,
                 SlashCommand::Copy => "Copied last response to clipboard.".to_string(),
+                SlashCommand::Paste => {
+                    let pasted = read_from_clipboard().unwrap_or_default();
+                    if pasted.is_empty() {
+                        "clipboard is empty or unavailable".to_string()
+                    } else {
+                        pasted
+                    }
+                }
+                SlashCommand::Voice(args) => slash_voice_output(&args)?,
                 SlashCommand::Debug(args) => match parse_debug_analysis_args(&args)? {
                     Some(doctor_args) => {
                         serde_json::to_string_pretty(&doctor_payload(cwd, &doctor_args)?)?
@@ -2188,11 +2709,26 @@ pub(crate) fn run_chat_tui(
 
             // Agent prompt — expand @file mentions and set stream callback.
             let engine_clone = Arc::clone(&engine);
-            let prompt = deepseek_ui::expand_at_mentions(prompt);
+            let mut prompt = deepseek_ui::expand_at_mentions(prompt);
+            if watch_files_enabled
+                && let Some((digest, hints)) = scan_watch_comment_payload(cwd)
+                && let Ok(mut guard) = watch_digest_for_closure.lock()
+                && *guard != Some(digest)
+            {
+                *guard = Some(digest);
+                prompt
+                    .push_str("\n\nAUTO_WATCH_CONTEXT_V1\nDetected comment hints in workspace:\n");
+                prompt.push_str(&hints);
+                prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
+            }
             let max_think = force_max_think.load(Ordering::Relaxed);
             let tx_stream = tx.clone();
             let tx_done = tx.clone();
             let read_only_for_turn = read_only_for_closure.load(Ordering::Relaxed);
+            let mode_for_turn = active_mode_for_closure
+                .lock()
+                .map(|mode| *mode)
+                .unwrap_or(ChatMode::Code);
             let prompt_additional_dirs = additional_dirs_for_closure
                 .lock()
                 .map(|dirs| dirs.clone())
@@ -2346,10 +2882,12 @@ pub(crate) fn run_chat_tui(
                             additional_dirs: prompt_additional_dirs,
                             repo_root_override: prompt_repo_root_override.clone(),
                             debug_context,
-                            mode: ChatMode::Code,
+                            mode: mode_for_turn,
                             force_execute,
                             force_plan_only,
                             teammate_mode: teammate_mode_for_turn.clone(),
+                            detect_urls,
+                            watch_files: watch_files_enabled,
                             ..Default::default()
                         },
                     )
@@ -3232,40 +3770,24 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
         engine.set_stream_callback(std::sync::Arc::new(move |chunk: StreamChunk| {
             let out = stdout();
             let mut handle = out.lock();
+            if stream_json {
+                let event = stream_chunk_to_event_json(&chunk);
+                let _ = serde_json::to_writer(&mut handle, &event);
+                let _ = writeln!(handle);
+                let _ = handle.flush();
+                return;
+            }
             match chunk {
                 StreamChunk::ContentDelta(text) => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "content", "text": text}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = write!(handle, "{text}");
-                    }
+                    let _ = write!(handle, "{text}");
                     let _ = handle.flush();
                 }
                 StreamChunk::ReasoningDelta(text) => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "reasoning", "text": text}),
-                        );
-                        let _ = writeln!(handle);
-                        let _ = handle.flush();
-                    }
+                    let _ = text;
                     // In text mode, reasoning is not shown
                 }
                 StreamChunk::ArchitectStarted { iteration } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"architect_started","iteration":iteration}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "\n[phase] architect started (iter {iteration})");
-                    }
+                    let _ = writeln!(handle, "\n[phase] architect started (iter {iteration})");
                     let _ = handle.flush();
                 }
                 StreamChunk::ArchitectCompleted {
@@ -3273,54 +3795,22 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     files,
                     no_edit,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"architect_completed","iteration":iteration,"files":files,"no_edit":no_edit}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] architect completed (iter {iteration}) files={files} no_edit={no_edit}"
-                        );
-                    }
+                    let _ = writeln!(
+                        handle,
+                        "[phase] architect completed (iter {iteration}) files={files} no_edit={no_edit}"
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::EditorStarted { iteration, files } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"editor_started","iteration":iteration,"files":files}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "[phase] editor started (iter {iteration}) files={files}");
-                    }
+                    let _ = writeln!(handle, "[phase] editor started (iter {iteration}) files={files}");
                     let _ = handle.flush();
                 }
                 StreamChunk::EditorCompleted { iteration, status } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"editor_completed","iteration":iteration,"status":status}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "[phase] editor completed (iter {iteration}) status={status}");
-                    }
+                    let _ = writeln!(handle, "[phase] editor completed (iter {iteration}) status={status}");
                     let _ = handle.flush();
                 }
                 StreamChunk::ApplyStarted { iteration } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"apply_started","iteration":iteration}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "[phase] apply started (iter {iteration})");
-                    }
+                    let _ = writeln!(handle, "[phase] apply started (iter {iteration})");
                     let _ = handle.flush();
                 }
                 StreamChunk::ApplyCompleted {
@@ -3328,39 +3818,23 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     success,
                     summary,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"apply_completed","iteration":iteration,"success":success,"summary":summary}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] apply {} (iter {iteration}) {}",
-                            if success { "ok" } else { "failed" },
-                            summary.replace('\n', " ")
-                        );
-                    }
+                    let _ = writeln!(
+                        handle,
+                        "[phase] apply {} (iter {iteration}) {}",
+                        if success { "ok" } else { "failed" },
+                        summary.replace('\n', " ")
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::VerifyStarted {
                     iteration,
                     commands,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"verify_started","iteration":iteration,"commands":commands}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] verify started (iter {iteration}) {}",
-                            commands.join(" | ")
-                        );
-                    }
+                    let _ = writeln!(
+                        handle,
+                        "[phase] verify started (iter {iteration}) {}",
+                        commands.join(" | ")
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::VerifyCompleted {
@@ -3368,20 +3842,12 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     success,
                     summary,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"phase","phase":"verify_completed","iteration":iteration,"success":success,"summary":summary}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] verify {} (iter {iteration}) {}",
-                            if success { "ok" } else { "failed" },
-                            summary.replace('\n', " ")
-                        );
-                    }
+                    let _ = writeln!(
+                        handle,
+                        "[phase] verify {} (iter {iteration}) {}",
+                        if success { "ok" } else { "failed" },
+                        summary.replace('\n', " ")
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::CommitProposal {
@@ -3392,83 +3858,45 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     verify_status,
                     suggested_message,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({
-                                "type":"commit_proposal",
-                                "files":files,
-                                "touched_files":touched_files,
-                                "loc_delta":loc_delta,
-                                "verify_commands":verify_commands,
-                                "verify_status":verify_status,
-                                "suggested_message":suggested_message
-                            }),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[commit] ready files={} touched={} loc={} message=\"{}\"",
-                            files.join(","),
-                            touched_files,
-                            loc_delta,
-                            suggested_message
-                        );
-                        let _ = writeln!(
-                            handle,
-                            "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
-                        );
-                    }
+                    let _ = verify_commands;
+                    let _ = verify_status;
+                    let _ = writeln!(
+                        handle,
+                        "[commit] ready files={} touched={} loc={} message=\"{}\"",
+                        files.join(","),
+                        touched_files,
+                        loc_delta,
+                        suggested_message
+                    );
+                    let _ = writeln!(
+                        handle,
+                        "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
+                    );
                     let _ = handle.flush();
                 }
-                StreamChunk::ToolCallStart { tool_name, args_summary } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "tool_start", "tool": tool_name, "args": args_summary}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "\n[tool: {tool_name}] {args_summary}");
-                    }
+                StreamChunk::ToolCallStart {
+                    tool_name,
+                    args_summary,
+                } => {
+                    let _ = writeln!(handle, "\n[tool: {tool_name}] {args_summary}");
                     let _ = handle.flush();
                 }
-                StreamChunk::ToolCallEnd { tool_name, duration_ms, success, summary } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "tool_end", "tool": tool_name, "duration_ms": duration_ms, "success": success, "summary": summary}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let status = if success { "ok" } else { "error" };
-                        let _ = writeln!(handle, "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}");
-                    }
+                StreamChunk::ToolCallEnd {
+                    tool_name,
+                    duration_ms,
+                    success,
+                    summary,
+                } => {
+                    let status = if success { "ok" } else { "error" };
+                    let _ = writeln!(handle, "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}");
                     let _ = handle.flush();
                 }
                 StreamChunk::ModeTransition { from, to, reason } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "mode_transition", "from": from, "to": to, "reason": reason}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
-                    }
+                    let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
                     let _ = handle.flush();
                 }
                 StreamChunk::SubagentSpawned { run_id, name, goal } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"subagent_spawned","run_id":run_id,"name":name,"goal":goal}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "[subagent:spawned] {name} ({run_id}) {goal}");
-                    }
+                    let _ = writeln!(handle, "[subagent:spawned] {name} ({run_id}) {goal}");
                     let _ = handle.flush();
                 }
                 StreamChunk::SubagentCompleted {
@@ -3476,19 +3904,11 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     name,
                     summary,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"subagent_completed","run_id":run_id,"name":name,"summary":summary}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[subagent:completed] {name} ({run_id}) {}",
-                            summary.replace('\n', " ")
-                        );
-                    }
+                    let _ = writeln!(
+                        handle,
+                        "[subagent:completed] {name} ({run_id}) {}",
+                        summary.replace('\n', " ")
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::SubagentFailed {
@@ -3496,31 +3916,15 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     name,
                     error,
                 } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type":"subagent_failed","run_id":run_id,"name":name,"error":error}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(
-                            handle,
-                            "[subagent:failed] {name} ({run_id}) {}",
-                            error.replace('\n', " ")
-                        );
-                    }
+                    let _ = writeln!(
+                        handle,
+                        "[subagent:failed] {name} ({run_id}) {}",
+                        error.replace('\n', " ")
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::ImageData { label, .. } => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "image", "label": label}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle, "[image: {label}]");
-                    }
+                    let _ = writeln!(handle, "[image: {label}]");
                     let _ = handle.flush();
                 }
                 StreamChunk::ClearStreamingText => {
@@ -3528,15 +3932,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     // written to stdout.
                 }
                 StreamChunk::Done => {
-                    if stream_json {
-                        let _ = serde_json::to_writer(
-                            &mut handle,
-                            &serde_json::json!({"type": "done"}),
-                        );
-                        let _ = writeln!(handle);
-                    } else {
-                        let _ = writeln!(handle);
-                    }
+                    let _ = writeln!(handle);
                     let _ = handle.flush();
                 }
             }
@@ -3631,6 +4027,8 @@ pub(crate) fn run_resume_specific(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn chrome_error_payload_classifies_endpoint_unreachable() {
@@ -3652,5 +4050,129 @@ mod tests {
             &anyhow::anyhow!("no_page_targets: no debuggable page target available"),
         );
         assert_eq!(payload["error"]["kind"], "no_page_targets");
+    }
+
+    #[test]
+    fn render_web_fetch_markdown_contains_metadata_and_extract_block() {
+        let output = serde_json::json!({
+            "status": 200,
+            "content_type": "text/html",
+            "truncated": false,
+            "bytes": 320,
+            "content": "Title\n\nFirst paragraph.\nSecond paragraph."
+        });
+        let rendered = render_web_fetch_markdown("https://example.com", &output, 6);
+        assert!(rendered.contains("# Web Fetch"));
+        assert!(rendered.contains("- URL: https://example.com"));
+        assert!(rendered.contains("- Status: 200"));
+        assert!(rendered.contains("## Extract"));
+        assert!(rendered.contains("```text"));
+        assert!(rendered.contains("First paragraph."));
+    }
+
+    #[test]
+    fn render_web_search_markdown_formats_results_and_extract() {
+        let results = vec![
+            serde_json::json!({
+                "title": "DeepSeek CLI docs",
+                "url": "https://example.com/docs",
+                "snippet": "A deterministic coding agent runtime."
+            }),
+            serde_json::json!({
+                "title": "Architecture notes",
+                "url": "https://example.com/notes",
+                "snippet": "Architect editor apply verify."
+            }),
+        ];
+        let rendered = render_web_search_markdown(
+            "deepseek cli",
+            &results,
+            Some((
+                "https://example.com/docs".to_string(),
+                "DeepSeek CLI is terminal-native.".to_string(),
+            )),
+        );
+        assert!(rendered.contains("# Web Search"));
+        assert!(rendered.contains("- Query: deepseek cli"));
+        assert!(rendered.contains("1. DeepSeek CLI docs"));
+        assert!(rendered.contains("## Extract (https://example.com/docs)"));
+        assert!(rendered.contains("DeepSeek CLI is terminal-native."));
+    }
+
+    #[test]
+    fn parse_chat_mode_name_supports_expected_aliases() {
+        assert_eq!(parse_chat_mode_name("ask"), Some(ChatMode::Ask));
+        assert_eq!(parse_chat_mode_name("code"), Some(ChatMode::Code));
+        assert_eq!(parse_chat_mode_name("architect"), Some(ChatMode::Architect));
+        assert_eq!(parse_chat_mode_name("plan"), Some(ChatMode::Architect));
+        assert_eq!(parse_chat_mode_name("context"), Some(ChatMode::Context));
+        assert_eq!(parse_chat_mode_name("invalid"), None);
+    }
+
+    #[test]
+    fn watch_scan_returns_digest_and_payload() -> Result<()> {
+        // rg must be a real binary on PATH (not just a shell alias)
+        let rg_available = std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !rg_available {
+            eprintln!("skipping watch_scan test: rg not found on PATH");
+            return Ok(());
+        }
+        let dir = tempdir()?;
+        let root = dir.path();
+        fs::write(
+            root.join("notes.md"),
+            "todo list\nTODO(ai): inspect runtime flow\n",
+        )?;
+        let result = scan_watch_comment_payload(root);
+        assert!(result.is_some());
+        let (digest, payload) = result.unwrap();
+        assert!(digest > 0);
+        assert!(payload.contains("TODO(ai): inspect runtime flow"));
+        assert!(payload.contains("notes.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_save_and_load_roundtrip() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+        let additional_dirs = vec![root.join("src"), root.join("docs")];
+        let save = slash_save_profile_output(
+            root,
+            &[String::from("roundtrip")],
+            ChatMode::Architect,
+            true,
+            true,
+            &additional_dirs,
+        )?;
+        assert!(save.contains("saved chat profile"));
+
+        let (mode, read_only, thinking, dirs, load_msg) =
+            slash_load_profile_output(root, &[String::from("roundtrip")])?;
+        assert_eq!(mode, ChatMode::Architect);
+        assert!(read_only);
+        assert!(thinking);
+        assert_eq!(dirs, additional_dirs);
+        assert!(load_msg.contains("loaded chat profile"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_git_without_args_returns_usage() -> Result<()> {
+        let dir = tempdir()?;
+        run_process(dir.path(), "git", &["init"])?;
+        let output = slash_git_output(dir.path(), &[])?;
+        assert!(output.trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn slash_voice_status_reports_capability_probe() -> Result<()> {
+        let output = slash_voice_output(&[String::from("status")])?;
+        assert!(output.contains("voice status:"));
+        Ok(())
     }
 }

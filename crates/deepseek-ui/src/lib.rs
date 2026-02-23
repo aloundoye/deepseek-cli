@@ -166,6 +166,10 @@ impl Drop for TerminalGuard {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
+    Ask(Vec<String>),
+    Code(Vec<String>),
+    Architect(Vec<String>),
+    ChatMode(Option<String>),
     Init,
     Clear,
     Compact,
@@ -201,7 +205,13 @@ pub enum SlashCommand {
     Keybindings,
     Doctor,
     Copy,
+    Paste,
     Debug(Vec<String>),
+    Git(Vec<String>),
+    Settings,
+    Load(Vec<String>),
+    Save(Vec<String>),
+    Voice(Vec<String>),
     Desktop(Vec<String>),
     Todos(Vec<String>),
     Chrome(Vec<String>),
@@ -243,6 +253,10 @@ impl SlashCommand {
 
         let cmd = match name.as_str() {
             "help" => Self::Help,
+            "ask" => Self::Ask(args),
+            "code" => Self::Code(args),
+            "architect" => Self::Architect(args),
+            "chat-mode" | "chat_mode" => Self::ChatMode(args.first().cloned()),
             "init" => Self::Init,
             "clear" => Self::Clear,
             "compact" => Self::Compact,
@@ -278,6 +292,12 @@ impl SlashCommand {
             "keybindings" => Self::Keybindings,
             "doctor" => Self::Doctor,
             "copy" => Self::Copy,
+            "paste" => Self::Paste,
+            "git" => Self::Git(args),
+            "settings" => Self::Settings,
+            "load" => Self::Load(args),
+            "save" => Self::Save(args),
+            "voice" => Self::Voice(args),
             "debug" => Self::Debug(args),
             "desktop" => Self::Desktop(args),
             "todos" => Self::Todos(args),
@@ -2627,16 +2647,15 @@ where
         cursor_visible = tick_count % 16 < 8;
         let approval_alert_active = pending_approval.is_some();
         let approval_flash_on = tick_count % 12 < 6;
-        if let Some((iteration, phase)) = active_phase.as_ref() {
-            if last_phase_event_at.elapsed() >= Duration::from_millis(phase_heartbeat_ms)
-                && last_phase_heartbeat_at.elapsed() >= Duration::from_millis(phase_heartbeat_ms)
-            {
-                info_line = format!("iter {iteration} {phase} in progress...");
-                shell.push_mission_control(format!(
-                    "iteration {iteration}: {phase} in progress (heartbeat)"
-                ));
-                last_phase_heartbeat_at = Instant::now();
-            }
+        if let Some((iteration, phase)) = active_phase.as_ref()
+            && last_phase_event_at.elapsed() >= Duration::from_millis(phase_heartbeat_ms)
+            && last_phase_heartbeat_at.elapsed() >= Duration::from_millis(phase_heartbeat_ms)
+        {
+            info_line = format!("iter {iteration} {phase} in progress...");
+            shell.push_mission_control(format!(
+                "iteration {iteration}: {phase} in progress (heartbeat)"
+            ));
+            last_phase_heartbeat_at = Instant::now();
         }
 
         // Print any new transcript entries above the inline viewport
@@ -2861,55 +2880,53 @@ where
                     .wrap(Wrap { trim: false }),
                     input_area,
                 );
+            } else if vim_enabled && vim_mode == VimMode::Command {
+                let body = format!(":{}{}", vim_command_buffer, cursor_ch);
+                let cursor_anchor = format!("{prompt_str}:{}{}", vim_command_buffer, cursor_ch);
+                let scroll_y = scroll_to_keep_row_visible(
+                    wrapped_text_rows(&cursor_anchor, input_area.width).saturating_sub(1),
+                    input_area.height,
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(prompt_str.to_string(), prompt_style),
+                        Span::raw(body),
+                    ]))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_y, 0)),
+                    input_area,
+                );
             } else {
-                if vim_enabled && vim_mode == VimMode::Command {
-                    let body = format!(":{}{}", vim_command_buffer, cursor_ch);
-                    let cursor_anchor = format!("{prompt_str}:{}{}", vim_command_buffer, cursor_ch);
-                    let scroll_y = scroll_to_keep_row_visible(
-                        wrapped_text_rows(&cursor_anchor, input_area.width).saturating_sub(1),
-                        input_area.height,
-                    );
-                    frame.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(prompt_str.to_string(), prompt_style),
-                            Span::raw(body),
-                        ]))
+                let before = &input[..cursor_pos.min(input.len())];
+                let after = &input[cursor_pos.min(input.len())..];
+                let cursor_anchor = format!("{prompt_str}{before}{cursor_ch}");
+                let scroll_y = scroll_to_keep_row_visible(
+                    wrapped_text_rows(&cursor_anchor, input_area.width).saturating_sub(1),
+                    input_area.height,
+                );
+                let mut spans = vec![
+                    Span::styled(prompt_str.to_string(), prompt_style),
+                    Span::raw(before.to_string()),
+                    Span::raw(cursor_ch.to_string()),
+                    Span::raw(after.to_string()),
+                ];
+                if scroll_y == 0
+                    && cursor_pos >= input.len()
+                    && let Some(ghost) = history_ghost_suffix(&history, &input)
+                {
+                    spans.push(Span::styled(
+                        ghost,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                frame.render_widget(
+                    Paragraph::new(Line::from(spans))
                         .wrap(Wrap { trim: false })
                         .scroll((scroll_y, 0)),
-                        input_area,
-                    );
-                } else {
-                    let before = &input[..cursor_pos.min(input.len())];
-                    let after = &input[cursor_pos.min(input.len())..];
-                    let cursor_anchor = format!("{prompt_str}{before}{cursor_ch}");
-                    let scroll_y = scroll_to_keep_row_visible(
-                        wrapped_text_rows(&cursor_anchor, input_area.width).saturating_sub(1),
-                        input_area.height,
-                    );
-                    let mut spans = vec![
-                        Span::styled(prompt_str.to_string(), prompt_style),
-                        Span::raw(before.to_string()),
-                        Span::raw(cursor_ch.to_string()),
-                        Span::raw(after.to_string()),
-                    ];
-                    if scroll_y == 0
-                        && cursor_pos >= input.len()
-                        && let Some(ghost) = history_ghost_suffix(&history, &input)
-                    {
-                        spans.push(Span::styled(
-                            ghost,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        ));
-                    }
-                    frame.render_widget(
-                        Paragraph::new(Line::from(spans))
-                            .wrap(Wrap { trim: false })
-                            .scroll((scroll_y, 0)),
-                        input_area,
-                    );
-                }
+                    input_area,
+                );
             }
             // Row N+1: thin separator line below input
             let sep2_area = Rect::new(area.x, sep2_y, width, 1);
@@ -4824,6 +4841,19 @@ mod tests {
     #[test]
     fn parses_slash_commands() {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse("/ask"), Some(SlashCommand::Ask(vec![])));
+        assert_eq!(
+            SlashCommand::parse("/code"),
+            Some(SlashCommand::Code(vec![]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/architect"),
+            Some(SlashCommand::Architect(vec![]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/chat-mode ask"),
+            Some(SlashCommand::ChatMode(Some("ask".to_string())))
+        );
         assert_eq!(
             SlashCommand::parse("/effort high"),
             Some(SlashCommand::Effort(Some("high".to_string())))
@@ -5009,6 +5039,30 @@ mod tests {
         );
         assert_eq!(SlashCommand::parse("/doctor"), Some(SlashCommand::Doctor));
         assert_eq!(SlashCommand::parse("/copy"), Some(SlashCommand::Copy));
+        assert_eq!(SlashCommand::parse("/paste"), Some(SlashCommand::Paste));
+        assert_eq!(
+            SlashCommand::parse("/git status --short"),
+            Some(SlashCommand::Git(vec![
+                "status".to_string(),
+                "--short".to_string()
+            ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/settings"),
+            Some(SlashCommand::Settings)
+        );
+        assert_eq!(
+            SlashCommand::parse("/load profile.json"),
+            Some(SlashCommand::Load(vec!["profile.json".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/save profile.json"),
+            Some(SlashCommand::Save(vec!["profile.json".to_string()]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/voice status"),
+            Some(SlashCommand::Voice(vec!["status".to_string()]))
+        );
         assert_eq!(
             SlashCommand::parse("/debug connection"),
             Some(SlashCommand::Debug(vec!["connection".to_string()]))
@@ -5631,6 +5685,11 @@ mod tests {
         // Comprehensive test of all slash command variants
         assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
         assert_eq!(SlashCommand::parse("/copy"), Some(SlashCommand::Copy));
+        assert_eq!(SlashCommand::parse("/paste"), Some(SlashCommand::Paste));
+        assert_eq!(
+            SlashCommand::parse("/settings"),
+            Some(SlashCommand::Settings)
+        );
         assert_eq!(SlashCommand::parse("/login"), Some(SlashCommand::Login));
         assert_eq!(SlashCommand::parse("/logout"), Some(SlashCommand::Logout));
         assert_eq!(SlashCommand::parse("/bug"), Some(SlashCommand::Bug));

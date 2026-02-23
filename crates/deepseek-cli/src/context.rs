@@ -75,6 +75,8 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         force_plan_only: cli.plan_only,
         teammate_mode: cli.teammate_mode.clone(),
         disable_team_orchestration: false,
+        detect_urls: cli.detect_urls,
+        watch_files: cli.watch_files,
     }
 }
 

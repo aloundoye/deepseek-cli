@@ -9,6 +9,9 @@ pub struct VerifyResult {
     pub summary: String,
 }
 
+/// Callback type for verify-step approval gating.
+type ApprovalCallback<'a> = Option<&'a mut dyn FnMut(&ToolCall) -> anyhow::Result<bool>>;
+
 pub fn derive_verify_commands(workspace: &Path) -> Vec<String> {
     if workspace.join("Cargo.toml").exists() {
         return vec!["cargo test -q".to_string()];
@@ -29,7 +32,7 @@ pub fn run_verify(
     tool_host: &LocalToolHost,
     commands: &[String],
     timeout_seconds: u64,
-    mut approval: Option<&mut dyn FnMut(&ToolCall) -> anyhow::Result<bool>>,
+    mut approval: ApprovalCallback<'_>,
 ) -> VerifyResult {
     let mut failures = Vec::new();
 
@@ -152,6 +155,56 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let cmds = derive_verify_commands(temp.path());
         assert!(!cmds.is_empty());
+        assert!(cmds[0].contains("git status"));
+    }
+
+    #[test]
+    fn derive_commands_cargo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let cmds = derive_verify_commands(temp.path());
+        assert_eq!(cmds, vec!["cargo test -q"]);
+    }
+
+    #[test]
+    fn derive_commands_npm() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("package.json"), "{}").unwrap();
+        let cmds = derive_verify_commands(temp.path());
+        assert_eq!(cmds, vec!["npm test --silent"]);
+    }
+
+    #[test]
+    fn derive_commands_python_pyproject() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("pyproject.toml"), "[project]").unwrap();
+        let cmds = derive_verify_commands(temp.path());
+        assert_eq!(cmds, vec!["pytest -q"]);
+    }
+
+    #[test]
+    fn derive_commands_python_setup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("setup.py"), "# setup").unwrap();
+        let cmds = derive_verify_commands(temp.path());
+        assert_eq!(cmds, vec!["pytest -q"]);
+    }
+
+    #[test]
+    fn derive_commands_go() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("go.mod"), "module x").unwrap();
+        let cmds = derive_verify_commands(temp.path());
+        assert_eq!(cmds, vec!["go test ./..."]);
+    }
+
+    #[test]
+    fn derive_commands_priority_cargo_over_npm() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(temp.path().join("package.json"), "").unwrap();
+        let cmds = derive_verify_commands(temp.path());
+        assert_eq!(cmds, vec!["cargo test -q"]);
     }
 
     #[test]
@@ -163,5 +216,61 @@ mod tests {
             true
         ));
         assert!(!command_passed(&json!({"status": 0}), false));
+    }
+
+    #[test]
+    fn command_passed_checks_exit_code() {
+        assert!(command_passed(&json!({"exit_code": 0}), true));
+        assert!(!command_passed(&json!({"exit_code": 1}), true));
+    }
+
+    #[test]
+    fn command_passed_checks_success_bool() {
+        assert!(command_passed(&json!({"success": true}), true));
+        assert!(!command_passed(&json!({"success": false}), true));
+    }
+
+    #[test]
+    fn command_passed_defaults_to_true_on_empty_output() {
+        assert!(command_passed(&json!({}), true));
+    }
+
+    #[test]
+    fn command_passed_tool_failure_overrides() {
+        assert!(!command_passed(&json!({"success": true}), false));
+    }
+
+    #[test]
+    fn extract_output_from_string() {
+        let val = json!("hello world");
+        assert_eq!(extract_output(&val), "hello world");
+    }
+
+    #[test]
+    fn extract_output_from_stdout_stderr() {
+        let val = json!({"stdout": "out", "stderr": "err"});
+        let output = extract_output(&val);
+        assert!(output.contains("out"));
+        assert!(output.contains("err"));
+    }
+
+    #[test]
+    fn extract_output_fallback_to_json_string() {
+        let val = json!({"code": 42});
+        let output = extract_output(&val);
+        assert!(output.contains("42"));
+    }
+
+    #[test]
+    fn truncate_short_text_unchanged() {
+        assert_eq!(truncate("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_long_text_clips() {
+        let long = "a".repeat(100);
+        let result = truncate(&long, 50);
+        assert!(result.len() < 100);
+        assert!(result.contains("(truncated)"));
     }
 }
