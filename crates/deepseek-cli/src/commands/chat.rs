@@ -214,16 +214,9 @@ pub(crate) fn run_chat(
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
         .unwrap_or(false);
-    let allow_r1_drive_tools = cli.map(|value| value.allow_r1_drive_tools).unwrap_or(false);
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
-        return run_chat_tui(
-            cwd,
-            allow_tools,
-            allow_r1_drive_tools,
-            &cfg,
-            force_max_think,
-        );
+        return run_chat_tui(cwd, allow_tools, &cfg, force_max_think);
     }
     if force_tui && !interactive_tty {
         return Err(anyhow!("--tui requires an interactive terminal"));
@@ -976,7 +969,6 @@ pub(crate) fn run_chat(
                                 &rendered,
                                 ChatOptions {
                                     tools: allow_tools,
-                                    allow_r1_drive_tools,
                                     force_max_think,
                                     additional_dirs: additional_dirs.clone(),
                                     ..Default::default()
@@ -1006,6 +998,68 @@ pub(crate) fn run_chat(
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ReasoningDelta(_) => {}
+                    deepseek_core::StreamChunk::ArchitectStarted { iteration } => {
+                        let _ = writeln!(handle, "\n[phase] architect started (iter {iteration})");
+                    }
+                    deepseek_core::StreamChunk::ArchitectCompleted {
+                        iteration,
+                        files,
+                        no_edit,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] architect completed (iter {iteration}) files={files} no_edit={no_edit}"
+                        );
+                    }
+                    deepseek_core::StreamChunk::EditorStarted { iteration, files } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] editor started (iter {iteration}) files={files}"
+                        );
+                    }
+                    deepseek_core::StreamChunk::EditorCompleted { iteration, status } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] editor completed (iter {iteration}) status={status}"
+                        );
+                    }
+                    deepseek_core::StreamChunk::ApplyStarted { iteration } => {
+                        let _ = writeln!(handle, "[phase] apply started (iter {iteration})");
+                    }
+                    deepseek_core::StreamChunk::ApplyCompleted {
+                        iteration,
+                        success,
+                        summary,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] apply {} (iter {iteration}) {}",
+                            if success { "ok" } else { "failed" },
+                            summary.replace('\n', " ")
+                        );
+                    }
+                    deepseek_core::StreamChunk::VerifyStarted {
+                        iteration,
+                        commands,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] verify started (iter {iteration}) {}",
+                            commands.join(" | ")
+                        );
+                    }
+                    deepseek_core::StreamChunk::VerifyCompleted {
+                        iteration,
+                        success,
+                        summary,
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] verify {} (iter {iteration}) {}",
+                            if success { "ok" } else { "failed" },
+                            summary.replace('\n', " ")
+                        );
+                    }
                     deepseek_core::StreamChunk::ToolCallStart {
                         tool_name,
                         args_summary,
@@ -1078,7 +1132,6 @@ pub(crate) fn run_chat(
             prompt,
             ChatOptions {
                 tools: allow_tools,
-                allow_r1_drive_tools,
                 force_max_think,
                 additional_dirs: additional_dirs.clone(),
                 ..Default::default()
@@ -1098,7 +1151,6 @@ pub(crate) fn run_chat(
 pub(crate) fn run_chat_tui(
     cwd: &Path,
     allow_tools: bool,
-    allow_r1_drive_tools: bool,
     cfg: &AppConfig,
     initial_force_max_think: bool,
 ) -> Result<()> {
@@ -1594,6 +1646,60 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ReasoningDelta(s) => {
                     let _ = tx_stream.send(TuiStreamEvent::ReasoningDelta(s));
                 }
+                StreamChunk::ArchitectStarted { iteration } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ArchitectStarted { iteration });
+                }
+                StreamChunk::ArchitectCompleted {
+                    iteration,
+                    files,
+                    no_edit,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ArchitectCompleted {
+                        iteration,
+                        files,
+                        no_edit,
+                    });
+                }
+                StreamChunk::EditorStarted { iteration, files } => {
+                    let _ = tx_stream.send(TuiStreamEvent::EditorStarted { iteration, files });
+                }
+                StreamChunk::EditorCompleted { iteration, status } => {
+                    let _ = tx_stream.send(TuiStreamEvent::EditorCompleted { iteration, status });
+                }
+                StreamChunk::ApplyStarted { iteration } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ApplyStarted { iteration });
+                }
+                StreamChunk::ApplyCompleted {
+                    iteration,
+                    success,
+                    summary,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ApplyCompleted {
+                        iteration,
+                        success,
+                        summary,
+                    });
+                }
+                StreamChunk::VerifyStarted {
+                    iteration,
+                    commands,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::VerifyStarted {
+                        iteration,
+                        commands,
+                    });
+                }
+                StreamChunk::VerifyCompleted {
+                    iteration,
+                    success,
+                    summary,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::VerifyCompleted {
+                        iteration,
+                        success,
+                        summary,
+                    });
+                }
                 StreamChunk::ToolCallStart {
                     tool_name,
                     args_summary,
@@ -1658,7 +1764,6 @@ pub(crate) fn run_chat_tui(
                         &prompt,
                         ChatOptions {
                             tools: allow_tools,
-                            allow_r1_drive_tools,
                             force_max_think: max_think,
                             additional_dirs: prompt_additional_dirs,
                             ..Default::default()
@@ -2566,6 +2671,134 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                         let _ = handle.flush();
                     }
                     // In text mode, reasoning is not shown
+                }
+                StreamChunk::ArchitectStarted { iteration } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"architect_started","iteration":iteration}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "\n[phase] architect started (iter {iteration})");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::ArchitectCompleted {
+                    iteration,
+                    files,
+                    no_edit,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"architect_completed","iteration":iteration,"files":files,"no_edit":no_edit}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] architect completed (iter {iteration}) files={files} no_edit={no_edit}"
+                        );
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::EditorStarted { iteration, files } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"editor_started","iteration":iteration,"files":files}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "[phase] editor started (iter {iteration}) files={files}");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::EditorCompleted { iteration, status } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"editor_completed","iteration":iteration,"status":status}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "[phase] editor completed (iter {iteration}) status={status}");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::ApplyStarted { iteration } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"apply_started","iteration":iteration}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(handle, "[phase] apply started (iter {iteration})");
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::ApplyCompleted {
+                    iteration,
+                    success,
+                    summary,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"apply_completed","iteration":iteration,"success":success,"summary":summary}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] apply {} (iter {iteration}) {}",
+                            if success { "ok" } else { "failed" },
+                            summary.replace('\n', " ")
+                        );
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::VerifyStarted {
+                    iteration,
+                    commands,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"verify_started","iteration":iteration,"commands":commands}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] verify started (iter {iteration}) {}",
+                            commands.join(" | ")
+                        );
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::VerifyCompleted {
+                    iteration,
+                    success,
+                    summary,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({"type":"phase","phase":"verify_completed","iteration":iteration,"success":success,"summary":summary}),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[phase] verify {} (iter {iteration}) {}",
+                            if success { "ok" } else { "failed" },
+                            summary.replace('\n', " ")
+                        );
+                    }
+                    let _ = handle.flush();
                 }
                 StreamChunk::ToolCallStart { tool_name, args_summary } => {
                     if stream_json {

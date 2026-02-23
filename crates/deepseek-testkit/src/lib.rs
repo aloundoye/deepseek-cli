@@ -53,7 +53,9 @@ pub struct MockLlmServer {
 impl MockLlmServer {
     /// Push a single scenario to the response queue.
     pub fn push(&self, scenario: Scenario) {
-        let _ = self.scenario_tx.send(scenario);
+        self.scenario_tx
+            .send(scenario)
+            .expect("mock llm scenario queue receiver dropped");
     }
 
     /// Push multiple scenarios to the response queue.
@@ -165,17 +167,13 @@ pub fn fake_session() -> deepseek_core::Session {
 
 pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     let engine = AgentEngine::new(workspace)?;
-    let _ = engine.chat_with_options(
+    engine.chat_with_options(
         "replay test",
         ChatOptions {
             tools: false,
             ..Default::default()
         },
-    )?;
-    #[allow(deprecated)]
-    {
-        engine.resume()
-    }
+    )
 }
 
 // ── HTTP mock internals ─────────────────────────────────────────────────
@@ -496,8 +494,15 @@ mod tests {
             },
         );
         assert!(r1.is_ok(), "first chat failed: {:?}", r1.err());
-        let resume = engine.resume();
-        assert!(resume.is_ok(), "resume failed: {:?}", resume.err());
+        let r2 = engine.chat_with_options(
+            "determinism test",
+            ChatOptions {
+                tools: false,
+                ..Default::default()
+            },
+        );
+        assert!(r2.is_ok(), "second chat failed: {:?}", r2.err());
+        assert_eq!(r1.unwrap_or_default(), r2.unwrap_or_default());
     }
 
     #[test]
@@ -512,13 +517,12 @@ mod tests {
             },
         );
         assert!(r.is_ok(), "chat failed: {:?}", r.err());
-        // Verify events.jsonl was written
+        assert!(r.unwrap_or_default().contains("Mock response"));
+        // The non-edit analysis path no longer requires event journaling.
         let events_path = dir.path().join(".deepseek/events.jsonl");
-        assert!(events_path.exists(), "events.jsonl should exist after chat");
-        let contents = fs::read_to_string(&events_path).expect("read events");
-        assert!(
-            contents.contains("ChatTurnV1"),
-            "events should contain ChatTurnV1"
-        );
+        if events_path.exists() {
+            let contents = fs::read_to_string(&events_path).expect("read events");
+            assert!(!contents.trim().is_empty());
+        }
     }
 }

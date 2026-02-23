@@ -82,7 +82,6 @@ Run `deepseek --help` for full details. The most used commands are:
 
 Useful global flags:
 - `--json`: machine-readable output
-- `--allow-r1-drive-tools`: break-glass opt-in for automatic R1 drive-tools escalation
 - `--permission-mode ask|auto|plan`: per-run permission mode override
 
 ## Example Workflows
@@ -160,9 +159,10 @@ Reference files:
 - `config.example.toml`
 
 Notable architecture/runtime defaults:
-- V3 (`deepseek-chat`) is the primary tool executor.
-- R1 (`deepseek-reasoner`) is copilot/checkpoint reasoning by default.
-- R1 drive-tools remains break-glass only (`--allow-r1-drive-tools` or router override).
+- Edit execution uses a deterministic loop: Architect (`deepseek-reasoner`) -> Editor (`deepseek-chat`) -> Apply -> Verify.
+- Unified diff is the only edit contract in the execution loop.
+- Tool/function-calling orchestration is not used as the core execution backbone.
+- Analysis/review commands use a separate non-edit path and do not mutate files.
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
 - Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).
 - Teleport link base URL is configurable (`ui.handoff_base_url`).

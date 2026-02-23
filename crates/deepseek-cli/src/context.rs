@@ -27,56 +27,9 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
     engine.set_max_budget_usd(cli.max_budget_usd);
 }
 
-/// Wire the subagent worker so spawn_task creates real child agents.
+/// Subagent orchestration is disabled in the Architect->Editor->Apply->Verify core loop.
 pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
-    let workspace = cwd.to_path_buf();
-    engine.set_subagent_worker(std::sync::Arc::new(move |task| {
-        let mut child = AgentEngine::new(&workspace)?;
-
-        // If task carries a custom agent definition, use its config.
-        if let Some(ref agent_def) = task.custom_agent {
-            let opts = ChatOptions {
-                tools: true,
-                allowed_tools: if agent_def.tools.is_empty() {
-                    None
-                } else {
-                    Some(agent_def.tools.clone())
-                },
-                disallowed_tools: if agent_def.disallowed_tools.is_empty() {
-                    None
-                } else {
-                    Some(agent_def.disallowed_tools.clone())
-                },
-                system_prompt_override: Some(agent_def.prompt.clone()),
-                ..Default::default()
-            };
-            child.set_max_turns(agent_def.max_turns.or(Some(50)));
-            return child.chat_with_options(&task.goal, opts);
-        }
-
-        // Configure tool restrictions based on subagent role
-        let opts = match task.role {
-            deepseek_subagent::SubagentRole::Explore | deepseek_subagent::SubagentRole::Plan => {
-                ChatOptions {
-                    tools: true,
-                    allowed_tools: Some(
-                        deepseek_tools::PLAN_MODE_TOOLS
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                    ..Default::default()
-                }
-            }
-            _ => ChatOptions {
-                tools: true,
-                ..Default::default()
-            },
-        };
-        // Limit child agent turns to prevent runaway
-        child.set_max_turns(Some(50));
-        child.chat_with_options(&task.goal, opts)
-    }));
+    let _ = (engine, cwd);
 }
 
 /// Build ChatOptions from CLI flags.
@@ -93,31 +46,6 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
     } else {
         cli.append_system_prompt.clone()
     };
-    // --tools flag: "" = none, "default" = all, comma-separated = restrict
-    let (effective_allowed, effective_disallowed) = if let Some(ref t) = cli.tools {
-        if t.is_empty() {
-            // No tools at all
-            (Some(vec![]), None)
-        } else if t == "default" {
-            (None, None)
-        } else {
-            let list = t.split(',').map(|s| s.trim().to_string()).collect();
-            (Some(list), None)
-        }
-    } else {
-        (
-            if cli.allowed_tools.is_empty() {
-                None
-            } else {
-                Some(cli.allowed_tools.clone())
-            },
-            if cli.disallowed_tools.is_empty() {
-                None
-            } else {
-                Some(cli.disallowed_tools.clone())
-            },
-        )
-    };
     let force_max_think = cli
         .model
         .as_deref()
@@ -128,10 +56,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool) -> ChatOptions {
         .unwrap_or(false);
     ChatOptions {
         tools,
-        allow_r1_drive_tools: cli.allow_r1_drive_tools,
         force_max_think,
-        allowed_tools: effective_allowed,
-        disallowed_tools: effective_disallowed,
         system_prompt_override: sys_override,
         system_prompt_append: sys_append,
         additional_dirs: cli.add_dir.clone(),

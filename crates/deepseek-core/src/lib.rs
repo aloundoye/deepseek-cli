@@ -1133,6 +1133,37 @@ pub enum StreamChunk {
     ContentDelta(String),
     /// A reasoning/thinking text delta.
     ReasoningDelta(String),
+    /// Architect phase started.
+    ArchitectStarted { iteration: u64 },
+    /// Architect phase completed.
+    ArchitectCompleted {
+        iteration: u64,
+        files: u32,
+        no_edit: bool,
+    },
+    /// Editor phase started.
+    EditorStarted { iteration: u64, files: u32 },
+    /// Editor phase completed.
+    EditorCompleted { iteration: u64, status: String },
+    /// Apply phase started.
+    ApplyStarted { iteration: u64 },
+    /// Apply phase completed.
+    ApplyCompleted {
+        iteration: u64,
+        success: bool,
+        summary: String,
+    },
+    /// Verify phase started.
+    VerifyStarted {
+        iteration: u64,
+        commands: Vec<String>,
+    },
+    /// Verify phase completed.
+    VerifyCompleted {
+        iteration: u64,
+        success: bool,
+        summary: String,
+    },
     /// A tool call has started execution.
     ToolCallStart {
         tool_name: String,
@@ -1145,7 +1176,7 @@ pub enum StreamChunk {
         success: bool,
         summary: String,
     },
-    /// Agent mode transition (e.g., V3Autopilot → R1DriveTools).
+    /// Agent mode transition.
     ModeTransition {
         from: String,
         to: String,
@@ -1326,6 +1357,7 @@ pub struct ChatRequest {
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub router: RouterConfig,
+    pub agent_loop: AgentLoopConfig,
     pub policy: PolicyConfig,
     pub tools: ToolsConfig,
     pub plugins: PluginsConfig,
@@ -1392,23 +1424,23 @@ fn default_cleanup_period_days() -> u32 {
 fn default_respect_gitignore() -> bool {
     true
 }
-fn default_true_bool() -> bool {
-    true
+fn default_agent_loop_max_iterations() -> u64 {
+    6
 }
-fn default_v3_max_step_failures() -> u32 {
+fn default_agent_loop_parse_retries() -> u64 {
     2
 }
-fn default_blast_radius_threshold() -> u32 {
-    5
+fn default_agent_loop_max_files_per_iteration() -> u64 {
+    12
 }
-fn default_r1_max_steps() -> u32 {
-    30
+fn default_agent_loop_max_file_bytes() -> u64 {
+    200_000
 }
-fn default_r1_max_parse_retries() -> u32 {
-    2
+fn default_agent_loop_max_diff_bytes() -> u64 {
+    400_000
 }
-fn default_v3_patch_max_context_requests() -> u32 {
-    3
+fn default_agent_loop_verify_timeout_seconds() -> u64 {
+    60
 }
 
 impl AppConfig {
@@ -1581,37 +1613,6 @@ impl Default for LlmConfig {
 pub struct RouterConfig {
     pub auto_max_think: bool,
     pub threshold_high: f32,
-    pub escalate_on_invalid_plan: bool,
-    pub max_escalations_per_unit: u8,
-    /// When true (default), use `deepseek-chat` with thinking mode enabled
-    /// alongside tools in a single API call (DeepSeek V3.2 unified mode).
-    pub unified_thinking_tools: bool,
-    /// Enable the mode router (V3Autopilot / R1DriveTools).
-    /// When false, always uses V3Autopilot.
-    #[serde(default = "default_true_bool")]
-    pub mode_router_enabled: bool,
-    /// Allow automatic escalation into R1DriveTools mode.
-    /// When false (default), R1DriveTools is break-glass only (manual opt-in).
-    #[serde(default)]
-    pub r1_drive_auto_escalation: bool,
-    /// Max consecutive failures on the same step before escalating from V3 to R1.
-    #[serde(default = "default_v3_max_step_failures")]
-    pub v3_max_step_failures: u32,
-    /// Max files changed since last green verify before escalating to R1.
-    #[serde(default = "default_blast_radius_threshold")]
-    pub blast_radius_threshold: u32,
-    /// Allow V3 one bounded recovery attempt for mechanical errors.
-    #[serde(default = "default_true_bool")]
-    pub v3_mechanical_recovery: bool,
-    /// Max total R1 drive-tools steps per task.
-    #[serde(default = "default_r1_max_steps")]
-    pub r1_max_steps: u32,
-    /// Max retries when R1 output fails schema validation.
-    #[serde(default = "default_r1_max_parse_retries")]
-    pub r1_max_parse_retries: u32,
-    /// Max context requests from V3 patch writer before giving up.
-    #[serde(default = "default_v3_patch_max_context_requests")]
-    pub v3_patch_max_context_requests: u32,
     pub w1: f32,
     pub w2: f32,
     pub w3: f32,
@@ -1625,23 +1626,45 @@ impl Default for RouterConfig {
         Self {
             auto_max_think: true,
             threshold_high: 0.72,
-            escalate_on_invalid_plan: true,
-            max_escalations_per_unit: 1,
-            unified_thinking_tools: true,
-            mode_router_enabled: true,
-            r1_drive_auto_escalation: false,
-            v3_max_step_failures: 2,
-            blast_radius_threshold: 5,
-            v3_mechanical_recovery: true,
-            r1_max_steps: 30,
-            r1_max_parse_retries: 2,
-            v3_patch_max_context_requests: 3,
             w1: 0.2,
             w2: 0.15,
             w3: 0.2,
             w4: 0.15,
             w5: 0.2,
             w6: 0.1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentLoopConfig {
+    #[serde(default = "default_agent_loop_max_iterations")]
+    pub max_iterations: u64,
+    #[serde(default = "default_agent_loop_parse_retries")]
+    pub architect_parse_retries: u64,
+    #[serde(default = "default_agent_loop_parse_retries")]
+    pub editor_parse_retries: u64,
+    #[serde(default = "default_agent_loop_max_files_per_iteration")]
+    pub max_files_per_iteration: u64,
+    #[serde(default = "default_agent_loop_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_agent_loop_max_diff_bytes")]
+    pub max_diff_bytes: u64,
+    #[serde(default = "default_agent_loop_verify_timeout_seconds")]
+    pub verify_timeout_seconds: u64,
+}
+
+impl Default for AgentLoopConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_agent_loop_max_iterations(),
+            architect_parse_retries: default_agent_loop_parse_retries(),
+            editor_parse_retries: default_agent_loop_parse_retries(),
+            max_files_per_iteration: default_agent_loop_max_files_per_iteration(),
+            max_file_bytes: default_agent_loop_max_file_bytes(),
+            max_diff_bytes: default_agent_loop_max_diff_bytes(),
+            verify_timeout_seconds: default_agent_loop_verify_timeout_seconds(),
         }
     }
 }
