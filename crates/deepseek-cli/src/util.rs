@@ -67,6 +67,66 @@ pub(crate) fn read_from_clipboard() -> Option<String> {
     None
 }
 
+/// Attempt to read image data from the system clipboard.
+/// Returns raw PNG/image bytes if an image is available, None otherwise.
+pub(crate) fn read_image_from_clipboard() -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        // Use osascript to check if clipboard has image data and save to temp file
+        let temp = std::env::temp_dir().join("deepseek_clipboard_image.png");
+        let script = format!(
+            "set theFile to POSIX file \"{}\" as text\ntry\n  set imgData to the clipboard as «class PNGf»\n  set fp to open for access file theFile with write permission\n  write imgData to fp\n  close access fp\n  return \"ok\"\non error\n  return \"no_image\"\nend try",
+            temp.display()
+        );
+        let output = Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .ok()?;
+        let result = String::from_utf8_lossy(&output.stdout);
+        if result.trim() == "ok" {
+            let data = std::fs::read(&temp).ok()?;
+            let _ = std::fs::remove_file(&temp);
+            if data.len() > 8 {
+                return Some(data);
+            }
+        }
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+            .output()
+            .ok()?;
+        if output.status.success() && output.stdout.len() > 8 {
+            return Some(output.stdout);
+        }
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$img = Get-Clipboard -Format Image; if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray()) } else { '' }",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if b64.is_empty() {
+            return None;
+        }
+        use base64::Engine;
+        return base64::engine::general_purpose::STANDARD.decode(&b64).ok();
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 pub(crate) fn run_process(cwd: &Path, program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program).current_dir(cwd).args(args).output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

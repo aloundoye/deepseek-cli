@@ -14,7 +14,6 @@
 - LLM outage / rate limit:
   - Verify `DEEPSEEK_API_KEY` or `llm.api_key` is configured and endpoint/provider/profile settings are correct.
   - Confirm `llm.provider=deepseek`; unsupported providers fail fast.
-  - If using `llm.profile=v3_2_speciale`, switch to `v3_2` if the Speciale endpoint/model is unavailable (DeepSeek documents a limited run ending December 15, 2025).
   - Increase retry/backoff in `[llm]`.
   - For non-urgent workloads, consider `[scheduling].off_peak=true` and `[scheduling].defer_non_urgent=true`.
 - Tool execution denied:

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepSeek Chat</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --fg: #d4d4d4;
+    --border: #3c3c3c;
+    --input-bg: #252526;
+    --user-bg: #264f78;
+    --assistant-bg: #2d2d2d;
+    --accent: #569cd6;
+    --error: #f44747;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--fg);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .msg {
+    padding: 8px 12px;
+    border-radius: 6px;
+    max-width: 90%;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+  }
+  .msg.user {
+    background: var(--user-bg);
+    align-self: flex-end;
+  }
+  .msg.assistant {
+    background: var(--assistant-bg);
+    align-self: flex-start;
+    border: 1px solid var(--border);
+  }
+  .msg.error {
+    background: transparent;
+    color: var(--error);
+    border: 1px solid var(--error);
+    align-self: center;
+    font-size: 12px;
+  }
+  .msg.streaming {
+    border-left: 3px solid var(--accent);
+  }
+  #input-row {
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--input-bg);
+  }
+  #prompt {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 13px;
+    resize: none;
+    outline: none;
+  }
+  #prompt:focus {
+    border-color: var(--accent);
+  }
+  #send {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #send:hover { opacity: 0.9; }
+  #send:disabled { opacity: 0.4; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<div id="messages">
+  <div class="msg assistant">DeepSeek CLI ready. Type a prompt to begin.</div>
+</div>
+
+<div id="input-row">
+  <textarea id="prompt" rows="1" placeholder="Ask DeepSeek..." autofocus></textarea>
+  <button id="send">Send</button>
+</div>
+
+<script>
+  const messagesEl = document.getElementById('messages');
+  const promptEl = document.getElementById('prompt');
+  const sendBtn = document.getElementById('send');
+  let currentStreamEl = null;
+  let busy = false;
+
+  function addMessage(text, cls) {
+    const el = document.createElement('div');
+    el.className = 'msg ' + cls;
+    el.textContent = text;
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return el;
+  }
+
+  function send() {
+    const text = promptEl.value.trim();
+    if (!text || busy) return;
+    busy = true;
+    sendBtn.disabled = true;
+    promptEl.value = '';
+    addMessage(text, 'user');
+    currentStreamEl = addMessage('', 'assistant streaming');
+    if (window.sendToPlugin) {
+      window.sendToPlugin(text);
+    } else {
+      addMessage('Plugin bridge not available.', 'error');
+      finish();
+    }
+  }
+
+  function finish() {
+    if (currentStreamEl) {
+      currentStreamEl.classList.remove('streaming');
+      if (!currentStreamEl.textContent.trim()) {
+        currentStreamEl.remove();
+      }
+    }
+    currentStreamEl = null;
+    busy = false;
+    sendBtn.disabled = false;
+    promptEl.focus();
+  }
+
+  // Called by the plugin for each content chunk.
+  window.onChunk = function(text) {
+    if (currentStreamEl) {
+      currentStreamEl.textContent += text;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  };
+
+  // Called by the plugin when streaming is complete.
+  window.onDone = function() {
+    finish();
+  };
+
+  // Called by the plugin on error.
+  window.onError = function(msg) {
+    addMessage('Error: ' + msg, 'error');
+    finish();
+  };
+
+  sendBtn.addEventListener('click', send);
+  promptEl.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+
+  // Auto-resize textarea
+  promptEl.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  });
+</script>
+</body>
+</html>

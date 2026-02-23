@@ -1,9 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    CacheStrategy, ChatMessage, ChatRequest, DEEPSEEK_PROFILE_V32_SPECIALE, LlmConfig, LlmRequest,
-    LlmResponse, LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model,
-    normalize_deepseek_profile,
+    CacheStrategy, ChatMessage, ChatRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
+    StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -225,6 +224,21 @@ impl DeepSeekClient {
                 } => json!({"role": "tool", "tool_call_id": tool_call_id, "content": content}),
             })
             .collect();
+
+        // If images are provided, convert the last User message to multipart content
+        if !req.images.is_empty() {
+            if let Some(last_user) = messages.iter_mut().rev().find(|m| m["role"] == "user") {
+                let text = last_user["content"].as_str().unwrap_or("").to_string();
+                let mut parts = vec![json!({"type": "text", "text": text})];
+                for img in &req.images {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
+                    }));
+                }
+                last_user["content"] = json!(parts);
+            }
+        }
 
         if enable_cache {
             let strategy = &self.cfg.cache_strategy;
@@ -507,16 +521,11 @@ impl DeepSeekClient {
     fn resolve_request_model(&self, requested: &str, profile: &str) -> Result<String> {
         let normalized = normalize_deepseek_model(requested).ok_or_else(|| {
             anyhow!(
-                "unsupported model '{}' (supported aliases: deepseek-chat, deepseek-reasoner, deepseek-v3.2, deepseek-v3.2-speciale)",
+                "unsupported model '{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
                 requested
             )
         })?;
-        if is_speciale_alias(requested) && profile != DEEPSEEK_PROFILE_V32_SPECIALE {
-            return Err(anyhow!(
-                "model '{}' requires llm.profile='v3_2_speciale'",
-                requested
-            ));
-        }
+        let _ = profile;
         Ok(normalized.to_string())
     }
 
@@ -761,7 +770,7 @@ impl LlmClient for DeepSeekClient {
 
         let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
             anyhow!(
-                "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+                "unsupported llm.profile='{}' (supported: v3_2)",
                 self.cfg.profile
             )
         })?;
@@ -784,7 +793,7 @@ impl LlmClient for DeepSeekClient {
 
         let profile = normalize_deepseek_profile(&self.cfg.profile).ok_or_else(|| {
             anyhow!(
-                "unsupported llm.profile='{}' (supported: v3_2, v3_2_speciale)",
+                "unsupported llm.profile='{}' (supported: v3_2)",
                 self.cfg.profile
             )
         })?;
@@ -911,13 +920,6 @@ fn should_retry_status(status: StatusCode) -> bool {
 
 fn should_retry_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
-}
-
-fn is_speciale_alias(model: &str) -> bool {
-    matches!(
-        model.trim().to_ascii_lowercase().as_str(),
-        "deepseek-v3.2-speciale" | "deepseek-v3.2-special" | "v3.2-speciale" | "v3_2_speciale"
-    )
 }
 
 fn parse_retry_after_seconds(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
@@ -1335,29 +1337,6 @@ mod tests {
     }
 
     #[test]
-    fn speciale_model_requires_speciale_profile() {
-        let cfg = LlmConfig {
-            api_key: Some("test-key".to_string()),
-            ..LlmConfig::default()
-        };
-        let client = DeepSeekClient::new(cfg).expect("client");
-        let err = client
-            .complete(&LlmRequest {
-                unit: deepseek_core::LlmUnit::Planner,
-                prompt: "hello".to_string(),
-                model: "deepseek-v3.2-speciale".to_string(),
-                max_tokens: 128,
-                non_urgent: false,
-                images: vec![],
-            })
-            .expect_err("speciale model should require speciale profile");
-        assert!(
-            err.to_string()
-                .contains("requires llm.profile='v3_2_speciale'")
-        );
-    }
-
-    #[test]
     fn non_deepseek_provider_is_rejected() {
         for provider in &["openai", "anthropic", "custom", "local", "ollama"] {
             let cfg = LlmConfig {
@@ -1520,6 +1499,7 @@ mod tests {
             max_tokens: 64,
             temperature: Some(0.2),
             thinking: None,
+            images: vec![],
         };
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");
@@ -1551,6 +1531,7 @@ mod tests {
             max_tokens: 64,
             temperature: Some(0.2),
             thinking: None,
+            images: vec![],
         };
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");
@@ -1587,6 +1568,7 @@ mod tests {
             max_tokens: 64,
             temperature: Some(0.2),
             thinking: None,
+            images: vec![],
         };
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");

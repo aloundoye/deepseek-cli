@@ -239,6 +239,8 @@ fn scan_watch_comment_payload(cwd: &Path) -> Option<(u64, String)> {
             "!target/**",
             "--glob",
             "!.deepseek/**",
+            "--ignore-file",
+            ".deepseekignore",
             "TODO\\(ai\\)|FIXME\\(ai\\)|AI:",
             ".",
         ],
@@ -448,15 +450,107 @@ fn slash_test_output(cwd: &Path, args: &[String]) -> Result<String> {
     slash_run_output(cwd, &[command])
 }
 
-fn slash_lint_output(cwd: &Path, args: &[String]) -> Result<String> {
-    let command = if args.is_empty() {
-        inferred_lint_command(cwd).ok_or_else(|| {
-            anyhow!("could not infer a lint command for this repo; pass one: /lint <command>")
-        })?
-    } else {
-        args.join(" ")
-    };
+fn slash_lint_output(cwd: &Path, args: &[String], cfg: Option<&AppConfig>) -> Result<String> {
+    if !args.is_empty() {
+        return slash_run_output(cwd, &[args.join(" ")]);
+    }
+
+    // Try configured lint commands from AppConfig.agent_loop.lint (derive per changed files)
+    if let Some(cfg) = cfg {
+        let lint_cfg = &cfg.agent_loop.lint;
+        if lint_cfg.enabled && !lint_cfg.commands.is_empty() {
+            let changed = changed_file_list(cwd);
+            let commands =
+                deepseek_agent::linter::derive_lint_commands(lint_cfg, &changed);
+            if !commands.is_empty() {
+                let mut results = Vec::new();
+                for cmd in &commands {
+                    let output = slash_run_output(cwd, &[cmd.clone()])?;
+                    results.push(format!("$ {cmd}\n{output}"));
+                }
+                return Ok(results.join("\n\n"));
+            }
+        }
+    }
+
+    // Fallback to inferred command
+    let command = inferred_lint_command(cwd).ok_or_else(|| {
+        anyhow!("could not infer a lint command for this repo; pass one: /lint <command>")
+    })?;
     slash_run_output(cwd, &[command])
+}
+
+/// List changed file paths (staged + unstaged) for lint command derivation.
+fn changed_file_list(cwd: &Path) -> Vec<String> {
+    let Ok(output) = run_process(cwd, "git", &["status", "--porcelain"]) else {
+        return Vec::new();
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.len() < 3 {
+                return None;
+            }
+            Some(trimmed[3..].trim().to_string())
+        })
+        .collect()
+}
+
+fn slash_tokens_output(cwd: &Path, cfg: &AppConfig) -> Result<String> {
+    let context_window = cfg.llm.context_window_tokens;
+
+    // System prompt estimate (model instructions, tool definitions, etc.)
+    let system_prompt_est: u64 = 800;
+
+    // Memory (DEEPSEEK.md)
+    let memory_tokens = {
+        let md_path = cwd.join("DEEPSEEK.md");
+        if md_path.exists() {
+            let content = std::fs::read_to_string(&md_path).unwrap_or_default();
+            estimate_tokens(&content)
+        } else {
+            0
+        }
+    };
+
+    // Conversation history from store
+    let conversation_tokens: u64 = {
+        let store = deepseek_store::Store::new(cwd).ok();
+        store
+            .and_then(|s| {
+                let session = s.load_latest_session().ok()??;
+                let projection = s.rebuild_from_events(session.session_id).ok()?;
+                let chars: u64 = projection
+                    .transcript
+                    .iter()
+                    .map(|t: &String| t.len() as u64)
+                    .sum();
+                Some(chars / 4)
+            })
+            .unwrap_or(0)
+    };
+
+    // Repo map estimate
+    let repo_map_tokens: u64 = 400; // typical bootstrap overhead
+
+    let total_used = system_prompt_est + memory_tokens + conversation_tokens + repo_map_tokens;
+    let reserved = cfg.context.reserved_overhead_tokens + cfg.context.response_budget_tokens;
+    let available = context_window.saturating_sub(total_used).saturating_sub(reserved);
+    let utilization = if context_window > 0 {
+        (total_used as f64 / context_window as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Cost estimate (based on tokens used so far)
+    let input_cost = (total_used as f64 / 1_000_000.0) * cfg.usage.cost_per_million_input;
+
+    Ok(format!(
+        "token breakdown:\n  system_prompt:  ~{system_prompt_est}\n  memory:         ~{memory_tokens}\n  conversation:   ~{conversation_tokens}\n  repo_map:       ~{repo_map_tokens}\n  ────────────────────\n  total_used:     ~{total_used}\n  reserved:       ~{reserved} (overhead={} response={})\n  available:      ~{available}\n  context_window: {context_window}\n  utilization:    {utilization:.1}%\n  est_input_cost: ${input_cost:.4}",
+        cfg.context.reserved_overhead_tokens,
+        cfg.context.response_budget_tokens,
+    ))
 }
 
 fn slash_web_output(cwd: &Path, args: &[String]) -> Result<String> {
@@ -869,6 +963,7 @@ pub(crate) fn run_chat(
     let mut read_only_mode = false;
     let mut active_chat_mode = ChatMode::Code;
     let mut last_watch_digest: Option<u64> = None;
+    let mut pending_images: Vec<deepseek_core::ImageContent> = vec![];
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
@@ -1132,6 +1227,14 @@ pub(crate) fn run_chat(
                         json_mode,
                     )?;
                 }
+                SlashCommand::Tokens => {
+                    let output = slash_tokens_output(cwd, &cfg)?;
+                    if json_mode {
+                        print_json(&json!({"tokens": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
                 SlashCommand::Mcp(args) => {
                     if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
                         run_mcp(cwd, McpCmd::List, json_mode)?;
@@ -1249,11 +1352,21 @@ pub(crate) fn run_chat(
                         println!("{output}");
                     }
                 }
-                SlashCommand::Map(args) | SlashCommand::MapRefresh(args) => {
+                SlashCommand::Map(args) => {
                     let output = slash_map_output(cwd, &args, &additional_dirs)?;
                     if json_mode {
                         print_json(&json!({"map": output}))?;
                     } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::MapRefresh(args) => {
+                    deepseek_agent::clear_tag_cache();
+                    let output = slash_map_output(cwd, &args, &additional_dirs)?;
+                    if json_mode {
+                        print_json(&json!({"map": output, "refreshed": true}))?;
+                    } else {
+                        println!("(cache cleared)");
                         println!("{output}");
                     }
                 }
@@ -1274,7 +1387,7 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Lint(args) => {
-                    let output = slash_lint_output(cwd, &args)?;
+                    let output = slash_lint_output(cwd, &args, Some(&cfg))?;
                     if json_mode {
                         print_json(&json!({"lint": output}))?;
                     } else {
@@ -1549,17 +1662,32 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Paste => {
-                    let pasted = read_from_clipboard().unwrap_or_default();
-                    if pasted.trim().is_empty() {
+                    // Check for image data first
+                    if let Some(img_bytes) = read_image_from_clipboard() {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+                        pending_images.push(deepseek_core::ImageContent {
+                            mime: "image/png".to_string(),
+                            base64_data: b64,
+                        });
                         if json_mode {
-                            print_json(&json!({"pasted": "", "empty": true}))?;
+                            print_json(&json!({"pasted_image": true, "size_bytes": img_bytes.len()}))?;
                         } else {
-                            println!("clipboard is empty or unavailable");
+                            println!("Image pasted ({} bytes). It will be included in your next prompt.", img_bytes.len());
                         }
-                    } else if json_mode {
-                        print_json(&json!({"pasted": pasted}))?;
                     } else {
-                        println!("{pasted}");
+                        let pasted = read_from_clipboard().unwrap_or_default();
+                        if pasted.trim().is_empty() {
+                            if json_mode {
+                                print_json(&json!({"pasted": "", "empty": true}))?;
+                            } else {
+                                println!("clipboard is empty or unavailable");
+                            }
+                        } else if json_mode {
+                            print_json(&json!({"pasted": pasted}))?;
+                        } else {
+                            println!("{pasted}");
+                        }
                     }
                 }
                 SlashCommand::Git(args) => {
@@ -2087,6 +2215,10 @@ pub(crate) fn run_chat(
                         let _ = writeln!(handle, "[image: {label}]");
                         let _ = handle.flush();
                     }
+                    deepseek_core::StreamChunk::WatchTriggered { comment_count, .. } => {
+                        let _ = writeln!(handle, "[watch: {comment_count} comment(s) detected]");
+                        let _ = handle.flush();
+                    }
                     deepseek_core::StreamChunk::ClearStreamingText => {
                         // In non-TUI mode, nothing to clear — text already
                         // written to stdout. Ignore.
@@ -2099,6 +2231,7 @@ pub(crate) fn run_chat(
             }));
         }
 
+        let images_for_turn = std::mem::take(&mut pending_images);
         let output = engine.chat_with_options(
             prompt,
             ChatOptions {
@@ -2113,6 +2246,7 @@ pub(crate) fn run_chat(
                 teammate_mode: teammate_mode.clone(),
                 detect_urls,
                 watch_files: watch_files_enabled,
+                images: images_for_turn,
                 ..Default::default()
             },
         )?;
@@ -2122,6 +2256,51 @@ pub(crate) fn run_chat(
             print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
         } else {
             println!("[status] {}", render_statusline(&ui_status));
+        }
+
+        // Watch auto-execute: if digest changed after agent turn, auto-dispatch
+        if watch_files_enabled {
+            let mut auto_watch_turns: usize = 0;
+            const MAX_WATCH_AUTO_TURNS: usize = 3;
+            while auto_watch_turns < MAX_WATCH_AUTO_TURNS {
+                if let Some((digest, hints)) = scan_watch_comment_payload(cwd) {
+                    if last_watch_digest == Some(digest) {
+                        break; // no change
+                    }
+                    last_watch_digest = Some(digest);
+                    auto_watch_turns += 1;
+                    let comment_count = hints.lines().count();
+                    if !json_mode {
+                        println!("[watch: auto-trigger {auto_watch_turns}/{MAX_WATCH_AUTO_TURNS} — {comment_count} comment(s)]");
+                    }
+                    let mut auto_prompt =
+                        "Resolve the following TODO/FIXME/AI comments detected in the workspace:".to_string();
+                    auto_prompt.push_str("\n\nAUTO_WATCH_CONTEXT_V1\n");
+                    auto_prompt.push_str(&hints);
+                    auto_prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
+
+                    let auto_output = engine.chat_with_options(
+                        &auto_prompt,
+                        ChatOptions {
+                            tools: allow_tools && !read_only_mode,
+                            force_max_think,
+                            additional_dirs: additional_dirs.clone(),
+                            repo_root_override: repo_root_override.clone(),
+                            debug_context,
+                            mode: active_chat_mode,
+                            force_execute,
+                            force_plan_only,
+                            teammate_mode: teammate_mode.clone(),
+                            detect_urls,
+                            watch_files: true,
+                            ..Default::default()
+                        },
+                    )?;
+                    last_assistant_response = Some(auto_output);
+                } else {
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -2148,6 +2327,7 @@ pub(crate) fn run_chat_tui(
     let read_only_mode = Arc::new(AtomicBool::new(false));
     let active_chat_mode = Arc::new(std::sync::Mutex::new(ChatMode::Code));
     let last_watch_digest = Arc::new(std::sync::Mutex::new(None::<u64>));
+    let pending_images = Arc::new(std::sync::Mutex::new(Vec::<deepseek_core::ImageContent>::new()));
 
     // Create the channel for TUI stream events.
     let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
@@ -2321,6 +2501,7 @@ pub(crate) fn run_chat_tui(
                         usage.input_tokens, usage.output_tokens
                     )
                 }
+                SlashCommand::Tokens => slash_tokens_output(cwd, cfg)?,
                 SlashCommand::Mcp(args) => {
                     let manager = McpManager::new(cwd)?;
                     if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
@@ -2433,20 +2614,33 @@ pub(crate) fn run_chat_tui(
                         }
                     )
                 }
-                SlashCommand::Map(args) | SlashCommand::MapRefresh(args) => {
+                SlashCommand::Map(args) => {
                     let guard = additional_dirs_for_closure
                         .lock()
                         .map_err(|_| anyhow!("failed to access additional dir state"))?;
                     slash_map_output(cwd, &args, &guard)?
                 }
+                SlashCommand::MapRefresh(args) => {
+                    deepseek_agent::clear_tag_cache();
+                    let guard = additional_dirs_for_closure
+                        .lock()
+                        .map_err(|_| anyhow!("failed to access additional dir state"))?;
+                    format!("(cache cleared)\n{}", slash_map_output(cwd, &args, &guard)?)
+                }
                 SlashCommand::Run(args) => slash_run_output(cwd, &args)?,
                 SlashCommand::Test(args) => slash_test_output(cwd, &args)?,
-                SlashCommand::Lint(args) => slash_lint_output(cwd, &args)?,
+                SlashCommand::Lint(args) => slash_lint_output(cwd, &args, Some(cfg))?,
                 SlashCommand::Web(args) => slash_web_output(cwd, &args)?,
                 SlashCommand::Diff(args) => slash_diff_output(cwd, &args)?,
                 SlashCommand::Stage(args) => slash_stage_output(cwd, &args)?,
                 SlashCommand::Unstage(args) => slash_unstage_output(cwd, &args)?,
-                SlashCommand::Commit(args) => slash_commit_output(cwd, cfg, &args)?,
+                SlashCommand::Commit(args) => {
+                    if parse_commit_message(&args)?.is_none() {
+                        "commit requires a message in TUI mode: /commit -m \"your message\"".to_string()
+                    } else {
+                        slash_commit_output(cwd, cfg, &args)?
+                    }
+                }
                 SlashCommand::Undo(_args) => {
                     let checkpoint = rewind_now(cwd, None)?;
                     format!(
@@ -2623,11 +2817,23 @@ pub(crate) fn run_chat_tui(
                 SlashCommand::Doctor => serde_json::to_string_pretty(&doctor_payload(cwd, &DoctorArgs::default())?)?,
                 SlashCommand::Copy => "Copied last response to clipboard.".to_string(),
                 SlashCommand::Paste => {
-                    let pasted = read_from_clipboard().unwrap_or_default();
-                    if pasted.is_empty() {
-                        "clipboard is empty or unavailable".to_string()
+                    if let Some(img_bytes) = read_image_from_clipboard() {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+                        if let Ok(mut imgs) = pending_images.lock() {
+                            imgs.push(deepseek_core::ImageContent {
+                                mime: "image/png".to_string(),
+                                base64_data: b64,
+                            });
+                        }
+                        format!("Image pasted ({} bytes). It will be included in your next prompt.", img_bytes.len())
                     } else {
-                        pasted
+                        let pasted = read_from_clipboard().unwrap_or_default();
+                        if pasted.is_empty() {
+                            "clipboard is empty or unavailable".to_string()
+                        } else {
+                            pasted
+                        }
                     }
                 }
                 SlashCommand::Voice(args) => slash_voice_output(&args)?,
@@ -2762,6 +2968,10 @@ pub(crate) fn run_chat_tui(
             let prompt_additional_dirs = additional_dirs_for_closure
                 .lock()
                 .map(|dirs| dirs.clone())
+                .unwrap_or_default();
+            let images_for_turn = pending_images
+                .lock()
+                .map(|mut imgs| std::mem::take(&mut *imgs))
                 .unwrap_or_default();
             let teammate_mode_for_turn = teammate_mode.clone();
 
@@ -2923,6 +3133,9 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ImageData { data, label } => {
                     let _ = tx_stream.send(TuiStreamEvent::ImageDisplay { data, label });
                 }
+                StreamChunk::WatchTriggered { digest, comment_count } => {
+                    let _ = tx_stream.send(TuiStreamEvent::WatchTriggered { digest, comment_count });
+                }
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
                 }
@@ -2946,6 +3159,7 @@ pub(crate) fn run_chat_tui(
                             teammate_mode: teammate_mode_for_turn.clone(),
                             detect_urls,
                             watch_files: watch_files_enabled,
+                            images: images_for_turn,
                             ..Default::default()
                         },
                     )
@@ -4015,6 +4229,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                 }
                 StreamChunk::ImageData { label, .. } => {
                     let _ = writeln!(handle, "[image: {label}]");
+                    let _ = handle.flush();
+                }
+                StreamChunk::WatchTriggered { comment_count, .. } => {
+                    let _ = writeln!(handle, "[watch: {comment_count} comment(s) detected]");
                     let _ = handle.flush();
                 }
                 StreamChunk::ClearStreamingText => {

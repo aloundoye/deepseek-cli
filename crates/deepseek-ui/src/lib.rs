@@ -157,6 +157,8 @@ pub enum TuiStreamEvent {
         name: String,
         error: String,
     },
+    /// Watch mode auto-triggered because comment digest changed.
+    WatchTriggered { digest: u64, comment_count: usize },
     /// Display an inline image in the terminal (raw bytes).
     ImageDisplay { data: Vec<u8>, label: String },
     /// Clear any previously streamed text — the response contained tool calls,
@@ -247,6 +249,7 @@ pub enum SlashCommand {
     Run(Vec<String>),
     Test(Vec<String>),
     Lint(Vec<String>),
+    Tokens,
     Web(Vec<String>),
     AddDir(Vec<String>),
     Bug,
@@ -334,6 +337,7 @@ impl SlashCommand {
             "run" => Self::Run(args),
             "test" => Self::Test(args),
             "lint" => Self::Lint(args),
+            "tokens" => Self::Tokens,
             "web" => Self::Web(args),
             "add-dir" => Self::AddDir(args),
             "bug" => Self::Bug,
@@ -3365,6 +3369,10 @@ where
                     ));
                     shell.push_error(format!("[subagent] failed {name}: {error_compact}"));
                     info_line = format!("subagent failed: {name}");
+                }
+                TuiStreamEvent::WatchTriggered { comment_count, .. } => {
+                    shell.push_system(format!("[watch: {comment_count} comment(s) detected, auto-triggering]"));
+                    info_line = format!("watch: {comment_count} hints");
                 }
                 TuiStreamEvent::ImageDisplay { data, label } => {
                     // Render inline image if terminal supports it

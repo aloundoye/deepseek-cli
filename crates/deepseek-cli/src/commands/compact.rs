@@ -286,3 +286,65 @@ pub(crate) fn run_compact(cwd: &Path, args: CompactArgs, json_mode: bool) -> Res
 
     Ok(())
 }
+
+/// Summarize older conversation messages using a heuristic extraction approach.
+/// Extracts key decisions, file paths, and task outcomes into a compressed summary
+/// that's roughly <25% of the original token count.
+pub(crate) fn summarize_conversation(transcript: &[String]) -> String {
+    if transcript.is_empty() {
+        return String::new();
+    }
+
+    let original_tokens = transcript.iter().map(|t| estimate_tokens(t)).sum::<u64>();
+    let target_lines = (original_tokens / 40).max(5).min(50) as usize; // ~10 tokens per summary line
+
+    let mut summary_parts = Vec::new();
+    summary_parts.push(format!(
+        "Conversation summary ({} turns, ~{} tokens compressed):",
+        transcript.len(),
+        original_tokens
+    ));
+
+    // Extract key information from each turn
+    for (i, turn) in transcript.iter().enumerate() {
+        let trimmed = turn.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Take first meaningful line as a summary
+        let first_line = trimmed
+            .lines()
+            .find(|l| !l.trim().is_empty() && l.trim().len() > 5)
+            .unwrap_or(trimmed);
+        let truncated = if first_line.len() > 150 {
+            format!("{}...", &first_line[..first_line.floor_char_boundary(150)])
+        } else {
+            first_line.to_string()
+        };
+        summary_parts.push(format!("[turn {}] {}", i + 1, truncated));
+
+        if summary_parts.len() >= target_lines {
+            break;
+        }
+    }
+
+    summary_parts.join("\n")
+}
+
+/// Check if the current context usage exceeds the auto-compact threshold.
+pub(crate) fn should_auto_compact(cfg: &AppConfig, transcript: &[String]) -> bool {
+    if transcript.len() < 4 {
+        return false; // too few turns to compact
+    }
+    let total_chars: u64 = transcript.iter().map(|t| t.len() as u64).sum();
+    let estimated_tokens = total_chars / 4;
+    let context_window = cfg.llm.context_window_tokens;
+    if context_window == 0 {
+        return false;
+    }
+    let reserved = cfg.context.reserved_overhead_tokens + cfg.context.response_budget_tokens;
+    let usable = context_window.saturating_sub(reserved);
+    let threshold = cfg.context.auto_compact_threshold;
+    let ratio = estimated_tokens as f64 / usable as f64;
+    ratio >= threshold as f64
+}

@@ -93,9 +93,6 @@ pub fn normalize_deepseek_model(model: &str) -> Option<&'static str> {
         | "reasoner"
         | "v3.2-reasoner"
         | "v3_2_reasoner" => Some(DEEPSEEK_V32_REASONER_MODEL),
-        "deepseek-v3.2-speciale" | "deepseek-v3.2-special" | "v3.2-speciale" | "v3_2_speciale" => {
-            Some(DEEPSEEK_V32_CHAT_MODEL)
-        }
         _ => None,
     }
 }
@@ -107,16 +104,14 @@ Accepted models (all resolve to DeepSeek API model IDs):
 |---|---|
 | `deepseek-chat`, `deepseek-v3.2`, `deepseek-v3.2-chat`, `v3.2`, `v3_2` | `deepseek-chat` |
 | `deepseek-reasoner`, `deepseek-v3.2-reasoner`, `reasoner`, `v3.2-reasoner`, `v3_2_reasoner` | `deepseek-reasoner` |
-| `deepseek-v3.2-speciale`, `deepseek-v3.2-special`, `v3.2-speciale`, `v3_2_speciale` | `deepseek-chat` |
 
-### `normalize_deepseek_profile()` (deepseek-core, lines 34-43)
+### `normalize_deepseek_profile()` (deepseek-core)
 
-Only two profiles are accepted:
+Only one profile is accepted:
 
 | Input(s) | Resolves to |
 |---|---|
 | `""`, `v3_2`, `v3.2`, `v32`, `deepseek-v3.2` | `v3_2` |
-| `v3_2_speciale`, `v3.2-speciale`, `v32-speciale`, `deepseek-v3.2-speciale` | `v3_2_speciale` |
 
 Any other profile string returns `None` and the request is rejected.
 
@@ -277,7 +272,6 @@ fn unsupported_profile_is_rejected() {
 | Test name | What it verifies |
 |---|---|
 | `truly_unsupported_provider_is_rejected()` | Arbitrary non-deepseek provider string is rejected |
-| `speciale_model_requires_speciale_profile()` | `deepseek-v3.2-speciale` model requires `v3_2_speciale` profile |
 | `missing_api_key_is_rejected()` | Absent `DEEPSEEK_API_KEY` with no config fallback fails cleanly |
 | `deepseek_model_normalization_is_case_and_whitespace_tolerant` (proptest) | Fuzz test confirms all known aliases normalize successfully regardless of casing/whitespace |
 

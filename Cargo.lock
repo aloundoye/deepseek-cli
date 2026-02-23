@@ -672,6 +672,7 @@ dependencies = [
  "deepseek-testkit",
  "deepseek-tools",
  "ignore",
+ "notify",
  "regex",
  "reqwest",
  "serde",
