@@ -90,6 +90,16 @@ fn build_workspace(path: &Path) -> Result<()> {
         "// FIXME: improve\npub fn demo() {}\n",
     )?;
     fs::write(path.join("tests/smoke_test.rs"), "#[test]\nfn smoke() {}\n")?;
+    let init = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(path)
+        .output()?;
+    if !init.status.success() {
+        return Err(anyhow!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        ));
+    }
     Ok(())
 }
 
@@ -187,5 +197,40 @@ fn vague_codebase_prompt_runs_audit_and_repairs_followup_budget() -> Result<()> 
         .join("\n");
     assert!(repair_user.contains("Repair required"));
     assert!(repair_user.contains("exactly 1 focused follow-up"));
+    Ok(())
+}
+
+#[test]
+fn repoish_prompt_outside_repo_returns_explicit_error() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    fs::write(temp.path().join("notes.txt"), "scratch")?;
+
+    let state = Arc::new(Mutex::new(CaptureState {
+        responses: VecDeque::from(vec!["unused".to_string()]),
+        chat_requests: Vec::new(),
+    }));
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(CapturingLlm::new(state.clone()));
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let err = engine
+        .chat_with_options(
+            "analyze this project",
+            ChatOptions {
+                tools: false,
+                mode: ChatMode::Ask,
+                ..Default::default()
+            },
+        )
+        .expect_err("expected explicit no-repo error");
+    assert_eq!(
+        err.to_string(),
+        "No repository detected. Run from project root or pass --repo <path>."
+    );
+
+    let guard = state.lock().map_err(|_| anyhow!("state poisoned"))?;
+    assert!(
+        guard.chat_requests.is_empty(),
+        "analysis should fail before LLM call when no repo is detected"
+    );
     Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::repo_map_v2;
 use anyhow::{Result, anyhow};
 use deepseek_core::{AppConfig, ChatMessage, ChatRequest, ToolChoice};
 use deepseek_llm::LlmClient;
@@ -34,6 +35,7 @@ pub struct ArchitectInput<'a> {
     pub feedback: &'a ArchitectFeedback,
     pub max_files: usize,
     pub additional_dirs: &'a [PathBuf],
+    pub debug_context: bool,
 }
 
 const ARCHITECT_SYSTEM_PROMPT: &str = r#"You are Architect (reasoning-only).
@@ -67,6 +69,17 @@ pub fn run_architect(
         input.max_files,
         input.additional_dirs,
     );
+    if input.debug_context {
+        let lines = repo_map.lines().count();
+        let est_tokens = repo_map.len() / 4;
+        eprintln!(
+            "[debug-context] intent=EditCode phase=Architect mode=Code repo_root={} repo_map_lines={} repo_map_est_tokens={} iteration={}",
+            workspace.display(),
+            lines,
+            est_tokens,
+            input.iteration
+        );
+    }
 
     let mut messages = vec![
         ChatMessage::System {
@@ -244,6 +257,12 @@ pub fn build_repo_map(
     max_files: usize,
     additional_dirs: &[PathBuf],
 ) -> String {
+    let v2_rows =
+        repo_map_v2::build_repo_map_v2(workspace, user_prompt, max_files, additional_dirs);
+    if !v2_rows.is_empty() {
+        return repo_map_v2::render_repo_map(&v2_rows);
+    }
+
     let mut files = tracked_files(workspace);
     for dir in additional_dirs {
         let joined = if dir.is_absolute() {

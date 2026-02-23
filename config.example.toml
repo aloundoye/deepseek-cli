@@ -46,6 +46,20 @@ fingerprint_lines = 40
 max_files_without_approval = 8
 max_loc_without_approval = 600
 
+[agent_loop.team]
+auto_enabled = true
+complexity_threshold = 60
+max_lanes = 4
+max_concurrency = 2
+
+[git]
+# Verify-pass never commits automatically. Commit is explicit via /commit or deepseek git commit.
+auto_commit_on_verify_pass = false
+commit_message_template = "deepseek: {goal}"
+require_signing = false
+allowed_branch_patterns = []
+# commit_message_regex = "^(feat|fix|chore):\\s.+$"
+
 [policy]
 approve_edits = "ask"
 approve_bash = "ask"

@@ -5,9 +5,10 @@ Updated: 2026-02-23
 ## 1. Scope
 This spec defines the production agent architecture for edit-execution flows in DeepSeek CLI.
 
-The runtime uses one deterministic pipeline:
+The runtime uses one deterministic intent split with a single execution engine:
 
-`Architect (R1) -> Editor (V3) -> Apply -> Verify`
+- `InspectRepo` (read-only analysis path with deterministic bootstrap), or
+- `EditCode` via `Architect (R1) -> Editor (V3) -> Apply -> Verify`
 
 There is no legacy dual-mode routing/escalation path in the execution loop.
 Chat modes are prompt-profile semantics only and do not alter this execution engine.
@@ -123,6 +124,17 @@ Safety-gate defaults:
 
 No hidden escalation path is used.
 
+### 4.2 Explicit Commit Intent
+Verify-pass does not auto-commit.
+
+On verify success, runtime emits a `CommitProposal` payload containing:
+- changed file list
+- diffstat (`touched_files`, `loc_delta`)
+- verify commands + verify status
+- suggested commit message template rendering
+
+Users commit explicitly through git command paths (for example `/commit` or `deepseek git commit`).
+
 ### 4.1 Team-Lane Composition (teammate mode)
 When teammate mode is enabled (`--teammate-mode`), execution composes deterministic lanes on top of the same runtime:
 - Each lane runs `Architect -> Editor -> Apply -> Verify` in an isolated git worktree.
@@ -140,7 +152,7 @@ Non-edit commands (for example `deepseek review`) use a separate analysis API:
 
 ### 5.1 Auto Context Bootstrap (repo-ish prompts)
 Before model analysis on non-execution prompts, the harness runs a deterministic gather stage:
-- Triggered for `Ask`/`Context` profile prompts by default, and for repo-ish prompt patterns (`project|repo|repository|codebase`, analyze/audit/check current code).
+- Triggered for `Context` mode by default, and for repo-ish prompt patterns in `Ask`/analysis flows (for example analyze/audit/check/inspect + project/repo/codebase terms).
 - Injects `AUTO_CONTEXT_BOOTSTRAP_V1` into model input with bounded:
   - `git status --porcelain -b` snapshot (or non-git fallback note)
   - root tree snapshot
@@ -157,6 +169,10 @@ Before model analysis on non-execution prompts, the harness runs a deterministic
   - ask at most 1–2 targeted follow-ups
   - ask exactly one focused follow-up for vague “check codebase” style prompts
   - use one bounded repair reprompt on shape/follow-up violations
+  - infer project type from manifests/README instead of generic “what type of project?” clarification
+
+If repo-oriented analysis is requested but no repository root is detected, runtime returns:
+- `No repository detected. Run from project root or pass --repo <path>.`
 
 ## 6. Streaming Contract
 Execution emits phase lifecycle chunks:
@@ -166,6 +182,9 @@ Execution emits phase lifecycle chunks:
 - `VerifyStarted`, `VerifyCompleted`
 
 These are consumed by CLI and TUI for real-time visibility.
+
+Additional execution chunk:
+- `CommitProposal` on verify-pass.
 
 ## 7. Module Boundaries
 Core modules:
@@ -212,7 +231,10 @@ Core modules:
 - `--plan-only` forces architect plan output without apply/verify.
 - `--force-execute` and `--plan-only` are mutually exclusive.
 - `--teammate-mode <mode>` enables deterministic team-lane orchestration on top of the same runtime.
+- `--repo <path>` overrides repository root for context/bootstrap.
+- `--debug-context` (or `DEEPSEEK_DEBUG_CONTEXT=1`) prints deterministic pre-model context digest.
 - No `--allow-r1-drive-tools` flag exists in this architecture.
+- Verify-pass never commits automatically; commit is explicit (`/commit`, `deepseek git commit`).
 
 ## 10. Removed Legacy Paths
 Removed from execution path:
@@ -231,6 +253,7 @@ Required integration scenarios for `deepseek-agent`:
 - teammate-mode deterministic fallback to single runtime
 - repo-ish analysis prompts inject `AUTO_CONTEXT_BOOTSTRAP_V1`
 - vague codebase prompts trigger baseline audit + bounded follow-up repair
+- repo-oriented analysis outside repository returns explicit no-repo error
 - runtime conformance denies legacy router/DSML symbols
 
 These scenarios are implemented under:

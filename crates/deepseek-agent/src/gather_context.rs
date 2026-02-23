@@ -38,6 +38,15 @@ pub struct AutoContextBootstrap {
     pub repoish: bool,
     pub vague_codebase_prompt: bool,
     pub packet: String,
+    pub repo_root: Option<PathBuf>,
+    pub manifest_type: Option<String>,
+    pub manifest_path: Option<String>,
+    pub readme_path: Option<String>,
+    pub readme_bytes: usize,
+    pub root_tree_count: usize,
+    pub repo_map_lines: usize,
+    pub repo_map_estimated_tokens: usize,
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +62,7 @@ pub fn gather_for_prompt(
     prompt: &str,
     mode: ChatMode,
     additional_dirs: &[PathBuf],
+    repo_root_override: Option<&Path>,
 ) -> AutoContextBootstrap {
     if !cfg.agent_loop.context_bootstrap_enabled {
         return AutoContextBootstrap {
@@ -68,33 +78,50 @@ pub fn gather_for_prompt(
             repoish: false,
             vague_codebase_prompt: false,
             packet: String::new(),
+            repo_root: resolve_repo_root(workspace, repo_root_override),
+            ..Default::default()
         };
     }
 
     let vague_codebase_prompt = is_vague_codebase_prompt(prompt);
+    let Some(repo_root) = resolve_repo_root(workspace, repo_root_override) else {
+        return AutoContextBootstrap {
+            enabled: true,
+            repoish: true,
+            vague_codebase_prompt,
+            packet: String::new(),
+            unavailable_reason: Some(
+                "No repository detected. Run from project root or pass --repo <path>.".to_string(),
+            ),
+            ..Default::default()
+        };
+    };
     let tree_entries = collect_tree_snapshot(
-        workspace,
+        &repo_root,
         cfg.agent_loop.context_bootstrap_max_tree_entries as usize,
         3,
     );
     let readme = read_readme_excerpt(
-        workspace,
+        &repo_root,
         cfg.agent_loop.context_bootstrap_max_readme_bytes as usize,
     );
     let manifests = discover_manifests(
-        workspace,
+        &repo_root,
         cfg.agent_loop.context_bootstrap_max_manifest_bytes as usize,
     );
+    let primary_manifest = select_primary_manifest(&manifests).cloned();
     let project_types = infer_project_types(&manifests);
     let repo_map = build_repo_map_summary(
-        workspace,
+        &repo_root,
         prompt,
         cfg.agent_loop.context_bootstrap_max_repo_map_lines as usize,
         additional_dirs,
     );
+    let repo_map_lines = repo_map.lines().count();
+    let repo_map_estimated_tokens = estimate_tokens(&repo_map);
 
     let mut lines = vec!["AUTO_CONTEXT_BOOTSTRAP_V1".to_string()];
-    lines.push(format!("workspace={}", workspace.display()));
+    lines.push(format!("workspace={}", repo_root.display()));
     lines.push(format!("repoish_prompt=true mode={mode:?}"));
     lines.push(format!(
         "vague_codebase_prompt={}",
@@ -106,14 +133,14 @@ pub fn gather_for_prompt(
     ));
 
     lines.push("GIT_STATUS:".to_string());
-    let git_status = git_status_snapshot(workspace);
+    let git_status = git_status_snapshot(&repo_root);
     append_indented_lines(&mut lines, &git_status, "  ", 20);
 
     lines.push("ROOT_TREE_SNAPSHOT:".to_string());
     if tree_entries.is_empty() {
         lines.push("  (no files discovered)".to_string());
     } else {
-        for entry in tree_entries {
+        for entry in &tree_entries {
             lines.push(format!("  {entry}"));
         }
     }
@@ -136,9 +163,9 @@ pub fn gather_for_prompt(
     }
 
     lines.push("README_EXCERPT:".to_string());
-    if let Some((path, excerpt)) = readme {
+    if let Some((path, excerpt)) = &readme {
         lines.push(format!("  file={path}"));
-        append_indented_lines(&mut lines, &excerpt, "  ", 20);
+        append_indented_lines(&mut lines, excerpt, "  ", 20);
     } else {
         lines.push("  (README not found)".to_string());
     }
@@ -152,7 +179,7 @@ pub fn gather_for_prompt(
 
     if vague_codebase_prompt {
         let audit = run_baseline_audit(
-            workspace,
+            &repo_root,
             cfg.agent_loop.context_bootstrap_max_audit_findings as usize,
             &manifests,
         );
@@ -201,31 +228,101 @@ pub fn gather_for_prompt(
         repoish: true,
         vague_codebase_prompt,
         packet: lines.join("\n"),
+        repo_root: Some(repo_root),
+        manifest_type: primary_manifest
+            .as_ref()
+            .map(|manifest| manifest.name.clone()),
+        manifest_path: primary_manifest
+            .as_ref()
+            .map(|manifest| manifest.path.clone()),
+        readme_path: readme.as_ref().map(|(path, _)| path.clone()),
+        readme_bytes: readme
+            .as_ref()
+            .map(|(_, excerpt)| excerpt.len())
+            .unwrap_or(0),
+        root_tree_count: tree_entries.len(),
+        repo_map_lines,
+        repo_map_estimated_tokens,
+        unavailable_reason: None,
+    }
+}
+
+pub fn debug_context_enabled(debug_flag: bool) -> bool {
+    if debug_flag {
+        return true;
+    }
+    std::env::var("DEEPSEEK_DEBUG_CONTEXT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+impl AutoContextBootstrap {
+    pub fn debug_digest(&self, task_intent: &str, mode: ChatMode) -> String {
+        let repo_root = self
+            .repo_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        let manifest = match (&self.manifest_type, &self.manifest_path) {
+            (Some(kind), Some(path)) => format!("{kind} ({path})"),
+            _ => "<none>".to_string(),
+        };
+        let readme = self.readme_path.as_deref().unwrap_or("<none>").to_string();
+        let unavailable = self.unavailable_reason.as_deref().unwrap_or("<none>");
+        format!(
+            "[debug-context] intent={task_intent} mode={mode:?} repo_root={repo_root} manifest={manifest} readme={readme} readme_bytes={} tree_entries={} repo_map_lines={} repo_map_est_tokens={} unavailable_reason={}",
+            self.readme_bytes,
+            self.root_tree_count,
+            self.repo_map_lines,
+            self.repo_map_estimated_tokens,
+            unavailable
+        )
     }
 }
 
 fn is_repoish_prompt(prompt: &str, mode: ChatMode) -> bool {
-    if matches!(mode, ChatMode::Ask | ChatMode::Context) {
+    if matches!(mode, ChatMode::Context) {
         return true;
     }
 
     let lower = prompt.to_ascii_lowercase();
-    let repo_keywords = [
+    let inspect_verbs = [
+        "analyze", "analyse", "audit", "overview", "inspect", "check", "review",
+    ];
+    let repo_subjects = [
         "project",
         "repo",
         "repository",
         "codebase",
+        "structure",
+        "dependencies",
+        "tests",
+        "security",
+        "quality",
+        "readme",
         "this project",
         "this codebase",
     ];
-    if repo_keywords.iter().any(|needle| lower.contains(needle)) {
+    let has_inspect_verb = inspect_verbs.iter().any(|needle| lower.contains(needle));
+    let has_repo_subject = repo_subjects.iter().any(|needle| lower.contains(needle));
+    if has_inspect_verb && has_repo_subject {
         return true;
     }
 
-    (lower.contains("analyze") || lower.contains("audit") || lower.contains("check"))
-        && (lower.contains("current code")
-            || lower.contains("current project")
-            || lower.contains("code"))
+    [
+        "analyze this project",
+        "analyze this codebase",
+        "check the codebase",
+        "check this project",
+        "audit this project",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn is_vague_codebase_prompt(prompt: &str) -> bool {
@@ -243,6 +340,34 @@ fn is_vague_codebase_prompt(prompt: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn resolve_repo_root(workspace: &Path, repo_root_override: Option<&Path>) -> Option<PathBuf> {
+    if let Some(repo) = repo_root_override {
+        if repo.is_dir() {
+            return repo
+                .canonicalize()
+                .ok()
+                .or_else(|| Some(repo.to_path_buf()));
+        }
+        return None;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
 }
 
 fn collect_tree_snapshot(workspace: &Path, max_entries: usize, max_depth: usize) -> Vec<String> {
@@ -324,6 +449,15 @@ fn discover_manifests(workspace: &Path, max_bytes: usize) -> Vec<ManifestEntry> 
     discover_manifests_recursive(workspace, workspace, 0, 3, max_bytes.max(1), &mut out);
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+}
+
+fn select_primary_manifest(manifests: &[ManifestEntry]) -> Option<&ManifestEntry> {
+    for manifest_name in MANIFEST_NAMES {
+        if let Some(entry) = manifests.iter().find(|entry| entry.name == *manifest_name) {
+            return Some(entry);
+        }
+    }
+    manifests.first()
 }
 
 fn discover_manifests_recursive(
@@ -908,13 +1042,21 @@ fn append_indented_lines(out: &mut Vec<String>, block: &str, prefix: &str, max_l
     }
 }
 
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn repoish_detection_covers_modes_and_keywords() {
-        assert!(is_repoish_prompt("hello", ChatMode::Ask));
+        assert!(!is_repoish_prompt("hello", ChatMode::Ask));
+        assert!(is_repoish_prompt(
+            "show me workspace context",
+            ChatMode::Context
+        ));
         assert!(is_repoish_prompt("Analyze this project", ChatMode::Code));
         assert!(!is_repoish_prompt("What is 2+2?", ChatMode::Code));
     }

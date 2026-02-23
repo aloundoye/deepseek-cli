@@ -39,6 +39,10 @@ use crate::commands::admin::{parse_permissions_cmd, permissions_payload, run_per
 use crate::commands::background::background_payload;
 use crate::commands::background::{parse_background_cmd, run_background};
 use crate::commands::compact::{compact_now, rewind_now, run_compact, run_rewind};
+use crate::commands::git::{
+    git_commit_interactive, git_commit_staged, git_diff as git_diff_output, git_stage,
+    git_status_summary, git_unstage,
+};
 use crate::commands::mcp::run_mcp;
 use crate::commands::memory::{run_export, run_memory};
 use crate::commands::remote_env::{parse_remote_env_cmd, remote_env_now, run_remote_env};
@@ -59,6 +63,89 @@ fn truncate_inline(text: &str, max_chars: usize) -> String {
     } else {
         format!("{}...", &text[..text.floor_char_boundary(max_chars)])
     }
+}
+
+fn parse_commit_message(args: &[String]) -> Result<Option<String>> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-m") | Some("--message")
+    ) {
+        let message = args[1..].join(" ").trim().to_string();
+        if message.is_empty() {
+            return Err(anyhow!("commit message cannot be empty"));
+        }
+        return Ok(Some(message));
+    }
+    Ok(Some(args.join(" ")))
+}
+
+fn parse_stage_args(args: &[String]) -> (bool, Vec<String>) {
+    let mut all = false;
+    let mut files = Vec::new();
+    for arg in args {
+        if matches!(arg.as_str(), "--all" | "-A") {
+            all = true;
+        } else {
+            files.push(arg.clone());
+        }
+    }
+    (all, files)
+}
+
+fn parse_diff_args(args: &[String]) -> (bool, bool) {
+    let staged = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--staged" | "--cached" | "-s"));
+    let stat = args.iter().any(|arg| arg == "--stat");
+    (staged, stat)
+}
+
+fn slash_stage_output(cwd: &Path, args: &[String]) -> Result<String> {
+    let (all, files) = parse_stage_args(args);
+    let summary = git_stage(cwd, all, &files)?;
+    Ok(format!(
+        "staged changes: staged={} unstaged={} untracked={}",
+        summary.staged, summary.unstaged, summary.untracked
+    ))
+}
+
+fn slash_unstage_output(cwd: &Path, args: &[String]) -> Result<String> {
+    let (all, files) = parse_stage_args(args);
+    let summary = git_unstage(cwd, all, &files)?;
+    Ok(format!(
+        "unstaged changes: staged={} unstaged={} untracked={}",
+        summary.staged, summary.unstaged, summary.untracked
+    ))
+}
+
+fn slash_diff_output(cwd: &Path, args: &[String]) -> Result<String> {
+    let (staged, stat) = parse_diff_args(args);
+    let output = git_diff_output(cwd, staged, stat)?;
+    if output.trim().is_empty() {
+        Ok("(no diff)".to_string())
+    } else {
+        Ok(output)
+    }
+}
+
+fn slash_commit_output(cwd: &Path, cfg: &AppConfig, args: &[String]) -> Result<String> {
+    let summary = git_status_summary(cwd)?;
+    if summary.staged == 0 {
+        return Err(anyhow!("no staged changes to commit. Run /stage first."));
+    }
+    if let Some(message) = parse_commit_message(args)? {
+        let output = git_commit_staged(cwd, cfg, &message)?;
+        return Ok(if output.trim().is_empty() {
+            format!("committed staged changes: {message}")
+        } else {
+            output
+        });
+    }
+    git_commit_interactive(cwd, cfg)?;
+    Ok("committed staged changes".to_string())
 }
 
 fn agents_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
@@ -217,6 +304,16 @@ pub(crate) fn run_chat(
     let force_execute = cli.map(|v| v.force_execute).unwrap_or(false);
     let force_plan_only = cli.map(|v| v.plan_only).unwrap_or(false);
     let teammate_mode = cli.and_then(|v| v.teammate_mode.clone());
+    let repo_root_override = cli.and_then(|v| v.repo.clone());
+    let debug_context = cli.map(|v| v.debug_context).unwrap_or(false)
+        || std::env::var("DEEPSEEK_DEBUG_CONTEXT")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
     if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
         return run_chat_tui(
@@ -227,6 +324,8 @@ pub(crate) fn run_chat(
             force_execute,
             force_plan_only,
             teammate_mode.clone(),
+            repo_root_override.clone(),
+            debug_context,
         );
     }
     if force_tui && !interactive_tty {
@@ -287,6 +386,11 @@ pub(crate) fn run_chat(
                             "/teleport",
                             "/remote-env",
                             "/status",
+                            "/diff",
+                            "/stage",
+                            "/unstage",
+                            "/commit",
+                            "/undo",
                             "/effort",
                             "/skills",
                             "/permissions",
@@ -486,6 +590,54 @@ pub(crate) fn run_chat(
                         }
                     }
                 },
+                SlashCommand::Diff(args) => {
+                    let output = slash_diff_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"diff": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Stage(args) => {
+                    let output = slash_stage_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"stage": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Unstage(args) => {
+                    let output = slash_unstage_output(cwd, &args)?;
+                    if json_mode {
+                        print_json(&json!({"unstage": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Commit(args) => {
+                    let output = slash_commit_output(cwd, &cfg, &args)?;
+                    if json_mode {
+                        print_json(&json!({"commit": output}))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                SlashCommand::Undo(_args) => {
+                    let checkpoint = rewind_now(cwd, None)?;
+                    let output = format!(
+                        "rewound to checkpoint {} (files={})",
+                        checkpoint.checkpoint_id, checkpoint.files_count
+                    );
+                    if json_mode {
+                        print_json(&json!({
+                            "undo": true,
+                            "checkpoint_id": checkpoint.checkpoint_id,
+                            "files_count": checkpoint.files_count
+                        }))?;
+                    } else {
+                        println!("{output}");
+                    }
+                }
                 SlashCommand::Status => run_status(cwd, json_mode)?,
                 SlashCommand::Effort(level) => {
                     let level = level.unwrap_or_else(|| "medium".to_string());
@@ -982,6 +1134,8 @@ pub(crate) fn run_chat(
                                     tools: allow_tools,
                                     force_max_think,
                                     additional_dirs: additional_dirs.clone(),
+                                    repo_root_override: repo_root_override.clone(),
+                                    debug_context,
                                     mode: ChatMode::Code,
                                     force_execute,
                                     force_plan_only,
@@ -1075,6 +1229,26 @@ pub(crate) fn run_chat(
                             summary.replace('\n', " ")
                         );
                     }
+                    deepseek_core::StreamChunk::CommitProposal {
+                        files,
+                        touched_files,
+                        loc_delta,
+                        suggested_message,
+                        ..
+                    } => {
+                        let _ = writeln!(
+                            handle,
+                            "[commit] ready files={} touched={} loc={} message=\"{}\"",
+                            files.join(","),
+                            touched_files,
+                            loc_delta,
+                            suggested_message
+                        );
+                        let _ = writeln!(
+                            handle,
+                            "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
+                        );
+                    }
                     deepseek_core::StreamChunk::ToolCallStart {
                         tool_name,
                         args_summary,
@@ -1149,6 +1323,8 @@ pub(crate) fn run_chat(
                 tools: allow_tools,
                 force_max_think,
                 additional_dirs: additional_dirs.clone(),
+                repo_root_override: repo_root_override.clone(),
+                debug_context,
                 mode: ChatMode::Code,
                 force_execute,
                 force_plan_only,
@@ -1175,6 +1351,8 @@ pub(crate) fn run_chat_tui(
     force_execute: bool,
     force_plan_only: bool,
     teammate_mode: Option<String>,
+    repo_root_override: Option<PathBuf>,
+    debug_context: bool,
 ) -> Result<()> {
     let engine = Arc::new(AgentEngine::new(cwd)?);
     wire_subagent_worker(&engine, cwd);
@@ -1219,7 +1397,7 @@ pub(crate) fn run_chat_tui(
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /effort /skills /permissions /background /visual /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Help => "commands: /help /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /desktop /todos /chrome /vim".to_string(),
                 SlashCommand::Init => {
                     let manager = MemoryManager::new(cwd)?;
                     let path = manager.ensure_initialized()?;
@@ -1388,6 +1566,17 @@ pub(crate) fn run_chat_tui(
                         }
                         Err(err) => format!("remote-env parse error: {err}"),
                     }
+                }
+                SlashCommand::Diff(args) => slash_diff_output(cwd, &args)?,
+                SlashCommand::Stage(args) => slash_stage_output(cwd, &args)?,
+                SlashCommand::Unstage(args) => slash_unstage_output(cwd, &args)?,
+                SlashCommand::Commit(args) => slash_commit_output(cwd, cfg, &args)?,
+                SlashCommand::Undo(_args) => {
+                    let checkpoint = rewind_now(cwd, None)?;
+                    format!(
+                        "rewound to checkpoint {} (files={})",
+                        checkpoint.checkpoint_id, checkpoint.files_count
+                    )
                 }
                 SlashCommand::Status => {
                     let status = current_ui_status(cwd, cfg, force_max_think.load(Ordering::Relaxed))?;
@@ -1723,6 +1912,23 @@ pub(crate) fn run_chat_tui(
                         summary,
                     });
                 }
+                StreamChunk::CommitProposal {
+                    files,
+                    touched_files,
+                    loc_delta,
+                    verify_commands,
+                    verify_status,
+                    suggested_message,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::CommitProposal {
+                        files,
+                        touched_files,
+                        loc_delta,
+                        verify_commands,
+                        verify_status,
+                        suggested_message,
+                    });
+                }
                 StreamChunk::ToolCallStart {
                     tool_name,
                     args_summary,
@@ -1781,6 +1987,7 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::Done => {}
             }));
 
+            let prompt_repo_root_override = repo_root_override.clone();
             thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     engine_clone.chat_with_options(
@@ -1789,6 +1996,8 @@ pub(crate) fn run_chat_tui(
                             tools: allow_tools,
                             force_max_think: max_think,
                             additional_dirs: prompt_additional_dirs,
+                            repo_root_override: prompt_repo_root_override.clone(),
+                            debug_context,
                             mode: ChatMode::Code,
                             force_execute,
                             force_plan_only,
@@ -2823,6 +3032,44 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                             "[phase] verify {} (iter {iteration}) {}",
                             if success { "ok" } else { "failed" },
                             summary.replace('\n', " ")
+                        );
+                    }
+                    let _ = handle.flush();
+                }
+                StreamChunk::CommitProposal {
+                    files,
+                    touched_files,
+                    loc_delta,
+                    verify_commands,
+                    verify_status,
+                    suggested_message,
+                } => {
+                    if stream_json {
+                        let _ = serde_json::to_writer(
+                            &mut handle,
+                            &serde_json::json!({
+                                "type":"commit_proposal",
+                                "files":files,
+                                "touched_files":touched_files,
+                                "loc_delta":loc_delta,
+                                "verify_commands":verify_commands,
+                                "verify_status":verify_status,
+                                "suggested_message":suggested_message
+                            }),
+                        );
+                        let _ = writeln!(handle);
+                    } else {
+                        let _ = writeln!(
+                            handle,
+                            "[commit] ready files={} touched={} loc={} message=\"{}\"",
+                            files.join(","),
+                            touched_files,
+                            loc_delta,
+                            suggested_message
+                        );
+                        let _ = writeln!(
+                            handle,
+                            "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
                         );
                     }
                     let _ = handle.flush();

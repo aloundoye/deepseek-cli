@@ -627,6 +627,14 @@ pub enum EventKind {
         success: bool,
         output: String,
     },
+    CommitProposalV1 {
+        files: Vec<String>,
+        touched_files: u64,
+        loc_delta: u64,
+        verify_commands: Vec<String>,
+        verify_status: String,
+        suggested_message: String,
+    },
     PluginInstalledV1 {
         plugin_id: String,
         version: String,
@@ -1011,6 +1019,9 @@ impl EventKind {
             // Verification
             Self::VerificationRunV1 { .. } => "verification",
 
+            // Git workflow guidance
+            Self::CommitProposalV1 { .. } => "git",
+
             // Checkpoint / rewind
             Self::CheckpointCreatedV1 { .. } | Self::CheckpointRewoundV1 { .. } => "checkpoint",
 
@@ -1156,6 +1167,15 @@ pub enum StreamChunk {
         iteration: u64,
         success: bool,
         summary: String,
+    },
+    /// Verify passed and the runtime is ready for an explicit user commit.
+    CommitProposal {
+        files: Vec<String>,
+        touched_files: u32,
+        loc_delta: u32,
+        verify_commands: Vec<String>,
+        verify_status: String,
+        suggested_message: String,
     },
     /// A tool call has started execution.
     ToolCallStart {
@@ -1350,6 +1370,7 @@ pub struct ChatRequest {
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub agent_loop: AgentLoopConfig,
+    pub git: GitWorkflowConfig,
     pub policy: PolicyConfig,
     pub tools: ToolsConfig,
     pub plugins: PluginsConfig,
@@ -1472,6 +1493,27 @@ fn default_safety_gate_max_files_without_approval() -> u64 {
 }
 fn default_safety_gate_max_loc_without_approval() -> u64 {
     600
+}
+fn default_team_auto_enabled() -> bool {
+    true
+}
+fn default_team_complexity_threshold() -> u64 {
+    60
+}
+fn default_team_max_lanes() -> u64 {
+    4
+}
+fn default_team_max_concurrency() -> u64 {
+    2
+}
+fn default_git_auto_commit_on_verify_pass() -> bool {
+    false
+}
+fn default_git_commit_message_template() -> String {
+    "deepseek: {goal}".to_string()
+}
+fn default_git_require_signing() -> bool {
+    false
 }
 
 impl AppConfig {
@@ -1678,6 +1720,8 @@ pub struct AgentLoopConfig {
     pub safety_gate: SafetyGateConfig,
     #[serde(default)]
     pub apply_strategy: ApplyStrategy,
+    #[serde(default)]
+    pub team: TeamOrchestrationConfig,
 }
 
 impl Default for AgentLoopConfig {
@@ -1707,6 +1751,31 @@ impl Default for AgentLoopConfig {
             failure_classifier: FailureClassifierConfig::default(),
             safety_gate: SafetyGateConfig::default(),
             apply_strategy: ApplyStrategy::default(),
+            team: TeamOrchestrationConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeamOrchestrationConfig {
+    #[serde(default = "default_team_auto_enabled")]
+    pub auto_enabled: bool,
+    #[serde(default = "default_team_complexity_threshold")]
+    pub complexity_threshold: u64,
+    #[serde(default = "default_team_max_lanes")]
+    pub max_lanes: u64,
+    #[serde(default = "default_team_max_concurrency")]
+    pub max_concurrency: u64,
+}
+
+impl Default for TeamOrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            auto_enabled: default_team_auto_enabled(),
+            complexity_threshold: default_team_complexity_threshold(),
+            max_lanes: default_team_max_lanes(),
+            max_concurrency: default_team_max_concurrency(),
         }
     }
 }
@@ -1756,6 +1825,33 @@ pub enum ApplyStrategy {
     #[default]
     Auto,
     ThreeWay,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitWorkflowConfig {
+    #[serde(default = "default_git_auto_commit_on_verify_pass")]
+    pub auto_commit_on_verify_pass: bool,
+    #[serde(default = "default_git_commit_message_template")]
+    pub commit_message_template: String,
+    #[serde(default = "default_git_require_signing")]
+    pub require_signing: bool,
+    #[serde(default)]
+    pub allowed_branch_patterns: Vec<String>,
+    #[serde(default)]
+    pub commit_message_regex: Option<String>,
+}
+
+impl Default for GitWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            auto_commit_on_verify_pass: default_git_auto_commit_on_verify_pass(),
+            commit_message_template: default_git_commit_message_template(),
+            require_signing: default_git_require_signing(),
+            allowed_branch_patterns: Vec::new(),
+            commit_message_regex: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

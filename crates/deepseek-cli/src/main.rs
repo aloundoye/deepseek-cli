@@ -136,6 +136,14 @@ struct Cli {
     #[arg(long = "add-dir", global = true)]
     add_dir: Vec<PathBuf>,
 
+    /// Override repository root used for bootstrap/context analysis.
+    #[arg(long = "repo", global = true)]
+    repo: Option<PathBuf>,
+
+    /// Print deterministic pre-model context digest to stderr.
+    #[arg(long = "debug-context", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    debug_context: bool,
+
     /// Enable verbose logging to stderr.
     #[arg(short = 'v', long = "verbose", global = true)]
     verbose: bool,
@@ -800,12 +808,23 @@ struct McpRemoveArgs {
 #[derive(Subcommand)]
 enum GitCmd {
     Status,
+    Diff(GitDiffArgs),
     History(GitHistoryArgs),
     Branch,
     Checkout(GitCheckoutArgs),
+    Stage(GitStageArgs),
+    Unstage(GitUnstageArgs),
     Commit(GitCommitArgs),
     Pr(GitPrArgs),
     Resolve(GitResolveArgs),
+}
+
+#[derive(Args)]
+struct GitDiffArgs {
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    staged: bool,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    stat: bool,
 }
 
 #[derive(Args)]
@@ -823,8 +842,24 @@ struct GitCheckoutArgs {
 struct GitCommitArgs {
     #[arg(long)]
     message: String,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     all: bool,
+}
+
+#[derive(Args)]
+struct GitStageArgs {
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    all: bool,
+    #[arg()]
+    files: Vec<String>,
+}
+
+#[derive(Args)]
+struct GitUnstageArgs {
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    all: bool,
+    #[arg()]
+    files: Vec<String>,
 }
 
 #[derive(Args)]
