@@ -16,6 +16,7 @@ deepseek-core = { path = "../deepseek-core" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-context = { path = "../deepseek-context" }
 deepseek-errors = { path = "../deepseek-errors" }
+deepseek-agent = { path = "../deepseek-agent" }
 
 [dev-dependencies]
 tempfile = "3"

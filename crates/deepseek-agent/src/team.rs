@@ -6,9 +6,11 @@ use anyhow::{Context, Result, anyhow};
 use deepseek_core::{ApplyStrategy, EventKind, StreamChunk, ToolCall, runtime_dir};
 use deepseek_diff::{GitApplyStrategy, PatchStore};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -16,6 +18,7 @@ struct LaneSpec {
     id: String,
     name: String,
     goal: String,
+    files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,12 +35,15 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         return r#loop::run(engine, prompt, &fallback);
     }
 
-    let mut lanes = plan_lanes(prompt);
+    let max_lanes = engine.cfg.agent_loop.team.max_lanes.max(1) as usize;
+    let max_concurrency = engine.cfg.agent_loop.team.max_concurrency.max(1) as usize;
+    let mut lanes = plan_lanes(engine, prompt, max_lanes);
     if lanes.len() <= 1 {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
         return r#loop::run(engine, prompt, &fallback);
     }
+    lanes.truncate(max_lanes);
     lanes.sort_by(|a, b| a.id.cmp(&b.id));
 
     let base_commit = git_stdout(&engine.workspace, &["rev-parse", "HEAD"])
@@ -49,52 +55,48 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     fs::create_dir_all(&lanes_root)?;
 
     let mut results = Vec::new();
-    for lane in lanes {
-        let run_id = Uuid::now_v7();
-        emit_spawned(engine, run_id, &lane);
+    for chunk in lanes.chunks(max_concurrency) {
+        let mut handles = Vec::new();
+        for lane in chunk.iter().cloned() {
+            let run_id = Uuid::now_v7();
+            emit_spawned(engine, run_id, &lane);
 
-        let lane_root = lanes_root.join(format!("{}-{}", lane.id, sanitize_name(&lane.name)));
-        if lane_root.exists() {
-            let _ = fs::remove_dir_all(&lane_root);
+            let workspace = engine.workspace.clone();
+            let base_commit = base_commit.clone();
+            let lanes_root = lanes_root.clone();
+            let prompt = prompt.to_string();
+            let mut lane_options = options.clone();
+            lane_options.mode = ChatMode::Code;
+            lane_options.force_execute = true;
+            lane_options.force_plan_only = false;
+            lane_options.disable_team_orchestration = true;
+
+            handles.push(thread::spawn(move || {
+                execute_lane(
+                    workspace,
+                    lanes_root,
+                    &base_commit,
+                    &prompt,
+                    lane_options,
+                    lane,
+                    run_id,
+                )
+            }));
         }
-        if let Err(err) = add_worktree(&engine.workspace, &lane_root, &base_commit) {
-            emit_failed(engine, run_id, &lane, &err.to_string());
-            return Err(err);
-        }
 
-        let mut lane_options = options.clone();
-        lane_options.mode = ChatMode::Code;
-        lane_options.force_execute = true;
-        lane_options.force_plan_only = false;
-        lane_options.disable_team_orchestration = true;
-
-        let lane_prompt = format!(
-            "{}\n\n[Team lane {}: {}]\nFocus strictly on this lane goal:\n{}",
-            prompt, lane.id, lane.name, lane.goal
-        );
-
-        let lane_result = (|| -> Result<LaneResult> {
-            let lane_engine = AgentEngine::new(&lane_root)?;
-            lane_engine.set_approval_handler(Box::new(|_call| Ok(true)));
-            let _ = lane_engine.chat_with_options(&lane_prompt, lane_options)?;
-            let patch = git_stdout(&lane_root, &["diff", "--binary"])
-                .context("failed to collect lane patch artifact")?;
-            Ok(LaneResult {
-                lane: lane.clone(),
-                run_id,
-                patch,
-            })
-        })();
-
-        let _ = remove_worktree(&engine.workspace, &lane_root);
-        match lane_result {
-            Ok(result) => {
-                emit_completed(engine, result.run_id, &result.lane, &result.patch);
-                results.push(result);
-            }
-            Err(err) => {
-                emit_failed(engine, run_id, &lane, &err.to_string());
-                return Err(err);
+        for handle in handles {
+            let lane_result = handle
+                .join()
+                .map_err(|_| anyhow!("team lane worker panicked"))?;
+            match lane_result {
+                Ok(result) => {
+                    emit_completed(engine, result.run_id, &result.lane, &result.patch);
+                    results.push(result);
+                }
+                Err((lane, run_id, err)) => {
+                    emit_failed(engine, run_id, &lane, &err.to_string());
+                    return Err(err);
+                }
             }
         }
     }
@@ -167,6 +169,61 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     engine.stream(StreamChunk::ContentDelta(response.clone()));
     engine.stream(StreamChunk::Done);
     Ok(response)
+}
+
+fn execute_lane(
+    workspace: std::path::PathBuf,
+    lanes_root: std::path::PathBuf,
+    base_commit: &str,
+    prompt: &str,
+    lane_options: ChatOptions,
+    lane: LaneSpec,
+    run_id: Uuid,
+) -> std::result::Result<LaneResult, (LaneSpec, Uuid, anyhow::Error)> {
+    let lane_root = lanes_root.join(format!("{}-{}", lane.id, sanitize_name(&lane.name)));
+    if lane_root.exists() {
+        let _ = fs::remove_dir_all(&lane_root);
+    }
+    if let Err(err) = add_worktree(&workspace, &lane_root, base_commit) {
+        return Err((lane, run_id, err));
+    }
+
+    let lane_prompt = format!(
+        "{}\n\n[Team lane {}: {}]\nFocus strictly on this lane goal:\n{}\n\nTarget files:\n{}",
+        prompt,
+        lane.id,
+        lane.name,
+        lane.goal,
+        if lane.files.is_empty() {
+            "- (none listed)".to_string()
+        } else {
+            lane.files
+                .iter()
+                .take(12)
+                .map(|file| format!("- {file}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    );
+
+    let lane_result = (|| -> Result<LaneResult> {
+        let lane_engine = AgentEngine::new(&lane_root)?;
+        lane_engine.set_approval_handler(Box::new(|_call| Ok(true)));
+        let _ = lane_engine.chat_with_options(&lane_prompt, lane_options)?;
+        let patch = git_stdout(&lane_root, &["diff", "--binary"])
+            .context("failed to collect lane patch artifact")?;
+        Ok(LaneResult {
+            lane: lane.clone(),
+            run_id,
+            patch,
+        })
+    })();
+
+    let _ = remove_worktree(&workspace, &lane_root);
+    match lane_result {
+        Ok(result) => Ok(result),
+        Err(err) => Err((lane, run_id, err)),
+    }
 }
 
 fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> Result<bool> {
@@ -275,71 +332,148 @@ fn validate_lane_patch_artifact(patch: &str) -> Result<()> {
     Ok(())
 }
 
-fn plan_lanes(prompt: &str) -> Vec<LaneSpec> {
-    let lower = prompt.to_ascii_lowercase();
+fn plan_lanes(engine: &AgentEngine, prompt: &str, max_lanes: usize) -> Vec<LaneSpec> {
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if let Ok(plan) = engine.plan_only(prompt) {
+        for step in &plan.steps {
+            for path in &step.files {
+                let lane = classify_lane_for_path(path);
+                grouped.entry(lane).or_default().insert(path.clone());
+            }
+        }
+    }
+
+    if grouped.is_empty() {
+        grouped = keyword_lane_groups(prompt);
+    }
+
+    if grouped.is_empty() {
+        grouped
+            .entry("core".to_string())
+            .or_default()
+            .insert("core".to_string());
+    }
+
+    let lane_order = ["frontend", "backend", "testing", "docs", "infra", "core"];
     let mut lanes = Vec::new();
-    maybe_add_lane(
-        &mut lanes,
-        &lower,
-        "01",
-        "frontend",
-        "UI, UX, and client-side behavior",
-        &["frontend", "ui", "react", "vue", "css", "html", "web"],
-    );
-    maybe_add_lane(
-        &mut lanes,
-        &lower,
-        "02",
-        "backend",
-        "API, server logic, and data flows",
-        &[
-            "backend", "api", "server", "database", "db", "sql", "endpoint",
-        ],
-    );
-    maybe_add_lane(
-        &mut lanes,
-        &lower,
-        "03",
-        "testing",
-        "Tests, linting, and verification hardening",
-        &["test", "testing", "qa", "verify", "lint", "ci"],
-    );
-    maybe_add_lane(
-        &mut lanes,
-        &lower,
-        "04",
-        "docs",
-        "Documentation and developer guidance",
-        &["docs", "readme", "spec", "documentation"],
-    );
-    if lanes.is_empty() {
+    for (idx, lane_name) in lane_order.iter().enumerate() {
+        if let Some(paths) = grouped.get(*lane_name) {
+            let files = paths.iter().cloned().collect::<Vec<_>>();
+            lanes.push(LaneSpec {
+                id: format!("{:02}", idx + 1),
+                name: lane_name.to_string(),
+                goal: lane_goal(lane_name, &files),
+                files,
+            });
+        }
+    }
+
+    for (name, paths) in grouped {
+        if lanes.iter().any(|lane| lane.name == name) {
+            continue;
+        }
+        let next = lanes.len() + 1;
         lanes.push(LaneSpec {
-            id: "01".to_string(),
-            name: "core".to_string(),
-            goal: "Primary implementation lane".to_string(),
+            id: format!("{next:02}"),
+            name: name.clone(),
+            goal: lane_goal(&name, &paths.iter().cloned().collect::<Vec<_>>()),
+            files: paths.iter().cloned().collect(),
         });
     }
+
+    lanes.sort_by(|a, b| a.id.cmp(&b.id));
+    lanes.truncate(max_lanes.max(1));
     lanes
 }
 
-fn maybe_add_lane(
-    lanes: &mut Vec<LaneSpec>,
-    prompt_lower: &str,
-    id: &str,
-    name: &str,
-    goal: &str,
-    keywords: &[&str],
-) {
-    if keywords
-        .iter()
-        .any(|keyword| prompt_lower.contains(keyword))
-    {
-        lanes.push(LaneSpec {
-            id: id.to_string(),
-            name: name.to_string(),
-            goal: goal.to_string(),
-        });
+fn lane_goal(name: &str, files: &[String]) -> String {
+    let scope = files.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+    let prefix = match name {
+        "frontend" => "UI and UX implementation updates",
+        "backend" => "API, server, and data-flow updates",
+        "testing" => "Verification, tests, and lint hardening",
+        "docs" => "Documentation and operator guidance updates",
+        "infra" => "Build, CI, and environment orchestration updates",
+        _ => "Core implementation updates",
+    };
+    if scope.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}; focus files: {scope}")
     }
+}
+
+fn classify_lane_for_path(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".md") || lower.contains("/docs/") || lower.contains("readme") {
+        return "docs".to_string();
+    }
+    if lower.contains("test")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".test.ts")
+    {
+        return "testing".to_string();
+    }
+    if lower.ends_with(".tsx")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".css")
+        || lower.ends_with(".html")
+        || lower.contains("/ui/")
+        || lower.contains("/frontend/")
+    {
+        return "frontend".to_string();
+    }
+    if lower.contains("/.github/")
+        || lower.contains("docker")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".yaml")
+    {
+        return "infra".to_string();
+    }
+    "backend".to_string()
+}
+
+fn contains_any(input: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| input.contains(keyword))
+}
+
+fn keyword_lane_groups(prompt: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let lower = prompt.to_ascii_lowercase();
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if contains_any(
+        &lower,
+        &["frontend", "ui", "react", "vue", "css", "html", "web"],
+    ) {
+        grouped
+            .entry("frontend".to_string())
+            .or_default()
+            .insert("ui".to_string());
+    }
+    if contains_any(
+        &lower,
+        &[
+            "backend", "api", "server", "database", "db", "sql", "endpoint",
+        ],
+    ) {
+        grouped
+            .entry("backend".to_string())
+            .or_default()
+            .insert("backend".to_string());
+    }
+    if contains_any(&lower, &["test", "testing", "qa", "verify", "lint", "ci"]) {
+        grouped
+            .entry("testing".to_string())
+            .or_default()
+            .insert("tests".to_string());
+    }
+    if contains_any(&lower, &["docs", "readme", "spec", "documentation"]) {
+        grouped
+            .entry("docs".to_string())
+            .or_default()
+            .insert("docs".to_string());
+    }
+    grouped
 }
 
 fn is_git_workspace(workspace: &Path) -> bool {
@@ -456,20 +590,15 @@ mod tests {
 
     #[test]
     fn lane_planning_is_deterministic() {
-        let a = plan_lanes("Refactor frontend and backend and add tests");
-        let b = plan_lanes("Refactor frontend and backend and add tests");
-        assert_eq!(a.len(), b.len());
-        assert_eq!(
-            a.iter().map(|lane| lane.id.clone()).collect::<Vec<_>>(),
-            b.iter().map(|lane| lane.id.clone()).collect::<Vec<_>>()
-        );
+        let a = keyword_lane_groups("Refactor frontend and backend and add tests");
+        let b = keyword_lane_groups("Refactor frontend and backend and add tests");
+        assert_eq!(a, b);
     }
 
     #[test]
     fn lane_planning_falls_back_to_core() {
-        let lanes = plan_lanes("minor tweak");
-        assert_eq!(lanes.len(), 1);
-        assert_eq!(lanes[0].name, "core");
+        let grouped = keyword_lane_groups("minor tweak");
+        assert!(grouped.is_empty());
     }
 
     #[test]

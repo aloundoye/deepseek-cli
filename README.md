@@ -171,6 +171,8 @@ Notable architecture/runtime defaults:
 - Repo-oriented prompts without a detected repository return: `No repository detected. Run from project root or pass --repo <path>.`
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
 - Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).
+- TUI visibility defaults to concise phase summaries with heartbeat progress (`ui.thinking_visibility = "concise"`, `ui.phase_heartbeat_ms = 5000`).
+- Mission Control retention is bounded (`ui.mission_control_max_events`).
 - Teleport link base URL is configurable (`ui.handoff_base_url`).
 
 Common execution control flags:
@@ -183,6 +185,11 @@ Explicit commit workflow:
 - `/stage`, `/unstage`, `/diff`, `/commit`, `/undo` are available in chat/TUI.
 - `/commit` commits staged changes only (no implicit staging).
 - `deepseek git commit --message "..."` also commits staged-only by default.
+
+Workflow parity slash commands:
+- Context/workspace controls: `/add`, `/drop`, `/read-only`, `/map`, `/map-refresh`
+- Deterministic command helpers: `/run`, `/test`, `/lint`
+- Web research helper: `/web`
 
 Default model/profile behavior:
 - `llm.provider = "deepseek"`

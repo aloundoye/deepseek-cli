@@ -1515,6 +1515,15 @@ fn default_git_commit_message_template() -> String {
 fn default_git_require_signing() -> bool {
     false
 }
+fn default_ui_thinking_visibility() -> String {
+    "concise".to_string()
+}
+fn default_ui_phase_heartbeat_ms() -> u64 {
+    5000
+}
+fn default_ui_mission_control_max_events() -> u64 {
+    400
+}
 
 impl AppConfig {
     pub fn user_settings_path() -> Option<PathBuf> {
@@ -2237,6 +2246,16 @@ pub struct UiConfig {
     pub keybindings_path: String,
     pub reduced_motion: bool,
     pub statusline_mode: String,
+    /// Thinking visibility mode in TUI.
+    /// Allowed values: "concise", "raw".
+    #[serde(default = "default_ui_thinking_visibility")]
+    pub thinking_visibility: String,
+    /// Heartbeat interval for active phase progress in milliseconds.
+    #[serde(default = "default_ui_phase_heartbeat_ms")]
+    pub phase_heartbeat_ms: u64,
+    /// Maximum retained mission-control timeline events.
+    #[serde(default = "default_ui_mission_control_max_events")]
+    pub mission_control_max_events: u64,
     /// Image fallback mode when terminal protocol does not support inline rendering.
     /// Allowed values: "open", "path", "none".
     pub image_fallback: String,
@@ -2251,6 +2270,9 @@ impl Default for UiConfig {
             keybindings_path: "~/.deepseek/keybindings.json".to_string(),
             reduced_motion: false,
             statusline_mode: "minimal".to_string(),
+            thinking_visibility: default_ui_thinking_visibility(),
+            phase_heartbeat_ms: default_ui_phase_heartbeat_ms(),
+            mission_control_max_events: default_ui_mission_control_max_events(),
             image_fallback: "open".to_string(),
             handoff_base_url: None,
         }

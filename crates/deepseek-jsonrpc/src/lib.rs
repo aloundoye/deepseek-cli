@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
-use deepseek_core::{ChatMessage, EventKind, Session, SessionBudgets, SessionState};
+use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
+use deepseek_core::{ChatMessage, EventKind, Session, SessionBudgets, SessionState, StreamChunk};
 use deepseek_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -171,8 +172,8 @@ pub struct IdeRpcHandler {
     approvals: Mutex<HashMap<Uuid, PendingToolApproval>>,
     /// Per-session conversation histories (for prompt/execute streaming).
     conversations: Mutex<HashMap<Uuid, Vec<ChatMessage>>>,
-    /// Per-prompt queued partial message chunks for stream polling.
-    prompt_streams: Mutex<HashMap<Uuid, Vec<String>>>,
+    /// Per-prompt queued partial event chunks for stream polling.
+    prompt_streams: Mutex<HashMap<Uuid, Vec<Value>>>,
     /// Whether partial-message streaming should be enabled by default.
     include_partial_messages: bool,
     /// Context manager for intelligent file suggestions.
@@ -322,7 +323,7 @@ impl IdeRpcHandler {
             .to_string();
 
         // Verify session exists.
-        let _session = self
+        let session = self
             .store
             .load_session(session_id)?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
@@ -350,37 +351,152 @@ impl IdeRpcHandler {
             },
         })?;
 
-        // Return a prompt_id for the IDE to track this execution.
-        // Actual LLM execution is handled by the agent runtime which the IDE
-        // polls via `prompt/status` or receives tool events.
+        // Execute the real agent runtime and collect deterministic stream events.
         let prompt_id = Uuid::now_v7();
         let include_partial = params
             .get("include_partial_messages")
             .and_then(|v| v.as_bool())
             .unwrap_or(self.include_partial_messages);
+
+        let repo_root = params
+            .get("repo_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        let debug_context = params
+            .get("debug_context")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let force_max_think = params
+            .get("force_max_think")
+            .or_else(|| params.get("thinking_enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let force_execute = params
+            .get("force_execute")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let force_plan_only = params
+            .get("plan_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let tools = params
+            .get("tools")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let mode = params
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(parse_chat_mode)
+            .unwrap_or(ChatMode::Code);
+        let teammate_mode = params
+            .get("teammate_mode")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        let additional_dirs = params
+            .get("additional_dirs")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_str())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let stream_rows: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let workspace_root = PathBuf::from(session.workspace_root.clone());
+
+        let (status, output, error_message) =
+            if let Some(mock_output) = params.get("mock_output").and_then(|v| v.as_str()) {
+                if let Ok(mut guard) = stream_rows.lock() {
+                    guard.push(stream_chunk_to_json(&StreamChunk::ContentDelta(
+                        mock_output.to_string(),
+                    )));
+                    guard.push(stream_chunk_to_json(&StreamChunk::Done));
+                }
+                ("completed".to_string(), mock_output.to_string(), None)
+            } else {
+                let engine = AgentEngine::new(&workspace_root)?;
+                let stream_rows_cb = Arc::clone(&stream_rows);
+                engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+                    let row = stream_chunk_to_json(&chunk);
+                    if let Ok(mut guard) = stream_rows_cb.lock() {
+                        guard.push(row);
+                    }
+                }));
+
+                let chat_options = ChatOptions {
+                    tools,
+                    force_max_think,
+                    additional_dirs,
+                    repo_root_override: repo_root,
+                    debug_context,
+                    mode,
+                    force_execute,
+                    force_plan_only,
+                    teammate_mode,
+                    ..Default::default()
+                };
+
+                match engine.chat_with_options(&prompt, chat_options) {
+                    Ok(output) => ("completed".to_string(), output, None),
+                    Err(err) => ("failed".to_string(), String::new(), Some(err.to_string())),
+                }
+            };
+
+        if !output.is_empty() {
+            self.conversations
+                .lock()
+                .expect("conversations lock")
+                .entry(session_id)
+                .or_default()
+                .push(ChatMessage::Assistant {
+                    content: Some(output.clone()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                });
+            let seq = self.store.next_seq_no(session_id)?;
+            self.store.append_event(&deepseek_core::EventEnvelope {
+                seq_no: seq,
+                at: chrono::Utc::now(),
+                session_id,
+                kind: EventKind::ChatTurnV1 {
+                    message: ChatMessage::Assistant {
+                        content: Some(output.clone()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                    },
+                },
+            })?;
+        }
+
         if include_partial {
-            let seed = format!("Processing prompt: {prompt}");
-            let chunks = split_partial_chunks(&seed, 48);
+            let rows = stream_rows.lock().expect("stream rows lock").clone();
             self.prompt_streams
                 .lock()
                 .expect("prompt_streams lock")
-                .insert(prompt_id, chunks);
+                .insert(prompt_id, rows);
         }
+
+        let stream_meta = if include_partial {
+            serde_json::json!({
+                "method": "prompt/stream_next",
+                "prompt_id": prompt_id.to_string(),
+                "cursor": 0,
+            })
+        } else {
+            Value::Null
+        };
+
         Ok(serde_json::json!({
             "prompt_id": prompt_id.to_string(),
             "session_id": session_id.to_string(),
-            "status": "queued",
+            "status": status,
             "prompt": prompt,
+            "output": if output.is_empty() { Value::Null } else { serde_json::json!(output) },
+            "error": error_message,
             "partial_messages_enabled": include_partial,
-            "stream": if include_partial {
-                serde_json::json!({
-                    "method": "prompt/stream_next",
-                    "prompt_id": prompt_id.to_string(),
-                    "cursor": 0,
-                })
-            } else {
-                Value::Null
-            },
+            "stream": stream_meta,
         }))
     }
 
@@ -410,12 +526,18 @@ impl IdeRpcHandler {
         let out_chunks = slice
             .iter()
             .enumerate()
-            .map(|(idx, delta)| {
-                serde_json::json!({
+            .map(|(idx, row)| {
+                let mut chunk = serde_json::json!({
                     "cursor": start + idx,
-                    "type": "assistant_partial",
-                    "delta": delta,
-                })
+                    "event": row,
+                });
+                if let Some(kind) = row.get("type").and_then(|v| v.as_str()) {
+                    chunk["type"] = serde_json::json!(kind);
+                }
+                if let Some(text) = row.get("text").and_then(|v| v.as_str()) {
+                    chunk["delta"] = serde_json::json!(text);
+                }
+                chunk
             })
             .collect::<Vec<_>>();
         let done = end >= chunks.len();
@@ -1074,6 +1196,63 @@ impl IdeRpcHandler {
         }
     }
 
+    fn handle_context_debug(&self, params: Value) -> Result<Value> {
+        let session_id = require_uuid(&params, "session_id")?;
+        let prompt = params
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing 'prompt' parameter"))?
+            .to_string();
+
+        let session = self
+            .store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let workspace_root = PathBuf::from(session.workspace_root);
+
+        let mode = params
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(parse_chat_mode)
+            .unwrap_or(ChatMode::Code);
+        let tools = params
+            .get("tools")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let force_execute = params
+            .get("force_execute")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let force_plan_only = params
+            .get("plan_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let repo_root_override = params
+            .get("repo_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+
+        let engine = AgentEngine::new(&workspace_root)?;
+        let digest = engine.context_debug_preview(
+            &prompt,
+            &ChatOptions {
+                tools,
+                mode,
+                force_execute,
+                force_plan_only,
+                repo_root_override,
+                debug_context: true,
+                ..Default::default()
+            },
+        );
+
+        Ok(serde_json::json!({
+            "schema": "deepseek.context.debug.v1",
+            "session_id": session_id.to_string(),
+            "digest": digest,
+        }))
+    }
+
     // -- Task methods --
 
     fn handle_task_list(&self, params: Value) -> Result<Value> {
@@ -1143,7 +1322,7 @@ impl RpcHandler for IdeRpcHandler {
                     "tool/approve", "tool/deny",
                     "patch/preview", "patch/apply",
                     "diagnostics/list", "events/poll",
-                    "context/suggest", "context/analyze", "context/compress", "context/related",
+                    "context/suggest", "context/analyze", "context/compress", "context/related", "context/debug",
                     "task/list", "task/update",
                     "status", "cancel", "shutdown"
                 ]
@@ -1187,6 +1366,7 @@ impl RpcHandler for IdeRpcHandler {
             "context/analyze" => self.handle_context_analyze(params),
             "context/compress" => self.handle_context_compress(params),
             "context/related" => self.handle_context_related(params),
+            "context/debug" => self.handle_context_debug(params),
 
             // Task management
             "task/list" => self.handle_task_list(params),
@@ -1257,31 +1437,168 @@ fn env_flag_enabled(key: &str) -> bool {
     }
 }
 
-fn split_partial_chunks(text: &str, max_chunk_bytes: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for token in text.split_whitespace() {
-        let candidate_len = if current.is_empty() {
-            token.len()
-        } else {
-            current.len() + 1 + token.len()
-        };
-        if candidate_len > max_chunk_bytes && !current.is_empty() {
-            out.push(current.clone());
-            current.clear();
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(token);
+fn parse_chat_mode(value: &str) -> ChatMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ask" => ChatMode::Ask,
+        "architect" => ChatMode::Architect,
+        "context" => ChatMode::Context,
+        _ => ChatMode::Code,
     }
-    if !current.is_empty() {
-        out.push(current);
+}
+
+fn stream_chunk_to_json(chunk: &StreamChunk) -> Value {
+    match chunk {
+        StreamChunk::ContentDelta(text) => serde_json::json!({
+            "type": "content_delta",
+            "text": text,
+        }),
+        StreamChunk::ReasoningDelta(text) => serde_json::json!({
+            "type": "reasoning_delta",
+            "text": text,
+        }),
+        StreamChunk::ArchitectStarted { iteration } => serde_json::json!({
+            "type": "phase",
+            "phase": "architect_started",
+            "iteration": iteration,
+        }),
+        StreamChunk::ArchitectCompleted {
+            iteration,
+            files,
+            no_edit,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "architect_completed",
+            "iteration": iteration,
+            "files": files,
+            "no_edit": no_edit,
+        }),
+        StreamChunk::EditorStarted { iteration, files } => serde_json::json!({
+            "type": "phase",
+            "phase": "editor_started",
+            "iteration": iteration,
+            "files": files,
+        }),
+        StreamChunk::EditorCompleted { iteration, status } => serde_json::json!({
+            "type": "phase",
+            "phase": "editor_completed",
+            "iteration": iteration,
+            "status": status,
+        }),
+        StreamChunk::ApplyStarted { iteration } => serde_json::json!({
+            "type": "phase",
+            "phase": "apply_started",
+            "iteration": iteration,
+        }),
+        StreamChunk::ApplyCompleted {
+            iteration,
+            success,
+            summary,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "apply_completed",
+            "iteration": iteration,
+            "success": success,
+            "summary": summary,
+        }),
+        StreamChunk::VerifyStarted {
+            iteration,
+            commands,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "verify_started",
+            "iteration": iteration,
+            "commands": commands,
+        }),
+        StreamChunk::VerifyCompleted {
+            iteration,
+            success,
+            summary,
+        } => serde_json::json!({
+            "type": "phase",
+            "phase": "verify_completed",
+            "iteration": iteration,
+            "success": success,
+            "summary": summary,
+        }),
+        StreamChunk::CommitProposal {
+            files,
+            touched_files,
+            loc_delta,
+            verify_commands,
+            verify_status,
+            suggested_message,
+        } => serde_json::json!({
+            "type": "commit_proposal",
+            "files": files,
+            "touched_files": touched_files,
+            "loc_delta": loc_delta,
+            "verify_commands": verify_commands,
+            "verify_status": verify_status,
+            "suggested_message": suggested_message,
+        }),
+        StreamChunk::ToolCallStart {
+            tool_name,
+            args_summary,
+        } => serde_json::json!({
+            "type": "tool_start",
+            "tool_name": tool_name,
+            "args_summary": args_summary,
+        }),
+        StreamChunk::ToolCallEnd {
+            tool_name,
+            duration_ms,
+            success,
+            summary,
+        } => serde_json::json!({
+            "type": "tool_end",
+            "tool_name": tool_name,
+            "duration_ms": duration_ms,
+            "success": success,
+            "summary": summary,
+        }),
+        StreamChunk::ModeTransition { from, to, reason } => serde_json::json!({
+            "type": "mode_transition",
+            "from": from,
+            "to": to,
+            "reason": reason,
+        }),
+        StreamChunk::SubagentSpawned { run_id, name, goal } => serde_json::json!({
+            "type": "subagent_spawned",
+            "run_id": run_id,
+            "name": name,
+            "goal": goal,
+        }),
+        StreamChunk::SubagentCompleted {
+            run_id,
+            name,
+            summary,
+        } => serde_json::json!({
+            "type": "subagent_completed",
+            "run_id": run_id,
+            "name": name,
+            "summary": summary,
+        }),
+        StreamChunk::SubagentFailed {
+            run_id,
+            name,
+            error,
+        } => serde_json::json!({
+            "type": "subagent_failed",
+            "run_id": run_id,
+            "name": name,
+            "error": error,
+        }),
+        StreamChunk::ImageData { label, .. } => serde_json::json!({
+            "type": "image",
+            "label": label,
+        }),
+        StreamChunk::ClearStreamingText => serde_json::json!({
+            "type": "clear_streaming_text",
+        }),
+        StreamChunk::Done => serde_json::json!({
+            "type": "done",
+        }),
     }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1360,6 +1677,7 @@ mod tests {
         assert!(caps.iter().any(|c| c == "events/poll"));
         assert!(caps.iter().any(|c| c == "tool/approve"));
         assert!(caps.iter().any(|c| c == "patch/preview"));
+        assert!(caps.iter().any(|c| c == "context/debug"));
     }
 
     #[test]
@@ -1434,12 +1752,41 @@ mod tests {
         let exec = handler
             .handle(
                 "prompt/execute",
-                json!({"session_id": sid, "prompt": "explain this code"}),
+                json!({
+                    "session_id": sid,
+                    "prompt": "explain this code",
+                    "mock_output": "Initial Analysis\n- sample"
+                }),
             )
             .expect("prompt/execute");
-        assert_eq!(exec["status"], "queued");
+        assert_eq!(exec["status"], "completed");
         assert_eq!(exec["prompt"], "explain this code");
         assert!(exec["prompt_id"].as_str().is_some());
+        assert!(exec["output"].as_str().is_some());
+    }
+
+    #[test]
+    fn ide_handler_context_debug_returns_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = IdeRpcHandler::new(tmp.path()).unwrap();
+        let opened = handler
+            .handle("session/open", json!({"workspace_root": tmp.path()}))
+            .unwrap();
+        let sid = opened["session_id"].as_str().unwrap();
+
+        let debug = handler
+            .handle(
+                "context/debug",
+                json!({
+                    "session_id": sid,
+                    "prompt": "analyze this project",
+                    "mode": "ask",
+                    "tools": false
+                }),
+            )
+            .expect("context/debug");
+        assert_eq!(debug["schema"], "deepseek.context.debug.v1");
+        assert!(debug["digest"].as_str().is_some());
     }
 
     #[test]
@@ -1457,7 +1804,8 @@ mod tests {
                 json!({
                     "session_id": sid,
                     "prompt": "stream this response please",
-                    "include_partial_messages": true
+                    "include_partial_messages": true,
+                    "mock_output": "stream this response please"
                 }),
             )
             .expect("prompt/execute");
@@ -1496,7 +1844,11 @@ mod tests {
         let _ = handler
             .handle(
                 "prompt/execute",
-                json!({"session_id": sid, "prompt": "save this conversation"}),
+                json!({
+                    "session_id": sid,
+                    "prompt": "save this conversation",
+                    "mock_output": "saved"
+                }),
             )
             .expect("prompt/execute");
 
@@ -1541,7 +1893,11 @@ mod tests {
         let _ = handler
             .handle(
                 "prompt/execute",
-                json!({"session_id": sid, "prompt": "handoff link seed"}),
+                json!({
+                    "session_id": sid,
+                    "prompt": "handoff link seed",
+                    "mock_output": "seeded"
+                }),
             )
             .expect("prompt/execute");
 
@@ -1578,7 +1934,11 @@ mod tests {
         let _ = handler
             .handle(
                 "prompt/execute",
-                json!({"session_id": sid, "prompt": "hello"}),
+                json!({
+                    "session_id": sid,
+                    "prompt": "hello",
+                    "mock_output": "hello there"
+                }),
             )
             .expect("prompt/execute");
 
