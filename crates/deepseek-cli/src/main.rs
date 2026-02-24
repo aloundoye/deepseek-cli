@@ -431,6 +431,8 @@ struct ChatArgs {
         default_missing_value = "true"
     )]
     tools: bool,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    json_events: bool,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     tui: bool,
 }
@@ -1579,7 +1581,7 @@ fn run() -> Result<()> {
         .unwrap_or(Commands::Chat(ChatArgs::default()));
 
     match command {
-        Commands::Chat(args) => run_chat(&cwd, cli.json, args.tools, args.tui, Some(&cli)),
+        Commands::Chat(args) => run_chat(&cwd, cli.json, args.json_events, args.tools, args.tui, Some(&cli)),
         Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),
         Commands::Ask(args) => {
             ensure_llm_ready(&cwd, cli.json)?;

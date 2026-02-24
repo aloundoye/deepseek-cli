@@ -906,9 +906,10 @@ fn render_mission_control_payload(payload: &serde_json::Value) -> String {
 pub(crate) fn run_chat(
     cwd: &Path,
     json_mode: bool,
+    json_events: bool,
     allow_tools: bool,
-    force_tui: bool,
-    cli: Option<&Cli>,
+    tui: bool,
+    cli: Option<&crate::Cli>,
 ) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
@@ -940,7 +941,7 @@ pub(crate) fn run_chat(
             })
             .unwrap_or(false);
     let interactive_tty = stdin().is_terminal() && stdout().is_terminal();
-    if !json_mode && (force_tui || cfg.ui.enable_tui) && interactive_tty {
+    if !json_mode && (tui || cfg.ui.enable_tui) && interactive_tty {
         return run_chat_tui(
             cwd,
             allow_tools,
@@ -955,7 +956,7 @@ pub(crate) fn run_chat(
             watch_files_enabled,
         );
     }
-    if force_tui && !interactive_tty {
+    if tui && !interactive_tty {
         return Err(anyhow!("--tui requires an interactive terminal"));
     }
     let mut last_assistant_response: Option<String> = None;
@@ -2042,7 +2043,74 @@ pub(crate) fn run_chat(
         }
 
         // Set up streaming callback for real-time token output
-        if !json_mode {
+        if json_events {
+            engine.set_stream_callback(std::sync::Arc::new(|chunk: deepseek_core::StreamChunk| {
+                use std::io::Write as _;
+                let out = std::io::stdout();
+                let mut handle = out.lock();
+                
+                let val = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    // Event stream payload. Exclude big texts or format appropriately.
+                    "type": match &chunk {
+                        deepseek_core::StreamChunk::ContentDelta(_) => "ContentDelta",
+                        deepseek_core::StreamChunk::ReasoningDelta(_) => "ReasoningDelta",
+                        deepseek_core::StreamChunk::ArchitectStarted { .. } => "ArchitectStarted",
+                        deepseek_core::StreamChunk::ArchitectCompleted { .. } => "ArchitectCompleted",
+                        deepseek_core::StreamChunk::EditorStarted { .. } => "EditorStarted",
+                        deepseek_core::StreamChunk::EditorCompleted { .. } => "EditorCompleted",
+                        deepseek_core::StreamChunk::ApplyStarted { .. } => "ApplyStarted",
+                        deepseek_core::StreamChunk::ApplyCompleted { .. } => "ApplyCompleted",
+                        deepseek_core::StreamChunk::VerifyStarted { .. } => "VerifyStarted",
+                        deepseek_core::StreamChunk::VerifyCompleted { .. } => "VerifyCompleted",
+                        deepseek_core::StreamChunk::LintStarted { .. } => "LintStarted",
+                        deepseek_core::StreamChunk::LintCompleted { .. } => "LintCompleted",
+                        deepseek_core::StreamChunk::CommitProposal { .. } => "CommitProposal",
+                        deepseek_core::StreamChunk::CommitCompleted { .. } => "CommitCompleted",
+                        deepseek_core::StreamChunk::CommitSkipped => "CommitSkipped",
+                        deepseek_core::StreamChunk::ToolCallStart { .. } => "ToolCallStart",
+                        deepseek_core::StreamChunk::ToolCallEnd { .. } => "ToolCallEnd",
+                        deepseek_core::StreamChunk::ModeTransition { .. } => "ModeTransition",
+                        deepseek_core::StreamChunk::SubagentSpawned { .. } => "SubagentSpawned",
+                        deepseek_core::StreamChunk::SubagentCompleted { .. } => "SubagentCompleted",
+                        deepseek_core::StreamChunk::SubagentFailed { .. } => "SubagentFailed",
+                        deepseek_core::StreamChunk::ImageData { .. } => "ImageData",
+                        deepseek_core::StreamChunk::WatchTriggered { .. } => "WatchTriggered",
+                        deepseek_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
+                        deepseek_core::StreamChunk::Done => "Done",
+                    },
+                    "payload": match &chunk {
+                        deepseek_core::StreamChunk::ContentDelta(text) | deepseek_core::StreamChunk::ReasoningDelta(text) => {
+                            serde_json::json!({ "text": text })
+                        },
+                        deepseek_core::StreamChunk::ArchitectStarted { iteration } => serde_json::json!({ "iteration": iteration }),
+                        deepseek_core::StreamChunk::ArchitectCompleted { iteration, files, no_edit } => serde_json::json!({ "iteration": iteration, "files": files, "no_edit": no_edit }),
+                        deepseek_core::StreamChunk::EditorStarted { iteration, files } => serde_json::json!({ "iteration": iteration, "files": files }),
+                        deepseek_core::StreamChunk::EditorCompleted { iteration, status } => serde_json::json!({ "iteration": iteration, "status": status }),
+                        deepseek_core::StreamChunk::ApplyStarted { iteration } => serde_json::json!({ "iteration": iteration }),
+                        deepseek_core::StreamChunk::ApplyCompleted { iteration, success, summary } => serde_json::json!({ "iteration": iteration, "success": success, "summary": summary }),
+                        deepseek_core::StreamChunk::VerifyStarted { iteration, commands } => serde_json::json!({ "iteration": iteration, "commands": commands }),
+                        deepseek_core::StreamChunk::VerifyCompleted { iteration, success, summary } => serde_json::json!({ "iteration": iteration, "success": success, "summary": summary }),
+                        deepseek_core::StreamChunk::LintStarted { iteration, commands } => serde_json::json!({ "iteration": iteration, "commands": commands }),
+                        deepseek_core::StreamChunk::LintCompleted { iteration, success, fixed, remaining } => serde_json::json!({ "iteration": iteration, "success": success, "fixed": fixed, "remaining": remaining }),
+                        deepseek_core::StreamChunk::CommitProposal { files, touched_files, loc_delta, verify_commands, verify_status, suggested_message } => serde_json::json!({ "files": files, "touched_files": touched_files, "loc_delta": loc_delta, "verify_commands": verify_commands, "verify_status": verify_status, "suggested_message": suggested_message }),
+                        deepseek_core::StreamChunk::CommitCompleted { sha, message } => serde_json::json!({ "sha": sha, "message": message }),
+                        deepseek_core::StreamChunk::ToolCallStart { tool_name, args_summary } => serde_json::json!({ "tool_name": tool_name, "args_summary": args_summary }),
+                        deepseek_core::StreamChunk::ToolCallEnd { tool_name, duration_ms, success, summary } => serde_json::json!({ "tool_name": tool_name, "duration_ms": duration_ms, "success": success, "summary": summary }),
+                        deepseek_core::StreamChunk::ModeTransition { from, to, reason } => serde_json::json!({ "from": from, "to": to, "reason": reason }),
+                        deepseek_core::StreamChunk::SubagentSpawned { run_id, name, goal } => serde_json::json!({ "run_id": run_id, "name": name, "goal": goal }),
+                        deepseek_core::StreamChunk::SubagentCompleted { run_id, name, summary } => serde_json::json!({ "run_id": run_id, "name": name, "summary": summary }),
+                        deepseek_core::StreamChunk::SubagentFailed { run_id, name, error } => serde_json::json!({ "run_id": run_id, "name": name, "error": error }),
+                        deepseek_core::StreamChunk::ImageData { label, .. } => serde_json::json!({ "label": label }),
+                        deepseek_core::StreamChunk::WatchTriggered { digest, comment_count } => serde_json::json!({ "digest": digest, "comment_count": comment_count }),
+                        _ => serde_json::json!({}),
+                    }
+                });
+                
+                let _ = writeln!(handle, "{}", serde_json::to_string(&val).unwrap());
+                let _ = handle.flush();
+            }));
+        } else if !json_mode {
             engine.set_stream_callback(std::sync::Arc::new(|chunk: deepseek_core::StreamChunk| {
                 use std::io::Write as _;
                 let out = std::io::stdout();
@@ -2053,89 +2121,62 @@ pub(crate) fn run_chat(
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ReasoningDelta(_) => {}
-                    deepseek_core::StreamChunk::ArchitectStarted { iteration } => {
-                        let _ = writeln!(handle, "\n[phase] architect started (iter {iteration})");
+                    deepseek_core::StreamChunk::ArchitectStarted { iteration: _ } => {
+                        let _ = writeln!(handle, "\n ◉  Understanding context and defining plan...");
                     }
                     deepseek_core::StreamChunk::ArchitectCompleted {
-                        iteration,
                         files,
                         no_edit,
+                        ..
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] architect completed (iter {iteration}) files={files} no_edit={no_edit}"
-                        );
+                        let status = if no_edit { "No changes needed".to_string() } else { format!("{files} files selected") };
+                        let _ = writeln!(handle, " ◯  Understanding completed ({status})");
                     }
-                    deepseek_core::StreamChunk::EditorStarted { iteration, files } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] editor started (iter {iteration}) files={files}"
-                        );
+                    deepseek_core::StreamChunk::EditorStarted { files, .. } => {
+                        let _ = writeln!(handle, " ◉  Working on {files} files...");
                     }
-                    deepseek_core::StreamChunk::EditorCompleted { iteration, status } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] editor completed (iter {iteration}) status={status}"
-                        );
+                    deepseek_core::StreamChunk::EditorCompleted { status, .. } => {
+                        let _ = writeln!(handle, " ◯  Working completed [{status}]");
                     }
-                    deepseek_core::StreamChunk::ApplyStarted { iteration } => {
-                        let _ = writeln!(handle, "[phase] apply started (iter {iteration})");
+                    deepseek_core::StreamChunk::ApplyStarted { .. } => {
+                        let _ = writeln!(handle, " ◉  Applying changes...");
                     }
                     deepseek_core::StreamChunk::ApplyCompleted {
-                        iteration,
                         success,
-                        summary,
+                        ..
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] apply {} (iter {iteration}) {}",
-                            if success { "ok" } else { "failed" },
-                            summary.replace('\n', " ")
-                        );
+                        let icon = if success { "◯" } else { "✗" };
+                        let _ = writeln!(handle, " {icon}  Applying changes");
                     }
                     deepseek_core::StreamChunk::VerifyStarted {
-                        iteration,
                         commands,
+                        ..
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] verify started (iter {iteration}) {}",
-                            commands.join(" | ")
-                        );
+                        if !commands.is_empty() {
+                            let _ = writeln!(handle, " ◉  Verifying changes...");
+                        }
                     }
                     deepseek_core::StreamChunk::VerifyCompleted {
-                        iteration,
                         success,
-                        summary,
+                        ..
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] verify {} (iter {iteration}) {}",
-                            if success { "ok" } else { "failed" },
-                            summary.replace('\n', " ")
-                        );
+                        let icon = if success { "◯" } else { "✗" };
+                        let _ = writeln!(handle, " {icon}  Verifying changes");
                     }
                     deepseek_core::StreamChunk::LintStarted {
-                        iteration,
                         commands,
+                        ..
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] lint started (iter {iteration}) {}",
-                            commands.join(" | ")
-                        );
+                        if !commands.is_empty() {
+                            let _ = writeln!(handle, " ◉  Linting...");
+                        }
                     }
                     deepseek_core::StreamChunk::LintCompleted {
-                        iteration,
                         success,
-                        fixed,
-                        remaining,
+                        ..
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[phase] lint {} (iter {iteration}) fixed={fixed} remaining={remaining}",
-                            if success { "ok" } else { "failed" },
-                        );
+                        let icon = if success { "◯" } else { "✗" };
+                        let _ = writeln!(handle, " {icon}  Linting");
                     }
                     deepseek_core::StreamChunk::CommitProposal {
                         files,
@@ -2169,19 +2210,19 @@ pub(crate) fn run_chat(
                         tool_name,
                         args_summary,
                     } => {
-                        let _ = writeln!(handle, "\n[tool: {tool_name}] {args_summary}");
+                        let _ = writeln!(handle, "\n ⌘  Tool running: {tool_name} ({args_summary})");
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ToolCallEnd {
                         tool_name,
                         duration_ms,
                         success,
-                        summary,
+                        ..
                     } => {
-                        let status = if success { "ok" } else { "error" };
+                        let icon = if success { "✓" } else { "✗" };
                         let _ = writeln!(
                             handle,
-                            "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}"
+                            " {icon}  Tool finished: {tool_name} [{duration_ms}ms]"
                         );
                         let _ = handle.flush();
                     }
@@ -4318,7 +4359,7 @@ pub(crate) fn run_continue_session(
         );
     }
     // Enter chat mode with the continued session context
-    run_chat(cwd, json_mode, true, false, None)
+    run_chat(cwd, json_mode, false, true, false, None)
 }
 
 pub(crate) fn run_resume_specific(
@@ -4342,7 +4383,7 @@ pub(crate) fn run_resume_specific(
             session.status
         );
     }
-    run_chat(cwd, json_mode, true, false, None)
+    run_chat(cwd, json_mode, false, true, false, None)
 }
 
 #[cfg(test)]
