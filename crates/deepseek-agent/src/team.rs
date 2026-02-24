@@ -32,7 +32,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     if !is_git_workspace(&engine.workspace) {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return r#loop::run(engine, prompt, &fallback);
+        return crate::run_engine::run(engine, prompt, &fallback);
     }
 
     let max_lanes = engine.cfg.agent_loop.team.max_lanes.max(1) as usize;
@@ -41,7 +41,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     if lanes.len() <= 1 {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return r#loop::run(engine, prompt, &fallback);
+        return crate::run_engine::run(engine, prompt, &fallback);
     }
     lanes.truncate(max_lanes);
     lanes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -129,7 +129,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                 "Lane merge conflict while applying {} ({})\n\nConflict details:\n{}\n\nOriginal request:\n{}\n\nResolve with a single unified patch and re-verify.",
                 lane.lane.id, lane.lane.name, conflict_text, prompt
             );
-            return r#loop::run(engine, &recovery_prompt, &recovery_options);
+            return crate::run_engine::run(engine, &recovery_prompt, &recovery_options);
         }
     }
 
@@ -149,7 +149,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             "Global verify failed after deterministic lane merge.\n\nVerify summary:\n{}\n\nOriginal request:\n{}\n\nProduce a corrective unified diff and pass verification.",
             verify.summary, prompt
         );
-        return r#loop::run(engine, &recovery_prompt, &recovery_options);
+        return crate::run_engine::run(engine, &recovery_prompt, &recovery_options);
     }
 
     let non_empty = results
@@ -246,9 +246,18 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> 
             "max_files_without_approval": gate.max_files_without_approval,
             "max_loc_without_approval": gate.max_loc_without_approval,
         }),
-        requires_approval: true,
+        requires_approval: files_over || loc_over,
     };
-    engine.request_approval(&call)
+    
+    match engine.policy.dry_run(&call) {
+        deepseek_policy::PermissionDryRunResult::Denied(msg) => {
+            Err(anyhow::anyhow!("Policy explicitly denied patch apply: {msg}"))
+        }
+        deepseek_policy::PermissionDryRunResult::AutoApproved | deepseek_policy::PermissionDryRunResult::Allowed => Ok(true),
+        deepseek_policy::PermissionDryRunResult::NeedsApproval => {
+            engine.request_approval(&call)
+        }
+    }
 }
 
 fn apply_lane_patch(

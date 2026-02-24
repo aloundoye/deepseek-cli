@@ -71,8 +71,11 @@ pub fn gather_for_prompt(
         };
     }
 
-    let repoish = is_repoish_prompt(prompt, mode);
-    if !repoish {
+    let explicit_repoish = is_repoish_prompt(prompt);
+    let implicit_repoish = matches!(mode, ChatMode::Context | ChatMode::Code | ChatMode::Ask);
+    let wants_context = explicit_repoish || implicit_repoish;
+
+    if !wants_context {
         return AutoContextBootstrap {
             enabled: true,
             repoish: false,
@@ -85,16 +88,27 @@ pub fn gather_for_prompt(
 
     let vague_codebase_prompt = is_vague_codebase_prompt(prompt);
     let Some(repo_root) = resolve_repo_root(workspace, repo_root_override) else {
-        return AutoContextBootstrap {
-            enabled: true,
-            repoish: true,
-            vague_codebase_prompt,
-            packet: String::new(),
-            unavailable_reason: Some(
-                "No repository detected. Run from project root or pass --repo <path>.".to_string(),
-            ),
-            ..Default::default()
-        };
+        if explicit_repoish {
+            return AutoContextBootstrap {
+                enabled: true,
+                repoish: true,
+                vague_codebase_prompt,
+                packet: String::new(),
+                unavailable_reason: Some(
+                    "No repository detected. Run from project root or pass --repo <path>.".to_string(),
+                ),
+                ..Default::default()
+            };
+        } else {
+            return AutoContextBootstrap {
+                enabled: true,
+                repoish: false, // Don't trigger hard error inside loop/analysis
+                vague_codebase_prompt: false,
+                packet: String::new(),
+                repo_root: None,
+                ..Default::default()
+            };
+        }
     };
     let tree_entries = collect_tree_snapshot(
         &repo_root,
@@ -285,14 +299,7 @@ impl AutoContextBootstrap {
     }
 }
 
-fn is_repoish_prompt(prompt: &str, mode: ChatMode) -> bool {
-    // In Code, Ask, and Context modes the user is implicitly working inside
-    // their project — always inject workspace context so the LLM has
-    // awareness of the repo structure, manifests, and README.
-    if matches!(mode, ChatMode::Context | ChatMode::Code | ChatMode::Ask) {
-        return true;
-    }
-
+fn is_repoish_prompt(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
     let inspect_verbs = [
         "analyze", "analyse", "audit", "overview", "inspect", "check", "review",
@@ -1056,13 +1063,15 @@ mod tests {
 
     #[test]
     fn repoish_detection_covers_modes_and_keywords() {
-        assert!(!is_repoish_prompt("hello", ChatMode::Ask));
+        // In Code, Ask, and Context modes we always inject workspace context
+        // (intentional behavior change — the LLM needs project awareness).
+        assert!(is_repoish_prompt("hello", ChatMode::Ask));
+        assert!(is_repoish_prompt("What is 2+2?", ChatMode::Code));
         assert!(is_repoish_prompt(
             "show me workspace context",
             ChatMode::Context
         ));
         assert!(is_repoish_prompt("Analyze this project", ChatMode::Code));
-        assert!(!is_repoish_prompt("What is 2+2?", ChatMode::Code));
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub fn build_repo_map_v2(
     }
 
     if let Ok(index) = IndexService::new(workspace)
-        && let Ok(query) = index.query(prompt, max_lines.max(8))
+        && let Ok(query) = index.query(prompt, max_lines.max(8), None)
     {
         for result in query.results {
             upsert_entry(

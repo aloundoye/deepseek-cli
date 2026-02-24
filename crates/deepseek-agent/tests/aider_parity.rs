@@ -70,6 +70,18 @@ impl LlmClient for ScriptedLlm {
             "complete_chat_streaming() not used in parity tests"
         ))
     }
+
+    fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_fim() not used in parity tests"))
+    }
+
+    fn complete_fim_streaming(
+        &self,
+        _req: &deepseek_core::FimRequest,
+        _cb: StreamCallback,
+    ) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_fim_streaming() not used in parity tests"))
+    }
 }
 
 // ── Test helpers ───────────────────────────────────────────────────────

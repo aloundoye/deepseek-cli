@@ -321,6 +321,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "ALTER TABLE usage_ledger ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE usage_ledger ADD COLUMN cache_miss_tokens INTEGER NOT NULL DEFAULT 0;",
     ),
+    (
+        8,
+        "CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -703,6 +714,109 @@ impl Store {
             }));
         }
         Ok(None)
+    }
+
+    pub fn save_run(&self, run: &deepseek_core::RunRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO runs (run_id, session_id, status, prompt, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run.run_id.to_string(),
+                run.session_id.to_string(),
+                serde_json::to_string(&run.status)?,
+                run.prompt,
+                run.created_at,
+                run.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_latest_run(&self, session_id: Uuid) -> Result<Option<deepseek_core::RunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, status, prompt, created_at, updated_at
+             FROM runs WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![session_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(deepseek_core::RunRecord {
+                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str())?,
+                status: serde_json::from_str(&row.get::<_, String>(2)?)?,
+                prompt: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn load_run(&self, run_id: Uuid) -> Result<Option<deepseek_core::RunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, status, prompt, created_at, updated_at
+             FROM runs WHERE run_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![run_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(deepseek_core::RunRecord {
+                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str())?,
+                status: serde_json::from_str(&row.get::<_, String>(2)?)?,
+                prompt: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<Session>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, workspace_root, baseline_commit, status, budgets, active_plan_id
+             FROM sessions ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Session {
+                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap(),
+                workspace_root: row.get(1)?,
+                baseline_commit: row.get(2)?,
+                status: serde_json::from_str(&row.get::<_, String>(3)?).unwrap(),
+                budgets: serde_json::from_str(&row.get::<_, String>(4)?).unwrap(),
+                active_plan_id: row.get::<_, Option<String>>(5)?.map(|v| Uuid::parse_str(&v).unwrap()),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_runs(&self, session_id: Uuid) -> Result<Vec<deepseek_core::RunRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, session_id, status, prompt, created_at, updated_at
+             FROM runs WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id.to_string()], |row| {
+            Ok(deepseek_core::RunRecord {
+                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap(),
+                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str()).unwrap(),
+                status: serde_json::from_str(&row.get::<_, String>(2)?).unwrap(),
+                prompt: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn save_plan(&self, session_id: Uuid, plan: &Plan) -> Result<()> {
@@ -2835,6 +2949,9 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::ChatTurnV1 { .. } => "ChatTurn@v1",
         EventKind::TurnRevertedV1 { .. } => "TurnReverted@v1",
         EventKind::SessionStateChangedV1 { .. } => "SessionStateChanged@v1",
+        EventKind::RunStartedV1 { .. } => "RunStarted@v1",
+        EventKind::RunStateChangedV1 { .. } => "RunStateChanged@v1",
+        EventKind::RunCompletedV1 { .. } => "RunCompleted@v1",
         EventKind::PlanCreatedV1 { .. } => "PlanCreated@v1",
         EventKind::PlanRevisedV1 { .. } => "PlanRevised@v1",
         EventKind::StepMarkedV1 { .. } => "StepMarked@v1",

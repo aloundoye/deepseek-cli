@@ -16,8 +16,10 @@ pub struct ArchitectPlan {
     pub steps: Vec<String>,
     pub files: Vec<ArchitectFileIntent>,
     pub verify_commands: Vec<String>,
+    pub retrieve_commands: Vec<(String, Option<String>)>,
+    pub tool_calls: Vec<(String, String)>,
     pub acceptance: Vec<String>,
-    pub subagents: Vec<String>,
+    pub subagents: Vec<(String, String)>,
     pub no_edit_reason: Option<String>,
     pub raw: String,
 }
@@ -28,6 +30,8 @@ pub struct ArchitectFeedback {
     pub apply_feedback: Option<String>,
     pub last_diff_summary: Option<String>,
     pub subagent_findings: Option<String>,
+    pub retrieval_findings: Option<String>,
+    pub tool_findings: Option<String>,
 }
 
 pub struct ArchitectInput<'a> {
@@ -49,12 +53,14 @@ PLAN|<step text>
 FILE|<path>|<intent>
 VERIFY|<command>
 ACCEPT|<criterion>
-SUBAGENT|<goal>         # optional
+RETRIEVE|<query>|<optional_scope> # optional (triggers semantic search if files/context are unclear)
+CALL|<tool_name>|<json_args> # optional, parallel safe read-only tool invocation (e.g. fs_read, fs_list, fs_grep, etc.)
+SUBAGENT|<name>|<goal>  # optional, execute specialized subagents (e.g., debugger, refactor-sheriff, security-sentinel)
 NO_EDIT|true|<reason>   # optional
 ARCHITECT_PLAN_END
 
 Rules:
-- Never emit unified diff, JSON, XML, markdown fences, or tool calls.
+- Never emit unified diff, XML, markdown fences, or JSON outside of CALL arguments.
 - FILE paths must be workspace-relative.
 - Be concrete and deterministic.
 "#;
@@ -172,6 +178,16 @@ fn build_architect_user_prompt(input: &ArchitectInput<'_>, repo_map: &str) -> St
         out.push_str(findings);
         out.push_str("\n\n");
     }
+    if let Some(ref retrieval) = input.feedback.retrieval_findings {
+        out.push_str("Retrieval (RAG) findings:\n");
+        out.push_str(retrieval);
+        out.push_str("\n\n");
+    }
+    if let Some(ref tools) = input.feedback.tool_findings {
+        out.push_str("Tool Execution Results:\n");
+        out.push_str(tools);
+        out.push_str("\n\n");
+    }
     out.push_str("Return ARCHITECT_PLAN_V1 now.");
     out
 }
@@ -191,6 +207,8 @@ pub fn parse_architect_plan(text: &str) -> Result<ArchitectPlan> {
     let mut steps = Vec::new();
     let mut files = Vec::new();
     let mut verify_commands = Vec::new();
+    let mut retrieve_commands = Vec::new();
+    let mut tool_calls = Vec::new();
     let mut acceptance = Vec::new();
     let mut subagents = Vec::new();
     let mut no_edit_reason = None;
@@ -235,10 +253,32 @@ pub fn parse_architect_plan(text: &str) -> Result<ArchitectPlan> {
             }
             continue;
         }
-        if let Some(value) = line.strip_prefix("SUBAGENT|") {
-            if !value.trim().is_empty() {
-                subagents.push(value.trim().to_string());
+        if let Some(rest) = line.strip_prefix("RETRIEVE|") {
+            let mut parts = rest.splitn(2, '|');
+            let query = parts.next().unwrap_or_default().trim();
+            let scope = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            if !query.is_empty() {
+                retrieve_commands.push((query.to_string(), scope));
             }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("CALL|") {
+            let mut parts = rest.splitn(2, '|');
+            let name = parts.next().unwrap_or_default().trim();
+            let args = parts.next().unwrap_or_default().trim();
+            if !name.is_empty() {
+                tool_calls.push((name.to_string(), args.to_string()));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SUBAGENT|") {
+            let mut parts = rest.splitn(2, '|');
+            let name = parts.next().unwrap_or_default().trim();
+            let goal = parts.next().unwrap_or_default().trim();
+            if name.is_empty() {
+                continue;
+            }
+            subagents.push((name.to_string(), goal.to_string()));
             continue;
         }
         if let Some(rest) = line.strip_prefix("NO_EDIT|") {
@@ -269,6 +309,8 @@ pub fn parse_architect_plan(text: &str) -> Result<ArchitectPlan> {
         steps,
         files,
         verify_commands,
+        retrieve_commands,
+        tool_calls,
         acceptance,
         subagents,
         no_edit_reason,

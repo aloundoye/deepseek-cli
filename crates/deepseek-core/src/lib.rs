@@ -136,6 +136,29 @@ pub struct PlanStep {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RunState {
+    Context,
+    Architect,
+    GatherEvidence,
+    Subagents,
+    Editor,
+    Apply,
+    Verify,
+    Recover,
+    Final,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub run_id: Uuid,
+    pub session_id: Uuid,
+    pub status: RunState,
+    pub prompt: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmUnit {
     Model(String),
@@ -631,6 +654,19 @@ pub enum EventKind {
     PlanRevisedV1 {
         plan: Plan,
     },
+    RunStartedV1 {
+        run_id: Uuid,
+        prompt: String,
+    },
+    RunStateChangedV1 {
+        run_id: Uuid,
+        from: RunState,
+        to: RunState,
+    },
+    RunCompletedV1 {
+        run_id: Uuid,
+        success: bool,
+    },
     StepMarkedV1 {
         step_id: Uuid,
         done: bool,
@@ -970,6 +1006,11 @@ impl EventKind {
             | Self::SessionResumedV1 { .. }
             | Self::SessionStateChangedV1 { .. }
             | Self::SessionForkedV1 { .. } => "session",
+
+            // Run lifecycle
+            Self::RunStartedV1 { .. }
+            | Self::RunStateChangedV1 { .. }
+            | Self::RunCompletedV1 { .. } => "run",
 
             // Chat / transcript
             Self::TurnAddedV1 { .. }

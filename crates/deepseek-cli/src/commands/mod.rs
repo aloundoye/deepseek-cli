@@ -18,6 +18,7 @@ pub(crate) mod revert;
 pub(crate) mod review;
 pub(crate) mod search;
 pub(crate) mod serve;
+pub(crate) mod session;
 pub(crate) mod skills;
 pub(crate) mod status;
 pub(crate) mod tasks;

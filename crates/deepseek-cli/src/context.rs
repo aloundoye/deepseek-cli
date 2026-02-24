@@ -41,11 +41,19 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
         move |task: &deepseek_subagent::SubagentTask| -> anyhow::Result<String> {
             let engine = deepseek_agent::AgentEngine::new(&workspace)?;
             let mut options = deepseek_agent::ChatOptions::default();
-            options.tools = true;
+            options.tools = false; // Subagents (specialists) do not have direct tool access
             options.mode = deepseek_agent::ChatMode::Ask; // Ensure no patching is done
+            
+            let system_prompt = match task.name.as_str() {
+                "debugger" => "You are the Debugger subagent. Triage failing tests or build data and return a strict JSON object with `{\"analysis\": \"...\", \"suspect_files\": [\"...\"], \"suggested_fix\": \"...\"}`.",
+                "refactor-sheriff" => "You are the Refactor Sheriff subagent. Analyze the code for refactoring opportunities without changing behavior. Return a strict JSON object with `{\"issues\": [\"...\"], \"recommendation\": \"...\"}`.",
+                "security-sentinel" => "You are the Security Sentinel subagent. Scan the requested changes or goal for security vulnerabilities or risky commands. Return a strict JSON object with `{\"safe\": boolean, \"risks\": [\"...\"], \"mitigation\": \"...\"}`.",
+                _ => "You are a specialized subagent. Execute your goal and return a strict JSON object with `{\"findings\": \"...\", \"recommendation\": \"...\"}`.",
+            };
+
             options.system_prompt_append = Some(format!(
-                "You are an isolated Subagent named '{}' tasked with the following explicitly:\n{}\n\nProvide a comprehensive finding exactly related to this goal. Do not attempt to edit files. Your findings will be submitted back to the Architect context.",
-                task.name, task.goal
+                "{system_prompt}\n\nYour Goal:\n{}\n\nRemember: Output ONLY valid JSON matching the exact schema required.",
+                task.goal
             ));
             engine.chat_with_options(&task.goal, options)
         },
