@@ -53,6 +53,7 @@ impl LlmClient for ScriptedLlm {
             finish_reason: "stop".to_string(),
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
+            usage: None,
         })
     }
 

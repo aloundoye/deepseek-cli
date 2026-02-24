@@ -37,7 +37,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
 
     let max_lanes = engine.cfg.agent_loop.team.max_lanes.max(1) as usize;
     let max_concurrency = engine.cfg.agent_loop.team.max_concurrency.max(1) as usize;
-    let mut lanes = plan_lanes(engine, prompt, max_lanes);
+    let mut lanes = plan_lanes(engine, prompt, max_lanes, options);
     if lanes.len() <= 1 {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
@@ -135,6 +135,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
 
     let verify_commands = derive_verify_commands(&engine.workspace);
     let verify = run_verify(
+        &engine.workspace,
         engine.tool_host.as_ref(),
         &verify_commands,
         engine.cfg.agent_loop.verify_timeout_seconds,
@@ -332,9 +333,14 @@ fn validate_lane_patch_artifact(patch: &str) -> Result<()> {
     Ok(())
 }
 
-fn plan_lanes(engine: &AgentEngine, prompt: &str, max_lanes: usize) -> Vec<LaneSpec> {
+fn plan_lanes(engine: &AgentEngine, prompt: &str, max_lanes: usize, options: &ChatOptions) -> Vec<LaneSpec> {
     let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if let Ok(plan) = engine.plan_only(prompt) {
+    if let Ok(plan) = engine.plan_only(prompt, options) {
+        let mut text = String::new();
+        for step in &plan.steps {
+            text.push_str(&step.intent);
+            text.push('\n');
+        }
         for step in &plan.steps {
             for path in &step.files {
                 let lane = classify_lane_for_path(path);

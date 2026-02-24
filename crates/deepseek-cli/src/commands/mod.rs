@@ -14,6 +14,7 @@ pub(crate) mod memory;
 pub(crate) mod profile;
 pub(crate) mod remote_env;
 pub(crate) mod replay;
+pub(crate) mod revert;
 pub(crate) mod review;
 pub(crate) mod search;
 pub(crate) mod serve;

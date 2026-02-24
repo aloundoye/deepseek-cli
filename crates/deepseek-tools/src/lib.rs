@@ -1270,6 +1270,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "fs_read".to_string(),
                 description: "Read the contents of a file. Returns file content with line numbers. For images, returns base64. For PDFs, extracts text.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1303,6 +1304,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "fs_write".to_string(),
                 description: "Write content to a file. Creates the file and parent directories if they don't exist. Prefer fs_edit for modifying existing files.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1324,6 +1326,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "fs_edit".to_string(),
                 description: "Edit a file by replacing an exact string match. The 'search' string must appear in the file. By default replaces all occurrences; set 'all' to false for first-only.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1353,6 +1356,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "fs_list".to_string(),
                 description: "List files and directories in the given directory.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1370,6 +1374,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "fs_glob".to_string(),
                 description: "Find files matching a glob pattern. Returns matching file paths.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1399,6 +1404,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "fs_grep".to_string(),
                 description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1432,6 +1438,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "bash_run".to_string(),
                 description: "Execute a shell command and return stdout/stderr. Use for git, build, test, and other terminal commands.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1461,6 +1468,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "multi_edit".to_string(),
                 description: "Apply edits across multiple files with checkpoint support. Each file entry contains a path and edits array with search/replace pairs.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1496,6 +1504,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "git_status".to_string(),
                 description: "Show the working tree status (git status --short).".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {},
@@ -1508,6 +1517,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "git_diff".to_string(),
                 description: "Show changes in the working directory (git diff).".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {},
@@ -1520,6 +1530,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "web_fetch".to_string(),
                 description: "Fetch content from a URL and return it as text. HTML is stripped to plain text.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1545,6 +1556,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "web_search".to_string(),
                 description: "Search the web and return results with titles, URLs, and snippets.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1566,6 +1578,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "notebook_read".to_string(),
                 description: "Read a Jupyter notebook (.ipynb), returning cell summaries with type and source preview.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1583,6 +1596,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "notebook_edit".to_string(),
                 description: "Edit a cell in a Jupyter notebook. Supports replace, insert, and delete operations.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1618,6 +1632,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "git_show".to_string(),
                 description: "Show a git object (commit, tag, tree, or blob). Use to inspect specific commits, files at a revision, or diff between commits.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1635,6 +1650,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "index_query".to_string(),
                 description: "Full-text search the code index. Returns matching file paths and snippets ranked by relevance.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1656,6 +1672,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "patch_stage".to_string(),
                 description: "Stage a unified diff as a patch for later application. Returns a patch_id for use with patch_apply.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1677,6 +1694,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "patch_apply".to_string(),
                 description: "Apply a previously staged patch by its ID. Returns whether the patch was applied successfully and any conflicts.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1694,6 +1712,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "diagnostics_check".to_string(),
                 description: "Run language-specific diagnostics (cargo check, tsc, ruff, etc.) on the project or a specific path. Auto-detects the appropriate checker.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1712,6 +1731,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "chrome_navigate".to_string(),
                 description: "Navigate a Chrome browser to a URL. Requires Chrome to be running with remote debugging enabled (--remote-debugging-port=9222).".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1733,6 +1753,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "chrome_click".to_string(),
                 description: "Click an element on the page by CSS selector.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1754,6 +1775,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "chrome_type_text".to_string(),
                 description: "Type text into an input element selected by CSS selector.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1779,6 +1801,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "chrome_screenshot".to_string(),
                 description: "Capture a screenshot of the current page. Returns the image as base64.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1801,6 +1824,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "chrome_read_console".to_string(),
                 description: "Read the browser's console log entries.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1818,6 +1842,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "chrome_evaluate".to_string(),
                 description: "Evaluate a JavaScript expression in the browser and return the result.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1840,6 +1865,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "user_question".to_string(),
                 description: "Ask the user a question and wait for their response. Use this when you need clarification, a decision, or user input to proceed.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1862,6 +1888,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "task_create".to_string(),
                 description: "Create a task to track progress on the current work. Returns the task ID.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1887,6 +1914,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "task_update".to_string(),
                 description: "Update a task's status. Use to mark tasks as in_progress, completed, or failed.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1913,6 +1941,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "spawn_task".to_string(),
                 description: "Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it. Launch multiple agents concurrently whenever possible to maximize performance.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1955,6 +1984,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "task_output".to_string(),
                 description: "Retrieve output from a running or completed background task. Use block=true to wait for completion, block=false for non-blocking status check.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1980,6 +2010,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "task_stop".to_string(),
                 description: "Stop a running background task by its ID.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1998,6 +2029,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "enter_plan_mode".to_string(),
                 description: "Enter plan mode to design an implementation approach before writing code. In plan mode, you can only use read-only tools (Read, Glob, Grep, search, git status/diff). Use this proactively when the task requires planning: new features, multiple valid approaches, multi-file changes, or unclear requirements. You will explore the codebase, design a plan, and present it for user approval before executing.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {},
@@ -2010,6 +2042,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "exit_plan_mode".to_string(),
                 description: "Exit plan mode after writing your plan. This signals that you are done planning and ready for the user to review and approve. The user will see the plan and decide whether to let you proceed with execution. Only use this after you have completed your plan.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2036,6 +2069,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "task_get".to_string(),
                 description: "Retrieve full details of a task by its ID, including description, status, and dependencies.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2053,6 +2087,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "task_list".to_string(),
                 description: "List all tasks in the task list with summary info: id, subject, status, owner, blockedBy.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {},
@@ -2066,6 +2101,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "skill".to_string(),
                 description: "Execute a skill (slash command) within the current conversation. Use this when the user asks you to perform tasks that match available skills, or when they reference a slash command like '/commit' or '/review-pr'.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2088,6 +2124,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "kill_shell".to_string(),
                 description: "Stop a running background shell process by its shell ID. Use this to terminate a bash command that was started with run_in_background: true.".to_string(),
+            strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2112,6 +2149,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                               or task decomposition for multi-step changes. Returns strategic \
                               advice — you keep control and execute the recommended approach."
                     .to_string(),
+                strict: None,
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2305,6 +2343,7 @@ pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
                 function: FunctionDefinition {
                     name: api_name,
                     description: format!("[Plugin: {}] {} command", plugin.manifest.name, cmd_name),
+            strict: None,
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {

@@ -32,6 +32,7 @@ pub struct EditorInput<'a> {
     pub apply_feedback: Option<&'a str>,
     pub max_diff_bytes: usize,
     pub debug_context: bool,
+    pub chat_history: &'a [ChatMessage],
 }
 
 const EDITOR_SYSTEM_PROMPT: &str = r#"You are Editor (code writer).
@@ -47,8 +48,7 @@ Rules:
 "#;
 
 pub fn run_editor(
-    llm: &(dyn LlmClient + Send + Sync),
-    cfg: &AppConfig,
+    engine: &crate::AgentEngine,
     input: &EditorInput<'_>,
     retries: usize,
 ) -> Result<EditorResponse> {
@@ -69,28 +69,37 @@ pub fn run_editor(
             input.apply_feedback.is_some()
         );
     }
-    let mut messages = vec![
-        ChatMessage::System {
-            content: EDITOR_SYSTEM_PROMPT.to_string(),
-        },
-        ChatMessage::User {
-            content: build_editor_prompt(input),
-        },
-    ];
+    let mut messages = vec![ChatMessage::System {
+        content: EDITOR_SYSTEM_PROMPT.to_string(),
+    }];
+    messages.extend(input.chat_history.iter().cloned());
+    messages.push(ChatMessage::User {
+        content: build_editor_prompt(input),
+    });
 
     for attempt in 0..=retries {
+        deepseek_core::strip_prior_reasoning_content(&mut messages);
         let req = ChatRequest {
-            model: cfg.llm.base_model.clone(),
+            model: engine.cfg.llm.base_model.clone(),
             messages: messages.clone(),
             tools: vec![],
             tool_choice: ToolChoice::none(),
             max_tokens: 8192,
             temperature: Some(0.0),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: None,
             images: vec![],
+            response_format: None,
         };
 
-        let response = llm.complete_chat(&req)?;
+        let response = engine.llm.complete_chat(&req)?;
+        if let Some(usage) = &response.usage {
+            engine.record_usage(&req.model, usage);
+        }
         match parse_editor_response(&response.text, input.max_diff_bytes) {
             Ok(editor) => return Ok(editor),
             Err(err) => {

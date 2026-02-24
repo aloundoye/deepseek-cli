@@ -46,9 +46,8 @@ pub enum ChatMode {
     Context,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChatOptions {
-    /// When false, run analysis-only response path (no edit/apply/verify loop).
     pub tools: bool,
     /// When true in analysis path, uses max_think model.
     pub force_max_think: bool,
@@ -60,24 +59,22 @@ pub struct ChatOptions {
     pub additional_dirs: Vec<PathBuf>,
     /// Optional repository root override for context bootstrap/analysis.
     pub repo_root_override: Option<PathBuf>,
-    /// Emit deterministic pre-model context digest before LLM calls.
+    /// Log expanded context blocks to stderr before sending to LLM.
     pub debug_context: bool,
-    /// UX-mode profile. Execution engine remains deterministic when enabled.
     pub mode: ChatMode,
-    /// Force execution through the edit loop even when heuristics would not.
+    /// When true, agents apply file changes directly without asking for confirmation.
     pub force_execute: bool,
-    /// Force plan-only behavior and skip execution/apply/verify.
     pub force_plan_only: bool,
-    /// Optional teammate mode hint. Non-empty enables lane orchestration.
     pub teammate_mode: Option<String>,
-    /// Internal guard for isolated lane runs so they do not recursively spawn lanes.
     pub disable_team_orchestration: bool,
-    /// Detect URLs in prompts and enrich context with bounded web extracts.
+    /// When true, attempts to parse and fetch web URLs from prompt.
     pub detect_urls: bool,
     /// Watch mode hint (CLI handles filesystem watch orchestration).
     pub watch_files: bool,
     /// Images to include with the next LLM request (multimodal paste).
     pub images: Vec<deepseek_core::ImageContent>,
+    /// Full context history (transcript) of the active session.
+    pub chat_history: Vec<ChatMessage>,
 }
 
 pub struct AgentEngine {
@@ -178,8 +175,14 @@ impl AgentEngine {
             tool_choice: ToolChoice::none(),
             max_tokens: 1,
             temperature: Some(0.0),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: None,
             images: vec![],
+            response_format: None,
         };
 
         match self.llm.complete_chat(&test_request) {
@@ -246,6 +249,10 @@ impl AgentEngine {
         }
     }
 
+    pub fn subagent_worker(&self) -> Option<SubagentWorkerFn> {
+        self.subagent_worker.lock().ok().and_then(|g| g.clone())
+    }
+
     pub(crate) fn stream(&self, chunk: StreamChunk) {
         if let Ok(guard) = self.stream_callback.lock()
             && let Some(cb) = guard.as_ref()
@@ -301,7 +308,7 @@ impl AgentEngine {
         bootstrap.debug_digest(intent_label, options.mode)
     }
 
-    pub fn plan_only(&self, prompt: &str) -> Result<deepseek_core::Plan> {
+    pub fn plan_only(&self, prompt: &str, options: &ChatOptions) -> Result<deepseek_core::Plan> {
         let feedback = architect::ArchitectFeedback::default();
         let input = architect::ArchitectInput {
             user_prompt: prompt,
@@ -310,10 +317,10 @@ impl AgentEngine {
             max_files: self.cfg.agent_loop.max_files_per_iteration as usize,
             additional_dirs: &[],
             debug_context: false,
+            chat_history: &options.chat_history,
         };
         let plan = architect::run_architect(
-            self.llm.as_ref(),
-            &self.cfg,
+            self,
             &self.workspace,
             &input,
             self.cfg.agent_loop.architect_parse_retries as usize,
@@ -341,18 +348,32 @@ impl AgentEngine {
         })
     }
 
-    pub fn chat_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
-        let prompt = enrich_prompt_with_urls(prompt, options.detect_urls);
+    pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
+        let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
         let task_intent = intent::classify_intent(&intent::IntentInput {
-            prompt: &prompt,
+            prompt: &prompt_enriched,
             mode: options.mode,
             tools: options.tools,
             force_execute: options.force_execute,
             force_plan_only: options.force_plan_only,
         });
 
-        if task_intent == intent::TaskIntent::ArchitectOnly {
-            let plan = self.plan_only(&prompt)?;
+        // Load chat history from the store if possible
+        if let Ok(Some(session)) = self.store.load_latest_session() {
+            if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
+                options.chat_history = projection.chat_messages;
+            }
+        }
+
+        // Record User Turn
+        self.append_event_best_effort(EventKind::ChatTurnV1 {
+            message: ChatMessage::User {
+                content: prompt_enriched.clone(),
+            },
+        });
+
+        let result = if task_intent == intent::TaskIntent::ArchitectOnly {
+            let plan = self.plan_only(&prompt_enriched, &options)?;
             let mut out = String::new();
             out.push_str("Architect plan (no execution):\n");
             for (idx, step) in plan.steps.iter().enumerate() {
@@ -367,18 +388,27 @@ impl AgentEngine {
             let rendered = out.trim_end().to_string();
             self.stream(StreamChunk::ContentDelta(rendered.clone()));
             self.stream(StreamChunk::Done);
-            return Ok(rendered);
+            Ok(rendered)
+        } else if task_intent == intent::TaskIntent::InspectRepo {
+            self.analyze_with_options(&prompt_enriched, options)
+        } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
+            team::run(self, &prompt_enriched, &options)
+        } else {
+            r#loop::run(self, &prompt_enriched, &options)
+        };
+
+        if let Ok(text) = &result {
+            // Record Assistant Turn
+            self.append_event_best_effort(EventKind::ChatTurnV1 {
+                message: ChatMessage::Assistant {
+                    content: Some(text.clone()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                },
+            });
         }
 
-        if task_intent == intent::TaskIntent::InspectRepo {
-            return self.analyze_with_options(&prompt, options);
-        }
-
-        if should_run_team_orchestration(self, &prompt, &options) {
-            return team::run(self, &prompt, &options);
-        }
-
-        r#loop::run(self, &prompt, &options)
+        result
     }
 
     pub(crate) fn append_event_best_effort(&self, kind: EventKind) {
@@ -395,6 +425,17 @@ impl AgentEngine {
             kind,
         };
         let _ = self.store.append_event(&event);
+    }
+
+    pub(crate) fn record_usage(&self, model: &str, usage: &deepseek_core::TokenUsage) {
+        self.append_event_best_effort(EventKind::UsageUpdatedV1 {
+            unit: deepseek_core::LlmUnit::Model(model.to_string()),
+            model: model.to_string(),
+            input_tokens: usage.prompt_tokens,
+            cache_hit_tokens: usage.prompt_cache_hit_tokens,
+            cache_miss_tokens: usage.prompt_cache_miss_tokens,
+            output_tokens: usage.completion_tokens,
+        });
     }
 
     pub(crate) fn request_approval(&self, call: &ToolCall) -> Result<bool> {

@@ -41,14 +41,13 @@ pub fn analyze(
         build_system_prompt(options, bootstrap.repoish, bootstrap.vague_codebase_prompt);
     let user_prompt = build_user_prompt(prompt, &bootstrap);
 
-    let mut messages = vec![
-        ChatMessage::System {
-            content: system_prompt,
-        },
-        ChatMessage::User {
-            content: user_prompt,
-        },
-    ];
+    let mut messages = vec![ChatMessage::System {
+        content: system_prompt,
+    }];
+    messages.extend(options.chat_history.iter().cloned());
+    messages.push(ChatMessage::User {
+        content: user_prompt,
+    });
 
     let model = if options.force_max_think {
         cfg.llm.max_think_model.clone()
@@ -62,6 +61,7 @@ pub fn analyze(
     let max_repairs = if enforce_profile_shape { 1 } else { 0 };
 
     for attempt in 0..=max_repairs {
+        deepseek_core::strip_prior_reasoning_content(&mut messages);
         let request = ChatRequest {
             model: model.clone(),
             messages: messages.clone(),
@@ -73,12 +73,18 @@ pub fn analyze(
             } else {
                 Some(0.0)
             },
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: if options.force_max_think {
                 Some(deepseek_core::ThinkingConfig::enabled(16_384))
             } else {
                 None
             },
             images: options.images.clone(),
+            response_format: None,
         };
 
         let response = llm.complete_chat(&request)?;

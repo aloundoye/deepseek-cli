@@ -1435,16 +1435,22 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Undo(_args) => {
-                    let checkpoint = rewind_now(cwd, None)?;
-                    let output = format!(
-                        "rewound to checkpoint {} (files={})",
-                        checkpoint.checkpoint_id, checkpoint.files_count
-                    );
+                    let checkpoint_msg = match crate::commands::compact::rewind_now(cwd, None) {
+                        Ok(checkpoint) => format!(
+                            "rewound to checkpoint {} (files={})",
+                            checkpoint.checkpoint_id, checkpoint.files_count
+                        ),
+                        Err(e) => format!("no files rewound ({e})"),
+                    };
+                    crate::context::append_control_event(
+                        cwd,
+                        deepseek_core::EventKind::TurnRevertedV1 { turns_dropped: 1 },
+                    )?;
+                    let output = format!("Reverted 1 conversation turn. {checkpoint_msg}");
                     if json_mode {
-                        print_json(&json!({
+                        crate::output::print_json(&serde_json::json!({
                             "undo": true,
-                            "checkpoint_id": checkpoint.checkpoint_id,
-                            "files_count": checkpoint.files_count
+                            "msg": output
                         }))?;
                     } else {
                         println!("{output}");
@@ -2642,11 +2648,18 @@ pub(crate) fn run_chat_tui(
                     }
                 }
                 SlashCommand::Undo(_args) => {
-                    let checkpoint = rewind_now(cwd, None)?;
-                    format!(
-                        "rewound to checkpoint {} (files={})",
-                        checkpoint.checkpoint_id, checkpoint.files_count
-                    )
+                    let checkpoint_msg = match crate::commands::compact::rewind_now(cwd, None) {
+                        Ok(checkpoint) => format!(
+                            "rewound to checkpoint {} (files={})",
+                            checkpoint.checkpoint_id, checkpoint.files_count
+                        ),
+                        Err(e) => format!("no files rewound ({e})"),
+                    };
+                    crate::context::append_control_event(
+                        cwd,
+                        deepseek_core::EventKind::TurnRevertedV1 { turns_dropped: 1 },
+                    )?;
+                    format!("Reverted 1 conversation turn. {checkpoint_msg}")
                 }
                 SlashCommand::Status => {
                     let status = current_ui_status(cwd, cfg, force_max_think.load(Ordering::Relaxed))?;

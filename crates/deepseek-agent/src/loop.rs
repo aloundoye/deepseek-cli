@@ -52,10 +52,10 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             max_files: cfg.max_files_per_iteration as usize,
             additional_dirs: &options.additional_dirs,
             debug_context: options.debug_context,
+            chat_history: &options.chat_history,
         };
         let plan = run_architect(
-            engine.llm.as_ref(),
-            &engine.cfg,
+            engine,
             &engine.workspace,
             &architect_input,
             cfg.architect_parse_retries as usize,
@@ -66,6 +66,42 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             files: plan.files.len() as u32,
             no_edit: plan.no_edit_reason.is_some(),
         });
+
+        if !plan.subagents.is_empty() {
+            let mut findings = Vec::new();
+            if let Some(worker) = engine.subagent_worker() {
+                std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for (i, goal) in plan.subagents.iter().enumerate() {
+                        let worker_clone = worker.clone();
+                        let task_name = format!("subagent-{}", i);
+                        let sub_task = deepseek_subagent::SubagentTask {
+                            run_id: uuid::Uuid::now_v7(),
+                            name: task_name,
+                            goal: goal.clone(),
+                            role: deepseek_subagent::SubagentRole::Task,
+                            team: "default".to_string(),
+                            read_only_fallback: true,
+                            custom_agent: None,
+                        };
+                        handles.push(s.spawn(move || {
+                            worker_clone(&sub_task).unwrap_or_else(|e| format!("Failed to run subagent: {e}"))
+                        }));
+                    }
+                    for handle in handles {
+                        if let Ok(result) = handle.join() {
+                            findings.push(result);
+                        }
+                    }
+                });
+            } else {
+                findings.push("Subagent Execution Engine is not configured/attached".to_string());
+            }
+
+            feedback.subagent_findings = Some(findings.join("\n\n---\n\n"));
+            // Trigger macro-loop to gather new context and plan again
+            continue;
+        }
 
         if let Some(reason) = plan.no_edit_reason.clone() {
             let response = format_no_edit_response(&plan, &reason);
@@ -89,6 +125,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         )?;
         let mut context_requests = 0u64;
         let mut editor_retry_used = false;
+        let mut editor_micro_retries = 0u64;
 
         'editor_cycle: loop {
             engine.stream(StreamChunk::EditorStarted {
@@ -105,11 +142,11 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                 apply_feedback: feedback.apply_feedback.as_deref(),
                 max_diff_bytes: cfg.max_diff_bytes as usize,
                 debug_context: options.debug_context,
+                chat_history: &options.chat_history,
             };
 
             let response = run_editor(
-                engine.llm.as_ref(),
-                &engine.cfg,
+                engine,
                 &editor_input,
                 cfg.editor_parse_retries as usize,
             )?;
@@ -276,10 +313,10 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                                 apply_feedback: None,
                                 max_diff_bytes: cfg.max_diff_bytes as usize,
                                 debug_context: options.debug_context,
+                                chat_history: &options.chat_history,
                             };
                             let lint_fix_response = match run_editor(
-                                engine.llm.as_ref(),
-                                &engine.cfg,
+                                engine,
                                 &lint_fix_input,
                                 cfg.editor_parse_retries as usize,
                             ) {
@@ -356,6 +393,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                             cb as &mut dyn FnMut(&deepseek_core::ToolCall) -> anyhow::Result<bool>
                         });
                         run_verify(
+                            &engine.workspace,
                             engine.tool_host.as_ref(),
                             &verify_commands,
                             cfg.verify_timeout_seconds,
@@ -363,6 +401,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                         )
                     } else {
                         run_verify(
+                            &engine.workspace,
                             engine.tool_host.as_ref(),
                             &verify_commands,
                             cfg.verify_timeout_seconds,
@@ -449,6 +488,14 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                         success: false,
                         summary: error.to_feedback(),
                     });
+                    
+                    if editor_micro_retries < cfg.max_editor_apply_retries {
+                        editor_micro_retries += 1;
+                        feedback.apply_feedback = Some(error.to_feedback());
+                        feedback.verify_feedback = None;
+                        continue 'editor_cycle;
+                    }
+                    
                     feedback.apply_feedback = Some(error.to_feedback());
                     feedback.verify_feedback = None;
                     break 'editor_cycle;

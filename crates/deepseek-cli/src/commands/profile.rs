@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use deepseek_agent::AgentEngine;
+use deepseek_agent::{AgentEngine, ChatOptions};
 use deepseek_core::{AppConfig, EventKind, runtime_dir};
 use deepseek_index::IndexService;
 use deepseek_store::Store;
@@ -890,8 +890,8 @@ pub(crate) fn run_profile_benchmark(
 
     for case in selected_cases.drain(..) {
         let started = Instant::now();
-        #[allow(deprecated)]
-        let result = engine.plan_only(&case.prompt);
+        let options = ChatOptions::default();
+        let result = engine.plan_only(&case.prompt, &options);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         latencies.push(elapsed_ms);
         match result {

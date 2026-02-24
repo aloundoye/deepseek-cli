@@ -18,6 +18,7 @@ pub struct ArchitectPlan {
     pub files: Vec<ArchitectFileIntent>,
     pub verify_commands: Vec<String>,
     pub acceptance: Vec<String>,
+    pub subagents: Vec<String>,
     pub no_edit_reason: Option<String>,
     pub raw: String,
 }
@@ -27,6 +28,7 @@ pub struct ArchitectFeedback {
     pub verify_feedback: Option<String>,
     pub apply_feedback: Option<String>,
     pub last_diff_summary: Option<String>,
+    pub subagent_findings: Option<String>,
 }
 
 pub struct ArchitectInput<'a> {
@@ -36,6 +38,7 @@ pub struct ArchitectInput<'a> {
     pub max_files: usize,
     pub additional_dirs: &'a [PathBuf],
     pub debug_context: bool,
+    pub chat_history: &'a [ChatMessage],
 }
 
 const ARCHITECT_SYSTEM_PROMPT: &str = r#"You are Architect (reasoning-only).
@@ -47,6 +50,7 @@ PLAN|<step text>
 FILE|<path>|<intent>
 VERIFY|<command>
 ACCEPT|<criterion>
+SUBAGENT|<goal>         # optional
 NO_EDIT|true|<reason>   # optional
 ARCHITECT_PLAN_END
 
@@ -57,8 +61,7 @@ Rules:
 "#;
 
 pub fn run_architect(
-    llm: &(dyn LlmClient + Send + Sync),
-    cfg: &AppConfig,
+    engine: &crate::AgentEngine,
     workspace: &Path,
     input: &ArchitectInput<'_>,
     retries: usize,
@@ -81,28 +84,37 @@ pub fn run_architect(
         );
     }
 
-    let mut messages = vec![
-        ChatMessage::System {
-            content: ARCHITECT_SYSTEM_PROMPT.to_string(),
-        },
-        ChatMessage::User {
-            content: build_architect_user_prompt(input, &repo_map),
-        },
-    ];
+    let mut messages = vec![ChatMessage::System {
+        content: ARCHITECT_SYSTEM_PROMPT.to_string(),
+    }];
+    messages.extend(input.chat_history.iter().cloned());
+    messages.push(ChatMessage::User {
+        content: build_architect_user_prompt(input, &repo_map),
+    });
 
     for attempt in 0..=retries {
+        deepseek_core::strip_prior_reasoning_content(&mut messages);
         let req = ChatRequest {
-            model: cfg.llm.max_think_model.clone(),
+            model: engine.cfg.llm.max_think_model.clone(),
             messages: messages.clone(),
             tools: vec![],
             tool_choice: ToolChoice::none(),
             max_tokens: 4096,
             temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: Some(deepseek_core::ThinkingConfig::enabled(16_384)),
             images: vec![],
+            response_format: None,
         };
 
-        let response = llm.complete_chat(&req)?;
+        let response = engine.llm.complete_chat(&req)?;
+        if let Some(usage) = &response.usage {
+            engine.record_usage(&req.model, usage);
+        }
         match parse_architect_plan(&response.text) {
             Ok(mut plan) => {
                 plan.raw = response.text;
@@ -156,6 +168,11 @@ fn build_architect_user_prompt(input: &ArchitectInput<'_>, repo_map: &str) -> St
         out.push_str(diff);
         out.push_str("\n\n");
     }
+    if let Some(ref findings) = input.feedback.subagent_findings {
+        out.push_str("Subagent findings:\n");
+        out.push_str(findings);
+        out.push_str("\n\n");
+    }
     out.push_str("Return ARCHITECT_PLAN_V1 now.");
     out
 }
@@ -176,6 +193,7 @@ pub fn parse_architect_plan(text: &str) -> Result<ArchitectPlan> {
     let mut files = Vec::new();
     let mut verify_commands = Vec::new();
     let mut acceptance = Vec::new();
+    let mut subagents = Vec::new();
     let mut no_edit_reason = None;
     let mut saw_end = false;
 
@@ -218,6 +236,12 @@ pub fn parse_architect_plan(text: &str) -> Result<ArchitectPlan> {
             }
             continue;
         }
+        if let Some(value) = line.strip_prefix("SUBAGENT|") {
+            if !value.trim().is_empty() {
+                subagents.push(value.trim().to_string());
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("NO_EDIT|") {
             let mut parts = rest.splitn(2, '|');
             let flag = parts.next().unwrap_or_default().trim();
@@ -247,6 +271,7 @@ pub fn parse_architect_plan(text: &str) -> Result<ArchitectPlan> {
         files,
         verify_commands,
         acceptance,
+        subagents,
         no_edit_reason,
         raw: String::new(),
     })
