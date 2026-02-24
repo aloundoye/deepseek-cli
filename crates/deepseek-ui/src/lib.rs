@@ -164,6 +164,25 @@ pub enum TuiStreamEvent {
     /// Clear any previously streamed text — the response contained tool calls,
     /// so interleaved text fragments are noise and should be removed.
     ClearStreamingText,
+    /// A diff was applied to a file — render inline in the TUI.
+    DiffApplied {
+        path: String,
+        hunks: u32,
+        added: u32,
+        removed: u32,
+    },
+    /// End-of-turn usage summary for cost display.
+    UsageSummary {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_hit_tokens: u64,
+        cost_usd: f64,
+    },
+    /// Role/phase header for clear visual boundaries.
+    RoleHeader {
+        role: String,
+        model: String,
+    },
     /// An error occurred during agent execution.
     Error(String),
     /// Agent execution completed with the given output.
@@ -3387,6 +3406,25 @@ where
                     // fragments that were streamed before/between them.
                     streaming_buffer.clear();
                     shell.clear_streaming_text();
+                }
+                TuiStreamEvent::DiffApplied { path, hunks, added, removed } => {
+                    shell.push_system(format!(
+                        "  \u{2502} {} \u{2014} {} hunk(s), +{} -{}", path, hunks, added, removed
+                    ));
+                }
+                TuiStreamEvent::UsageSummary { input_tokens, output_tokens, cache_hit_tokens, cost_usd } => {
+                    let cache_info = if cache_hit_tokens > 0 {
+                        format!(" (cache hit: {})", cache_hit_tokens)
+                    } else {
+                        String::new()
+                    };
+                    shell.push_system(format!(
+                        "\u{2500}\u{2500} tokens: {}in / {}out{} \u{2502} cost: ${:.4}",
+                        input_tokens, output_tokens, cache_info, cost_usd
+                    ));
+                }
+                TuiStreamEvent::RoleHeader { role, model } => {
+                    shell.push_system(format!("\u{2501}\u{2501} {} ({}) \u{2501}\u{2501}", role, model));
                 }
                 TuiStreamEvent::ApprovalNeeded {
                     tool_name,

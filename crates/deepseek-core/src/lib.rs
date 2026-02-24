@@ -541,17 +541,52 @@ fn parse_event_kind_compat_value(kind_value: serde_json::Value) -> Result<EventK
         .get("payload")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+
+    // Handle well-known removed/renamed event types explicitly.
     match kind_type {
-        "RouterDecisionV1" => Ok(EventKind::TelemetryEventV1 {
-            name: "legacy.router_decision".to_string(),
-            properties: payload,
-        }),
-        "RouterEscalationV1" => Ok(EventKind::TelemetryEventV1 {
-            name: "legacy.router_escalation".to_string(),
-            properties: payload,
-        }),
-        _ => Err(anyhow::anyhow!("unknown event kind type: {kind_type}")),
+        "RouterDecisionV1" => {
+            return Ok(EventKind::TelemetryEventV1 {
+                name: "legacy.router_decision".to_string(),
+                properties: payload,
+            });
+        }
+        "RouterEscalationV1" => {
+            return Ok(EventKind::TelemetryEventV1 {
+                name: "legacy.router_escalation".to_string(),
+                properties: payload,
+            });
+        }
+        _ => {}
     }
+
+    // For known event types whose schema evolved (e.g. added fields with
+    // defaults), inject default values and retry deserialization.
+    if let serde_json::Value::Object(mut payload_map) = payload.clone() {
+        // UsageUpdatedV1: added cache_hit_tokens / cache_miss_tokens
+        if kind_type == "UsageUpdatedV1" {
+            payload_map
+                .entry("cache_hit_tokens")
+                .or_insert(serde_json::Value::Number(0.into()));
+            payload_map
+                .entry("cache_miss_tokens")
+                .or_insert(serde_json::Value::Number(0.into()));
+        }
+
+        let patched = serde_json::json!({
+            "type": kind_type,
+            "payload": payload_map,
+        });
+        if let Ok(kind) = serde_json::from_value::<EventKind>(patched) {
+            return Ok(kind);
+        }
+    }
+
+    // Last resort: wrap in a telemetry event so sessions with unknown future
+    // event types can still load rather than crashing.
+    Ok(EventKind::TelemetryEventV1 {
+        name: format!("unknown.{}", kind_type),
+        properties: payload,
+    })
 }
 
 /// Parse an `EventKind` payload with read compatibility for removed router events.

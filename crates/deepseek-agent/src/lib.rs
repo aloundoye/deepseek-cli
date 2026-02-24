@@ -91,8 +91,7 @@ pub struct AgentEngine {
     approval_handler: Mutex<Option<ApprovalHandler>>,
     user_question_handler: Mutex<Option<UserQuestionHandler>>,
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
-    #[allow(dead_code)]
-    hooks: HookRuntime,
+    pub(crate) hooks: HookRuntime,
     #[allow(dead_code)]
     mcp: Option<McpManager>,
 }
@@ -253,6 +252,35 @@ impl AgentEngine {
         self.subagent_worker.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Fire PreToolUse hooks. Returns the aggregate result.
+    /// Callers should check `result.blocked` to decide whether to skip tool execution.
+    pub fn fire_pre_tool_use(&self, tool_name: &str, tool_input: &serde_json::Value) -> deepseek_hooks::HookResult {
+        let input = deepseek_hooks::HookInput {
+            event: deepseek_hooks::HookEvent::PreToolUse.as_str().to_string(),
+            tool_name: Some(tool_name.to_string()),
+            tool_input: Some(tool_input.clone()),
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: self.workspace.display().to_string(),
+        };
+        self.hooks.fire(deepseek_hooks::HookEvent::PreToolUse, &input)
+    }
+
+    /// Fire Stop hooks at end of agent execution.
+    pub fn fire_stop(&self) {
+        let input = deepseek_hooks::HookInput {
+            event: deepseek_hooks::HookEvent::Stop.as_str().to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: self.workspace.display().to_string(),
+        };
+        let _ = self.hooks.fire(deepseek_hooks::HookEvent::Stop, &input);
+    }
+
     pub(crate) fn stream(&self, chunk: StreamChunk) {
         if let Ok(guard) = self.stream_callback.lock()
             && let Some(cb) = guard.as_ref()
@@ -407,6 +435,9 @@ impl AgentEngine {
                 },
             });
         }
+
+        // Fire Stop hooks for post-processing (logging, notifications, etc.)
+        self.fire_stop();
 
         result
     }

@@ -587,7 +587,7 @@ impl DeepSeekClient {
                         let mut reasoning_out = String::new();
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
-                        let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
+                        let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
                         // Suppress text display once structured tool_calls
                         // deltas arrive — the text fragments between tool calls
                         // are noise that confuses the TUI display.

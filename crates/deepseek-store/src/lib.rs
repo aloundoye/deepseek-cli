@@ -316,6 +316,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
             changed_at TEXT NOT NULL
          );",
     ),
+    (
+        7,
+        "ALTER TABLE usage_ledger ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE usage_ledger ADD COLUMN cache_miss_tokens INTEGER NOT NULL DEFAULT 0;",
+    ),
 ];
 
 #[derive(Debug, Clone)]

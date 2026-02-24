@@ -1,7 +1,6 @@
 use crate::architect::ArchitectPlan;
 use anyhow::{Result, anyhow};
-use deepseek_core::{AppConfig, ChatMessage, ChatRequest, ToolChoice};
-use deepseek_llm::LlmClient;
+use deepseek_core::{ChatMessage, ChatRequest, ToolChoice};
 
 #[derive(Debug, Clone)]
 pub struct EditorFileContext {

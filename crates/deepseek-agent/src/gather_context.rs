@@ -286,7 +286,10 @@ impl AutoContextBootstrap {
 }
 
 fn is_repoish_prompt(prompt: &str, mode: ChatMode) -> bool {
-    if matches!(mode, ChatMode::Context) {
+    // In Code, Ask, and Context modes the user is implicitly working inside
+    // their project — always inject workspace context so the LLM has
+    // awareness of the repo structure, manifests, and README.
+    if matches!(mode, ChatMode::Context | ChatMode::Code | ChatMode::Ask) {
         return true;
     }
 
@@ -314,12 +317,16 @@ fn is_repoish_prompt(prompt: &str, mode: ChatMode) -> bool {
         return true;
     }
 
+    // Also check for explicit project-referencing phrases
     [
         "analyze this project",
         "analyze this codebase",
         "check the codebase",
         "check this project",
         "audit this project",
+        "current project",
+        "this repo",
+        "this repository",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
