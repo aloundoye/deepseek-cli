@@ -1,0 +1,6 @@
+{
+    "id": "example-hello-plugin",
+    "name": "Hello World Example Plugin",
+    "version": "1.0.0",
+    "description": "An example plugin to demonstrate the deepseek-plugin system."
+}

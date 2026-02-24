@@ -1112,6 +1112,8 @@ mod tests {
             verify_commands: vec![],
             acceptance: vec![],
             subagents: vec![],
+            retrieve_commands: vec![],
+            tool_calls: vec![],
             no_edit_reason: None,
             raw: String::new(),
         };
@@ -1130,6 +1132,8 @@ mod tests {
             verify_commands: vec![],
             acceptance: vec![],
             subagents: vec![],
+            retrieve_commands: vec![],
+            tool_calls: vec![],
             no_edit_reason: None,
             raw: String::new(),
         };
@@ -1147,6 +1151,8 @@ mod tests {
             verify_commands: vec![],
             acceptance: vec![],
             subagents: vec![],
+            retrieve_commands: vec![],
+            tool_calls: vec![],
             no_edit_reason: Some("Already correct".to_string()),
             raw: String::new(),
         };

@@ -309,81 +309,113 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Interactive chat session.
     Chat(ChatArgs),
+    /// Bounded unattended agent loop.
     Autopilot(AutopilotArgs),
+    /// One-shot question and response.
     Ask(AskArgs),
+    /// Generate an execution plan without applying changes.
     Plan(PromptArg),
+    /// Continue execution for a session.
     Run(RunArgs),
+    /// Show the current pending diff.
     Diff,
+    /// Apply a staged patch.
     Apply(ApplyArgs),
+    /// Inspect and benchmark model profiles.
     Profile(ProfileArgs),
+    /// Rewind to a previous checkpoint.
     Rewind(RewindArgs),
     /// Revert the last N conversation turns.
     Revert(RevertArgs),
+    /// Export session data.
     Export(ExportArgs),
+    /// Manage long-term memory notes.
     Memory {
         #[command(subcommand)]
         command: MemoryCmd,
     },
+    /// Manage MCP tool servers (add, list, get, remove).
     Mcp {
         #[command(subcommand)]
         command: McpCmd,
     },
+    /// Git operations under policy enforcement.
     Git {
         #[command(subcommand)]
         command: GitCmd,
     },
+    /// Manage prompt skills (list, install, run, reload).
     Skills {
         #[command(subcommand)]
         command: SkillsCmd,
     },
+    /// Deterministic session replay.
     Replay {
         #[command(subcommand)]
         command: ReplayCmd,
     },
+    /// Background task management.
     Background {
         #[command(subcommand)]
         command: BackgroundCmd,
     },
+    /// Visual artifact workflows.
     Visual {
         #[command(subcommand)]
         command: VisualCmd,
     },
+    /// Cross-environment handoff.
     Teleport(TeleportArgs),
+    /// Remote SSH environment profiles.
     RemoteEnv {
         #[command(subcommand)]
         command: RemoteEnvCmd,
     },
+    /// Session management (list, show, resume).
     Session {
         #[command(subcommand)]
         command: SessionCmd,
     },
+    /// Show current agent status summary.
     Status,
+    /// Display token and cost usage.
     Usage(UsageArgs),
+    /// Compact conversation history.
     Compact(CompactArgs),
+    /// Diagnose runtime, test, and performance issues.
     Doctor(DoctorArgs),
+    /// Enterprise leadership readiness report.
     Leadership(LeadershipArgs),
+    /// Check for and apply CLI updates.
     Update(UpdateArgs),
+    /// Manage the local code index.
     Index {
         #[command(subcommand)]
         command: IndexCmd,
     },
+    /// View and edit configuration.
     Config {
         #[command(subcommand)]
         command: ConfigCmd,
     },
+    /// Run benchmark suites and matrices.
     Benchmark {
         #[command(subcommand)]
         command: BenchmarkCmd,
     },
+    /// Inspect and configure safety permissions.
     Permissions {
         #[command(subcommand)]
         command: PermissionsCmd,
     },
+    /// Manage plugins: install, enable/disable, inspect, catalog.
     Plugins {
         #[command(subcommand)]
         command: PluginCmd,
     },
+    /// Remove stale runtime data.
     Clean(CleanArgs),
     /// Code review: analyze diffs and provide structured feedback.
     Review(ReviewArgs),
@@ -1342,15 +1374,25 @@ struct PermissionsSetArgs {
 
 #[derive(Subcommand)]
 enum PluginCmd {
+    /// List installed plugins (or discover available ones with --discover).
     List(PluginListArgs),
+    /// Install a plugin from a local directory.
     Install(PluginInstallArgs),
+    /// Remove an installed plugin.
     Remove(PluginIdArgs),
+    /// Enable a disabled plugin.
     Enable(PluginIdArgs),
+    /// Disable an enabled plugin.
     Disable(PluginIdArgs),
+    /// Show detailed information about a plugin.
     Inspect(PluginIdArgs),
+    /// Sync and display the plugin catalog.
     Catalog,
+    /// Search the plugin catalog.
     Search(PluginSearchArgs),
+    /// Verify a catalog plugin's signature.
     Verify(PluginIdArgs),
+    /// Run a plugin command prompt.
     Run(PluginRunArgs),
 }
 
