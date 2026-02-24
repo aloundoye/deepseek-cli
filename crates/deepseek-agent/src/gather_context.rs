@@ -1062,16 +1062,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repoish_detection_covers_modes_and_keywords() {
-        // In Code, Ask, and Context modes we always inject workspace context
-        // (intentional behavior change — the LLM needs project awareness).
-        assert!(is_repoish_prompt("hello", ChatMode::Ask));
-        assert!(is_repoish_prompt("What is 2+2?", ChatMode::Code));
-        assert!(is_repoish_prompt(
-            "show me workspace context",
-            ChatMode::Context
-        ));
-        assert!(is_repoish_prompt("Analyze this project", ChatMode::Code));
+    fn repoish_detection_covers_keywords() {
+        // Keyword-based detection: needs an inspect verb + repo subject.
+        assert!(is_repoish_prompt("Analyze this project"));
+        assert!(is_repoish_prompt("review the codebase for issues"));
+        assert!(is_repoish_prompt("audit this repository"));
+        // Plain prompts without repo subjects should NOT match.
+        assert!(!is_repoish_prompt("hello"));
+        assert!(!is_repoish_prompt("What is 2+2?"));
     }
 
     #[test]

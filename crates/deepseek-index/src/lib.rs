@@ -467,4 +467,48 @@ mod tests {
         let status = svc.status().expect("status").expect("manifest");
         assert!(status.fresh);
     }
+
+    // ── Phase 11: Retrieval returns cited chunks ────────────────────────
+
+    #[test]
+    fn retrieval_results_include_file_path_and_line_citations() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-index-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            workspace.join("utils.rs"),
+            "fn calculate_score(x: i32) -> i32 {\n    x * 2\n}\n",
+        )
+        .expect("seed file");
+
+        let svc = IndexService::new(&workspace).expect("svc");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 10,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        svc.build(&session).expect("build");
+
+        let result = svc.query("calculate_score", 5, None).expect("query");
+        assert!(!result.results.is_empty(), "should find at least one match");
+
+        // Each QueryResult must carry file-path + line citation
+        for hit in &result.results {
+            assert!(
+                !hit.path.is_empty(),
+                "result must include a non-empty file path"
+            );
+            assert!(hit.line > 0, "result line number must be positive");
+            assert!(
+                !hit.excerpt.is_empty(),
+                "result must include a non-empty excerpt"
+            );
+        }
+    }
 }

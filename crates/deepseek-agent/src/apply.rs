@@ -453,4 +453,95 @@ mod tests {
         assert!(feedback.contains("conflict1"));
         assert!(feedback.contains("file.rs"));
     }
+
+    // ── Phase 11: Patch gate auto-repair tests ──────────────────────────
+
+    #[test]
+    fn auto_repair_stale_hash_then_fresh_hash_succeeds_validation() {
+        // Simulates the auto-repair flow: first attempt fails due to stale
+        // hash, second attempt uses fresh hash and passes validation.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_content = "original line\n";
+        fs::write(temp.path().join("lib.rs"), file_content).expect("seed");
+
+        let stale_hash = "0000000000000000".to_string();
+        let allowed = HashSet::from(["lib.rs".to_string()]);
+
+        let diff = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-original line\n+new line\n";
+
+        // 1) Stale hash → must fail
+        let stale_expected = HashMap::from([("lib.rs".to_string(), stale_hash)]);
+        let err = apply_unified_diff(
+            temp.path(),
+            diff,
+            &allowed,
+            &stale_expected,
+            ApplyStrategy::Auto,
+        )
+        .expect_err("stale hash should fail");
+        assert!(err.reason.contains("stale editor context hash mismatch"));
+
+        // 2) Re-read file, compute fresh hash → must pass validation gate
+        let fresh_hash = hash_text(file_content);
+        let fresh_expected = HashMap::from([("lib.rs".to_string(), fresh_hash)]);
+        // Validation passes (hash matches), but actual git apply may fail
+        // in test env without git init. The important thing is it gets past
+        // the hash gate.
+        let result = apply_unified_diff(
+            temp.path(),
+            diff,
+            &allowed,
+            &fresh_expected,
+            ApplyStrategy::Auto,
+        );
+        // Either succeeds or fails on git apply (not on hash mismatch)
+        match result {
+            Ok(_) => {} // apply worked
+            Err(e) => assert!(
+                !e.reason.contains("stale editor context hash mismatch"),
+                "should not fail on hash mismatch with fresh hash"
+            ),
+        }
+    }
+
+    #[test]
+    fn apply_gate_accepts_matching_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let content = "fn main() {}\n";
+        fs::write(temp.path().join("main.rs"), content).expect("seed");
+
+        let hash = hash_text(content);
+        let allowed = HashSet::from(["main.rs".to_string()]);
+        let expected = HashMap::from([("main.rs".to_string(), hash)]);
+
+        let diff =
+            "--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { println!(\"hi\"); }\n";
+
+        let result =
+            apply_unified_diff(temp.path(), diff, &allowed, &expected, ApplyStrategy::Auto);
+        // Must not fail on hash mismatch
+        match result {
+            Ok(_) => {}
+            Err(e) => assert!(
+                !e.reason.contains("hash mismatch"),
+                "matching hash should not produce hash mismatch error"
+            ),
+        }
+    }
+
+    #[test]
+    fn apply_failure_feedback_includes_classification_for_auto_repair() {
+        let failure = ApplyFailure {
+            class: ApplyFailureClass::PatchMismatch,
+            reason: "stale editor context hash mismatch: lib.rs".to_string(),
+            conflicts: vec![],
+            changed_files: vec!["lib.rs".to_string()],
+        };
+        let feedback = failure.to_feedback();
+        // Auto-repair classifier uses the PatchMismatch classification
+        assert!(feedback.contains("PatchMismatch"));
+        // Includes the file path so the engine can re-read it
+        assert!(feedback.contains("lib.rs"));
+        assert!(feedback.contains("stale editor context hash mismatch"));
+    }
 }

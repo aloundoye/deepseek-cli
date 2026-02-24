@@ -3415,4 +3415,104 @@ mod tests {
         assert_eq!(rebuilt.transcript.len(), 1);
         assert_eq!(rebuilt.plugin_events, vec!["demo".to_string()]);
     }
+
+    // ── Phase 11: Deterministic event ordering tests ────────────────────
+
+    #[test]
+    fn event_ordering_preserved_across_mixed_types() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+        let sid = Uuid::now_v7();
+        let session = Session {
+            session_id: sid,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        // Insert events of different types in a known order
+        let event_specs: Vec<(u64, EventKind)> = vec![
+            (1, EventKind::TurnAddedV1 { role: "user".to_string(), content: "first".to_string() }),
+            (2, EventKind::TurnAddedV1 { role: "assistant".to_string(), content: "second".to_string() }),
+            (3, EventKind::PluginEnabledV1 { plugin_id: "plug-a".to_string() }),
+            (4, EventKind::TurnAddedV1 { role: "user".to_string(), content: "third".to_string() }),
+        ];
+
+        for (seq, kind) in &event_specs {
+            store
+                .append_event(&EventEnvelope {
+                    seq_no: *seq,
+                    at: Utc::now(),
+                    session_id: sid,
+                    kind: kind.clone(),
+                })
+                .expect("append");
+        }
+
+        // Rebuild and verify insertion order is preserved
+        let rebuilt = store.rebuild_from_events(sid).expect("rebuild");
+        assert_eq!(rebuilt.transcript.len(), 3); // 3 TurnAddedV1
+        assert_eq!(rebuilt.plugin_events.len(), 1); // 1 PluginEnabledV1
+        assert!(rebuilt.transcript[0].contains("first"));
+        assert!(rebuilt.transcript[1].contains("second"));
+        assert!(rebuilt.transcript[2].contains("third"));
+
+        // Verify seq_no monotonicity
+        let next = store.next_seq_no(sid).expect("next");
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn replay_produces_identical_projections() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+        let sid = Uuid::now_v7();
+        let session = Session {
+            session_id: sid,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        // Seed events
+        for i in 1..=5 {
+            store
+                .append_event(&EventEnvelope {
+                    seq_no: i,
+                    at: Utc::now(),
+                    session_id: sid,
+                    kind: EventKind::TurnAddedV1 {
+                        role: if i % 2 == 1 { "user" } else { "assistant" }.to_string(),
+                        content: format!("msg-{i}"),
+                    },
+                })
+                .expect("append");
+        }
+
+        // Replay twice from the same event log
+        let p1 = store.rebuild_from_events(sid).expect("rebuild 1");
+        let p2 = store.rebuild_from_events(sid).expect("rebuild 2");
+
+        // Both replays must produce identical transcripts
+        assert_eq!(p1.transcript, p2.transcript);
+        assert_eq!(p1.transcript.len(), 5);
+        assert_eq!(p1.usage_input_tokens, p2.usage_input_tokens);
+        assert_eq!(p1.plugin_events, p2.plugin_events);
+    }
 }

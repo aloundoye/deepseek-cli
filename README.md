@@ -12,6 +12,40 @@ DeepSeek CLI is a terminal-native coding agent written in Rust. It combines chat
 - Permission and sandbox policy controls
 - Built-in benchmark and parity tooling
 
+## Architecture
+
+DeepSeek CLI is a Rust workspace organized into focused crates:
+
+| Crate | Role |
+|-------|------|
+| `deepseek-cli` | CLI dispatch, argument parsing, subcommand handlers |
+| `deepseek-agent` | Run Engine state machine, Architect/Editor/Verify orchestration |
+| `deepseek-core` | Shared types, config loading, event definitions |
+| `deepseek-diff` | Unified diff parsing, patch staging, and git-apply |
+| `deepseek-store` | Session persistence, event log (JSONL), SQLite projections |
+| `deepseek-policy` | Permission engine — denylist/allowlist, approval gates, sandbox |
+| `deepseek-tools` | Tool execution, plugin manager, shell runner |
+| `deepseek-index` | Full-text code index (Tantivy), RAG retrieval with citations |
+| `deepseek-mcp` | MCP server management (JSON-RPC stdio/http transports) |
+| `deepseek-memory` | Long-term memory and context management |
+| `deepseek-llm` | LLM client, streaming, prompt cache |
+| `deepseek-ui` | TUI rendering, status line, progress display |
+| `deepseek-skills` | Skill discovery, installation, and prompt rendering |
+| `deepseek-subagent` | Specialist subagents (debugger, refactor-sheriff, security-sentinel) |
+| `deepseek-observe` | Observability, structured logging |
+
+The core execution pipeline follows a deterministic state machine:
+
+```
+Context → Architect → Editor → Apply → Verify → (loop or done)
+```
+
+- **Architect** plans which files to edit (`deepseek-reasoner`, thinking enabled)
+- **Editor** produces strict unified diffs (`deepseek-chat`, thinking disabled)
+- **Apply Gate** validates hashes, enforces approval, creates checkpoints
+- **Verify** runs derived commands, classifies failures for auto-repair
+- On failure, the engine classifies the error and retries Editor-first or Architect-first
+
 ## Install
 
 ### Option 1: Prebuilt release binary (recommended)
@@ -268,3 +302,4 @@ bash scripts/parity_regression_check.sh
 - Operations playbook: `docs/OPERATIONS.md`
 - Production readiness: `docs/PRODUCTION_READINESS.md`
 - Feature audit matrix: `docs/FEATURE_MATRIX.md`
+- Configuration reference: `docs/CONFIG_REFERENCE.md`
