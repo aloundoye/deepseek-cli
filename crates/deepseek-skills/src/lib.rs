@@ -12,6 +12,24 @@ pub struct SkillEntry {
     pub name: String,
     pub path: PathBuf,
     pub summary: String,
+    /// Tools this skill is allowed to use (empty = all tools).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Scope of this skill in the hierarchy: Project > User > BuiltIn.
+    #[serde(default)]
+    pub scope: SkillScope,
+}
+
+/// Skill scope in the resolution hierarchy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillScope {
+    /// Defined in the project's `.deepseek/skills/` directory.
+    Project,
+    /// Defined in the user's `~/.deepseek/skills/` directory.
+    User,
+    /// Built-in skill shipped with the CLI.
+    #[default]
+    BuiltIn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +111,8 @@ impl SkillManager {
                     name,
                     path: skill_path.to_path_buf(),
                     summary,
+                    allowed_tools: Vec::new(),
+                    scope: SkillScope::BuiltIn,
                 });
             }
         }

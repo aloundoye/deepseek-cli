@@ -290,6 +290,7 @@ pub(crate) fn run_compact(cwd: &Path, args: CompactArgs, json_mode: bool) -> Res
 /// Summarize older conversation messages using a heuristic extraction approach.
 /// Extracts key decisions, file paths, and task outcomes into a compressed summary
 /// that's roughly <25% of the original token count.
+#[allow(dead_code)]
 pub(crate) fn summarize_conversation(transcript: &[String]) -> String {
     if transcript.is_empty() {
         return String::new();
@@ -332,6 +333,7 @@ pub(crate) fn summarize_conversation(transcript: &[String]) -> String {
 }
 
 /// Check if the current context usage exceeds the auto-compact threshold.
+#[allow(dead_code)]
 pub(crate) fn should_auto_compact(cfg: &AppConfig, transcript: &[String]) -> bool {
     if transcript.len() < 4 {
         return false; // too few turns to compact

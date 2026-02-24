@@ -1,7 +1,6 @@
 use crate::repo_map_v2;
 use anyhow::{Result, anyhow};
-use deepseek_core::{AppConfig, ChatMessage, ChatRequest, ToolChoice};
-use deepseek_llm::LlmClient;
+use deepseek_core::{ChatMessage, ChatRequest, ToolChoice};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
