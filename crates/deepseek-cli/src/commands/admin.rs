@@ -445,7 +445,7 @@ pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()
             }
         }
         IndexCmd::Query { q, top_k } => {
-            let result = service.query(&q, top_k)?;
+            let result = service.query(&q, top_k, None)?;
             if json_mode {
                 print_json(&result)?;
             } else {

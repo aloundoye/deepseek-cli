@@ -183,7 +183,7 @@ impl IndexService {
         Ok(Some(manifest))
     }
 
-    pub fn query(&self, q: &str, top_k: usize) -> Result<QueryResponse> {
+    pub fn query(&self, q: &str, top_k: usize, scope: Option<&str>) -> Result<QueryResponse> {
         let status = self.status()?;
         let freshness = if let Some(m) = &status {
             if m.corrupt {
@@ -198,9 +198,9 @@ impl IndexService {
         }
         .to_string();
 
-        let results = match self.query_tantivy(q, top_k) {
+        let results = match self.query_tantivy(q, top_k, scope) {
             Ok(results) => results,
-            Err(_) => self.query_fallback(q, top_k)?,
+            Err(_) => self.query_fallback(q, top_k, scope)?,
         };
 
         Ok(QueryResponse { freshness, results })
@@ -234,7 +234,7 @@ impl IndexService {
         Ok(())
     }
 
-    fn query_tantivy(&self, q: &str, top_k: usize) -> Result<Vec<QueryResult>> {
+    fn query_tantivy(&self, q: &str, top_k: usize, scope: Option<&str>) -> Result<Vec<QueryResult>> {
         let index = Index::open_in_dir(self.tantivy_dir())?;
         let schema = index.schema();
         let path_field = schema.get_field("path")?;
@@ -263,6 +263,11 @@ impl IndexService {
             if !seen.insert(path.clone()) {
                 continue;
             }
+            if let Some(s) = scope {
+                if !path.starts_with(s) && !path.contains(s) {
+                    continue;
+                }
+            }
 
             let full = self.workspace.join(&path);
             let (line, excerpt) = extract_match_line(&full, q).unwrap_or((1, String::new()));
@@ -278,7 +283,7 @@ impl IndexService {
         Ok(out)
     }
 
-    fn query_fallback(&self, q: &str, top_k: usize) -> Result<Vec<QueryResult>> {
+    fn query_fallback(&self, q: &str, top_k: usize, scope: Option<&str>) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
         for path in workspace_file_paths(&self.workspace, true) {
             if !path.is_file() {
@@ -289,6 +294,11 @@ impl IndexService {
                 continue;
             }
             let rel = rel_path.to_string_lossy().to_string();
+            if let Some(s) = scope {
+                if !rel.starts_with(s) && !rel.contains(s) {
+                    continue;
+                }
+            }
             if let Ok(content) = fs::read_to_string(path) {
                 for (idx, line) in content.lines().enumerate() {
                     if line.contains(q) {
@@ -419,7 +429,7 @@ mod tests {
             active_plan_id: None,
         };
         svc.build(&session).expect("build");
-        let result = svc.query("router_decision", 5).expect("query");
+        let result = svc.query("router_decision", 5, None).expect("query");
         assert!(!result.results.is_empty());
     }
 

@@ -72,12 +72,12 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             if let Some(worker) = engine.subagent_worker() {
                 std::thread::scope(|s| {
                     let mut handles = Vec::new();
-                    for (i, goal) in plan.subagents.iter().enumerate() {
+                    for (name, goal) in &plan.subagents {
                         let worker_clone = worker.clone();
-                        let task_name = format!("subagent-{}", i);
+                        let task_name = format!("subagent-{}", name);
                         let sub_task = deepseek_subagent::SubagentTask {
                             run_id: uuid::Uuid::now_v7(),
-                            name: task_name,
+                            name: name.clone(),
                             goal: goal.clone(),
                             role: deepseek_subagent::SubagentRole::Task,
                             team: "default".to_string(),
@@ -85,7 +85,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                             custom_agent: None,
                         };
                         handles.push(s.spawn(move || {
-                            worker_clone(&sub_task).unwrap_or_else(|e| format!("Failed to run subagent: {e}"))
+                            worker_clone(&sub_task).unwrap_or_else(|e| format!("Failed to run {name}: {e}"))
                         }));
                     }
                     for handle in handles {
@@ -1111,6 +1111,7 @@ mod tests {
             }],
             verify_commands: vec![],
             acceptance: vec![],
+            subagents: vec![],
             no_edit_reason: None,
             raw: String::new(),
         };
@@ -1128,6 +1129,7 @@ mod tests {
             files: vec![],
             verify_commands: vec![],
             acceptance: vec![],
+            subagents: vec![],
             no_edit_reason: None,
             raw: String::new(),
         };
@@ -1144,6 +1146,7 @@ mod tests {
             files: vec![],
             verify_commands: vec![],
             acceptance: vec![],
+            subagents: vec![],
             no_edit_reason: Some("Already correct".to_string()),
             raw: String::new(),
         };

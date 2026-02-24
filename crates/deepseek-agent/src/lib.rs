@@ -7,6 +7,7 @@ mod gather_context;
 mod intent;
 pub mod linter;
 mod r#loop;
+pub mod run_engine;
 mod repo_map_v2;
 mod team;
 mod verify;
@@ -83,7 +84,7 @@ pub struct AgentEngine {
     pub(crate) llm: Box<dyn LlmClient + Send + Sync>,
     observer: Observer,
     pub(crate) tool_host: Arc<LocalToolHost>,
-    policy: PolicyEngine,
+    pub(crate) policy: PolicyEngine,
     pub(crate) cfg: AppConfig,
     stream_callback: Mutex<Option<deepseek_core::StreamCallback>>,
     max_turns: Option<u64>,
@@ -401,28 +402,13 @@ impl AgentEngine {
         });
 
         let result = if task_intent == intent::TaskIntent::ArchitectOnly {
-            let plan = self.plan_only(&prompt_enriched, &options)?;
-            let mut out = String::new();
-            out.push_str("Architect plan (no execution):\n");
-            for (idx, step) in plan.steps.iter().enumerate() {
-                out.push_str(&format!("{}. {}\n", idx + 1, step.intent));
-            }
-            if !plan.verification.is_empty() {
-                out.push_str("\nVerify commands:\n");
-                for command in &plan.verification {
-                    out.push_str(&format!("- `{}`\n", command));
-                }
-            }
-            let rendered = out.trim_end().to_string();
-            self.stream(StreamChunk::ContentDelta(rendered.clone()));
-            self.stream(StreamChunk::Done);
-            Ok(rendered)
+            run_engine::run(self, &prompt_enriched, &options)
         } else if task_intent == intent::TaskIntent::InspectRepo {
             self.analyze_with_options(&prompt_enriched, options)
         } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
             team::run(self, &prompt_enriched, &options)
         } else {
-            r#loop::run(self, &prompt_enriched, &options)
+            run_engine::run(self, &prompt_enriched, &options)
         };
 
         if let Ok(text) = &result {

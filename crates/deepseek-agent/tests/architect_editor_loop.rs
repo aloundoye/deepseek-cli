@@ -66,6 +66,18 @@ impl LlmClient for ScriptedLlm {
             "complete_chat_streaming() not used in architect/editor loop tests"
         ))
     }
+
+    fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_fim() not used in architect/editor loop tests"))
+    }
+
+    fn complete_fim_streaming(
+        &self,
+        _req: &deepseek_core::FimRequest,
+        _cb: StreamCallback,
+    ) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_fim_streaming() not used in architect/editor loop tests"))
+    }
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Result<()> {
@@ -210,34 +222,58 @@ fn patch_fails_to_apply_then_recovers() -> Result<()> {
 
 #[test]
 fn tests_fail_then_recovers() -> Result<()> {
+    // This test verifies the orchestrator can re-architect and recover
+    // after a verify failure. We use a verify command that fails exactly
+    // once (creating a marker file), then succeeds on the retry within
+    // the same iteration via the MechanicalVerifyFailure path.
     let dir = tempfile::tempdir()?;
     init_git(dir.path())?;
     fs::write(dir.path().join("demo.txt"), "old\n")?;
     commit_all(dir.path(), "seed")?;
 
-    let first_diff = generate_diff(dir.path(), &[("demo.txt", "interim\n")])?;
-    let retry_diff =
-        "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-interim\n+interim_retry\n"
-            .to_string();
-    let final_diff =
-        "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-interim\n+final\n"
-            .to_string();
-    let plan_one = "ARCHITECT_PLAN_V1\nPLAN|First attempt\nFILE|demo.txt|set interim value\nVERIFY|cargo test -q\nACCEPT|passes\nARCHITECT_PLAN_END\n".to_string();
-    let plan_two = "ARCHITECT_PLAN_V1\nPLAN|Second attempt\nFILE|demo.txt|set final value\nVERIFY|git status --short\nACCEPT|passes\nARCHITECT_PLAN_END\n".to_string();
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "final\n")])?;
 
-    let engine = build_engine(
-        dir.path(),
-        vec![plan_one, first_diff, retry_diff, plan_two, final_diff],
-    )?;
+    let marker = dir.path().join(".verify_marker");
+    let verify_cmd = format!(
+        "test -f {} || (touch {} && false)",
+        marker.display(),
+        marker.display()
+    );
 
-    let _ = engine.chat_with_options(
+    let plan = format!(
+        "ARCHITECT_PLAN_V1\nPLAN|Update demo\nFILE|demo.txt|Replace old with final\nVERIFY|{}\nACCEPT|passes\nARCHITECT_PLAN_END\n",
+        verify_cmd
+    );
+
+    // The orchestrator's retry path on verify failure is:
+    //   architect(plan) → editor(diff) → apply → verify fails
+    //   → MechanicalVerifyFailure → continue editor_cycle → editor(diff) → apply(fail, already applied)
+    //   → micro retry → editor(diff) → apply(fail) → micro retry → editor(diff) → apply(fail)
+    //   → max retries → break editor_cycle → loop back → architect(plan) → editor(diff) ...
+    //
+    // With max_editor_apply_retries=3 and the marker verify failing once:
+    // Iteration 1: plan + diff + diff(apply fail, retry1) + diff(retry2) + diff(retry3) = 5
+    // Iteration 2: plan + diff = 2
+    // Total: ~7 minimum, provide 12 to cover edge cases + parse retries.
+    let mut responses: Vec<String> = Vec::new();
+    // Iteration 1
+    responses.push(plan.clone());
+    for _ in 0..6 { responses.push(good_diff.clone()); }
+    // Iteration 2
+    responses.push(plan.clone());
+    for _ in 0..4 { responses.push(good_diff.clone()); }
+
+    let engine = build_engine(dir.path(), responses)?;
+
+    let result = engine.chat_with_options(
         "Fix demo and verify",
         ChatOptions {
             tools: true,
             ..Default::default()
         },
-    )?;
+    );
 
+    assert!(result.is_ok(), "chat_with_options failed: {:?}", result.err());
     assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "final\n");
     Ok(())
 }

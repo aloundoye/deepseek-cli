@@ -40,6 +40,7 @@ use commands::revert::run_revert;
 use commands::review::run_review;
 use commands::search::run_search;
 use commands::serve::{run_completions, run_native_host, run_serve};
+use commands::session::{run_session_cmd, SessionCmd};
 use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
@@ -352,6 +353,10 @@ enum Commands {
     RemoteEnv {
         #[command(subcommand)]
         command: RemoteEnvCmd,
+    },
+    Session {
+        #[command(subcommand)]
+        command: SessionCmd,
     },
     Status,
     Usage(UsageArgs),
@@ -1627,6 +1632,7 @@ fn run() -> Result<()> {
         Commands::Visual { command } => run_visual(&cwd, command, cli.json),
         Commands::Teleport(args) => run_teleport(&cwd, args, cli.json),
         Commands::RemoteEnv { command } => run_remote_env(&cwd, command, cli.json),
+        Commands::Session { command } => run_session_cmd(&cwd, command, cli.json),
         Commands::Status => run_status(&cwd, cli.json),
         Commands::Usage(args) => run_usage(&cwd, args, cli.json),
         Commands::Compact(args) => run_compact(&cwd, args, cli.json),

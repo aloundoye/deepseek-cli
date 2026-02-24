@@ -103,6 +103,10 @@ impl LocalToolHost {
         })
     }
 
+    pub fn index(&self) -> &deepseek_index::IndexService {
+        &self.index
+    }
+
     /// Enable review mode (read-only pipeline).
     pub fn set_review_mode(&mut self, enabled: bool) {
         self.review_mode = enabled;
@@ -516,7 +520,11 @@ impl LocalToolHost {
                     .get("top_k")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
-                Ok(serde_json::to_value(self.index.query(q, top_k)?)?)
+                let scope = call
+                    .args
+                    .get("scope")
+                    .and_then(|v| v.as_str());
+                Ok(serde_json::to_value(self.index.query(q, top_k, scope)?)?)
             }
             "patch.stage" => {
                 let diff = call
