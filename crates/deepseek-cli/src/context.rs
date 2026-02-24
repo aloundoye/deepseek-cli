@@ -34,9 +34,23 @@ pub(crate) fn apply_cli_flags(engine: &mut AgentEngine, cli: &Cli) {
     }
 }
 
-/// Subagent orchestration is disabled in the Architect->Editor->Apply->Verify core loop.
+/// Subagent orchestration connects the parallel Worker execution to isolated engine scopes.
 pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
-    let _ = (engine, cwd);
+    let workspace = cwd.to_path_buf();
+    let worker = std::sync::Arc::new(
+        move |task: &deepseek_subagent::SubagentTask| -> anyhow::Result<String> {
+            let engine = deepseek_agent::AgentEngine::new(&workspace)?;
+            let mut options = deepseek_agent::ChatOptions::default();
+            options.tools = true;
+            options.mode = deepseek_agent::ChatMode::Ask; // Ensure no patching is done
+            options.system_prompt_append = Some(format!(
+                "You are an isolated Subagent named '{}' tasked with the following explicitly:\n{}\n\nProvide a comprehensive finding exactly related to this goal. Do not attempt to edit files. Your findings will be submitted back to the Architect context.",
+                task.name, task.goal
+            ));
+            engine.chat_with_options(&task.goal, options)
+        },
+    );
+    engine.set_subagent_worker(worker);
 }
 
 /// Build ChatOptions from CLI flags.
@@ -85,6 +99,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
         detect_urls: cli.detect_urls,
         watch_files: cli.watch_files,
         images: vec![],
+        chat_history: vec![],
     }
 }
 

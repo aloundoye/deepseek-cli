@@ -328,9 +328,11 @@ pub struct PluginStateRecord {
     pub manifest_json: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UsageSummary {
     pub input_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
     pub output_tokens: u64,
     pub records: u64,
 }
@@ -339,6 +341,8 @@ pub struct UsageSummary {
 pub struct UsageByUnitSummary {
     pub unit: String,
     pub input_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -920,34 +924,36 @@ impl Store {
     ) -> Result<UsageSummary> {
         let conn = self.db()?;
         let since = last_hours.map(|h| Utc::now() - chrono::Duration::hours(h));
-        let (input_tokens, output_tokens, records) = match (session_id, since) {
+        let (input_tokens, cache_hit, cache_miss, output_tokens, records) = match (session_id, since) {
             (Some(session_id), Some(since)) => conn.query_row(
-                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
                  FROM usage_ledger WHERE session_id = ?1 AND recorded_at >= ?2",
                 params![session_id.to_string(), since.to_rfc3339()],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
             )?,
             (Some(session_id), None) => conn.query_row(
-                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
                  FROM usage_ledger WHERE session_id = ?1",
                 [session_id.to_string()],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
             )?,
             (None, Some(since)) => conn.query_row(
-                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
                  FROM usage_ledger WHERE recorded_at >= ?1",
                 [since.to_rfc3339()],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
             )?,
             (None, None) => conn.query_row(
-                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(COUNT(1),0)
                  FROM usage_ledger",
                 [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
             )?,
         };
         Ok(UsageSummary {
             input_tokens: input_tokens.max(0) as u64,
+            cache_hit_tokens: cache_hit.max(0) as u64,
+            cache_miss_tokens: cache_miss.max(0) as u64,
             output_tokens: output_tokens.max(0) as u64,
             records: records.max(0) as u64,
         })
@@ -956,14 +962,16 @@ impl Store {
     pub fn usage_by_unit(&self, session_id: Uuid) -> Result<Vec<UsageByUnitSummary>> {
         let conn = self.db()?;
         let mut stmt = conn.prepare(
-            "SELECT unit, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+            "SELECT unit, COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(output_tokens),0)
              FROM usage_ledger WHERE session_id = ?1 GROUP BY unit ORDER BY unit",
         )?;
         let rows = stmt.query_map([session_id.to_string()], |r| {
             Ok(UsageByUnitSummary {
                 unit: r.get(0)?,
                 input_tokens: r.get::<_, i64>(1)?.max(0) as u64,
-                output_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                cache_hit_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                cache_miss_tokens: r.get::<_, i64>(3)?.max(0) as u64,
+                output_tokens: r.get::<_, i64>(4)?.max(0) as u64,
             })
         })?;
         let mut out = Vec::new();
@@ -2234,16 +2242,20 @@ impl Store {
                 unit,
                 model,
                 input_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
                 output_tokens,
             } => {
                 conn.execute(
-                    "INSERT INTO usage_ledger (session_id, unit, model, input_tokens, output_tokens, recorded_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO usage_ledger (session_id, unit, model, input_tokens, cache_hit_tokens, cache_miss_tokens, output_tokens, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         event.session_id.to_string(),
                         serde_json::to_string(unit)?,
                         model,
                         *input_tokens as i64,
+                        *cache_hit_tokens as i64,
+                        *cache_miss_tokens as i64,
                         *output_tokens as i64,
                         Utc::now().to_rfc3339(),
                     ],
@@ -2738,6 +2750,8 @@ pub struct RebuildProjection {
     pub state: Option<SessionState>,
     pub plugin_events: Vec<String>,
     pub usage_input_tokens: u64,
+    pub usage_cache_hit_tokens: u64,
+    pub usage_cache_miss_tokens: u64,
     pub usage_output_tokens: u64,
     pub compaction_events: usize,
     pub autopilot_runs: Vec<Uuid>,
@@ -2753,6 +2767,12 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
         }
         EventKind::ChatTurnV1 { message } => {
             proj.chat_messages.push(message.clone());
+        }
+        EventKind::TurnRevertedV1 { turns_dropped } => {
+            let keep_chat = proj.chat_messages.len().saturating_sub(*turns_dropped as usize);
+            proj.chat_messages.truncate(keep_chat);
+            let keep_transcript = proj.transcript.len().saturating_sub(*turns_dropped as usize);
+            proj.transcript.truncate(keep_transcript);
         }
         EventKind::PlanCreatedV1 { plan } | EventKind::PlanRevisedV1 { plan } => {
             proj.latest_plan = Some(plan.clone())
@@ -2783,10 +2803,14 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
         | EventKind::PluginDisabledV1 { plugin_id } => proj.plugin_events.push(plugin_id.clone()),
         EventKind::UsageUpdatedV1 {
             input_tokens,
+            cache_hit_tokens,
+            cache_miss_tokens,
             output_tokens,
             ..
         } => {
             proj.usage_input_tokens = proj.usage_input_tokens.saturating_add(*input_tokens);
+            proj.usage_cache_hit_tokens = proj.usage_cache_hit_tokens.saturating_add(*cache_hit_tokens);
+            proj.usage_cache_miss_tokens = proj.usage_cache_miss_tokens.saturating_add(*cache_miss_tokens);
             proj.usage_output_tokens = proj.usage_output_tokens.saturating_add(*output_tokens);
         }
         EventKind::ContextCompactedV1 { .. } => {
@@ -2804,6 +2828,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::TurnAddedV1 { .. } => "TurnAdded@v1",
         EventKind::ChatTurnV1 { .. } => "ChatTurn@v1",
+        EventKind::TurnRevertedV1 { .. } => "TurnReverted@v1",
         EventKind::SessionStateChangedV1 { .. } => "SessionStateChanged@v1",
         EventKind::PlanCreatedV1 { .. } => "PlanCreated@v1",
         EventKind::PlanRevisedV1 { .. } => "PlanRevised@v1",

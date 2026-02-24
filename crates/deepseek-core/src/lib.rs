@@ -138,6 +138,7 @@ pub struct PlanStep {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmUnit {
+    Model(String),
     Planner,
     Executor,
 }
@@ -581,6 +582,10 @@ pub enum EventKind {
     ChatTurnV1 {
         message: ChatMessage,
     },
+    /// Reverts the session to a prior state by dropping N turns.
+    TurnRevertedV1 {
+        turns_dropped: u32,
+    },
     SessionStateChangedV1 {
         from: SessionState,
         to: SessionState,
@@ -644,6 +649,8 @@ pub enum EventKind {
         unit: LlmUnit,
         model: String,
         input_tokens: u64,
+        cache_hit_tokens: u64,
+        cache_miss_tokens: u64,
         output_tokens: u64,
     },
     ContextCompactedV1 {
@@ -932,6 +939,7 @@ impl EventKind {
             // Chat / transcript
             Self::TurnAddedV1 { .. }
             | Self::ChatTurnV1 { .. }
+            | Self::TurnRevertedV1 { .. }
             | Self::ContextCompactedV1 { .. }
             | Self::EffortChangedV1 { .. }
             | Self::PermissionModeChangedV1 { .. }
@@ -1120,6 +1128,25 @@ pub struct LlmResponse {
     pub reasoning_content: String,
     #[serde(default)]
     pub tool_calls: Vec<LlmToolCall>,
+    /// Token usage from the API response.
+    #[serde(default)]
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token usage information from a DeepSeek API response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: u64,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: u64,
+    /// Tokens used for chain-of-thought reasoning (thinking mode).
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 /// A single chunk emitted during streaming.
@@ -1513,6 +1540,41 @@ pub enum ChatMessage {
     },
 }
 
+/// Strip `reasoning_content` from all assistant messages that belong to
+/// **prior** user-question turns, while keeping it for the **current** turn's
+/// tool-call loop.
+///
+/// DeepSeek API lifecycle rules:
+/// - Within a single user question's tool-call loop: **keep** reasoning_content
+///   so the model retains its logical thread.
+/// - When the next user question begins: **clear** reasoning_content from
+///   earlier turns to save bandwidth and avoid API 400 errors.
+///
+/// Strategy: walk backward from the end; every assistant message *after* the
+/// last User message belongs to the current turn (keep reasoning). Everything
+/// before that last User message is a prior turn (strip reasoning).
+pub fn strip_prior_reasoning_content(messages: &mut [ChatMessage]) {
+    // Find the index of the last User message.
+    let last_user_idx = messages
+        .iter()
+        .rposition(|m| matches!(m, ChatMessage::User { .. }));
+
+    let boundary = match last_user_idx {
+        Some(idx) => idx,
+        None => return, // no user messages → nothing to strip
+    };
+
+    // Strip reasoning_content from all assistant messages before the boundary.
+    for msg in &mut messages[..boundary] {
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = msg
+        {
+            *reasoning_content = None;
+        }
+    }
+}
+
 /// A tool (function) definition sent to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -1526,6 +1588,8 @@ pub struct ToolDefinition {
 pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub strict: Option<bool>,
     pub parameters: serde_json::Value,
 }
 
@@ -1570,11 +1634,34 @@ pub struct ChatRequest {
     pub tool_choice: ToolChoice,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    /// Request log probabilities. Incompatible with thinking mode (API will error).
+    pub logprobs: Option<bool>,
+    /// Number of top log probabilities to return. Incompatible with thinking mode.
+    pub top_logprobs: Option<u8>,
     /// When set, enables thinking mode on `deepseek-chat`.
-    /// The API requires `temperature` to be omitted when thinking is enabled.
+    /// The API requires temperature/top_p/presence_penalty/frequency_penalty to be
+    /// omitted and logprobs/top_logprobs to not be set when thinking is enabled.
     pub thinking: Option<ThinkingConfig>,
     /// Optional images to include with the user message (multimodal).
     pub images: Vec<ImageContent>,
+    /// Optional response format, e.g json_object
+    pub response_format: Option<serde_json::Value>,
+}
+
+/// Request for the Beta Fill-In-the-Middle (FIM) Completion API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FimRequest {
+    pub model: String,
+    pub prompt: String,
+    pub suffix: Option<String>,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1865,6 +1952,8 @@ pub struct LlmConfig {
     pub profile: String,
     pub context_window_tokens: u64,
     pub temperature: f32,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
     pub endpoint: String,
     pub api_key: Option<String>,
     pub api_key_env: String,
@@ -1887,6 +1976,7 @@ impl Default for LlmConfig {
             profile: DEEPSEEK_PROFILE_V32.to_string(),
             context_window_tokens: 128_000,
             temperature: 0.2,
+            base_url: "https://api.deepseek.com".to_string(),
             endpoint: "https://api.deepseek.com/chat/completions".to_string(),
             api_key: None,
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
@@ -1894,12 +1984,20 @@ impl Default for LlmConfig {
             language: "en".to_string(),
             prompt_cache_enabled: true,
             cache_strategy: CacheStrategy::Auto,
-            timeout_seconds: 60,
+            timeout_seconds: 600,
             max_retries: 3,
             retry_base_ms: 400,
             stream: true,
         }
     }
+}
+
+fn default_base_url() -> String {
+    "https://api.deepseek.com".to_string()
+}
+
+fn default_agent_loop_max_editor_apply_retries() -> u64 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1911,6 +2009,8 @@ pub struct AgentLoopConfig {
     pub architect_parse_retries: u64,
     #[serde(default = "default_agent_loop_parse_retries")]
     pub editor_parse_retries: u64,
+    #[serde(default = "default_agent_loop_max_editor_apply_retries")]
+    pub max_editor_apply_retries: u64,
     #[serde(default = "default_agent_loop_max_files_per_iteration")]
     pub max_files_per_iteration: u64,
     #[serde(default = "default_agent_loop_max_file_bytes")]
@@ -1953,6 +2053,7 @@ impl Default for AgentLoopConfig {
             max_iterations: default_agent_loop_max_iterations(),
             architect_parse_retries: default_agent_loop_parse_retries(),
             editor_parse_retries: default_agent_loop_parse_retries(),
+            max_editor_apply_retries: default_agent_loop_max_editor_apply_retries(),
             max_files_per_iteration: default_agent_loop_max_files_per_iteration(),
             max_file_bytes: default_agent_loop_max_file_bytes(),
             max_diff_bytes: default_agent_loop_max_diff_bytes(),
@@ -2960,6 +3061,105 @@ mod tests {
                 assert_eq!(properties["reason"], "repeat failures");
             }
             other => panic!("unexpected mapped kind: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn strip_prior_reasoning_clears_old_turns_keeps_current() {
+        let mut messages = vec![
+            ChatMessage::System {
+                content: "system".to_string(),
+            },
+            ChatMessage::User {
+                content: "first question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("answer 1".to_string()),
+                reasoning_content: Some("thinking about q1".to_string()),
+                tool_calls: vec![],
+            },
+            // New user turn starts here
+            ChatMessage::User {
+                content: "second question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("tool call".to_string()),
+                reasoning_content: Some("thinking about q2".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+
+        strip_prior_reasoning_content(&mut messages);
+
+        // Prior turn (index 2): reasoning_content should be cleared
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[2]
+        {
+            assert!(
+                reasoning_content.is_none(),
+                "prior turn reasoning should be stripped"
+            );
+        } else {
+            panic!("expected assistant at index 2");
+        }
+
+        // Current turn (index 4, after last User): reasoning_content should be kept
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[4]
+        {
+            assert_eq!(
+                reasoning_content.as_deref(),
+                Some("thinking about q2"),
+                "current turn reasoning should be kept"
+            );
+        } else {
+            panic!("expected assistant at index 4");
+        }
+    }
+
+    #[test]
+    fn strip_prior_reasoning_no_user_messages_is_noop() {
+        let mut messages = vec![
+            ChatMessage::System {
+                content: "system".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("answer".to_string()),
+                reasoning_content: Some("thinking".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+        strip_prior_reasoning_content(&mut messages);
+        // No user messages → nothing stripped
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[1]
+        {
+            assert_eq!(reasoning_content.as_deref(), Some("thinking"));
+        }
+    }
+
+    #[test]
+    fn strip_prior_reasoning_single_turn_preserves_all() {
+        let mut messages = vec![
+            ChatMessage::User {
+                content: "question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("answer".to_string()),
+                reasoning_content: Some("thinking".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+        strip_prior_reasoning_content(&mut messages);
+        // Only one user turn → assistant after it is "current", reasoning kept
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[1]
+        {
+            assert_eq!(reasoning_content.as_deref(), Some("thinking"));
         }
     }
 }

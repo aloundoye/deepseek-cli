@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    CacheStrategy, ChatMessage, ChatRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
+    CacheStrategy, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
     StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
@@ -29,8 +29,13 @@ pub trait LlmClient {
     fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse>;
 
     /// Streaming chat completion with tool definitions.
-    fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback)
-    -> Result<LlmResponse>;
+    fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback) -> Result<LlmResponse>;
+
+    /// Beta FIM completion (Fill-In-The-Middle)
+    fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse>;
+
+    /// Beta FIM completion streaming (Fill-In-The-Middle)
+    fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse>;
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +52,22 @@ impl DeepSeekClient {
         Ok(Self { cfg, client })
     }
 
+    fn resolved_endpoint(&self, is_chat: bool, is_fim: bool) -> String {
+        let default_ep = "https://api.deepseek.com/chat/completions";
+        if self.cfg.endpoint != default_ep && !self.cfg.endpoint.is_empty() {
+            return self.cfg.endpoint.clone();
+        }
+        let base = self.cfg.base_url.trim_end_matches('/');
+        let path = if is_fim {
+            "/beta/completions"
+        } else if is_chat {
+            "/chat/completions"
+        } else {
+            "/completions"
+        };
+        format!("{}{}", base, path)
+    }
+
     fn complete_inner(&self, req: &LlmRequest, api_key: &str) -> Result<LlmResponse> {
         let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_payload(req);
@@ -56,7 +77,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.cfg.endpoint)
+                .post(&self.resolved_endpoint(false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -122,10 +143,12 @@ impl DeepSeekClient {
         enable_server_cache: bool,
     ) -> Value {
         let fast_mode = self.cfg.fast_mode;
+        let thinking_enabled = req.model.to_ascii_lowercase().contains("reasoner");
+        let max_cap = if thinking_enabled { 16384 } else { 8192 };
         let max_tokens = if fast_mode {
             req.max_tokens.min(2048)
         } else {
-            req.max_tokens
+            req.max_tokens.min(max_cap)
         };
         let temperature = if fast_mode {
             self.cfg.temperature.min(0.2)
@@ -170,6 +193,31 @@ impl DeepSeekClient {
             "stream": self.cfg.stream,
             "max_tokens": max_tokens
         })
+    }
+
+    fn build_fim_payload(&self, req: &FimRequest) -> Value {
+        let mut payload = json!({
+            "model": normalize_deepseek_model(&req.model).unwrap_or(&req.model),
+            "prompt": req.prompt,
+            "max_tokens": req.max_tokens.min(8192),
+            "stream": false
+        });
+        if let Some(s) = &req.suffix {
+            payload["suffix"] = json!(s);
+        }
+        if let Some(temp) = req.temperature {
+            payload["temperature"] = json!(temp);
+        }
+        if let Some(top_p) = req.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+        if let Some(pp) = req.presence_penalty {
+            payload["presence_penalty"] = json!(pp);
+        }
+        if let Some(fp) = req.frequency_penalty {
+            payload["frequency_penalty"] = json!(fp);
+        }
+        payload
     }
 
     fn build_chat_payload(&self, req: &ChatRequest) -> Value {
@@ -247,15 +295,49 @@ impl DeepSeekClient {
             }
         }
 
+        let max_cap = if thinking_enabled { 16384 } else { 8192 };
         let mut payload = json!({
             "model": normalize_deepseek_model(&req.model).unwrap_or(&req.model),
             "messages": messages,
-            "max_tokens": req.max_tokens,
+            "max_tokens": req.max_tokens.min(max_cap as u32),
             "stream": false
         });
-        // DeepSeek API requires temperature to be omitted when thinking is enabled.
-        if !thinking_enabled && let Some(temp) = req.temperature {
-            payload["temperature"] = json!(temp);
+        // DeepSeek API requires temperature/top_p/presence_penalty/frequency_penalty
+        // to be omitted when thinking is enabled. logprobs/top_logprobs are errors.
+        if thinking_enabled {
+            if req.logprobs == Some(true) || req.top_logprobs.is_some() {
+                // Cannot return Err from a non-Result fn; the caller validates via
+                // complete_chat which calls resolve_request_model. We strip silently
+                // here and let validate_thinking_params catch it early.
+            }
+        } else {
+            if let Some(temp) = req.temperature {
+                payload["temperature"] = json!(temp);
+            }
+            if let Some(top_p) = req.top_p {
+                payload["top_p"] = json!(top_p);
+            }
+            if let Some(pp) = req.presence_penalty {
+                payload["presence_penalty"] = json!(pp);
+            }
+            if let Some(fp) = req.frequency_penalty {
+                payload["frequency_penalty"] = json!(fp);
+            }
+        }
+        
+        if let Some(fmt) = &req.response_format {
+            payload["response_format"] = fmt.clone();
+        }
+
+        if let Some(logprobs) = req.logprobs {
+            if !thinking_enabled {
+                payload["logprobs"] = json!(logprobs);
+            }
+        }
+        if let Some(top_logprobs) = req.top_logprobs {
+            if !thinking_enabled {
+                payload["top_logprobs"] = json!(top_logprobs);
+            }
         }
         if let Some(ref thinking) = req.thinking {
             payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
@@ -277,7 +359,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.cfg.endpoint)
+                .post(&self.resolved_endpoint(true, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -326,6 +408,154 @@ impl DeepSeekClient {
         Err(last_err.unwrap_or_else(|| anyhow!("chat request failed")))
     }
 
+    fn complete_fim_inner(&self, req: &FimRequest, api_key: &str) -> Result<LlmResponse> {
+        let payload = self.build_fim_payload(req);
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempt: u8 = 0;
+        while attempt <= self.cfg.max_retries {
+            let response = self
+                .client
+                .post(&self.resolved_endpoint(false, true))
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    let body = resp.text()?;
+                    if status.is_success() {
+                        return parse_fim_non_streaming_payload(&body);
+                    }
+                    last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
+                    if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        std::thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format_transport_error(&e));
+                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("fim request failed")))
+    }
+
+    fn complete_fim_streaming_inner(
+        &self,
+        req: &FimRequest,
+        api_key: &str,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let mut payload = self.build_fim_payload(req);
+        payload["stream"] = json!(true);
+        payload["stream_options"] = json!({"include_usage": true});
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempt: u8 = 0;
+        while attempt <= self.cfg.max_retries {
+            let response = self
+                .client
+                .post(&self.resolved_endpoint(false, true))
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+
+                    if status.is_success() {
+                        let mut content_out = String::new();
+                        let mut finish_reason: Option<String> = None;
+                        let mut usage: Option<deepseek_core::TokenUsage> = None;
+
+                        let reader = std::io::BufReader::new(resp);
+                        for line_result in std::io::BufRead::lines(reader) {
+                            let line = match line_result {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    last_err = Some(anyhow!("stream read error: {e}"));
+                                    break;
+                                }
+                            };
+                            let trimmed = line.trim();
+                            if !trimmed.starts_with("data:") {
+                                continue;
+                            }
+                            let chunk = trimmed.trim_start_matches("data:").trim();
+                            if chunk == "[DONE]" {
+                                cb(StreamChunk::Done);
+                                break;
+                            }
+                            let value: Value = match serde_json::from_str(chunk) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            if let Some(usage_value) = value.get("usage") {
+                                if !usage_value.is_null() {
+                                    usage = parse_usage_object(Some(usage_value));
+                                }
+                            }
+                            let choice = value
+                                .get("choices")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first());
+                            let Some(choice) = choice else {
+                                continue;
+                            };
+                            if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                                finish_reason = Some(reason.to_string());
+                            }
+                            if let Some(text) = choice.get("text").and_then(|v| v.as_str()) {
+                                cb(StreamChunk::ContentDelta(text.to_string()));
+                                content_out.push_str(text);
+                            }
+                        }
+                        if last_err.is_none() {
+                            return Ok(LlmResponse {
+                                text: content_out,
+                                finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
+                                reasoning_content: String::new(),
+                                tool_calls: vec![],
+                                usage,
+                            });
+                        }
+                    } else {
+                        let body = resp.text().unwrap_or_default();
+                        last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
+                    }
+                    if should_retry_status(status) && attempt < self.cfg.max_retries {
+                        std::thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format_transport_error(&e));
+                    if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
+                        std::thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("fim stream request failed")))
+    }
+
     fn complete_chat_streaming_inner(
         &self,
         req: &ChatRequest,
@@ -335,13 +565,14 @@ impl DeepSeekClient {
         let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_chat_payload(req);
         payload["stream"] = json!(true);
+        payload["stream_options"] = json!({"include_usage": true});
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.cfg.endpoint)
+                .post(&self.resolved_endpoint(true, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -356,11 +587,12 @@ impl DeepSeekClient {
                         let mut reasoning_out = String::new();
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
-                        let completed_tool_calls: Vec<LlmToolCall> = Vec::new();
+                        let mut completed_tool_calls: Vec<LlmToolCall> = Vec::new();
                         // Suppress text display once structured tool_calls
                         // deltas arrive — the text fragments between tool calls
                         // are noise that confuses the TUI display.
                         let mut has_structured_tool_calls = false;
+                        let mut usage: Option<deepseek_core::TokenUsage> = None;
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
@@ -384,6 +616,11 @@ impl DeepSeekClient {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                            if let Some(usage_value) = value.get("usage") {
+                                if !usage_value.is_null() {
+                                    usage = parse_usage_object(Some(usage_value));
+                                }
+                            }
                             let choice = value
                                 .get("choices")
                                 .and_then(|v| v.as_array())
@@ -463,6 +700,7 @@ impl DeepSeekClient {
                             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
                             reasoning_content: reasoning_out,
                             tool_calls,
+                            usage,
                         });
                     }
 
@@ -529,6 +767,30 @@ impl DeepSeekClient {
         Ok(normalized.to_string())
     }
 
+    /// Validate that thinking-mode-incompatible parameters are not set.
+    /// DeepSeek API errors on logprobs/top_logprobs when thinking is enabled,
+    /// and ignores temperature/top_p/presence_penalty/frequency_penalty.
+    fn validate_thinking_params(req: &ChatRequest) -> Result<()> {
+        let thinking_enabled = req
+            .thinking
+            .as_ref()
+            .is_some_and(|t| t.thinking_type == "enabled");
+        if !thinking_enabled {
+            return Ok(());
+        }
+        if req.logprobs == Some(true) {
+            return Err(anyhow!(
+                "logprobs is incompatible with thinking mode; remove logprobs or disable thinking"
+            ));
+        }
+        if req.top_logprobs.is_some() {
+            return Err(anyhow!(
+                "top_logprobs is incompatible with thinking mode; remove top_logprobs or disable thinking"
+            ));
+        }
+        Ok(())
+    }
+
     /// Streaming variant: reads the SSE response line-by-line, invoking `cb`
     /// for each content/reasoning delta, then returns the assembled response.
     fn complete_streaming_inner(
@@ -541,13 +803,14 @@ impl DeepSeekClient {
         let mut payload = self.build_payload(req);
         // Force streaming on for the HTTP request
         payload["stream"] = json!(true);
+        payload["stream_options"] = json!({"include_usage": true});
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.cfg.endpoint)
+                .post(&self.resolved_endpoint(false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -564,6 +827,7 @@ impl DeepSeekClient {
                         let mut finish_reason: Option<String> = None;
                         let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
                         let mut completed_tool_calls = Vec::new();
+                        let mut usage: Option<deepseek_core::TokenUsage> = None;
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
@@ -587,6 +851,11 @@ impl DeepSeekClient {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                            if let Some(usage_value) = value.get("usage") {
+                                if !usage_value.is_null() {
+                                    usage = parse_usage_object(Some(usage_value));
+                                }
+                            }
                             let choice = value
                                 .get("choices")
                                 .and_then(|v| v.as_array())
@@ -670,6 +939,7 @@ impl DeepSeekClient {
                             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
                             reasoning_content: reasoning_out,
                             tool_calls,
+                            usage,
                         });
                     }
 
@@ -810,6 +1080,7 @@ impl LlmClient for DeepSeekClient {
                 self.cfg.provider
             ));
         }
+        Self::validate_thinking_params(req)?;
         let key = self
             .resolve_api_key()
             .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
@@ -828,39 +1099,90 @@ impl LlmClient for DeepSeekClient {
                 self.cfg.provider
             ));
         }
+        Self::validate_thinking_params(req)?;
         let key = self
             .resolve_api_key()
             .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
         self.complete_chat_streaming_inner(req, &key, cb)
     }
+
+    fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
+        let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" {
+            return Err(anyhow!("unsupported llm.provider"));
+        }
+        let key = self.resolve_api_key().ok_or_else(|| anyhow!("api_key missing"))?;
+        self.complete_fim_inner(req, &key)
+    }
+
+    fn complete_fim_streaming(
+        &self,
+        req: &FimRequest,
+        cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        let provider = self.cfg.provider.to_ascii_lowercase();
+        if provider != "deepseek" {
+            return Err(anyhow!("unsupported llm.provider"));
+        }
+        let key = self.resolve_api_key().ok_or_else(|| anyhow!("api_key missing"))?;
+        self.complete_fim_streaming_inner(req, &key, cb)
+    }
 }
 
 /// Produce a user-friendly error from a DeepSeek API HTTP response.
 fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8) -> anyhow::Error {
-    // Try to extract the error message from JSON body
-    let detail = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.get("message").or(Some(e)))
-                .and_then(|m| m.as_str().map(ToString::to_string))
-        })
+    // Parse structured error from JSON body: {"error": {"type": "...", "message": "..."}}
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let error_obj = parsed.as_ref().and_then(|v| v.get("error"));
+    let error_type = error_obj
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("unknown");
+    let detail = error_obj
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(ToString::to_string)
         .unwrap_or_else(|| body.chars().take(200).collect());
 
     match status {
+        StatusCode::BAD_REQUEST => anyhow!(
+            "Invalid request (HTTP 400, type={}): {}\n\
+             Check that your request parameters are valid for the selected model.",
+            error_type,
+            detail
+        ),
         StatusCode::UNAUTHORIZED => anyhow!(
             "Invalid or missing API key (HTTP 401).\n\
              Set DEEPSEEK_API_KEY environment variable or configure llm.api_key in settings.\n\
              Get an API key at https://platform.deepseek.com"
         ),
+        StatusCode::PAYMENT_REQUIRED => anyhow!(
+            "Insufficient balance (HTTP 402). Top up your DeepSeek account at https://platform.deepseek.com"
+        ),
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            let param = error_obj
+                .and_then(|e| e.get("param"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("unknown");
+            let code = error_obj
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown");
+            anyhow!(
+                "Invalid parameters (HTTP 422, type={}, code={}, param={}): {}\n\
+                 Common causes: logprobs/top_logprobs with thinking mode, unsupported parameter \
+                 combinations, or malformed tool definitions. Review your request configuration.",
+                error_type,
+                code,
+                param,
+                detail
+            )
+        },
         StatusCode::TOO_MANY_REQUESTS => anyhow!(
             "Rate limited (HTTP 429). Exhausted {}/{} retries. Try again shortly or reduce request frequency. Detail: {}",
             attempt + 1,
             max_retries + 1,
             detail
-        ),
-        StatusCode::PAYMENT_REQUIRED => anyhow!(
-            "Insufficient balance (HTTP 402). Top up your DeepSeek account at https://platform.deepseek.com"
         ),
         StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => anyhow!(
             "DeepSeek server error (HTTP {}). Exhausted {}/{} retries. The service may be temporarily unavailable. Detail: {}",
@@ -869,7 +1191,7 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
             max_retries + 1,
             detail
         ),
-        _ => anyhow!("DeepSeek API error (HTTP {}): {}", status.as_u16(), detail),
+        _ => anyhow!("DeepSeek API error (HTTP {}, type={}): {}", status.as_u16(), error_type, detail),
     }
 }
 
@@ -952,7 +1274,37 @@ fn retry_delay_ms(base_ms: u64, attempt: u8, retry_after_seconds: Option<u64>) -
     Duration::from_millis(exponential.max(base_ms.max(100)))
 }
 
+fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
+    let value: Value = serde_json::from_str(body)?;
+    let choice = value
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first());
+    let Some(choice) = choice else {
+        return Err(anyhow!("unexpected non-streaming payload: missing choices[0]"));
+    };
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stop")
+        .to_string();
+    let text = choice
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let usage = parse_usage_object(value.get("usage"));
+    Ok(LlmResponse {
+        text,
+        finish_reason,
+        reasoning_content: String::new(),
+        tool_calls: vec![],
+        usage,
+    })
+}
+
 fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
+
     let value: Value = serde_json::from_str(body)?;
     let choice = value
         .get("choices")
@@ -993,11 +1345,41 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
     } else {
         content
     };
+    let usage = parse_usage_object(value.get("usage"));
     Ok(LlmResponse {
         text,
         finish_reason,
         reasoning_content,
         tool_calls,
+        usage,
+    })
+}
+
+/// Extract token usage from a DeepSeek API usage JSON object.
+fn parse_usage_object(usage_value: Option<&Value>) -> Option<deepseek_core::TokenUsage> {
+    let u = usage_value?;
+    Some(deepseek_core::TokenUsage {
+        prompt_tokens: u
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        completion_tokens: u
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        prompt_cache_hit_tokens: u
+            .get("prompt_cache_hit_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        prompt_cache_miss_tokens: u
+            .get("prompt_cache_miss_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        reasoning_tokens: u
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     })
 }
 
@@ -1008,6 +1390,7 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
     let mut tool_call_parts: BTreeMap<u64, StreamToolCall> = BTreeMap::new();
     let mut completed_tool_calls = Vec::new();
     let mut parsed_any = false;
+    let mut usage: Option<deepseek_core::TokenUsage> = None;
     for line in body.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("data:") {
@@ -1018,6 +1401,11 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
             break;
         }
         let value: Value = serde_json::from_str(chunk)?;
+        if let Some(usage_value) = value.get("usage") {
+            if !usage_value.is_null() {
+                usage = parse_usage_object(Some(usage_value));
+            }
+        }
         let choice = value
             .get("choices")
             .and_then(|v| v.as_array())
@@ -1089,6 +1477,7 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
             reasoning_content: reasoning_out,
             tool_calls,
+            usage,
         })
     } else {
         parse_non_streaming_payload(body)
@@ -1337,6 +1726,164 @@ mod tests {
     }
 
     #[test]
+    fn thinking_mode_rejects_logprobs() {
+        let cfg = LlmConfig {
+            api_key: Some("test-key".to_string()),
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: Some(true),
+            top_logprobs: None,
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(4096)),
+            images: vec![],
+            response_format: None,
+        };
+        let err = client
+            .complete_chat(&req)
+            .expect_err("logprobs with thinking should fail");
+        assert!(err.to_string().contains("logprobs is incompatible with thinking mode"));
+    }
+
+    #[test]
+    fn thinking_mode_rejects_top_logprobs() {
+        let cfg = LlmConfig {
+            api_key: Some("test-key".to_string()),
+            ..LlmConfig::default()
+        };
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: Some(5),
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(4096)),
+            images: vec![],
+            response_format: None,
+        };
+        let err = client
+            .complete_chat(&req)
+            .expect_err("top_logprobs with thinking should fail");
+        assert!(err.to_string().contains("top_logprobs is incompatible with thinking mode"));
+    }
+
+    #[test]
+    fn thinking_mode_strips_sampling_params_from_payload() {
+        let cfg = LlmConfig::default();
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            presence_penalty: Some(0.1),
+            frequency_penalty: Some(0.2),
+            logprobs: None,
+            top_logprobs: None,
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(4096)),
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req);
+        // With thinking enabled, all sampling params must be omitted
+        assert!(payload.get("temperature").is_none(), "temperature should be stripped");
+        assert!(payload.get("top_p").is_none(), "top_p should be stripped");
+        assert!(payload.get("presence_penalty").is_none(), "presence_penalty should be stripped");
+        assert!(payload.get("frequency_penalty").is_none(), "frequency_penalty should be stripped");
+        // thinking config should be present
+        assert!(payload.get("thinking").is_some(), "thinking should be present");
+    }
+
+    #[test]
+    fn non_thinking_mode_includes_sampling_params_in_payload() {
+        let cfg = LlmConfig::default();
+        let client = DeepSeekClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: deepseek_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            presence_penalty: Some(0.1),
+            frequency_penalty: Some(0.2),
+            logprobs: Some(true),
+            top_logprobs: Some(3),
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req);
+        assert!(payload.get("temperature").is_some(), "temperature should be present");
+        assert!(payload.get("top_p").is_some(), "top_p should be present");
+        assert!(payload.get("presence_penalty").is_some(), "presence_penalty should be present");
+        assert!(payload.get("frequency_penalty").is_some(), "frequency_penalty should be present");
+        assert_eq!(payload["logprobs"], true);
+        assert_eq!(payload["top_logprobs"], 3);
+    }
+
+    #[test]
+    fn format_api_error_parses_structured_error() {
+        let body = r#"{"error": {"type": "invalid_request_error", "message": "logprobs is not supported with reasoning"}}"#;
+        let err = format_api_error(StatusCode::UNPROCESSABLE_ENTITY, body, 0, 3);
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 422"), "should mention 422: {msg}");
+        assert!(
+            msg.contains("invalid_request_error"),
+            "should include error type: {msg}"
+        );
+        assert!(
+            msg.contains("logprobs is not supported"),
+            "should include detail: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_api_error_400_includes_type() {
+        let body = r#"{"error": {"type": "invalid_format", "message": "bad json"}}"#;
+        let err = format_api_error(StatusCode::BAD_REQUEST, body, 0, 3);
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 400"), "should mention 400: {msg}");
+        assert!(msg.contains("invalid_format"), "should include type: {msg}");
+    }
+
+    #[test]
+    fn format_api_error_fallback_on_non_json_body() {
+        let body = "something went wrong";
+        let err = format_api_error(StatusCode::INTERNAL_SERVER_ERROR, body, 2, 3);
+        let msg = err.to_string();
+        assert!(msg.contains("something went wrong"), "should include raw body: {msg}");
+    }
+
+    #[test]
     fn non_deepseek_provider_is_rejected() {
         for provider in &["openai", "anthropic", "custom", "local", "ollama"] {
             let cfg = LlmConfig {
@@ -1498,8 +2045,14 @@ mod tests {
             tool_choice: deepseek_core::ToolChoice::none(),
             max_tokens: 64,
             temperature: Some(0.2),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: None,
             images: vec![],
+            response_format: None,
         };
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");
@@ -1530,8 +2083,14 @@ mod tests {
             tool_choice: deepseek_core::ToolChoice::none(),
             max_tokens: 64,
             temperature: Some(0.2),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: None,
             images: vec![],
+            response_format: None,
         };
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");
@@ -1567,8 +2126,14 @@ mod tests {
             tool_choice: deepseek_core::ToolChoice::none(),
             max_tokens: 64,
             temperature: Some(0.2),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             thinking: None,
             images: vec![],
+            response_format: None,
         };
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");

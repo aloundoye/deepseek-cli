@@ -36,6 +36,7 @@ use commands::memory::{run_export, run_memory};
 use commands::profile::{run_benchmark, run_profile};
 use commands::remote_env::run_remote_env;
 use commands::replay::run_replay;
+use commands::revert::run_revert;
 use commands::review::run_review;
 use commands::search::run_search;
 use commands::serve::{run_completions, run_native_host, run_serve};
@@ -316,6 +317,8 @@ enum Commands {
     Apply(ApplyArgs),
     Profile(ProfileArgs),
     Rewind(RewindArgs),
+    /// Revert the last N conversation turns.
+    Revert(RevertArgs),
     Export(ExportArgs),
     Memory {
         #[command(subcommand)]
@@ -552,6 +555,15 @@ struct ApplyArgs {
 struct RewindArgs {
     #[arg(long)]
     to_checkpoint: Option<String>,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args, Default)]
+struct RevertArgs {
+    /// Number of conversation turns to drop.
+    #[arg(long, default_value_t = 1)]
+    turns: u32,
     #[arg(long)]
     yes: bool,
 }
@@ -1582,7 +1594,8 @@ fn run() -> Result<()> {
             ensure_llm_ready(&cwd, cli.json)?;
             let engine = AgentEngine::new(&cwd)?;
             #[allow(deprecated)]
-            let plan = engine.plan_only(&args.prompt)?;
+            let options = chat_options_from_cli(&cli, false, ChatMode::Architect);
+            let plan = engine.plan_only(&args.prompt, &options)?;
             if cli.json {
                 print_json(&plan)?;
             } else {
@@ -1603,6 +1616,7 @@ fn run() -> Result<()> {
         Commands::Apply(args) => run_apply(&cwd, args, cli.json),
         Commands::Profile(args) => run_profile(&cwd, args, cli.json),
         Commands::Rewind(args) => run_rewind(&cwd, args, cli.json),
+        Commands::Revert(args) => run_revert(&cwd, args, cli.json),
         Commands::Export(args) => run_export(&cwd, args, cli.json),
         Commands::Memory { command } => run_memory(&cwd, command, cli.json),
         Commands::Mcp { command } => run_mcp(&cwd, command, cli.json),

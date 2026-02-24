@@ -4,9 +4,10 @@ base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 provider = "deepseek"
 profile = "v3_2"
-context_window_tokens = 1000000
+context_window_tokens = 128000
 temperature = 0.2
-endpoint = "https://api.deepseek.com/chat/completions"
+base_url = "https://api.deepseek.com"
+# endpoint = "https://api.deepseek.com/chat/completions" # legacy override
 # Optional workspace-local key override (prefer env in CI/prod):
 # api_key = "dsk-..."
 api_key_env = "DEEPSEEK_API_KEY"

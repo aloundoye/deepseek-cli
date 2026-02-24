@@ -203,6 +203,7 @@ pub fn tool_search_definition() -> ToolDefinition {
                           Returns matching tool names and descriptions that you can then use \
                           directly."
                 .to_string(),
+            strict: None,
             parameters: json!({
                 "type": "object",
                 "properties": {

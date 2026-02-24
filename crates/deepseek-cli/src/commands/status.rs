@@ -281,6 +281,8 @@ pub(crate) fn run_usage(cwd: &Path, args: UsageArgs, json_mode: bool) -> Result<
             "last_hours": lookback_hours,
         },
         "input_tokens": usage.input_tokens,
+        "cache_hit_tokens": usage.cache_hit_tokens,
+        "cache_miss_tokens": usage.cache_miss_tokens,
         "output_tokens": usage.output_tokens,
         "records": usage.records,
         "estimated_cost_usd": input_cost + output_cost,
@@ -292,8 +294,9 @@ pub(crate) fn run_usage(cwd: &Path, args: UsageArgs, json_mode: bool) -> Result<
         print_json(&payload)?;
     } else {
         println!(
-            "input_tokens={} output_tokens={} estimated_cost_usd={:.6} compactions={} rate_limits={}",
+            "input_tokens={} (cache={:.1}%) output_tokens={} estimated_cost_usd={:.6} compactions={} rate_limits={}",
             usage.input_tokens,
+            if usage.input_tokens > 0 { (usage.cache_hit_tokens as f64 / usage.input_tokens as f64) * 100.0 } else { 0.0 },
             usage.output_tokens,
             input_cost + output_cost,
             compactions.len(),

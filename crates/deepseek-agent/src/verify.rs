@@ -29,6 +29,7 @@ pub fn derive_verify_commands(workspace: &Path) -> Vec<String> {
 }
 
 pub fn run_verify(
+    workspace: &Path,
     tool_host: &LocalToolHost,
     commands: &[String],
     timeout_seconds: u64,
@@ -65,11 +66,21 @@ pub fn run_verify(
         if command_passed(&result.output, result.success) {
             continue;
         } else {
-            failures.push(format!(
+            let mut failure_message = format!(
                 "`{}` failed:\n{}",
                 command,
                 truncate(&output, 2500)
-            ));
+            );
+            
+            // FailureContextPack: Append auto-extracted files matching paths from the trace
+            let context_pack = build_failure_context_pack(workspace, &output);
+            if !context_pack.is_empty() {
+                failure_message.push_str("\n\n=== Failure Context Pack (Referenced Files) ===\n");
+                failure_message.push_str(&context_pack);
+                failure_message.push_str("===============================================\n");
+            }
+
+            failures.push(failure_message);
         }
     }
 
@@ -143,6 +154,52 @@ fn truncate(text: &str, max: usize) -> String {
         return text.to_string();
     }
     format!("{}...(truncated)", &text[..text.floor_char_boundary(max)])
+}
+
+fn build_failure_context_pack(workspace: &Path, output: &str) -> String {
+    use std::collections::HashSet;
+    use std::fs;
+
+    let mut found_files = HashSet::new();
+    let mut pack = String::new();
+
+    // Tokenize roughly to try finding workspace-relative files
+    for token in output.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=' || c == '[' || c == ']') {
+        // Strip common trailing punctuation (e.g., from Python stack trace: file.py:20)
+        let clean_token = token
+            .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.')
+            .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
+            
+        // Look for typical file names and line numbers
+        let path_str = if let Some(idx) = clean_token.rfind(':') {
+            &clean_token[..idx]
+        } else {
+            clean_token
+        };
+
+        if path_str.is_empty() || path_str.len() > 255 {
+            continue;
+        }
+
+        // Ignore things that are obviously not files (numbers, short words)
+        if !path_str.contains('.') && !path_str.contains('/') {
+            continue;
+        }
+
+        let full_path = workspace.join(path_str);
+        if full_path.is_file() && !found_files.contains(path_str) {
+            found_files.insert(path_str.to_string());
+            if let Ok(content) = fs::read_to_string(&full_path) {
+                let content_str = if content.len() > 8000 {
+                    format!("{}...(truncated)", &content[..8000])
+                } else {
+                    content
+                };
+                pack.push_str(&format!("\n--- Context Auto-Attached: {} ---\n{}\n", path_str, content_str));
+            }
+        }
+    }
+    pack
 }
 
 #[cfg(test)]
