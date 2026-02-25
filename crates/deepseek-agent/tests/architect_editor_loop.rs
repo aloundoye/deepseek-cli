@@ -223,45 +223,66 @@ fn patch_fails_to_apply_then_recovers() -> Result<()> {
 #[test]
 fn tests_fail_then_recovers() -> Result<()> {
     // This test verifies the orchestrator can re-architect and recover
-    // after a verify failure. We use a verify command that fails exactly
-    // once (creating a marker file), then succeeds on the retry within
-    // the same iteration via the MechanicalVerifyFailure path.
+    // after a verify failure loops back to Architect. The setup:
+    //   Iteration 1: Architect plans, Editor diffs `old → mid`. Apply succeeds.
+    //   Verify checks `grep mid demo.txt` → fails (we want "final", not "mid").
+    //   Engine fails: verify failure → micro-retries all fail (stale hash) → Architect.
+    //   Iteration 2: Architect plans, Editor diffs `mid → final`. Apply succeeds.
+    //   Verify checks `grep final demo.txt` → succeeds.
     let dir = tempfile::tempdir()?;
     init_git(dir.path())?;
     fs::write(dir.path().join("demo.txt"), "old\n")?;
     commit_all(dir.path(), "seed")?;
 
-    let good_diff = generate_diff(dir.path(), &[("demo.txt", "final\n")])?;
+    // Diff that changes "old" → "mid"
+    let diff1 = generate_diff(dir.path(), &[("demo.txt", "mid\n")])?;
 
-    let marker = dir.path().join(".verify_marker");
-    let verify_cmd = format!(
-        "test -f {} || (touch {} && false)",
-        marker.display(),
-        marker.display()
+    // Diff that changes "mid" → "final" (requires committing mid first)
+    fs::write(dir.path().join("demo.txt"), "mid\n")?;
+    commit_all(dir.path(), "interim_mid")?;
+    let diff2 = generate_diff(dir.path(), &[("demo.txt", "final\n")])?;
+
+    // Restore file to "old" for test run
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "restore_old")?;
+
+    // Plan 1: applies diff1 (old→mid), verify FAILS - search for a pattern that never exists
+    // rg exits non-zero when pattern not found = verify failure
+    let plan1 = format!(
+        "ARCHITECT_PLAN_V1\nPLAN|Update demo\nFILE|demo.txt|Replace old with mid\nVERIFY|rg VERIFY_FAIL_SIGNAL {}\nACCEPT|file updated\nARCHITECT_PLAN_END\n",
+        dir.path().join("demo.txt").display()
     );
 
-    let plan = format!(
-        "ARCHITECT_PLAN_V1\nPLAN|Update demo\nFILE|demo.txt|Replace old with final\nVERIFY|{}\nACCEPT|passes\nARCHITECT_PLAN_END\n",
-        verify_cmd
-    );
+    // Plan 2: applies diff2 (mid→final), verify PASSES - git status always exits 0
+    let plan2 = "ARCHITECT_PLAN_V1\nPLAN|Finalize demo\nFILE|demo.txt|Replace mid with final\nVERIFY|git status --short\nACCEPT|file updated\nARCHITECT_PLAN_END\n".to_string();
 
-    // The orchestrator's retry path on verify failure is:
-    //   architect(plan) → editor(diff) → apply → verify fails
-    //   → MechanicalVerifyFailure → continue editor_cycle → editor(diff) → apply(fail, already applied)
-    //   → micro retry → editor(diff) → apply(fail) → micro retry → editor(diff) → apply(fail)
-    //   → max retries → break editor_cycle → loop back → architect(plan) → editor(diff) ...
+    // The actual flow of responses (confirmed by debug traces):
+    // Iteration 1:
+    //   step_architect: reads plan1 [1]
+    //   step_editor:    reads diff1 → apply ok [2]
+    //   step_verify:    verify "grep -q final demo.txt" FAILS (content is "mid")
+    //   classify → MechanicalVerifyFailure (editor_retry_used=false) → Editor retry
+    //   step_editor:    reads diff1 → apply FAILS (stale hash, file already "mid") [3]
+    //   micro-retry 1:  step_editor reads diff1 → apply FAILS (stale) [4]
+    //   micro-retry 2:  step_editor reads diff1 → apply FAILS (stale) [5]
+    //   micro-retry 3:  step_editor reads diff1 → apply FAILS (stale) [6]
+    //   max micro-retries reached → Architect (Iteration 2)
     //
-    // With max_editor_apply_retries=3 and the marker verify failing once:
-    // Iteration 1: plan + diff + diff(apply fail, retry1) + diff(retry2) + diff(retry3) = 5
-    // Iteration 2: plan + diff = 2
-    // Total: ~7 minimum, provide 12 to cover edge cases + parse retries.
+    // Iteration 2:
+    //   step_architect: reads plan2 [7]
+    //   step_editor:    reads diff2 → apply ok (mid→final) [8]
+    //   step_verify:    verify "grep -q final demo.txt" PASSES (content is "final") → Final
     let mut responses: Vec<String> = Vec::new();
     // Iteration 1
-    responses.push(plan.clone());
-    for _ in 0..6 { responses.push(good_diff.clone()); }
+    responses.push(plan1.clone());
+    responses.push(diff1.clone()); // 1: apply ok (old→mid), verify fails
+    responses.push(diff1.clone()); // 2: MechanicalVerifyFailure editor retry, apply fails (stale hash)
+    responses.push(diff1.clone()); // 3: micro-retry 1, apply fails
+    responses.push(diff1.clone()); // 4: micro-retry 2, apply fails
+    responses.push(diff1.clone()); // 5: micro-retry 3: max retries → Architect
     // Iteration 2
-    responses.push(plan.clone());
-    for _ in 0..4 { responses.push(good_diff.clone()); }
+    responses.push(plan2.clone());
+    responses.push(diff2.clone()); // 6: apply ok (mid→final), verify passes → Final
 
     let engine = build_engine(dir.path(), responses)?;
 
@@ -277,6 +298,9 @@ fn tests_fail_then_recovers() -> Result<()> {
     assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "final\n");
     Ok(())
 }
+
+
+
 
 /// Golden cassette #5: Editor requests NEED_CONTEXT, context is merged,
 /// and the subsequent editor call emits a successful diff.

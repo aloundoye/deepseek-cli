@@ -24,6 +24,7 @@ glob.workspace = true
 regex.workspace = true
 crossterm.workspace = true
 base64.workspace = true
+termimad = "0.30"
 deepseek-agent = { path = "../deepseek-agent" }
 deepseek-core = { path = "../deepseek-core" }
 deepseek-diff = { path = "../deepseek-diff" }

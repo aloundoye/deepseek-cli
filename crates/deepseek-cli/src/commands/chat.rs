@@ -2165,72 +2165,73 @@ pub(crate) fn run_chat(
                 let _ = handle.flush();
             }));
         } else if !json_mode {
-            engine.set_stream_callback(std::sync::Arc::new(|chunk: deepseek_core::StreamChunk| {
-                use std::io::Write as _;
-                let out = std::io::stdout();
-                let mut handle = out.lock();
+            let md_renderer = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::md_render::StreamingMdRenderer::new(),
+            ));
+            let md_clone = md_renderer.clone();
+            engine.set_stream_callback(std::sync::Arc::new(move |chunk: deepseek_core::StreamChunk| {
                 match chunk {
                     deepseek_core::StreamChunk::ContentDelta(text) => {
-                        let _ = write!(handle, "{text}");
-                        let _ = handle.flush();
+                        if let Ok(mut renderer) = md_clone.lock() {
+                            renderer.push(&text);
+                        }
                     }
                     deepseek_core::StreamChunk::ReasoningDelta(_) => {}
                     deepseek_core::StreamChunk::ArchitectStarted { iteration: _ } => {
-                        let _ = writeln!(handle, "\n ◉  Understanding context and defining plan...");
+                        crate::md_render::print_phase("◉", "Planning", "understanding context and defining plan");
                     }
                     deepseek_core::StreamChunk::ArchitectCompleted {
                         files,
                         no_edit,
                         ..
                     } => {
-                        let status = if no_edit { "No changes needed".to_string() } else { format!("{files} files selected") };
-                        let _ = writeln!(handle, " ◯  Understanding completed ({status})");
+                        let detail = if no_edit { "no changes needed".to_string() } else { format!("{files} file(s) selected") };
+                        crate::md_render::print_phase_done(true, "Plan complete", &detail);
                     }
                     deepseek_core::StreamChunk::EditorStarted { files, .. } => {
-                        let _ = writeln!(handle, " ◉  Working on {files} files...");
+                        crate::md_render::print_phase("◉", "Editing", &format!("{files} file(s)"));
                     }
                     deepseek_core::StreamChunk::EditorCompleted { status, .. } => {
-                        let _ = writeln!(handle, " ◯  Working completed [{status}]");
+                        let success = status != "error";
+                        crate::md_render::print_phase_done(success, "Edit complete", &status);
                     }
                     deepseek_core::StreamChunk::ApplyStarted { .. } => {
-                        let _ = writeln!(handle, " ◉  Applying changes...");
+                        crate::md_render::print_phase("◉", "Applying", "writing changes to disk");
                     }
                     deepseek_core::StreamChunk::ApplyCompleted {
                         success,
                         ..
                     } => {
-                        let icon = if success { "◯" } else { "✗" };
-                        let _ = writeln!(handle, " {icon}  Applying changes");
+                        crate::md_render::print_phase_done(success, "Apply complete", "");
                     }
                     deepseek_core::StreamChunk::VerifyStarted {
                         commands,
                         ..
                     } => {
                         if !commands.is_empty() {
-                            let _ = writeln!(handle, " ◉  Verifying changes...");
+                            crate::md_render::print_phase("◉", "Verifying", &commands.join(", "));
                         }
                     }
                     deepseek_core::StreamChunk::VerifyCompleted {
                         success,
                         ..
                     } => {
-                        let icon = if success { "◯" } else { "✗" };
-                        let _ = writeln!(handle, " {icon}  Verifying changes");
+                        let label = if success { "Verification passed" } else { "Verification failed" };
+                        crate::md_render::print_phase_done(success, label, "");
                     }
                     deepseek_core::StreamChunk::LintStarted {
                         commands,
                         ..
                     } => {
                         if !commands.is_empty() {
-                            let _ = writeln!(handle, " ◉  Linting...");
+                            crate::md_render::print_phase("◉", "Linting", &commands.join(", "));
                         }
                     }
                     deepseek_core::StreamChunk::LintCompleted {
                         success,
                         ..
                     } => {
-                        let icon = if success { "◯" } else { "✗" };
-                        let _ = writeln!(handle, " {icon}  Linting");
+                        crate::md_render::print_phase_done(success, "Lint complete", "");
                     }
                     deepseek_core::StreamChunk::CommitProposal {
                         files,
@@ -2239,100 +2240,109 @@ pub(crate) fn run_chat(
                         suggested_message,
                         ..
                     } => {
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
                         let _ = writeln!(
                             handle,
-                            "[commit] ready files={} touched={} loc={} message=\"{}\"",
-                            files.join(","),
-                            touched_files,
-                            loc_delta,
-                            suggested_message
+                            "\n  \x1b[33m◆\x1b[0m  \x1b[1mCommit Proposal\x1b[0m — {} file(s), +{} LoC",
+                            touched_files, loc_delta
                         );
+                        for f in &files {
+                            let _ = writeln!(handle, "     \x1b[90m•\x1b[0m {f}");
+                        }
                         let _ = writeln!(
                             handle,
-                            "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
+                            "     \x1b[90mmessage:\x1b[0m \"{suggested_message}\""
                         );
+                        let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::CommitCompleted { sha, message } => {
-                        let _ = writeln!(handle, "[commit] completed sha={sha} message=\"{message}\"");
-                        let _ = handle.flush();
+                        crate::md_render::print_phase_done(true, "Committed", &format!("{} — {}", &sha[..7.min(sha.len())], message));
                     }
                     deepseek_core::StreamChunk::CommitSkipped => {
-                        let _ = writeln!(handle, "[commit] skipped by user");
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = writeln!(handle, "  \x1b[90m◦  Commit skipped\x1b[0m");
                         let _ = handle.flush();
                     }
-                    deepseek_core::StreamChunk::ToolCallStart {
-                        tool_name,
-                        args_summary,
-                    } => {
-                        let _ = writeln!(handle, "\n ⌘  Tool running: {tool_name} ({args_summary})");
-                        let _ = handle.flush();
+                    deepseek_core::StreamChunk::ToolCallStart { tool_name, args_summary } => {
+                        crate::md_render::print_phase("⚡", &tool_name, &args_summary);
                     }
                     deepseek_core::StreamChunk::ToolCallEnd {
                         tool_name,
                         duration_ms,
                         success,
-                        ..
+                        summary,
                     } => {
-                        let icon = if success { "✓" } else { "✗" };
+                        let detail = if summary.is_empty() {
+                            format!("{duration_ms}ms")
+                        } else {
+                            format!("{duration_ms}ms — {}", summary.replace('\n', " "))
+                        };
+                        crate::md_render::print_phase_done(success, &tool_name, &detail);
+                    }
+                    deepseek_core::StreamChunk::ModeTransition { from, to, reason } => {
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
                         let _ = writeln!(
                             handle,
-                            " {icon}  Tool finished: {tool_name} [{duration_ms}ms]"
+                            "  \x1b[35m→\x1b[0m  Mode: {from} → {to} \x1b[90m({reason})\x1b[0m"
                         );
                         let _ = handle.flush();
                     }
-                    deepseek_core::StreamChunk::ModeTransition { from, to, reason } => {
-                        let _ = writeln!(handle, "\n[mode: {from} -> {to}: {reason}]");
-                        let _ = handle.flush();
-                    }
-                    deepseek_core::StreamChunk::SubagentSpawned { run_id, name, goal } => {
-                        let _ = writeln!(handle, "[subagent:spawned] {name} ({run_id}) {goal}");
-                        let _ = handle.flush();
+                    deepseek_core::StreamChunk::SubagentSpawned {
+                        run_id: _,
+                        name,
+                        goal,
+                    } => {
+                        crate::md_render::print_phase("◉", &format!("Subagent: {name}"), &goal);
                     }
                     deepseek_core::StreamChunk::SubagentCompleted {
-                        run_id,
+                        run_id: _,
                         name,
                         summary,
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[subagent:completed] {name} ({run_id}) {}",
-                            summary.replace('\n', " ")
-                        );
-                        let _ = handle.flush();
+                        crate::md_render::print_phase_done(true, &format!("Subagent: {name}"), &summary.replace('\n', " "));
                     }
                     deepseek_core::StreamChunk::SubagentFailed {
-                        run_id,
+                        run_id: _,
                         name,
                         error,
                     } => {
-                        let _ = writeln!(
-                            handle,
-                            "[subagent:failed] {name} ({run_id}) {}",
-                            error.replace('\n', " ")
-                        );
-                        let _ = handle.flush();
+                        crate::md_render::print_phase_done(false, &format!("Subagent: {name}"), &error.replace('\n', " "));
                     }
                     deepseek_core::StreamChunk::ImageData { label, .. } => {
-                        let _ = writeln!(handle, "[image: {label}]");
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = writeln!(handle, "  \x1b[90m[image: {label}]\x1b[0m");
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::WatchTriggered { comment_count, .. } => {
-                        let _ = writeln!(handle, "[watch: {comment_count} comment(s) detected]");
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = writeln!(handle, "  \x1b[35m◉\x1b[0m  \x1b[1mWatch triggered\x1b[0m \x1b[90m({comment_count} comment(s))\x1b[0m");
                         let _ = handle.flush();
                     }
-                    deepseek_core::StreamChunk::ClearStreamingText => {
-                        // In non-TUI mode, nothing to clear — text already
-                        // written to stdout. Ignore.
-                    }
+                    deepseek_core::StreamChunk::ClearStreamingText => {}
                     deepseek_core::StreamChunk::Done => {
-                        let _ = writeln!(handle);
-                        let _ = handle.flush();
+                        // Flush any remaining partial line from the renderer
+                        if let Ok(mut renderer) = md_clone.lock() {
+                            renderer.flush_remaining();
+                        }
                     }
                 }
             }));
         }
 
         let images_for_turn = std::mem::take(&mut pending_images);
+        if !json_mode && !json_events {
+            crate::md_render::print_role_header("assistant", &cfg.llm.base_model);
+        }
         let output = engine.chat_with_options(
             prompt,
             ChatOptions {
@@ -2352,6 +2362,9 @@ pub(crate) fn run_chat(
             },
         )?;
         last_assistant_response = Some(output.clone());
+        if !json_mode && !json_events {
+            crate::md_render::print_role_footer();
+        }
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
             let suggestions = generate_prompt_suggestions(&output);

@@ -6,7 +6,6 @@ mod editor;
 mod gather_context;
 mod intent;
 pub mod linter;
-#[allow(dead_code)]
 mod r#loop;
 pub mod run_engine;
 mod repo_map_v2;
@@ -302,15 +301,29 @@ impl AgentEngine {
     }
 
     pub fn analyze_with_options(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        // Grab a clone of the stream callback (if any) to pass to analyze().
+        // complete_chat_streaming will fire ContentDelta per-token in real-time.
+        let stream_cb = self
+            .stream_callback
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+
         let response = analysis::analyze(
             self.llm.as_ref(),
             &self.cfg,
             &self.workspace,
             prompt,
             &options,
+            stream_cb.clone(),
         )?;
-        self.stream(StreamChunk::ContentDelta(response.clone()));
-        self.stream(StreamChunk::Done);
+
+        // If we streamed token-by-token, complete_chat_streaming already emitted Done.
+        // Only emit bulk ContentDelta + Done for the non-streaming fallback path.
+        if stream_cb.is_none() {
+            self.stream(StreamChunk::ContentDelta(response.clone()));
+            self.stream(StreamChunk::Done);
+        }
         Ok(response)
     }
 
@@ -425,6 +438,42 @@ impl AgentEngine {
 
         // Fire Stop hooks for post-processing (logging, notifications, etc.)
         self.fire_stop();
+
+        result
+    }
+
+    /// Alternative agent loop with integrated lint auto-fix, failure classification,
+    /// and commit proposals. Uses a monolithic loop (architect → editor → lint → verify)
+    /// instead of the state-machine `RunEngine` approach.
+    pub fn chat_loop(&self, prompt: &str, options: ChatOptions) -> Result<String> {
+        let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
+
+        // Load chat history from the store if possible
+        let mut options = options;
+        if let Ok(Some(session)) = self.store.load_latest_session() {
+            if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
+                options.chat_history = projection.chat_messages;
+            }
+        }
+
+        // Record User Turn
+        self.append_event_best_effort(EventKind::ChatTurnV1 {
+            message: ChatMessage::User {
+                content: prompt_enriched.clone(),
+            },
+        });
+
+        let result = r#loop::run(self, &prompt_enriched, &options);
+
+        if let Ok(text) = &result {
+            self.append_event_best_effort(EventKind::ChatTurnV1 {
+                message: ChatMessage::Assistant {
+                    content: Some(text.clone()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                },
+            });
+        }
 
         result
     }

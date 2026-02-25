@@ -16,6 +16,7 @@ use context_enhanced::errors as enhanced_errors;
 
 mod commands;
 mod context;
+mod md_render;
 mod output;
 mod util;
 

@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use deepseek_core::{AppConfig, ChatMessage, ChatRequest, ToolChoice};
+use deepseek_core::{AppConfig, ChatMessage, ChatRequest, StreamCallback, ToolChoice};
 use deepseek_llm::LlmClient;
 use std::path::Path;
 
@@ -12,6 +12,7 @@ pub fn analyze(
     workspace: &Path,
     prompt: &str,
     options: &ChatOptions,
+    stream_cb: Option<StreamCallback>,
 ) -> Result<String> {
     let workspace = options.repo_root_override.as_deref().unwrap_or(workspace);
     let bootstrap = gather_context::gather_for_prompt(
@@ -87,7 +88,18 @@ pub fn analyze(
             response_format: None,
         };
 
-        let response = llm.complete_chat(&request)?;
+        // First attempt: use streaming so the renderer can display tokens in real-time.
+        // Repair attempts fall back to blocking since the first-pass stream already completed.
+        let response = if attempt == 0 {
+            if let Some(ref cb) = stream_cb {
+                llm.complete_chat_streaming(&request, cb.clone())?
+            } else {
+                llm.complete_chat(&request)?
+            }
+        } else {
+            // Repair pass: stream already done, use blocking to avoid double output
+            llm.complete_chat(&request)?
+        };
         let violation = if enforce_profile_shape {
             validate_analysis_shape(&response.text, bootstrap.vague_codebase_prompt)
         } else {

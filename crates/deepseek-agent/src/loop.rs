@@ -1,41 +1,21 @@
-use crate::apply::{apply_unified_diff, diff_stats, ensure_repo_relative_path, hash_text};
+use crate::apply::{apply_unified_diff, diff_stats};
 use crate::architect::{ArchitectFeedback, ArchitectInput, ArchitectPlan, run_architect};
-use crate::editor::{EditorFileContext, EditorInput, EditorResponse, FileRequest, run_editor};
+use crate::editor::{EditorInput, EditorResponse, run_editor};
+use crate::run_engine::{
+    FailureClass, FailureTracker,
+    build_commit_message, build_expected_hashes, checkpoint_best_effort,
+    classify_verify_failure, format_no_edit_response, format_success_response,
+    load_architect_files, merge_requested_files, propose_commit,
+    require_patch_approval,
+};
 use crate::verify::{derive_verify_commands, run_verify};
 use crate::{AgentEngine, ChatOptions};
 use anyhow::{Result, anyhow};
-use deepseek_core::{EventKind, FailureClassifierConfig, StreamChunk, ToolCall};
-use deepseek_memory::MemoryManager;
-use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use deepseek_core::{EventKind, StreamChunk};
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureClass {
-    PatchMismatch,
-    MechanicalVerifyFailure,
-    RepeatedVerifyFailure,
-    DesignMismatch,
-}
 
-impl FailureClass {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::PatchMismatch => "PatchMismatch",
-            Self::MechanicalVerifyFailure => "MechanicalVerifyFailure",
-            Self::RepeatedVerifyFailure => "RepeatedVerifyFailure",
-            Self::DesignMismatch => "DesignMismatch",
-        }
-    }
-}
-
-#[derive(Default)]
-struct FailureTracker {
-    last_fingerprint: Option<String>,
-    repeat_count: u64,
-    last_error_set: Option<HashSet<String>>,
-}
 
 pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<String> {
     let mut feedback = ArchitectFeedback::default();
@@ -512,393 +492,6 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     ))
 }
 
-fn require_patch_approval(engine: &AgentEngine, diff: &str) -> Result<bool> {
-    let stats = diff_stats(diff);
-    let gate = &engine.cfg.agent_loop.safety_gate;
-    let files_over = stats.touched_files as u64 > gate.max_files_without_approval;
-    let loc_over = stats.loc_delta as u64 > gate.max_loc_without_approval;
-    if !files_over && !loc_over {
-        return Ok(true);
-    }
-
-    let call = ToolCall {
-        name: "patch.apply".to_string(),
-        args: json!({
-            "touched_files": stats.touched_files,
-            "loc_delta": stats.loc_delta,
-            "max_files_without_approval": gate.max_files_without_approval,
-            "max_loc_without_approval": gate.max_loc_without_approval,
-        }),
-        requires_approval: true,
-    };
-
-    if let Ok(mut guard) = engine.approval_handler.lock()
-        && let Some(handler) = guard.as_mut()
-    {
-        return handler(&call);
-    }
-    Ok(false)
-}
-
-/// Ask the user whether to commit after a successful verify pass.
-/// If the user accepts (or provides a custom message), stage and commit the changed files.
-/// If the user declines or no handler is set, skip silently.
-fn propose_commit(engine: &AgentEngine, changed_files: &[String], suggested_message: &str) {
-    use deepseek_core::UserQuestion;
-    use std::process::Command;
-
-    let handler = if let Ok(guard) = engine.user_question_handler.lock() {
-        guard.clone()
-    } else {
-        None
-    };
-
-    let handler = match handler {
-        Some(h) => h,
-        None => {
-            // No user question handler — skip commit proposal
-            engine.stream(StreamChunk::CommitSkipped);
-            return;
-        }
-    };
-
-    let question = UserQuestion {
-        question: format!(
-            "Commit {} changed file(s)?\nSuggested message: \"{}\"\n\nReply 'yes' to accept, type a custom message, or 'no' to skip.",
-            changed_files.len(),
-            suggested_message
-        ),
-        options: vec![
-            "yes".to_string(),
-            "no".to_string(),
-        ],
-    };
-
-    let answer = match handler(question) {
-        Some(a) => a,
-        None => {
-            engine.stream(StreamChunk::CommitSkipped);
-            return;
-        }
-    };
-
-    let answer_lower = answer.trim().to_ascii_lowercase();
-    if answer_lower == "no" || answer_lower == "skip" || answer_lower.is_empty() {
-        engine.stream(StreamChunk::CommitSkipped);
-        return;
-    }
-
-    let commit_message = if answer_lower == "yes" || answer_lower == "y" {
-        suggested_message.to_string()
-    } else {
-        // User provided a custom message
-        answer.trim().to_string()
-    };
-
-    // Stage changed files
-    let mut stage_args = vec!["add", "--"];
-    let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
-    stage_args.extend(file_refs);
-
-    let stage_result = Command::new("git")
-        .args(&stage_args)
-        .current_dir(&engine.workspace)
-        .output();
-
-    if let Err(e) = stage_result {
-        engine.stream(StreamChunk::ContentDelta(format!(
-            "\nFailed to stage files: {e}\n"
-        )));
-        engine.stream(StreamChunk::CommitSkipped);
-        return;
-    }
-
-    // Commit
-    let mut commit_args = vec!["commit", "-m", &commit_message];
-    if engine.cfg.git.require_signing {
-        commit_args.push("-S");
-    }
-
-    let commit_result = Command::new("git")
-        .args(&commit_args)
-        .current_dir(&engine.workspace)
-        .output();
-
-    match commit_result {
-        Ok(output) if output.status.success() => {
-            // Extract SHA from commit output
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let sha = stdout
-                .split_whitespace()
-                .find(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
-                .unwrap_or("unknown")
-                .to_string();
-            engine.stream(StreamChunk::CommitCompleted {
-                sha,
-                message: commit_message,
-            });
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            engine.stream(StreamChunk::ContentDelta(format!(
-                "\nCommit failed: {stderr}\n"
-            )));
-            engine.stream(StreamChunk::CommitSkipped);
-        }
-        Err(e) => {
-            engine.stream(StreamChunk::ContentDelta(format!(
-                "\nCommit failed: {e}\n"
-            )));
-            engine.stream(StreamChunk::CommitSkipped);
-        }
-    }
-}
-
-fn build_expected_hashes(file_context: &[EditorFileContext]) -> HashMap<String, String> {
-    file_context
-        .iter()
-        .filter_map(|file| {
-            file.base_hash
-                .as_ref()
-                .map(|hash| (file.path.clone(), hash.clone()))
-        })
-        .collect()
-}
-
-fn classify_verify_failure(
-    summary: &str,
-    tracker: &mut FailureTracker,
-    cfg: &FailureClassifierConfig,
-    editor_retry_used: bool,
-) -> (FailureClass, String, f32, usize, usize) {
-    let error_set = normalize_error_set(summary, cfg.fingerprint_lines as usize);
-    let mut sorted = error_set.iter().cloned().collect::<Vec<_>>();
-    sorted.sort();
-    let fingerprint = hash_text(&sorted.join("\n"));
-    let same_fingerprint = tracker
-        .last_fingerprint
-        .as_ref()
-        .is_some_and(|last| last == &fingerprint);
-    let old_set = tracker.last_error_set.clone().unwrap_or_default();
-
-    if same_fingerprint {
-        tracker.repeat_count = tracker.repeat_count.saturating_add(1);
-    } else {
-        tracker.repeat_count = 1;
-    }
-
-    let mut class = FailureClass::MechanicalVerifyFailure;
-    let mut similarity = 0.0_f32;
-    let repeat_threshold = cfg.repeat_threshold.max(1);
-    if tracker.repeat_count >= repeat_threshold || (editor_retry_used && same_fingerprint) {
-        if old_set.is_empty() {
-            class = FailureClass::RepeatedVerifyFailure;
-        } else {
-            similarity = jaccard_similarity(&old_set, &error_set);
-            let materially_reduced =
-                error_set.len() < old_set.len() || similarity < cfg.similarity_threshold;
-            class = if materially_reduced {
-                FailureClass::RepeatedVerifyFailure
-            } else {
-                FailureClass::DesignMismatch
-            };
-        }
-    }
-
-    tracker.last_fingerprint = Some(fingerprint.clone());
-    tracker.last_error_set = Some(error_set.clone());
-    (
-        class,
-        fingerprint,
-        similarity,
-        old_set.len(),
-        error_set.len(),
-    )
-}
-
-fn normalize_error_set(summary: &str, max_lines: usize) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for line in summary.lines().take(max_lines.max(1)) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        let normalized = lower
-            .chars()
-            .map(|ch| if ch.is_ascii_digit() { '#' } else { ch })
-            .collect::<String>();
-        let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !normalized.is_empty() {
-            out.insert(normalized);
-        }
-    }
-    out
-}
-
-fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let intersection = a.intersection(b).count() as f32;
-    let union = a.union(b).count() as f32;
-    if union <= f32::EPSILON {
-        0.0
-    } else {
-        intersection / union
-    }
-}
-
-fn checkpoint_best_effort(workspace: &Path, reason: &str) {
-    if let Ok(manager) = MemoryManager::new(workspace) {
-        // Prefer git shadow commit; fall back to file-based checkpoint
-        if manager.create_shadow_commit(reason).is_err() {
-            let _ = manager.create_checkpoint(reason);
-        }
-    }
-}
-
-fn load_architect_files(
-    workspace: &Path,
-    plan: &ArchitectPlan,
-    max_files: usize,
-    max_file_bytes: usize,
-) -> Result<Vec<EditorFileContext>> {
-    let mut files = Vec::new();
-    for file in plan.files.iter().take(max_files.max(1)) {
-        files.push(read_file_context(
-            workspace,
-            &file.path,
-            None,
-            max_file_bytes,
-        )?);
-    }
-    Ok(files)
-}
-
-fn merge_requested_files(
-    workspace: &Path,
-    plan: &ArchitectPlan,
-    current: &mut Vec<EditorFileContext>,
-    requests: &[FileRequest],
-    max_file_bytes: usize,
-    max_context_range_lines: usize,
-) -> Result<()> {
-    let allowed: HashSet<&str> = plan.files.iter().map(|f| f.path.as_str()).collect();
-    let mut by_path: HashMap<String, usize> = current
-        .iter()
-        .enumerate()
-        .map(|(idx, f)| (f.path.clone(), idx))
-        .collect();
-
-    for req in requests {
-        if !allowed.contains(req.path.as_str()) {
-            return Err(anyhow!(
-                "requested context for undeclared file: {}",
-                req.path
-            ));
-        }
-        ensure_repo_relative_path(&req.path).map_err(|e| anyhow!(e.reason))?;
-        if let Some((start, end)) = req.range {
-            let lines = end.saturating_sub(start).saturating_add(1);
-            if lines > max_context_range_lines {
-                return Err(anyhow!(
-                    "requested context range too large for {}: {} lines > {}",
-                    req.path,
-                    lines,
-                    max_context_range_lines
-                ));
-            }
-        }
-
-        let ctx = read_file_context(workspace, &req.path, req.range, max_file_bytes)?;
-        if let Some(idx) = by_path.get(&req.path).copied() {
-            current[idx] = ctx;
-        } else {
-            by_path.insert(req.path.clone(), current.len());
-            current.push(ctx);
-        }
-    }
-    Ok(())
-}
-
-fn read_file_context(
-    workspace: &Path,
-    rel_path: &str,
-    range: Option<(usize, usize)>,
-    max_file_bytes: usize,
-) -> Result<EditorFileContext> {
-    ensure_repo_relative_path(rel_path).map_err(|e| anyhow!(e.reason))?;
-    let full_path = workspace.join(rel_path);
-    if !full_path.exists() {
-        return Ok(EditorFileContext {
-            path: rel_path.to_string(),
-            content: String::new(),
-            partial: false,
-            base_hash: None,
-        });
-    }
-
-    let raw = fs::read_to_string(&full_path)?;
-    let base_hash = Some(hash_text(&raw));
-    let content = if let Some((start, end)) = range {
-        slice_lines(&raw, start, end)
-    } else {
-        raw
-    };
-
-    if content.len() > max_file_bytes {
-        Ok(EditorFileContext {
-            path: rel_path.to_string(),
-            content: content[..content.floor_char_boundary(max_file_bytes)].to_string(),
-            partial: true,
-            base_hash,
-        })
-    } else {
-        Ok(EditorFileContext {
-            path: rel_path.to_string(),
-            content,
-            partial: range.is_some(),
-            base_hash,
-        })
-    }
-}
-
-fn slice_lines(content: &str, start: usize, end: usize) -> String {
-    let start = start.max(1);
-    let end = end.max(start);
-    content
-        .lines()
-        .enumerate()
-        .filter(|(idx, _)| {
-            let line = idx + 1;
-            line >= start && line <= end
-        })
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn format_success_response(plan: &ArchitectPlan, verify_commands: &[String]) -> String {
-    let mut out = String::new();
-    out.push_str("Implemented the architect plan and verified locally.\n");
-    if !plan.steps.is_empty() {
-        out.push_str("\nPlan executed:\n");
-        for step in &plan.steps {
-            out.push_str(&format!("- {}\n", step));
-        }
-    }
-    if !verify_commands.is_empty() {
-        out.push_str("\nVerification:\n");
-        for command in verify_commands {
-            out.push_str(&format!("- `{}`\n", command));
-        }
-    }
-    out.push_str(
-        "\n✅ Verify passed. Run `/commit` to save changes, `/diff` to review, `/undo` to revert.",
-    );
-    out.trim_end().to_string()
-}
 
 fn format_plan_only_response(plan: &ArchitectPlan) -> String {
     let mut out = String::new();
@@ -912,34 +505,27 @@ fn format_plan_only_response(plan: &ArchitectPlan) -> String {
     out.trim_end().to_string()
 }
 
-fn format_no_edit_response(plan: &ArchitectPlan, reason: &str) -> String {
-    let mut out = String::new();
-    out.push_str(reason);
-    if !plan.steps.is_empty() {
-        out.push_str("\n\nRecommended steps:\n");
-        for step in &plan.steps {
-            out.push_str(&format!("- {}\n", step));
-        }
-    }
-    out.trim_end().to_string()
-}
-
-fn build_commit_message(template: &str, prompt: &str) -> String {
-    let mut goal = prompt.trim().replace('\n', " ");
-    if goal.len() > 72 {
-        goal.truncate(goal.floor_char_boundary(72));
-    }
-    if goal.is_empty() {
-        goal = "apply verified changes".to_string();
-    }
-    template.replace("{goal}", goal.trim())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::architect::{ArchitectFileIntent, ArchitectPlan};
+    use crate::run_engine::{normalize_error_set, jaccard_similarity};
     use deepseek_core::FailureClassifierConfig;
+
+    fn slice_lines(content: &str, start: usize, end: usize) -> String {
+        let start = start.max(1);
+        let end = end.max(start);
+        content
+            .lines()
+            .enumerate()
+            .filter(|(idx, _)| {
+                let line = idx + 1;
+                line >= start && line <= end
+            })
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     // ── failure classification ──────────────────────────────────────────
 
@@ -1124,7 +710,7 @@ mod tests {
         let response = format_success_response(&plan, &verify);
         assert!(response.contains("Add feature"));
         assert!(response.contains("cargo test"));
-        assert!(response.contains("Verify passed"));
+        assert!(response.contains("Implemented"));
     }
 
     #[test]

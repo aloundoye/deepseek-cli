@@ -14,7 +14,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureClass {
+pub(crate) enum FailureClass {
     PatchMismatch,
     MechanicalVerifyFailure,
     RepeatedVerifyFailure,
@@ -22,7 +22,7 @@ enum FailureClass {
 }
 
 impl FailureClass {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::PatchMismatch => "PatchMismatch",
             Self::MechanicalVerifyFailure => "MechanicalVerifyFailure",
@@ -33,10 +33,10 @@ impl FailureClass {
 }
 
 #[derive(Default)]
-struct FailureTracker {
-    last_fingerprint: Option<String>,
-    repeat_count: u64,
-    last_error_set: Option<HashSet<String>>,
+pub(crate) struct FailureTracker {
+    pub(crate) last_fingerprint: Option<String>,
+    pub(crate) repeat_count: u64,
+    pub(crate) last_error_set: Option<HashSet<String>>,
 }
 
 pub struct RunEngine<'a> {
@@ -142,6 +142,11 @@ impl<'a> RunEngine<'a> {
     }
 
     fn step_architect(&mut self) -> Result<RunState> {
+        // Reset per-iteration state trackers
+        self.editor_micro_retries = 0;
+        self.editor_retry_used = false;
+        self.context_requests = 0;
+        
         self.engine.stream(StreamChunk::ArchitectStarted { iteration: self.iteration });
         let cfg = &self.engine.cfg.agent_loop;
 
@@ -382,6 +387,14 @@ impl<'a> RunEngine<'a> {
                     self.feedback.verify_feedback = None;
                     // Fail back to architect if we can't complete the edit
                     self.iteration += 1;
+                    if self.iteration > cfg.max_iterations.max(1) as u64 {
+                        return Err(anyhow!(
+                            "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
+                            cfg.max_iterations,
+                            self.feedback.apply_feedback,
+                            self.feedback.verify_feedback
+                        ));
+                    }
                     return Ok(RunState::Architect);
                 }
 
@@ -400,6 +413,14 @@ impl<'a> RunEngine<'a> {
                     ));
                     self.feedback.verify_feedback = None;
                     self.iteration += 1;
+                    if self.iteration > cfg.max_iterations.max(1) as u64 {
+                        return Err(anyhow!(
+                            "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
+                            cfg.max_iterations,
+                            self.feedback.apply_feedback,
+                            self.feedback.verify_feedback
+                        ));
+                    }
                     return Ok(RunState::Architect);
                 }
                 // Try editor again
@@ -421,6 +442,15 @@ impl<'a> RunEngine<'a> {
             ));
             self.feedback.verify_feedback = None;
             self.iteration += 1;
+            if self.iteration > cfg.max_iterations.max(1) as u64 {
+                return Err(anyhow!(
+                    "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
+                    cfg.max_iterations,
+                    self.feedback.apply_feedback,
+                    self.feedback.verify_feedback
+                ));
+            }
+
             return Ok(RunState::Architect);
         }
 
@@ -439,6 +469,7 @@ impl<'a> RunEngine<'a> {
 
         match apply_result {
             Ok(success) => {
+
                 checkpoint_best_effort(&self.engine.workspace, "agent_post_apply");
                 let summary = format!(
                     "patch={} files={}",
@@ -452,26 +483,97 @@ impl<'a> RunEngine<'a> {
                 });
                 self.feedback.apply_feedback = None;
                 self.feedback.last_diff_summary = Some(summary);
+                
+                // ── Lint auto-fix sub-loop ──────────────────────
+                let lint_commands = crate::linter::derive_lint_commands(
+                    &cfg.lint,
+                    &success.changed_files,
+                );
+                if !lint_commands.is_empty() {
+                    let lint_iter = 1; // Simplify to single lint execution per iteration in the state machine
+                    self.engine.stream(StreamChunk::LintStarted {
+                        iteration: lint_iter,
+                        commands: lint_commands.clone(),
+                    });
+
+                    let lint_result = if let Ok(mut approval_guard) =
+                        self.engine.approval_handler.lock()
+                    {
+                        let callback = approval_guard.as_mut().map(|cb| {
+                            cb as &mut dyn FnMut(&deepseek_core::ToolCall) -> anyhow::Result<bool>
+                        });
+                        crate::linter::run_lint(
+                            self.engine.tool_host.as_ref(),
+                            &lint_commands,
+                            cfg.lint.timeout_seconds,
+                            callback,
+                        )
+                    } else {
+                        crate::linter::run_lint(
+                            self.engine.tool_host.as_ref(),
+                            &lint_commands,
+                            cfg.lint.timeout_seconds,
+                            None,
+                        )
+                    };
+
+                    if lint_result.success {
+                        self.engine.stream(StreamChunk::LintCompleted {
+                            iteration: lint_iter,
+                            success: true,
+                            fixed: lint_result.fixed,
+                            remaining: 0,
+                        });
+                    } else {
+                        self.engine.stream(StreamChunk::LintCompleted {
+                            iteration: lint_iter,
+                            success: false,
+                            fixed: lint_result.fixed,
+                            remaining: lint_result.remaining,
+                        });
+                        
+                        // Transition to editor for lint fixes
+                        self.feedback.verify_feedback = Some(format!(
+                            "LINT_ERRORS (iteration {}):\n{}",
+                            lint_iter, lint_result.summary
+                        ));
+                        self.feedback.apply_feedback = None;
+                        return Ok(RunState::Editor);
+                    }
+                }
+                // ── End lint sub-loop ────────────────────────────
+
                 Ok(RunState::Verify)
             }
             Err(error) => {
+
                 self.engine.stream(StreamChunk::ApplyCompleted {
                     iteration: self.iteration,
                     success: false,
                     summary: error.to_feedback(),
                 });
                 
-                if self.editor_micro_retries < cfg.max_editor_apply_retries as u64 {
-                    self.editor_micro_retries += 1;
+                if self.editor_micro_retries >= cfg.max_editor_apply_retries as u64 {
                     self.feedback.apply_feedback = Some(error.to_feedback());
                     self.feedback.verify_feedback = None;
-                    return Ok(RunState::Editor);
+                    self.iteration += 1;
+                    if self.iteration > cfg.max_iterations.max(1) as u64 {
+                        return Err(anyhow!(
+                            "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
+                            cfg.max_iterations,
+                            self.feedback.apply_feedback,
+                            self.feedback.verify_feedback
+                        ));
+                    }
+
+                    return Ok(RunState::Architect);
                 }
                 
+                self.editor_micro_retries += 1;
                 self.feedback.apply_feedback = Some(error.to_feedback());
                 self.feedback.verify_feedback = None;
-                self.iteration += 1;
-                Ok(RunState::Architect)
+
+                Ok(RunState::Editor)
             }
         }
     }
@@ -490,6 +592,7 @@ impl<'a> RunEngine<'a> {
             iteration: self.iteration,
             commands: verify_commands.clone(),
         });
+
 
         let verify_result = if let Ok(mut approval_guard) = self.engine.approval_handler.lock() {
             let callback = approval_guard.as_mut().map(|cb| {
@@ -629,10 +732,11 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         response_str.unwrap_or_else(|| "Completed".to_string())
     };
     
+    engine.stream(StreamChunk::Done);
     Ok(out)
 }
 
-fn require_patch_approval(engine: &AgentEngine, diff: &str) -> Result<bool> {
+pub(crate) fn require_patch_approval(engine: &AgentEngine, diff: &str) -> Result<bool> {
     let stats = diff_stats(diff);
     let gate = &engine.cfg.agent_loop.safety_gate;
     let files_over = stats.touched_files as u64 > gate.max_files_without_approval;
@@ -669,7 +773,7 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str) -> Result<bool> {
     }
 }
 
-fn build_commit_message(template: &str, prompt: &str) -> String {
+pub(crate) fn build_commit_message(template: &str, prompt: &str) -> String {
     let mut goal = prompt.trim().replace('\n', " ");
     if goal.len() > 72 {
         goal.truncate(goal.floor_char_boundary(72));
@@ -683,7 +787,7 @@ fn build_commit_message(template: &str, prompt: &str) -> String {
 /// Ask the user whether to commit after a successful verify pass.
 /// If the user accepts (or provides a custom message), stage and commit the changed files.
 /// If the user declines or no handler is set, skip silently.
-fn propose_commit(engine: &AgentEngine, changed_files: &[String], suggested_message: &str) {
+pub(crate) fn propose_commit(engine: &AgentEngine, changed_files: &[String], suggested_message: &str) {
     use deepseek_core::UserQuestion;
     use std::process::Command;
 
@@ -794,7 +898,7 @@ fn propose_commit(engine: &AgentEngine, changed_files: &[String], suggested_mess
     }
 }
 
-fn build_expected_hashes(file_context: &[EditorFileContext]) -> HashMap<String, String> {
+pub(crate) fn build_expected_hashes(file_context: &[EditorFileContext]) -> HashMap<String, String> {
     file_context
         .iter()
         .filter_map(|file| {
@@ -805,7 +909,7 @@ fn build_expected_hashes(file_context: &[EditorFileContext]) -> HashMap<String, 
         .collect()
 }
 
-fn classify_verify_failure(
+pub(crate) fn classify_verify_failure(
     summary: &str,
     tracker: &mut FailureTracker,
     cfg: &FailureClassifierConfig,
@@ -856,7 +960,7 @@ fn classify_verify_failure(
     )
 }
 
-fn normalize_error_set(summary: &str, max_lines: usize) -> HashSet<String> {
+pub(crate) fn normalize_error_set(summary: &str, max_lines: usize) -> HashSet<String> {
     let mut out = HashSet::new();
     for line in summary.lines().take(max_lines.max(1)) {
         let trimmed = line.trim();
@@ -876,7 +980,7 @@ fn normalize_error_set(summary: &str, max_lines: usize) -> HashSet<String> {
     out
 }
 
-fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
+pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
@@ -889,7 +993,7 @@ fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
     }
 }
 
-fn checkpoint_best_effort(workspace: &Path, reason: &str) {
+pub(crate) fn checkpoint_best_effort(workspace: &Path, reason: &str) {
     if let Ok(manager) = MemoryManager::new(workspace) {
         // Prefer git shadow commit; fall back to file-based checkpoint
         if manager.create_shadow_commit(reason).is_err() {
@@ -898,7 +1002,7 @@ fn checkpoint_best_effort(workspace: &Path, reason: &str) {
     }
 }
 
-fn load_architect_files(
+pub(crate) fn load_architect_files(
     workspace: &Path,
     plan: &ArchitectPlan,
     max_files: usize,
@@ -916,7 +1020,7 @@ fn load_architect_files(
     Ok(files)
 }
 
-fn merge_requested_files(
+pub(crate) fn merge_requested_files(
     workspace: &Path,
     plan: &ArchitectPlan,
     current: &mut Vec<EditorFileContext>,
@@ -965,7 +1069,7 @@ fn merge_requested_files(
     Ok(())
 }
 
-fn read_file_context(
+pub(crate) fn read_file_context(
     workspace: &Path,
     rel_path: &str,
     range: Option<(usize, usize)>,
@@ -1033,19 +1137,20 @@ fn merge_file_context(
     read_file_context(workspace, &current.path, new_range, max_file_bytes)
 }
 
-fn format_no_edit_response(plan: &ArchitectPlan, reason: &str) -> String {
-    let mut out = format!("⚠️ **No Edits Performed**\n*Reason:* {}\n\n", reason);
+pub(crate) fn format_no_edit_response(plan: &ArchitectPlan, reason: &str) -> String {
+    let mut out = String::new();
+    out.push_str(reason);
     if !plan.steps.is_empty() {
-        out.push_str("**Analysis/Plan:**\n");
-        for (i, step) in plan.steps.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n", i + 1, step));
+        out.push_str("\n\nRecommended steps:\n");
+        for step in &plan.steps {
+            out.push_str(&format!("- {}\n", step));
         }
     }
-    out
+    out.trim_end().to_string()
 }
 
-fn format_success_response(plan: &ArchitectPlan, verify_commands: &[String]) -> String {
-    let mut out = String::from("✅ **Patch Verified & Applied**\n\n**Steps Completed:**\n");
+pub(crate) fn format_success_response(plan: &ArchitectPlan, verify_commands: &[String]) -> String {
+    let mut out = String::from("✅ **Implemented & Verified** — Patch Applied\n\n**Steps Completed:**\n");
     for (i, step) in plan.steps.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, step));
     }
