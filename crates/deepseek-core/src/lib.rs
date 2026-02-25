@@ -1338,7 +1338,9 @@ pub enum StreamChunk {
     /// so the interleaved text fragments should be discarded from the display.
     ClearStreamingText,
     /// Streaming is done; the final assembled response follows.
-    Done,
+    /// An optional reason string explains *why* the agent stopped
+    /// (e.g. "max iterations reached", "plan dedup", content filter).
+    Done { reason: Option<String> },
 }
 
 /// Canonical stream-json event representation used across CLI/TUI/RPC adapters.
@@ -1529,9 +1531,13 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
         StreamChunk::ClearStreamingText => serde_json::json!({
             "type": "clear_streaming_text",
         }),
-        StreamChunk::Done => serde_json::json!({
-            "type": "done",
-        }),
+        StreamChunk::Done { reason } => {
+            let mut obj = serde_json::json!({ "type": "done" });
+            if let Some(r) = reason {
+                obj["reason"] = serde_json::json!(r);
+            }
+            obj
+        }
     }
 }
 
@@ -1649,6 +1655,29 @@ pub fn strip_prior_reasoning_content(messages: &mut [ChatMessage]) {
             *reasoning_content = None;
         }
     }
+}
+
+/// Rough token estimate: ~4 chars per token for English (conservative).
+/// DeepSeek docs say ~0.3 tokens/char; we use 0.25 as safety margin.
+pub fn estimate_message_tokens(messages: &[ChatMessage]) -> u64 {
+    let total_chars: u64 = messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::System { content } => content.len() as u64,
+            ChatMessage::User { content } => content.len() as u64,
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => {
+                content.as_deref().map_or(0, |c| c.len() as u64)
+                    + reasoning_content.as_deref().map_or(0, |r| r.len() as u64)
+                    + tool_calls.iter().map(|tc| tc.arguments.len() as u64).sum::<u64>()
+            }
+            ChatMessage::Tool { content, .. } => content.len() as u64,
+        })
+        .sum();
+    total_chars / 4
 }
 
 /// A tool (function) definition sent to the LLM.
@@ -3236,6 +3265,122 @@ mod tests {
         } = &messages[1]
         {
             assert_eq!(reasoning_content.as_deref(), Some("thinking"));
+        }
+    }
+
+    // ── P0 estimate_message_tokens tests ──────────────────────────────
+
+    #[test]
+    fn estimate_message_tokens_basic() {
+        // 400 chars → ~100 tokens
+        let messages = vec![ChatMessage::User {
+            content: "a".repeat(400),
+        }];
+        assert_eq!(estimate_message_tokens(&messages), 100);
+    }
+
+    #[test]
+    fn estimate_message_tokens_empty() {
+        assert_eq!(estimate_message_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_message_tokens_multi_role() {
+        let messages = vec![
+            ChatMessage::System {
+                content: "x".repeat(100),
+            },
+            ChatMessage::User {
+                content: "y".repeat(200),
+            },
+            ChatMessage::Assistant {
+                content: Some("z".repeat(100)),
+                reasoning_content: Some("r".repeat(200)),
+                tool_calls: vec![],
+            },
+        ];
+        // (100 + 200 + 100 + 200) / 4 = 150
+        assert_eq!(estimate_message_tokens(&messages), 150);
+    }
+
+    // ── P0 strip_reasoning_from_prior_turns tests ─────────────────────
+
+    #[test]
+    fn strip_reasoning_from_prior_turns() {
+        let mut messages = vec![
+            ChatMessage::User {
+                content: "turn 1 question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("turn 1 answer".to_string()),
+                reasoning_content: Some("turn 1 thinking".to_string()),
+                tool_calls: vec![],
+            },
+            ChatMessage::User {
+                content: "turn 2 question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("turn 2 answer".to_string()),
+                reasoning_content: Some("turn 2 thinking".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+        strip_prior_reasoning_content(&mut messages);
+        // Turn 1 assistant reasoning cleared
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[1]
+        {
+            assert!(reasoning_content.is_none(), "turn 1 reasoning should be stripped");
+        }
+        // Turn 2 assistant reasoning kept (current turn)
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[3]
+        {
+            assert_eq!(reasoning_content.as_deref(), Some("turn 2 thinking"));
+        }
+    }
+
+    #[test]
+    fn strip_reasoning_preserves_current_tool_loop() {
+        let mut messages = vec![
+            ChatMessage::User {
+                content: "question".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("thinking step 1".to_string()),
+                reasoning_content: Some("reasoning 1".to_string()),
+                tool_calls: vec![LlmToolCall {
+                    id: "c1".to_string(),
+                    name: "test".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c1".to_string(),
+                content: "result".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("thinking step 2".to_string()),
+                reasoning_content: Some("reasoning 2".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+        strip_prior_reasoning_content(&mut messages);
+        // All assistant messages are after the last User message (idx 0),
+        // so they're all in the "current" turn and reasoning is preserved.
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[1]
+        {
+            assert_eq!(reasoning_content.as_deref(), Some("reasoning 1"));
+        }
+        if let ChatMessage::Assistant {
+            reasoning_content, ..
+        } = &messages[3]
+        {
+            assert_eq!(reasoning_content.as_deref(), Some("reasoning 2"));
         }
     }
 }

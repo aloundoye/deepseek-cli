@@ -495,7 +495,7 @@ impl DeepSeekClient {
                             }
                             let chunk = trimmed.trim_start_matches("data:").trim();
                             if chunk == "[DONE]" {
-                                cb(StreamChunk::Done);
+                                cb(StreamChunk::Done { reason: None });
                                 break;
                             }
                             let value: Value = match serde_json::from_str(chunk) {
@@ -609,7 +609,7 @@ impl DeepSeekClient {
                             }
                             let chunk = trimmed.trim_start_matches("data:").trim();
                             if chunk == "[DONE]" {
-                                cb(StreamChunk::Done);
+                                cb(StreamChunk::Done { reason: None });
                                 break;
                             }
                             let value: Value = match serde_json::from_str(chunk) {
@@ -844,7 +844,7 @@ impl DeepSeekClient {
                             }
                             let chunk = trimmed.trim_start_matches("data:").trim();
                             if chunk == "[DONE]" {
-                                cb(StreamChunk::Done);
+                                cb(StreamChunk::Done { reason: None });
                                 break;
                             }
                             let value: Value = match serde_json::from_str(chunk) {
@@ -2554,7 +2554,7 @@ mod tests {
             StreamChunk::ContentDelta(text) => {
                 chunks_clone.lock().expect("test lock").push(text);
             }
-            StreamChunk::Done => {
+            StreamChunk::Done { .. } => {
                 chunks_clone
                     .lock()
                     .expect("test lock")
@@ -2588,5 +2588,119 @@ mod tests {
         unsafe {
             std::env::remove_var("DEEPSEEK_API_KEY_STREAM_TEST");
         }
+    }
+
+    // ── P0-06: SSE keep-alive test coverage ───────────────────────────
+
+    #[test]
+    fn sse_keep_alive_lines_are_ignored() {
+        let body = concat!(
+            ": keep-alive\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            ": keep-alive\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            ": keep-alive\n\n",
+            "data: [DONE]"
+        );
+        let got = parse_streaming_payload(body).expect("stream parse");
+        assert_eq!(got.text, "hello");
+    }
+
+    #[test]
+    fn sse_empty_comment_lines_ignored() {
+        let body = concat!(
+            ":\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            ":\n\n",
+            "data: [DONE]"
+        );
+        let got = parse_streaming_payload(body).expect("stream parse");
+        assert_eq!(got.text, "hi");
+    }
+
+    #[test]
+    fn sse_blank_lines_between_events() {
+        let body = concat!(
+            "\n\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
+            "\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n",
+            "\n",
+            "data: [DONE]"
+        );
+        let got = parse_streaming_payload(body).expect("stream parse");
+        assert_eq!(got.text, "onetwo");
+    }
+
+    // ── P0-05: Usage parsing tests ────────────────────────────────────
+
+    #[test]
+    fn parse_usage_all_fields() {
+        let usage_json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_cache_hit_tokens": 30,
+            "prompt_cache_miss_tokens": 70,
+            "completion_tokens_details": {
+                "reasoning_tokens": 20
+            }
+        });
+        let usage = parse_usage_object(Some(&usage_json)).expect("should parse");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.prompt_cache_hit_tokens, 30);
+        assert_eq!(usage.prompt_cache_miss_tokens, 70);
+        assert_eq!(usage.reasoning_tokens, 20);
+    }
+
+    #[test]
+    fn parse_usage_defaults_missing() {
+        let usage_json = serde_json::json!({
+            "prompt_tokens": 42,
+            "completion_tokens": 10
+        });
+        let usage = parse_usage_object(Some(&usage_json)).expect("should parse");
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.prompt_cache_hit_tokens, 0);
+        assert_eq!(usage.prompt_cache_miss_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_none_returns_none() {
+        assert!(parse_usage_object(None).is_none());
+    }
+
+    // ── P0-07/10: Retry status tests ─────────────────────────────────
+
+    #[test]
+    fn http_429_is_retryable() {
+        assert!(should_retry_status(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn http_500_is_retryable() {
+        assert!(should_retry_status(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn http_503_is_retryable() {
+        assert!(should_retry_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn http_401_is_not_retryable() {
+        assert!(!should_retry_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn http_400_is_not_retryable() {
+        assert!(!should_retry_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn http_422_is_not_retryable() {
+        assert!(!should_retry_status(StatusCode::UNPROCESSABLE_ENTITY));
     }
 }

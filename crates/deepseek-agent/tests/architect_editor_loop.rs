@@ -363,7 +363,7 @@ fn no_edit_response_exits_early() -> Result<()> {
                 format!("ArchitectCompleted(no_edit={})", no_edit)
             }
             StreamChunk::EditorStarted { .. } => "EditorStarted".to_string(),
-            StreamChunk::Done => "Done".to_string(),
+            StreamChunk::Done { .. } => "Done".to_string(),
             _ => return,
         };
         if let Ok(mut guard) = events_clone.lock() {
@@ -431,7 +431,7 @@ fn lint_loop_runs_when_configured() -> Result<()> {
                 iteration, success, ..
             } => format!("LintCompleted(iter={},success={})", iteration, success),
             StreamChunk::ArchitectStarted { .. } => "ArchitectStarted".to_string(),
-            StreamChunk::Done => "Done".to_string(),
+            StreamChunk::Done { .. } => "Done".to_string(),
             _ => return,
         };
         if let Ok(mut guard) = events_clone.lock() {
@@ -707,5 +707,359 @@ fn commit_proposal_custom_message() -> Result<()> {
         "git log should contain custom message; got: {}",
         log_str
     );
+    Ok(())
+}
+
+// ── ScriptedLlm variant that supports custom finish_reason ──────────
+
+struct ScriptedLlmWithFinishReason {
+    responses: Mutex<VecDeque<(String, String)>>, // (text, finish_reason)
+}
+
+impl ScriptedLlmWithFinishReason {
+    fn new(responses: Vec<(String, String)>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+        }
+    }
+
+    fn next_response(&self) -> anyhow::Result<(String, String)> {
+        let mut guard = self
+            .responses
+            .lock()
+            .map_err(|_| anyhow!("scripted llm mutex poisoned"))?;
+        guard
+            .pop_front()
+            .ok_or_else(|| anyhow!("scripted llm exhausted"))
+    }
+}
+
+impl LlmClient for ScriptedLlmWithFinishReason {
+    fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete() not used"))
+    }
+
+    fn complete_streaming(
+        &self,
+        _req: &LlmRequest,
+        _cb: StreamCallback,
+    ) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_streaming() not used"))
+    }
+
+    fn complete_chat(&self, _req: &ChatRequest) -> anyhow::Result<LlmResponse> {
+        let (text, finish_reason) = self.next_response()?;
+        Ok(LlmResponse {
+            text,
+            finish_reason,
+            reasoning_content: String::new(),
+            tool_calls: Vec::<LlmToolCall>::new(),
+            usage: None,
+        })
+    }
+
+    fn complete_chat_streaming(
+        &self,
+        _req: &ChatRequest,
+        _cb: StreamCallback,
+    ) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_chat_streaming() not used"))
+    }
+
+    fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_fim() not used"))
+    }
+
+    fn complete_fim_streaming(
+        &self,
+        _req: &deepseek_core::FimRequest,
+        _cb: StreamCallback,
+    ) -> anyhow::Result<LlmResponse> {
+        Err(anyhow!("complete_fim_streaming() not used"))
+    }
+}
+
+/// P0-03: finish_reason "content_filter" stops architect with error.
+#[test]
+fn finish_reason_content_filter_stops_architect() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "content\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Do thing\nFILE|demo.txt|Edit\nVERIFY|true\nACCEPT|done\nARCHITECT_PLAN_END\n".to_string();
+    let llm = Box::new(ScriptedLlmWithFinishReason::new(vec![
+        (plan, "content_filter".to_string()),
+    ]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    let result = engine.chat_with_options(
+        "Edit demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("content filter"),
+        "error should mention content filter; got: {err_msg}"
+    );
+    Ok(())
+}
+
+/// P0-03: finish_reason "length" emits warning but still uses the plan.
+#[test]
+fn finish_reason_length_emits_warning() -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo file\nFILE|demo.txt|Replace old with new\nVERIFY|git status --short\nACCEPT|demo updated\nARCHITECT_PLAN_END\n".to_string();
+
+    let llm = Box::new(ScriptedLlmWithFinishReason::new(vec![
+        (plan, "length".to_string()),
+        (good_diff, "stop".to_string()),
+    ]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        if let StreamChunk::ContentDelta(text) = &chunk {
+            if text.contains("[warn]") {
+                if let Ok(mut guard) = events_clone.lock() {
+                    guard.push(text.clone());
+                }
+            }
+        }
+    }));
+
+    let output = engine.chat_with_options(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    // Plan was still used despite truncation warning
+    assert!(
+        output.contains("Implemented"),
+        "plan should still succeed; got: {output}"
+    );
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| e.contains("truncated")),
+        "should emit truncation warning; events: {:?}",
+        *captured
+    );
+    Ok(())
+}
+
+/// P0-03: max_iterations emits Done with reason.
+#[test]
+fn max_iterations_emits_done_with_reason() -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    // Plan that uses NO_EDIT so we skip editor entirely. The plan
+    // has no files so loop.rs just returns the plan-only response,
+    // which hits the success path (not the max-iterations path).
+    // Instead, use a plan with a file and VERIFY that always fails,
+    // and provide enough editor responses for the retry cycle.
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let good_diff2 = good_diff.clone();
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Do thing\nFILE|demo.txt|Edit\nVERIFY|false\nACCEPT|done\nARCHITECT_PLAN_END\n".to_string();
+
+    // Provide enough responses: architect(1) + editor(1) + editor retry after verify fail(1)
+    let llm = Box::new(ScriptedLlm::new(vec![plan, good_diff, good_diff2]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    engine.cfg_mut().agent_loop.max_iterations = 1;
+    engine.cfg_mut().agent_loop.max_editor_apply_retries = 0;
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        if let StreamChunk::Done { reason } = &chunk {
+            let label = format!("Done(reason={:?})", reason);
+            if let Ok(mut guard) = events_clone.lock() {
+                guard.push(label);
+            }
+        }
+    }));
+
+    // Use chat_loop which goes through loop.rs (has the Done { reason } logic)
+    let result = engine.chat_loop(
+        "Edit demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("max iterations"),
+        "error should mention max iterations; got: {err_msg}"
+    );
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| e.contains("max iterations")),
+        "should emit Done with max iterations reason; events: {:?}",
+        *captured
+    );
+    Ok(())
+}
+
+/// P0-09: Identical plans trigger dedup stop.
+#[test]
+fn identical_plans_trigger_dedup_stop() -> Result<()> {
+    use deepseek_core::StreamChunk;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    // Same plan text repeated — should trigger dedup on iteration 2
+    let plan = "ARCHITECT_PLAN_V1\nPLAN|Update demo file\nFILE|demo.txt|Replace old with new\nVERIFY|false\nACCEPT|demo updated\nARCHITECT_PLAN_END\n".to_string();
+    let plan2 = plan.clone();
+    // Supply enough responses for retry cycles.
+    // The loop may retry editor multiple times before hitting iteration 2.
+    let mut responses = vec![plan];
+    for _ in 0..6 {
+        responses.push(good_diff.clone());
+    }
+    responses.push(plan2);
+    for _ in 0..6 {
+        responses.push(good_diff.clone());
+    }
+    let llm = Box::new(ScriptedLlm::new(responses));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+    engine.cfg_mut().agent_loop.max_iterations = 3;
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    engine.set_stream_callback(Arc::new(move |chunk: StreamChunk| {
+        if let StreamChunk::Done { reason } = &chunk {
+            let label = format!("Done(reason={:?})", reason);
+            if let Ok(mut guard) = events_clone.lock() {
+                guard.push(label);
+            }
+        }
+    }));
+
+    let result = engine.chat_loop(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("near-identical"),
+        "error should mention near-identical; got: {err_msg}"
+    );
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| e.contains("near-identical")),
+        "should emit Done with dedup reason; events: {:?}",
+        *captured
+    );
+    Ok(())
+}
+
+/// P0-10: Hash mismatch detected when file is modified between plan and apply.
+#[test]
+fn hash_mismatch_detected_on_stale_file() -> Result<()> {
+    use deepseek_agent::apply::{apply_unified_diff, hash_text};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    let original = "line one\nline two\n";
+    fs::write(dir.path().join("demo.txt"), original)?;
+    commit_all(dir.path(), "seed")?;
+
+    // Compute hash from original content (simulating editor context load)
+    let original_hash = hash_text(original);
+    let mut expected_hashes = HashMap::new();
+    expected_hashes.insert("demo.txt".to_string(), original_hash);
+
+    // Now modify file externally (simulating concurrent edit)
+    fs::write(dir.path().join("demo.txt"), "line one\nmodified line two\n")?;
+
+    // Try to apply diff based on original content
+    let diff = "--- a/demo.txt\n+++ b/demo.txt\n@@ -1,2 +1,2 @@\n line one\n-line two\n+line three\n";
+    let mut allowed = HashSet::new();
+    allowed.insert("demo.txt".to_string());
+
+    let result = apply_unified_diff(
+        dir.path(),
+        diff,
+        &allowed,
+        &expected_hashes,
+        deepseek_core::ApplyStrategy::Auto,
+    );
+
+    assert!(result.is_err(), "should fail on hash mismatch");
+    let err = result.unwrap_err();
+    assert!(
+        err.reason.contains("hash mismatch"),
+        "should mention hash mismatch; got: {}",
+        err.reason
+    );
+    Ok(())
+}
+
+/// P0-09: Different plans do not trigger dedup.
+#[test]
+fn different_plans_do_not_trigger_dedup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_git(dir.path())?;
+    fs::write(dir.path().join("demo.txt"), "old\n")?;
+    commit_all(dir.path(), "seed")?;
+
+    let good_diff = generate_diff(dir.path(), &[("demo.txt", "new\n")])?;
+    let llm = Box::new(ScriptedLlm::new(vec![
+        "ARCHITECT_PLAN_V1\nPLAN|First approach\nFILE|demo.txt|Edit\nVERIFY|git status --short\nACCEPT|ok\nARCHITECT_PLAN_END\n".to_string(),
+        good_diff,
+    ]));
+    let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    let result = engine.chat_loop(
+        "Update demo.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    );
+
+    // Should succeed (no dedup triggered for first iteration)
+    assert!(result.is_ok(), "should succeed; got: {:?}", result);
     Ok(())
 }

@@ -21,6 +21,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     let mut feedback = ArchitectFeedback::default();
     let cfg = &engine.cfg.agent_loop;
     let mut failure_tracker = FailureTracker::default();
+    let mut prev_plan_raw: Option<String> = None;
 
     for iteration in 1..=cfg.max_iterations.max(1) {
         engine.stream(StreamChunk::ArchitectStarted { iteration });
@@ -47,6 +48,26 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             no_edit: plan.no_edit_reason.is_some(),
         });
 
+        // Plan-level dedup: stop if architect producing near-identical plans
+        if let Some(ref prev) = prev_plan_raw {
+            let prev_words: HashSet<String> =
+                prev.split_whitespace().map(String::from).collect();
+            let curr_words: HashSet<String> =
+                plan.raw.split_whitespace().map(String::from).collect();
+            let sim = crate::run_engine::jaccard_similarity(&prev_words, &curr_words);
+            if sim > 0.90 {
+                let reason = format!(
+                    "Stopped: architect producing near-identical plans (similarity={:.0}%)",
+                    sim * 100.0
+                );
+                engine.stream(StreamChunk::Done {
+                    reason: Some(reason.clone()),
+                });
+                return Err(anyhow!("{reason}"));
+            }
+        }
+        prev_plan_raw = Some(plan.raw.clone());
+
         if !plan.subagents.is_empty() {
             let mut findings = Vec::new();
             if let Some(worker) = engine.subagent_worker() {
@@ -54,7 +75,6 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                     let mut handles = Vec::new();
                     for (name, goal) in &plan.subagents {
                         let worker_clone = worker.clone();
-                        let _task_name = format!("subagent-{}", name);
                         let sub_task = deepseek_subagent::SubagentTask {
                             run_id: uuid::Uuid::now_v7(),
                             name: name.clone(),
@@ -64,12 +84,33 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
                             read_only_fallback: true,
                             custom_agent: None,
                         };
-                        handles.push(s.spawn(move || {
-                            worker_clone(&sub_task).unwrap_or_else(|e| format!("Failed to run {name}: {e}"))
-                        }));
+                        // Log ToolProposedV1 before spawning
+                        engine.append_event_best_effort(EventKind::ToolProposedV1 {
+                            proposal: deepseek_core::ToolProposal {
+                                invocation_id: sub_task.run_id,
+                                call: deepseek_core::ToolCall {
+                                    name: format!("subagent.{}", name),
+                                    args: serde_json::json!({"goal": goal}),
+                                    requires_approval: false,
+                                },
+                                approved: true,
+                            },
+                        });
+                        let run_id = sub_task.run_id;
+                        handles.push((run_id, name.clone(), s.spawn(move || {
+                            worker_clone(&sub_task).unwrap_or_else(|e| format!("Failed to run {}: {e}", sub_task.name))
+                        })));
                     }
-                    for handle in handles {
+                    for (run_id, _name, handle) in handles {
                         if let Ok(result) = handle.join() {
+                            // Log ToolResultV1 after completion
+                            engine.append_event_best_effort(EventKind::ToolResultV1 {
+                                result: deepseek_core::ToolResult {
+                                    invocation_id: run_id,
+                                    success: true,
+                                    output: serde_json::json!({"output": &result}),
+                                },
+                            });
                             findings.push(result);
                         }
                     }
@@ -86,14 +127,14 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         if let Some(reason) = plan.no_edit_reason.clone() {
             let response = format_no_edit_response(&plan, &reason);
             engine.stream(StreamChunk::ContentDelta(response.clone()));
-            engine.stream(StreamChunk::Done);
+            engine.stream(StreamChunk::Done { reason: None });
             return Ok(response);
         }
 
         if plan.files.is_empty() {
             let response = format_plan_only_response(&plan);
             engine.stream(StreamChunk::ContentDelta(response.clone()));
-            engine.stream(StreamChunk::Done);
+            engine.stream(StreamChunk::Done { reason: None });
             return Ok(response);
         }
 
@@ -425,7 +466,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
 
                         let response = format_success_response(&plan, &verify_commands);
                         engine.stream(StreamChunk::ContentDelta(response.clone()));
-                        engine.stream(StreamChunk::Done);
+                        engine.stream(StreamChunk::Done { reason: None });
                         return Ok(response);
                     }
 
@@ -484,9 +525,15 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         }
     }
 
+    let reason = format!(
+        "max iterations ({}) reached without passing verification",
+        cfg.max_iterations
+    );
+    engine.stream(StreamChunk::Done {
+        reason: Some(reason.clone()),
+    });
     Err(anyhow!(
-        "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
-        cfg.max_iterations,
+        "{reason}; last_apply={:?}; last_verify={:?}",
         feedback.apply_feedback,
         feedback.verify_feedback
     ))

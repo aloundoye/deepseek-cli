@@ -99,6 +99,23 @@ pub fn run_architect(
 
     for attempt in 0..=retries {
         deepseek_core::strip_prior_reasoning_content(&mut messages);
+
+        // Context window pre-flight: trim oldest non-system messages if near limit
+        let estimated = deepseek_core::estimate_message_tokens(&messages);
+        let window = engine.cfg.llm.context_window_tokens;
+        if window > 0 && estimated > window * 95 / 100 {
+            let target = window * 80 / 100;
+            while deepseek_core::estimate_message_tokens(&messages) > target && messages.len() > 2
+            {
+                messages.remove(1); // Remove oldest non-system message
+            }
+            engine.stream(deepseek_core::StreamChunk::ContentDelta(format!(
+                "[info] Context trimmed: ~{}K / {}K tokens\n",
+                estimated / 1000,
+                window / 1000
+            )));
+        }
+
         let req = ChatRequest {
             model: engine.cfg.llm.max_think_model.clone(),
             messages: messages.clone(),
@@ -119,6 +136,17 @@ pub fn run_architect(
         let response = engine.llm.complete_chat(&req)?;
         if let Some(usage) = &response.usage {
             engine.record_usage(&req.model, usage);
+        }
+        match response.finish_reason.as_str() {
+            "content_filter" => {
+                return Err(anyhow!("API content filter triggered on architect response"));
+            }
+            "length" => {
+                engine.stream(deepseek_core::StreamChunk::ContentDelta(
+                    "[warn] Architect response truncated (max_tokens reached)\n".into(),
+                ));
+            }
+            _ => {} // "stop" is normal
         }
         match parse_architect_plan(&response.text) {
             Ok(mut plan) => {

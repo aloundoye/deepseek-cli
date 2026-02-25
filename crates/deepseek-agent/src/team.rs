@@ -167,7 +167,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         response = response.trim_end().to_string();
     }
     engine.stream(StreamChunk::ContentDelta(response.clone()));
-    engine.stream(StreamChunk::Done);
+    engine.stream(StreamChunk::Done { reason: None });
     Ok(response)
 }
 

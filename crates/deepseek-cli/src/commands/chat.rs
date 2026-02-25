@@ -2131,7 +2131,7 @@ pub(crate) fn run_chat(
                         deepseek_core::StreamChunk::ImageData { .. } => "ImageData",
                         deepseek_core::StreamChunk::WatchTriggered { .. } => "WatchTriggered",
                         deepseek_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
-                        deepseek_core::StreamChunk::Done => "Done",
+                        deepseek_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
                         deepseek_core::StreamChunk::ContentDelta(text) | deepseek_core::StreamChunk::ReasoningDelta(text) => {
@@ -2329,7 +2329,7 @@ pub(crate) fn run_chat(
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ClearStreamingText => {}
-                    deepseek_core::StreamChunk::Done => {
+                    deepseek_core::StreamChunk::Done { .. } => {
                         // Flush any remaining partial line from the renderer
                         if let Ok(mut renderer) = md_clone.lock() {
                             renderer.flush_remaining();
@@ -3267,7 +3267,7 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
                 }
-                StreamChunk::Done => {}
+                StreamChunk::Done { .. } => {}
             }));
 
             let prompt_repo_root_override = repo_root_override.clone();
@@ -4413,7 +4413,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     // In non-TUI mode, nothing to clear — text already
                     // written to stdout.
                 }
-                StreamChunk::Done => {
+                StreamChunk::Done { .. } => {
                     let _ = writeln!(handle);
                     let _ = handle.flush();
                 }

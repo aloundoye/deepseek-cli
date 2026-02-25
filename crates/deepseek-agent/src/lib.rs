@@ -1,5 +1,5 @@
 mod analysis;
-mod apply;
+pub mod apply;
 mod architect;
 mod complexity;
 mod editor;
@@ -253,6 +253,11 @@ impl AgentEngine {
         self.subagent_worker.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Mutable access to the configuration for test overrides.
+    pub fn cfg_mut(&mut self) -> &mut deepseek_core::AppConfig {
+        &mut self.cfg
+    }
+
     /// Fire PreToolUse hooks. Returns the aggregate result.
     /// Callers should check `result.blocked` to decide whether to skip tool execution.
     pub fn fire_pre_tool_use(&self, tool_name: &str, tool_input: &serde_json::Value) -> deepseek_hooks::HookResult {
@@ -322,7 +327,7 @@ impl AgentEngine {
         // Only emit bulk ContentDelta + Done for the non-streaming fallback path.
         if stream_cb.is_none() {
             self.stream(StreamChunk::ContentDelta(response.clone()));
-            self.stream(StreamChunk::Done);
+            self.stream(StreamChunk::Done { reason: None });
         }
         Ok(response)
     }

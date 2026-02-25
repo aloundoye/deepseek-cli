@@ -94,6 +94,22 @@ impl<'a> RunEngine<'a> {
         })
     }
 
+    fn max_iterations_exceeded(&self) -> anyhow::Error {
+        let cfg = &self.engine.cfg.agent_loop;
+        let reason = format!(
+            "max iterations ({}) reached without passing verification",
+            cfg.max_iterations
+        );
+        self.engine.stream(StreamChunk::Done {
+            reason: Some(reason.clone()),
+        });
+        anyhow!(
+            "{reason}; last_apply={:?}; last_verify={:?}",
+            self.feedback.apply_feedback,
+            self.feedback.verify_feedback
+        )
+    }
+
     pub fn advance(&mut self) -> Result<Option<String>> {
         // Evaluate the state machine until Final
         loop {
@@ -388,12 +404,7 @@ impl<'a> RunEngine<'a> {
                     // Fail back to architect if we can't complete the edit
                     self.iteration += 1;
                     if self.iteration > cfg.max_iterations.max(1) as u64 {
-                        return Err(anyhow!(
-                            "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
-                            cfg.max_iterations,
-                            self.feedback.apply_feedback,
-                            self.feedback.verify_feedback
-                        ));
+                        return Err(self.max_iterations_exceeded());
                     }
                     return Ok(RunState::Architect);
                 }
@@ -414,12 +425,7 @@ impl<'a> RunEngine<'a> {
                     self.feedback.verify_feedback = None;
                     self.iteration += 1;
                     if self.iteration > cfg.max_iterations.max(1) as u64 {
-                        return Err(anyhow!(
-                            "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
-                            cfg.max_iterations,
-                            self.feedback.apply_feedback,
-                            self.feedback.verify_feedback
-                        ));
+                        return Err(self.max_iterations_exceeded());
                     }
                     return Ok(RunState::Architect);
                 }
@@ -443,12 +449,7 @@ impl<'a> RunEngine<'a> {
             self.feedback.verify_feedback = None;
             self.iteration += 1;
             if self.iteration > cfg.max_iterations.max(1) as u64 {
-                return Err(anyhow!(
-                    "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
-                    cfg.max_iterations,
-                    self.feedback.apply_feedback,
-                    self.feedback.verify_feedback
-                ));
+                return Err(self.max_iterations_exceeded());
             }
 
             return Ok(RunState::Architect);
@@ -558,12 +559,7 @@ impl<'a> RunEngine<'a> {
                     self.feedback.verify_feedback = None;
                     self.iteration += 1;
                     if self.iteration > cfg.max_iterations.max(1) as u64 {
-                        return Err(anyhow!(
-                            "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
-                            cfg.max_iterations,
-                            self.feedback.apply_feedback,
-                            self.feedback.verify_feedback
-                        ));
+                        return Err(self.max_iterations_exceeded());
                     }
 
                     return Ok(RunState::Architect);
@@ -671,14 +667,9 @@ impl<'a> RunEngine<'a> {
         self.iteration += 1;
         
         if self.iteration > cfg.max_iterations.max(1) as u64 {
-            return Err(anyhow!(
-                "max iterations ({}) reached without passing verification; last_apply={:?}; last_verify={:?}",
-                cfg.max_iterations,
-                self.feedback.apply_feedback,
-                self.feedback.verify_feedback
-            ));
+            return Err(self.max_iterations_exceeded());
         }
-        
+
         Ok(RunState::Architect)
     }
 
@@ -732,7 +723,7 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
         response_str.unwrap_or_else(|| "Completed".to_string())
     };
     
-    engine.stream(StreamChunk::Done);
+    engine.stream(StreamChunk::Done { reason: None });
     Ok(out)
 }
 
