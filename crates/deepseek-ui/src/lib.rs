@@ -126,6 +126,8 @@ pub enum TuiStreamEvent {
         tool_name: String,
         duration_ms: u64,
         summary: String,
+        /// Whether the tool call succeeded (true) or failed (false).
+        success: bool,
     },
     /// The agent needs user approval before proceeding.
     ApprovalNeeded {
@@ -3249,6 +3251,11 @@ where
                         if success { "ok" } else { "failed" },
                         truncate_inline(&summary.replace('\n', " "), 120)
                     ));
+                    if success {
+                        shell.push_system(
+                            "\x1b[2mtip: use /rewind to undo changes\x1b[0m".to_string(),
+                        );
+                    }
                     info_line = format!(
                         "iter {iteration} verify {}",
                         if success { "ok" } else { "failed" }
@@ -3347,8 +3354,10 @@ where
                     tool_name,
                     duration_ms,
                     summary,
+                    success,
                 } => {
-                    shell.push_tool_result(&tool_name, duration_ms, &summary);
+                    let marker = if success { "✓" } else { "✗" };
+                    shell.push_tool_result(&format!("{marker} {tool_name}"), duration_ms, &summary);
                     shell.active_tool = None;
                 }
                 TuiStreamEvent::ModeTransition { from, to, reason } => {

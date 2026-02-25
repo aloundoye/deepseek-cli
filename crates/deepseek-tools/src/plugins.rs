@@ -20,6 +20,24 @@ pub struct PluginManifest {
     pub version: String,
     #[serde(default)]
     pub description: String,
+    /// Optional LSP server configurations bundled with the plugin.
+    #[serde(default)]
+    pub lsp: Vec<PluginLspConfig>,
+}
+
+/// LSP server configuration bundled with a plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginLspConfig {
+    /// Language identifier (e.g., "rust", "python", "typescript").
+    pub language_id: String,
+    /// Command to start the LSP server.
+    pub command: String,
+    /// Arguments to pass to the LSP server command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// File extensions this LSP server handles.
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +49,9 @@ pub struct PluginInfo {
     pub agents: Vec<PathBuf>,
     pub skills: Vec<PathBuf>,
     pub hooks: Vec<PathBuf>,
+    /// Discovered LSP configs (from manifest + .lsp.json files).
+    #[serde(default)]
+    pub lsp_configs: Vec<PluginLspConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +458,20 @@ fn is_plugin_root(path: &Path) -> bool {
 
 fn load_plugin_info(path: &Path, enabled: bool) -> Result<PluginInfo> {
     let manifest = load_manifest(path)?;
+
+    // Collect LSP configs from manifest + .lsp.json files
+    let mut lsp_configs = manifest.lsp.clone();
+    let lsp_json_path = path.join(".lsp.json");
+    if lsp_json_path.exists() {
+        if let Ok(raw) = fs::read_to_string(&lsp_json_path) {
+            if let Ok(mut file_configs) = serde_json::from_str::<Vec<PluginLspConfig>>(&raw) {
+                lsp_configs.append(&mut file_configs);
+            } else if let Ok(single) = serde_json::from_str::<PluginLspConfig>(&raw) {
+                lsp_configs.push(single);
+            }
+        }
+    }
+
     Ok(PluginInfo {
         manifest,
         root: path.to_path_buf(),
@@ -445,6 +480,7 @@ fn load_plugin_info(path: &Path, enabled: bool) -> Result<PluginInfo> {
         agents: collect_files(path.join("agents"), Some("md"))?,
         skills: collect_files(path.join("skills"), Some("md"))?,
         hooks: collect_files(path.join("hooks"), None)?,
+        lsp_configs,
     })
 }
 

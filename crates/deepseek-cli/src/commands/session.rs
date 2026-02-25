@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::Subcommand;
 use deepseek_store::Store;
 use std::path::Path;

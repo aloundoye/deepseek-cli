@@ -6,6 +6,7 @@ mod editor;
 mod gather_context;
 mod intent;
 pub mod linter;
+#[allow(dead_code)]
 mod r#loop;
 pub mod run_engine;
 mod repo_map_v2;

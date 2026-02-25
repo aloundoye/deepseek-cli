@@ -1,5 +1,4 @@
 use crate::apply::{diff_stats, ensure_repo_relative_path, extract_target_files};
-use crate::r#loop;
 use crate::verify::{derive_verify_commands, run_verify};
 use crate::{AgentEngine, ChatMode, ChatOptions};
 use anyhow::{Context, Result, anyhow};
