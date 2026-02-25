@@ -33,6 +33,16 @@ impl ExportFormat {
     }
 }
 
+/// A git-backed shadow commit for lightweight checkpointing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowCommit {
+    pub id: Uuid,
+    pub ref_name: String,
+    pub reason: String,
+    pub created_at: String,
+    pub git_backed: bool,
+}
+
 pub struct MemoryManager {
     workspace: PathBuf,
     store: Store,
@@ -364,6 +374,191 @@ impl MemoryManager {
 
     pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
         self.store.list_checkpoints()
+    }
+
+    // ── Git Shadow Commits ───────────────────────────────────────────────────
+
+    /// Create a shadow commit on hidden ref `refs/deepseek-shadow/<id>`.
+    /// This is a lightweight alternative to full-file checkpointing that uses
+    /// git's object store directly. Falls back to file-based checkpoint if
+    /// not in a git repo.
+    pub fn create_shadow_commit(&self, reason: &str) -> Result<ShadowCommit> {
+        let commit_id = Uuid::now_v7();
+        let ref_name = format!("refs/deepseek-shadow/{commit_id}");
+        let workspace = &self.workspace;
+
+        // Check if we're in a git repo
+        let git_status = std::process::Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(workspace)
+            .output();
+
+        if git_status.is_err() || !git_status.as_ref().unwrap().status.success() {
+            // Not a git repo — fall back to file-based checkpoint
+            let record = self.create_checkpoint(reason)?;
+            return Ok(ShadowCommit {
+                id: commit_id,
+                ref_name,
+                reason: reason.to_string(),
+                created_at: record.created_at,
+                git_backed: false,
+            });
+        }
+
+        // Stage all tracked + untracked files to a temporary index
+        let stash_result = std::process::Command::new("git")
+            .args(["stash", "create"])
+            .current_dir(workspace)
+            .output()?;
+
+        let tree_sha = if stash_result.status.success() && !stash_result.stdout.is_empty() {
+            // We have changes — use the stash tree
+            let stash_sha = String::from_utf8_lossy(&stash_result.stdout).trim().to_string();
+            // Get the tree from the stash commit
+            let tree_out = std::process::Command::new("git")
+                .args(["rev-parse", &format!("{stash_sha}^{{tree}}")])
+                .current_dir(workspace)
+                .output()?;
+            String::from_utf8_lossy(&tree_out.stdout).trim().to_string()
+        } else {
+            // No changes — use HEAD tree
+            let head_tree = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD^{tree}"])
+                .current_dir(workspace)
+                .output()?;
+            if !head_tree.status.success() {
+                return Err(anyhow!("no git HEAD found for shadow commit"));
+            }
+            String::from_utf8_lossy(&head_tree.stdout).trim().to_string()
+        };
+
+        // Create a commit object from the tree
+        let commit_msg = format!("deepseek shadow: {reason} [{commit_id}]");
+        let commit_out = std::process::Command::new("git")
+            .args(["commit-tree", &tree_sha, "-m", &commit_msg])
+            .current_dir(workspace)
+            .output()?;
+
+        if !commit_out.status.success() {
+            return Err(anyhow!(
+                "git commit-tree failed: {}",
+                String::from_utf8_lossy(&commit_out.stderr)
+            ));
+        }
+
+        let commit_sha = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+
+        // Create the hidden ref
+        let ref_result = std::process::Command::new("git")
+            .args(["update-ref", &ref_name, &commit_sha])
+            .current_dir(workspace)
+            .output()?;
+
+        if !ref_result.status.success() {
+            return Err(anyhow!(
+                "git update-ref failed: {}",
+                String::from_utf8_lossy(&ref_result.stderr)
+            ));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        Ok(ShadowCommit {
+            id: commit_id,
+            ref_name,
+            reason: reason.to_string(),
+            created_at: now,
+            git_backed: true,
+        })
+    }
+
+    /// Restore workspace files from a shadow commit ref.
+    pub fn restore_shadow_commit(&self, shadow_id: Uuid) -> Result<()> {
+        let ref_name = format!("refs/deepseek-shadow/{shadow_id}");
+        let workspace = &self.workspace;
+
+        // Check if the ref exists
+        let verify = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", &ref_name])
+            .current_dir(workspace)
+            .output()?;
+
+        if !verify.status.success() {
+            // Try file-based checkpoint fallback
+            self.rewind_to_checkpoint(shadow_id)?;
+            return Ok(());
+        }
+
+        let commit_sha = String::from_utf8_lossy(&verify.stdout).trim().to_string();
+
+        // Restore files: checkout tree from shadow commit
+        let checkout = std::process::Command::new("git")
+            .args(["checkout", &commit_sha, "--", "."])
+            .current_dir(workspace)
+            .output()?;
+
+        if !checkout.status.success() {
+            return Err(anyhow!(
+                "git checkout from shadow commit failed: {}",
+                String::from_utf8_lossy(&checkout.stderr)
+            ));
+        }
+
+        // Unstage the checkout so working tree is clean but not committed
+        let _ = std::process::Command::new("git")
+            .args(["reset", "HEAD", "."])
+            .current_dir(workspace)
+            .output();
+
+        Ok(())
+    }
+
+    /// List all shadow commit refs.
+    pub fn list_shadow_commits(&self) -> Result<Vec<ShadowCommit>> {
+        let workspace = &self.workspace;
+        let output = std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)\t%(subject)\t%(creatordate:iso-strict)",
+                "refs/deepseek-shadow/",
+            ])
+            .current_dir(workspace)
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut commits = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let ref_name = parts[0].to_string();
+            let subject = parts[1].to_string();
+            let created_at = parts.get(2).unwrap_or(&"").to_string();
+
+            // Extract UUID from ref name
+            let id_str = ref_name.strip_prefix("refs/deepseek-shadow/").unwrap_or("");
+            let id = Uuid::parse_str(id_str).unwrap_or(Uuid::nil());
+
+            // Extract reason from subject: "deepseek shadow: <reason> [<id>]"
+            let reason = subject
+                .strip_prefix("deepseek shadow: ")
+                .and_then(|s| s.rsplit_once(" [").map(|(r, _)| r.to_string()))
+                .unwrap_or(subject);
+
+            commits.push(ShadowCommit {
+                id,
+                ref_name,
+                reason,
+                created_at,
+                git_backed: true,
+            });
+        }
+
+        Ok(commits)
     }
 
     pub fn export_transcript(

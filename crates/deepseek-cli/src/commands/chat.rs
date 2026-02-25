@@ -1255,10 +1255,64 @@ pub(crate) fn run_chat(
                             }),
                             json_mode,
                         )?;
+                    } else if args[0].eq_ignore_ascii_case("prompt") {
+                        // H8: MCP prompts as slash commands
+                        let mcp = deepseek_mcp::McpManager::new(cwd)?;
+                        if args.len() < 3 {
+                            // List available prompts across all servers
+                            let servers = mcp.list_servers()?;
+                            if json_mode {
+                                let prompts: Vec<serde_json::Value> = servers.iter().map(|s| {
+                                    json!({"server": s.id, "hint": format!("/mcp prompt {} <name> [args...]", s.id)})
+                                }).collect();
+                                print_json(&json!({"mcp_prompts": prompts}))?;
+                            } else {
+                                println!("MCP prompts — usage: /mcp prompt <server> <name> [args...]");
+                                for s in &servers {
+                                    println!("  server: {}", s.id);
+                                }
+                            }
+                        } else {
+                            // Invoke: /mcp prompt <server_id> <prompt_name> [arg=val ...]
+                            let server_id = &args[1];
+                            let prompt_name = &args[2];
+                            let prompt_args: serde_json::Value = if args.len() > 3 {
+                                let mut map = serde_json::Map::new();
+                                for kv in &args[3..] {
+                                    if let Some((k, v)) = kv.split_once('=') {
+                                        map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                                    }
+                                }
+                                serde_json::Value::Object(map)
+                            } else {
+                                json!({})
+                            };
+                            let result = deepseek_mcp::execute_mcp_stdio_request(
+                                &mcp.get_server(server_id)?
+                                    .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?,
+                                "prompts/get",
+                                json!({"name": prompt_name, "arguments": prompt_args}),
+                                3,
+                                std::time::Duration::from_secs(10),
+                            )?;
+                            if json_mode {
+                                print_json(&result)?;
+                            } else {
+                                if let Some(messages) = result.pointer("/result/messages").and_then(|v| v.as_array()) {
+                                    for msg in messages {
+                                        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                                        let text = msg.pointer("/content/text").and_then(|v| v.as_str()).unwrap_or("");
+                                        println!("[{role}] {text}");
+                                    }
+                                } else {
+                                    println!("{}", serde_json::to_string_pretty(&result)?);
+                                }
+                            }
+                        }
                     } else if json_mode {
-                        print_json(&json!({"error":"use /mcp list|get <id>|remove <id>"}))?;
+                        print_json(&json!({"error":"use /mcp list|get <id>|remove <id>|prompt <server> <name>"}))?;
                     } else {
-                        println!("use /mcp list|get <id>|remove <id>");
+                        println!("use /mcp list|get <id>|remove <id>|prompt <server> <name>");
                     }
                 }
                 SlashCommand::Rewind(args) => {
@@ -2300,9 +2354,15 @@ pub(crate) fn run_chat(
         last_assistant_response = Some(output.clone());
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
-            print_json(&json!({"output": output, "statusline": render_statusline(&ui_status)}))?;
+            let suggestions = generate_prompt_suggestions(&output);
+            print_json(&json!({"output": output, "statusline": render_statusline(&ui_status), "suggestions": suggestions}))?;
         } else {
             println!("[status] {}", render_statusline(&ui_status));
+            // Show follow-up prompt suggestions
+            let suggestions = generate_prompt_suggestions(&output);
+            if !suggestions.is_empty() {
+                println!("\x1b[2m  suggestions: {}\x1b[0m", suggestions.join(" | "));
+            }
         }
 
         // Watch auto-execute: if digest changed after agent turn, auto-dispatch
@@ -3147,13 +3207,14 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ToolCallEnd {
                     tool_name,
                     duration_ms,
+                    success,
                     summary,
-                    ..
                 } => {
                     let _ = tx_stream.send(TuiStreamEvent::ToolCallEnd {
                         tool_name,
                         duration_ms,
                         summary,
+                        success,
                     });
                 }
                 StreamChunk::ModeTransition { from, to, reason } => {
@@ -3493,6 +3554,52 @@ fn desktop_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
     }))
 }
 
+/// Generate 2-3 context-aware follow-up prompt suggestions from the assistant response.
+fn generate_prompt_suggestions(response: &str) -> Vec<String> {
+    let lower = response.to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+
+    // Detect edits → suggest test/review/commit
+    if lower.contains("applied") || lower.contains("modified") || lower.contains("created") {
+        suggestions.push("run tests".to_string());
+        suggestions.push("/diff".to_string());
+        if lower.contains("created") {
+            suggestions.push("document this change".to_string());
+        }
+    }
+
+    // Detect errors → suggest debug/fix
+    if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
+        suggestions.push("fix the error".to_string());
+        suggestions.push("show the full stack trace".to_string());
+    }
+
+    // Detect test results → suggest coverage
+    if lower.contains("test") && (lower.contains("passed") || lower.contains("ok")) {
+        suggestions.push("check test coverage".to_string());
+    }
+
+    // Detect refactoring → suggest verification
+    if lower.contains("refactor") || lower.contains("renamed") || lower.contains("moved") {
+        suggestions.push("verify no regressions".to_string());
+    }
+
+    // Detect explanations → suggest deeper dives
+    if lower.contains("because") || lower.contains("reason") || lower.contains("architecture") {
+        suggestions.push("explain in more detail".to_string());
+    }
+
+    // Always cap at 3 suggestions
+    suggestions.truncate(3);
+
+    // Fallback if nothing triggered
+    if suggestions.is_empty() {
+        suggestions.push("/compact".to_string());
+        suggestions.push("/cost".to_string());
+    }
+
+    suggestions
+}
 fn todos_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
     let mut max_results = 100usize;
     let mut query = None;

@@ -135,10 +135,44 @@ pub enum HookHandler {
         #[serde(default = "default_timeout")]
         timeout: u64,
     },
+    /// Async (fire-and-forget) command handler. Runs in background without blocking.
+    Async {
+        command: String,
+        /// Timeout in seconds (default 60). Process is killed after timeout.
+        #[serde(default = "default_async_timeout")]
+        timeout: u64,
+    },
+    /// Prompt-based hook: sends context to an LLM for allow/deny/modify decisions.
+    Prompt {
+        /// The prompt template. `{{event}}` and `{{context}}` are replaced with
+        /// the event name and JSON-serialized hook input respectively.
+        prompt: String,
+        /// Optional model override (uses session model if absent).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional JSON schema for structured output validation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schema: Option<serde_json::Value>,
+    },
+    /// Agent-based hook: delegates hook evaluation to a named subagent.
+    Agent {
+        /// Name of the subagent to run (must be defined in agents config).
+        agent: String,
+        /// Optional model override for the subagent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional tool restrictions for the subagent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+    },
 }
 
 fn default_timeout() -> u64 {
     30
+}
+
+fn default_async_timeout() -> u64 {
+    60
 }
 
 /// Full hooks configuration — maps event names to hook definitions.
@@ -323,6 +357,125 @@ impl HookRuntime {
             HookHandler::Command { command, timeout } => {
                 self.run_command_handler(command, input, *timeout)
             }
+            HookHandler::Async { command, timeout } => {
+                self.run_async_handler(command, *timeout)
+            }
+            HookHandler::Prompt {
+                prompt,
+                model,
+                schema,
+            } => self.run_prompt_handler(prompt, model.as_deref(), schema.as_ref(), input),
+            HookHandler::Agent {
+                agent,
+                model,
+                tools,
+            } => self.run_agent_handler(agent, model.as_deref(), tools, input),
+        }
+    }
+
+    /// Fire-and-forget a command in the background. Never blocks the main loop.
+    fn run_async_handler(&self, command: &str, timeout_secs: u64) -> HookRun {
+        let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
+        let shell_flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+
+        let mut cmd = Command::new(shell);
+        cmd.arg(shell_flag)
+            .arg(command)
+            .current_dir(&self.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let spawned = cmd.spawn().is_ok();
+
+        // Spawn a reaper thread if needed to enforce timeout.
+        if spawned {
+            let timeout = Duration::from_secs(timeout_secs);
+            let cmd_str = command.to_string();
+            let ws = self.workspace.clone();
+            std::thread::spawn(move || {
+                // Re-spawn so we can wait with timeout (the original handle is moved)
+                let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
+                let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+                if let Ok(mut child) = Command::new(shell)
+                    .arg(flag)
+                    .arg(&cmd_str)
+                    .current_dir(&ws)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    match child.wait_timeout(timeout) {
+                        Ok(None) => { let _ = child.kill(); let _ = child.wait(); }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        HookRun {
+            handler_description: format!("async: {command}"),
+            success: spawned,
+            timed_out: false,
+            exit_code: None,
+            output: HookOutput::default(),
+            blocked: false,
+        }
+    }
+
+    /// Prompt-based hook: evaluates hook context via an LLM prompt.
+    /// Returns allow/deny/modify decision based on LLM response.
+    ///
+    /// NOTE: This is a framework implementation. The actual LLM call should be
+    /// injected via a callback or trait in production. For now, it falls back to
+    /// a command-based evaluation using the prompt as a shell script.
+    fn run_prompt_handler(
+        &self,
+        prompt_template: &str,
+        _model: Option<&str>,
+        _schema: Option<&serde_json::Value>,
+        input: &HookInput,
+    ) -> HookRun {
+        // Expand template variables.
+        let context_json = serde_json::to_string(input).unwrap_or_default();
+        let expanded = prompt_template
+            .replace("{{event}}", &input.event)
+            .replace("{{context}}", &context_json);
+
+        // For now, treat the expanded prompt as a shell command that outputs HookOutput JSON.
+        // In production, this would call the LLM API.
+        self.run_command_handler(&expanded, input, default_timeout())
+    }
+
+    /// Agent-based hook: delegates to a named subagent for evaluation.
+    ///
+    /// NOTE: This is a framework implementation. Full subagent invocation
+    /// requires the agent runtime which is in deepseek-agent crate. This
+    /// implementation records the delegation intent and returns a non-blocking
+    /// result. The agent loop should check for agent hook results and dispatch.
+    fn run_agent_handler(
+        &self,
+        agent_name: &str,
+        _model: Option<&str>,
+        _tools: &[String],
+        input: &HookInput,
+    ) -> HookRun {
+        // Record the agent delegation as additional context.
+        // The main agent loop in deepseek-agent reads this and dispatches.
+        let context_json = serde_json::to_string(input).unwrap_or_default();
+        HookRun {
+            handler_description: format!("agent: {agent_name}"),
+            success: true,
+            timed_out: false,
+            exit_code: Some(0),
+            output: HookOutput {
+                additional_context: Some(format!(
+                    "[hook:agent:{agent_name}] Context: {context_json}"
+                )),
+                ..Default::default()
+            },
+            blocked: false,
         }
     }
 

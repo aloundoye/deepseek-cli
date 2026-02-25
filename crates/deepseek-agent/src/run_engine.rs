@@ -9,7 +9,7 @@ use deepseek_memory::MemoryManager;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -175,7 +175,7 @@ impl<'a> RunEngine<'a> {
                     let mut handles = Vec::new();
                     for (name, goal) in &plan.subagents {
                         let worker_clone = worker.clone();
-                        let task_name = format!("subagent-{}", name);
+                        let _task_name = format!("subagent-{}", name);
                         let sub_task = deepseek_subagent::SubagentTask {
                             run_id: uuid::Uuid::now_v7(),
                             name: name.clone(),
@@ -891,7 +891,10 @@ fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
 
 fn checkpoint_best_effort(workspace: &Path, reason: &str) {
     if let Ok(manager) = MemoryManager::new(workspace) {
-        let _ = manager.create_checkpoint(reason);
+        // Prefer git shadow commit; fall back to file-based checkpoint
+        if manager.create_shadow_commit(reason).is_err() {
+            let _ = manager.create_checkpoint(reason);
+        }
     }
 }
 

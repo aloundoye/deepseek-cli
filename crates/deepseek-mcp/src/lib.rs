@@ -352,6 +352,77 @@ impl McpManager {
         }
         Ok(count)
     }
+
+    /// Search tools by relevance when >50 tools are registered.
+    /// Uses keyword scoring to surface the most relevant subset.
+    pub fn search_tools_by_relevance(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<McpTool>> {
+        let all_tools = self.discover_tools()?;
+
+        // Below threshold, return all tools
+        if all_tools.len() <= 50 {
+            return Ok(all_tools);
+        }
+
+        let query_lower = query.to_ascii_lowercase();
+        let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut scored: Vec<(f64, McpTool)> = all_tools
+            .into_iter()
+            .map(|tool| {
+                let name_lower = tool.name.to_ascii_lowercase();
+                let desc_lower = tool.description.to_ascii_lowercase();
+
+                let mut score = 0.0_f64;
+
+                // Exact name match is highest priority
+                if name_lower == query_lower {
+                    score += 10.0;
+                }
+
+                // Name contains query
+                if name_lower.contains(&query_lower) {
+                    score += 5.0;
+                }
+
+                // Per-term scoring: each query term that matches gets a score boost
+                for term in &query_terms {
+                    if name_lower.contains(term) {
+                        score += 3.0;
+                    }
+                    if desc_lower.contains(term) {
+                        score += 1.0;
+                    }
+                }
+
+                // Server ID match bonus
+                if tool.server_id.to_ascii_lowercase().contains(&query_lower) {
+                    score += 2.0;
+                }
+
+                (score, tool)
+            })
+            .filter(|(score, _)| *score > 0.0)
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(max_results);
+        Ok(scored.into_iter().map(|(_, tool)| tool).collect())
+    }
+
+    /// Load managed MCP config (enterprise lockdown).
+    /// This is read from a system-wide location and cannot be overridden by users.
+    pub fn load_managed_mcp_config() -> Option<McpConfig> {
+        let path = managed_mcp_config_path()?;
+        if !path.exists() {
+            return None;
+        }
+        let raw = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
 }
 
 fn tool_fingerprint(tools: &[McpTool]) -> Result<String> {
@@ -478,6 +549,30 @@ fn claude_desktop_config_path() -> Option<PathBuf> {
     {
         let home = std::env::var("HOME").ok()?;
         Some(PathBuf::from(home).join(".config/claude/claude_desktop_config.json"))
+    }
+}
+
+/// System-wide managed MCP config path for enterprise lockdown.
+fn managed_mcp_config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(PathBuf::from(
+            "/Library/Application Support/DeepSeekCode/managed-mcp.json",
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(PathBuf::from("/etc/deepseek-code/managed-mcp.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(PathBuf::from(
+            "C:\\Program Files\\DeepSeekCode\\managed-mcp.json",
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
     }
 }
 
