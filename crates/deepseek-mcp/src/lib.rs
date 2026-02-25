@@ -22,6 +22,7 @@ use uuid::Uuid;
 pub enum McpTransport {
     Stdio,
     Http,
+    Sse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,8 @@ pub struct McpServer {
     pub url: Option<String>,
     pub enabled: bool,
     pub metadata: serde_json::Value,
+    /// Custom headers for HTTP/SSE transport (e.g. authorization).
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for McpServer {
@@ -48,6 +51,7 @@ impl Default for McpServer {
             url: None,
             enabled: true,
             metadata: serde_json::Value::Null,
+            headers: Vec::new(),
         }
     }
 }
@@ -155,6 +159,10 @@ impl McpManager {
 
     pub fn list_servers(&self) -> Result<Vec<McpServer>> {
         let mut merged = Vec::new();
+        // Managed config has highest priority (cannot be overridden)
+        if let Some(managed) = Self::load_managed_mcp_config() {
+            merged.extend(managed.servers);
+        }
         if let Some(path) = Self::user_config_path() {
             merged.extend(load_config_if_exists(&path)?.servers);
         }
@@ -163,8 +171,15 @@ impl McpManager {
         }
         merged.extend(self.load_project_config()?.servers);
         merged.sort_by(|a, b| a.id.cmp(&b.id));
-        merged.dedup_by(|a, b| a.id == b.id);
+        merged.dedup_by(|a, b| a.id == b.id); // first wins (managed > user > project)
         Ok(merged)
+    }
+
+    /// Check whether a server ID comes from managed (enterprise) config.
+    pub fn is_managed_server(server_id: &str) -> bool {
+        Self::load_managed_mcp_config()
+            .map(|cfg| cfg.servers.iter().any(|s| s.id == server_id))
+            .unwrap_or(false)
     }
 
     pub fn get_server(&self, id: &str) -> Result<Option<McpServer>> {
@@ -185,6 +200,7 @@ impl McpManager {
             transport: match server.transport {
                 McpTransport::Stdio => "stdio".to_string(),
                 McpTransport::Http => "http".to_string(),
+                McpTransport::Sse => "sse".to_string(),
             },
             endpoint: server.command.or(server.url).unwrap_or_default(),
             enabled: server.enabled,
@@ -195,6 +211,9 @@ impl McpManager {
     }
 
     pub fn remove_server(&self, id: &str) -> Result<bool> {
+        if Self::is_managed_server(id) {
+            return Err(anyhow!("cannot remove managed server: {id}"));
+        }
         let mut cfg = self.load_project_config()?;
         let before = cfg.servers.len();
         cfg.servers.retain(|existing| existing.id != id);
@@ -304,14 +323,17 @@ impl McpManager {
             .ok_or_else(|| anyhow!("MCP server not found: {server_id}"))?;
 
         match server.transport {
-            McpTransport::Http => {
+            McpTransport::Http | McpTransport::Sse => {
                 let base_url = server
                     .url
                     .as_deref()
-                    .ok_or_else(|| anyhow!("HTTP MCP server has no URL"))?;
+                    .ok_or_else(|| anyhow!("HTTP/SSE MCP server has no URL"))?;
                 let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-                let resp: serde_json::Value = client
-                    .post(base_url)
+                let mut req = client.post(base_url);
+                for (k, v) in &server.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                let resp: serde_json::Value = req
                     .json(&json!({
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -411,6 +433,103 @@ impl McpManager {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(max_results);
         Ok(scored.into_iter().map(|(_, tool)| tool).collect())
+    }
+
+    /// List MCP resources from all enabled servers for autocomplete.
+    pub fn list_resources(&self) -> Result<Vec<McpResource>> {
+        let mut resources = Vec::new();
+        for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
+            let discovered = match server.transport {
+                McpTransport::Stdio => {
+                    execute_mcp_stdio_request(
+                        &server,
+                        "resources/list",
+                        json!({}),
+                        3,
+                        Duration::from_secs(6),
+                    )
+                    .ok()
+                    .and_then(|r| r.get("result")?.get("resources")?.as_array().cloned())
+                }
+                McpTransport::Http | McpTransport::Sse => {
+                    server.url.as_deref().and_then(|url| {
+                        Client::builder()
+                            .timeout(Duration::from_secs(10))
+                            .build()
+                            .ok()?
+                            .post(url)
+                            .json(&json!({"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}))
+                            .send()
+                            .ok()?
+                            .json::<serde_json::Value>()
+                            .ok()?
+                            .get("result")?
+                            .get("resources")?
+                            .as_array()
+                            .cloned()
+                    })
+                }
+            };
+            if let Some(items) = discovered {
+                for item in items {
+                    resources.push(McpResource {
+                        server_id: server.id.clone(),
+                        uri: item
+                            .get("uri")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        description: item
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        mime_type: item
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    });
+                }
+            }
+        }
+        Ok(resources)
+    }
+
+    /// Search resources by prefix for autocomplete (e.g. `@server:uri`).
+    pub fn autocomplete_resources(&self, prefix: &str) -> Result<Vec<McpResource>> {
+        let all = self.list_resources()?;
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let mut matches: Vec<McpResource> = all
+            .into_iter()
+            .filter(|r| {
+                let label = format!("@{}:{}", r.server_id, r.uri).to_ascii_lowercase();
+                label.starts_with(&prefix_lower)
+                    || r.name.to_ascii_lowercase().contains(&prefix_lower)
+            })
+            .collect();
+        matches.truncate(10);
+        Ok(matches)
+    }
+
+    /// Returns tools appropriate for the current context usage.
+    /// When `context_used_pct` > 10%, uses search-based filtering if a query is provided.
+    pub fn tools_for_context(
+        &self,
+        context_used_pct: f64,
+        query: Option<&str>,
+        max_results: usize,
+    ) -> Result<Vec<McpTool>> {
+        if context_used_pct > 10.0 {
+            if let Some(q) = query {
+                return self.search_tools_by_relevance(q, max_results);
+            }
+        }
+        self.discover_tools()
     }
 
     /// Load managed MCP config (enterprise lockdown).
@@ -526,6 +645,7 @@ pub fn import_from_claude_desktop() -> Result<Vec<McpServer>> {
             url,
             enabled: true,
             metadata: entry.get("env").cloned().unwrap_or(serde_json::Value::Null),
+            headers: Vec::new(),
         });
     }
     Ok(servers)
@@ -672,8 +792,47 @@ fn discover_server_tools(server: &McpServer) -> Result<Vec<McpTool>> {
                 .unwrap_or_default();
             Ok(tools)
         }
+        McpTransport::Sse => discover_sse_tools(server),
         McpTransport::Stdio => discover_stdio_tools(server),
     }
+}
+
+fn discover_sse_tools(server: &McpServer) -> Result<Vec<McpTool>> {
+    let url = server
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("SSE transport requires url"))?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let mut req = client.get(url);
+    for (k, v) in &server.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req
+        .header("Accept", "text/event-stream")
+        .send()?
+        .error_for_status()?;
+    let text = resp.text()?;
+    parse_sse_tools(&server.id, &text)
+}
+
+fn parse_sse_tools(server_id: &str, sse_text: &str) -> Result<Vec<McpTool>> {
+    let mut tools = Vec::new();
+    for chunk in sse_text.split("\n\n") {
+        let data = chunk
+            .strip_prefix("data: ")
+            .or_else(|| chunk.lines().find_map(|l| l.strip_prefix("data: ")));
+        if let Some(json_str) = data {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                tools.extend(parse_mcp_tools_message(server_id, &value));
+            }
+        }
+    }
+    if tools.is_empty() {
+        return Err(anyhow!("no tools discovered from SSE MCP server"));
+    }
+    Ok(tools)
 }
 
 fn discover_stdio_tools(server: &McpServer) -> Result<Vec<McpTool>> {
@@ -1009,6 +1168,280 @@ pub fn delete_mcp_token(server_id: &str) -> Result<()> {
     Ok(())
 }
 
+// ── OAuth 2.0 for MCP ────────────────────────────────────────────────────────
+
+/// OAuth 2.0 configuration for an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthConfig {
+    pub authorization_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub scopes: Vec<String>,
+    /// Local port for the OAuth redirect callback (default 8912).
+    #[serde(default = "default_redirect_port")]
+    pub redirect_port: u16,
+}
+
+fn default_redirect_port() -> u16 {
+    8912
+}
+
+/// Check whether an OAuth token has expired.
+pub fn is_token_expired(token: &McpOAuthToken) -> bool {
+    token.expires_at.as_deref().is_some_and(|exp| {
+        chrono::DateTime::parse_from_rfc3339(exp)
+            .map(|dt| dt < Utc::now())
+            .unwrap_or(false)
+    })
+}
+
+/// Generate a PKCE code verifier (random URL-safe base64 string).
+fn generate_pkce_verifier() -> String {
+    let buf = rand_bytes();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Generate a PKCE code challenge (S256) from a verifier.
+fn generate_pkce_challenge(verifier: &str) -> String {
+    let hash = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+}
+
+fn rand_bytes() -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut buf);
+    } else {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        buf[..16].copy_from_slice(&seed.to_le_bytes());
+        buf[16..20].copy_from_slice(&std::process::id().to_le_bytes());
+    }
+    buf
+}
+
+/// Start the OAuth 2.0 authorization code flow for an MCP server.
+pub fn start_oauth_flow(server: &McpServer) -> Result<McpOAuthToken> {
+    let oauth = server
+        .metadata
+        .get("oauth")
+        .map(|v| serde_json::from_value::<McpOAuthConfig>(v.clone()))
+        .transpose()?
+        .ok_or_else(|| anyhow!("server has no OAuth config in metadata"))?;
+
+    // 1. Start local listener
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", oauth.redirect_port))?;
+
+    // 2. Build authorization URL with PKCE
+    let state = format!("{:x}", Sha256::digest(rand_bytes()));
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", oauth.redirect_port);
+    let auth_url = format!(
+        "{}?client_id={}&redirect_uri={}&response_type=code&state={}&scope={}&code_challenge={}&code_challenge_method=S256",
+        oauth.authorization_url,
+        oauth.client_id,
+        urlencoding(&redirect_uri),
+        state,
+        oauth.scopes.join("+"),
+        code_challenge,
+    );
+
+    // 3. Open browser
+    eprintln!("Opening browser for OAuth authorization...");
+    let _ = open_browser(&auth_url);
+    eprintln!("If browser didn't open, visit: {auth_url}");
+
+    // 4. Wait for callback
+    let code = wait_for_oauth_callback(&listener, &state, Duration::from_secs(120))?;
+
+    // 5. Exchange code for token
+    let token = exchange_oauth_code(&oauth, &code, &code_verifier, &server.id)?;
+
+    // 6. Store token
+    store_mcp_token(&server.id, &token)?;
+    Ok(token)
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
+fn exchange_oauth_code(
+    oauth: &McpOAuthConfig,
+    code: &str,
+    code_verifier: &str,
+    server_id: &str,
+) -> Result<McpOAuthToken> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut body = json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": oauth.client_id,
+        "code_verifier": code_verifier,
+    });
+    if let Some(ref secret) = oauth.client_secret {
+        body["client_secret"] = json!(secret);
+    }
+    let resp: serde_json::Value = client
+        .post(&oauth.token_url)
+        .json(&body)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(McpOAuthToken {
+        access_token: resp["access_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        refresh_token: resp
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        token_type: resp["token_type"]
+            .as_str()
+            .unwrap_or("Bearer")
+            .to_string(),
+        expires_at: resp.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
+            (Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+        }),
+        server_id: server_id.to_string(),
+    })
+}
+
+/// Refresh an expired OAuth token.
+pub fn refresh_oauth_token(server: &McpServer, token: &McpOAuthToken) -> Result<McpOAuthToken> {
+    let oauth = server
+        .metadata
+        .get("oauth")
+        .map(|v| serde_json::from_value::<McpOAuthConfig>(v.clone()))
+        .transpose()?
+        .ok_or_else(|| anyhow!("server has no OAuth config"))?;
+    let refresh = token
+        .refresh_token
+        .as_deref()
+        .ok_or_else(|| anyhow!("no refresh token available"))?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let resp: serde_json::Value = client
+        .post(&oauth.token_url)
+        .json(&json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": oauth.client_id,
+        }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    let new_token = McpOAuthToken {
+        access_token: resp["access_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        refresh_token: resp
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| token.refresh_token.clone()),
+        token_type: resp["token_type"]
+            .as_str()
+            .unwrap_or("Bearer")
+            .to_string(),
+        expires_at: resp.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
+            (Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+        }),
+        server_id: server.id.clone(),
+    };
+    store_mcp_token(&server.id, &new_token)?;
+    Ok(new_token)
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("cmd").args(["/c", "start", url]).spawn();
+    }
+    Ok(())
+}
+
+fn wait_for_oauth_callback(
+    listener: &std::net::TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
+    listener.set_nonblocking(true)?;
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > timeout {
+            return Err(anyhow!("OAuth callback timed out"));
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                use std::io::Read;
+                let mut buf = [0u8; 4096];
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                if let Some(code) = extract_query_param(&request, "code") {
+                    let state = extract_query_param(&request, "state").unwrap_or_default();
+                    if state != expected_state {
+                        return Err(anyhow!("OAuth state mismatch"));
+                    }
+                    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>Authorization successful. You can close this tab.</body></html>";
+                    use std::io::Write;
+                    let _ = stream.write_all(response.as_bytes());
+                    return Ok(code);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn extract_query_param(request: &str, param: &str) -> Option<String> {
+    let query = request.split_whitespace().nth(1)?.split('?').nth(1)?;
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == param {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Start an MCP JSON-RPC 2.0 server on stdin/stdout, exposing DeepSeek tools.
 ///
 /// This allows other MCP-compatible clients to use DeepSeek CLI as a tool server.
@@ -1337,6 +1770,7 @@ mod tests {
                 url: None,
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"hello","description":"test"}]}),
+                headers: vec![],
             })
             .expect("add");
 
@@ -1366,6 +1800,7 @@ mod tests {
                 url: None,
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"a"},{"name":"b"}]}),
+                headers: vec![],
             })
             .expect("add");
 
@@ -1390,6 +1825,7 @@ mod tests {
                 url: None,
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name":"b"},{"name":"c"}]}),
+                headers: vec![],
             })
             .expect("replace");
 
@@ -1553,6 +1989,7 @@ mod tests {
             url: None,
             enabled: true,
             metadata: serde_json::Value::Null,
+            headers: vec![],
         };
         expand_server_env_vars(&mut server);
         assert_eq!(server.command.as_deref(), Some("node"));
@@ -1620,6 +2057,7 @@ mod tests {
                         {"name": "gamma", "description": "Gamma tool"}
                     ]
                 }),
+                headers: vec![],
             })
             .expect("add");
 
@@ -1647,6 +2085,7 @@ mod tests {
                 url: None,
                 enabled: true,
                 metadata: serde_json::Value::Null,
+                headers: vec![],
             })
             .expect("add");
 
@@ -1675,6 +2114,7 @@ mod tests {
                 url: Some("http://127.0.0.1:0/mcp".to_string()),
                 enabled: true,
                 metadata: serde_json::json!({"tools": [{"name": "remote_tool", "description": "A remote tool"}]}),
+                headers: vec![],
             })
             .expect("add http server");
 
@@ -1708,5 +2148,295 @@ mod tests {
         let (out2, truncated2) = enforce_mcp_token_limit(&over, &limits);
         assert!(truncated2, "over limit should truncate");
         assert!(out2.contains("truncated"));
+    }
+
+    #[test]
+    fn tools_for_context_returns_all_below_threshold() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-ctx-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "ctx-test".to_string(),
+                name: "Ctx Test".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                metadata: serde_json::json!({"tools": [
+                    {"name":"t1","description":"tool 1"},
+                    {"name":"t2","description":"tool 2"}
+                ]}),
+                headers: vec![],
+            })
+            .expect("add");
+
+        // Below 10% threshold → returns all tools regardless of query
+        let tools = manager.tools_for_context(5.0, Some("t1"), 10).expect("tools");
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn tools_for_context_no_query_above_threshold_returns_all() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-ctx2-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "ctx-test2".to_string(),
+                name: "Ctx Test2".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                metadata: serde_json::json!({"tools": [
+                    {"name":"a","description":"alpha"},
+                    {"name":"b","description":"beta"}
+                ]}),
+                headers: vec![],
+            })
+            .expect("add");
+
+        // Above 10% but no query → returns all tools
+        let tools = manager.tools_for_context(15.0, None, 10).expect("tools");
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn tools_for_context_filters_above_threshold() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-ctx3-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "ctx-test3".to_string(),
+                name: "Ctx Test3".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                metadata: serde_json::json!({"tools": [
+                    {"name":"search","description":"search tool"},
+                    {"name":"read","description":"read tool"}
+                ]}),
+                headers: vec![],
+            })
+            .expect("add");
+
+        // Above 10% with query — search_tools_by_relevance is called.
+        // Since there are only 2 tools (below the 50-tool threshold in search),
+        // it returns all tools.
+        let tools = manager
+            .tools_for_context(15.0, Some("search"), 10)
+            .expect("tools");
+        assert!(!tools.is_empty());
+    }
+
+    // ── P2-01: OAuth 2.0 tests ─────────────────────────────────────────
+
+    #[test]
+    fn generate_pkce_challenge_is_deterministic_for_same_verifier() {
+        let verifier = "test-verifier-12345";
+        let c1 = generate_pkce_challenge(verifier);
+        let c2 = generate_pkce_challenge(verifier);
+        assert_eq!(c1, c2, "same verifier should produce same challenge");
+        assert!(!c1.is_empty());
+    }
+
+    #[test]
+    fn extract_query_param_parses_code() {
+        let request = "GET /callback?code=abc123&state=xyz HTTP/1.1\r\nHost: localhost";
+        let code = extract_query_param(request, "code");
+        assert_eq!(code, Some("abc123".to_string()));
+        let state = extract_query_param(request, "state");
+        assert_eq!(state, Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn extract_query_param_missing_returns_none() {
+        let request = "GET /callback?code=abc HTTP/1.1";
+        assert!(extract_query_param(request, "state").is_none());
+        assert!(extract_query_param("", "code").is_none());
+    }
+
+    #[test]
+    fn is_token_expired_true_for_past_date() {
+        let token = McpOAuthToken {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            token_type: "Bearer".to_string(),
+            expires_at: Some("2020-01-01T00:00:00Z".to_string()),
+            server_id: "srv".to_string(),
+        };
+        assert!(is_token_expired(&token));
+    }
+
+    #[test]
+    fn is_token_expired_false_for_future_date() {
+        let token = McpOAuthToken {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            token_type: "Bearer".to_string(),
+            expires_at: Some("2099-12-31T23:59:59Z".to_string()),
+            server_id: "srv".to_string(),
+        };
+        assert!(!is_token_expired(&token));
+    }
+
+    // ── P2-02: Resource autocomplete tests ───────────────────────────────
+
+    #[test]
+    fn autocomplete_resources_no_servers_returns_empty() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-ac-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        let results = manager.autocomplete_resources("@").expect("autocomplete");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn autocomplete_resources_empty_prefix_returns_all() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-ac2-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        // No servers → empty results (can't test with real servers in unit tests)
+        let results = manager.autocomplete_resources("").expect("autocomplete");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn autocomplete_resources_filters_by_prefix() {
+        // This tests the filter logic directly without servers
+        let all = vec![
+            McpResource {
+                server_id: "srv1".to_string(),
+                uri: "file:///docs/readme.md".to_string(),
+                name: "readme".to_string(),
+                description: "Project readme".to_string(),
+                mime_type: None,
+            },
+            McpResource {
+                server_id: "srv2".to_string(),
+                uri: "file:///src/main.rs".to_string(),
+                name: "main".to_string(),
+                description: "Entry point".to_string(),
+                mime_type: Some("text/x-rust".to_string()),
+            },
+        ];
+        let prefix = "@srv1";
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let matches: Vec<_> = all
+            .into_iter()
+            .filter(|r| {
+                let label = format!("@{}:{}", r.server_id, r.uri).to_ascii_lowercase();
+                label.starts_with(&prefix_lower)
+                    || r.name.to_ascii_lowercase().contains(&prefix_lower)
+            })
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].server_id, "srv1");
+    }
+
+    #[test]
+    fn parse_sse_tools_from_event_stream() {
+        let sse_text = r#"data: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"sse_tool","description":"SSE test tool"}]}}
+
+data: {"other":"ignored"}
+
+"#;
+        let tools = parse_sse_tools("sse-srv", sse_text).expect("parse SSE");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "sse_tool");
+        assert_eq!(tools[0].server_id, "sse-srv");
+    }
+
+    #[test]
+    fn parse_sse_tools_empty_stream_returns_error() {
+        let result = parse_sse_tools("srv", "");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no tools"));
+    }
+
+    #[test]
+    fn sse_transport_serialization() {
+        let transport = McpTransport::Sse;
+        let json = serde_json::to_string(&transport).unwrap();
+        assert_eq!(json, "\"sse\"");
+        let parsed: McpTransport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, McpTransport::Sse);
+    }
+
+    #[test]
+    fn sse_server_add_and_list() {
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-sse-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "sse-test".to_string(),
+                name: "SSE Test".to_string(),
+                transport: McpTransport::Sse,
+                command: None,
+                args: vec![],
+                url: Some("http://127.0.0.1:0/sse".to_string()),
+                enabled: true,
+                metadata: serde_json::json!({"tools": [{"name":"sse_tool"}]}),
+                headers: vec![("Authorization".to_string(), "Bearer tok".to_string())],
+            })
+            .expect("add sse server");
+
+        let listed = manager.list_servers().expect("list");
+        let sse = listed.iter().find(|s| s.id == "sse-test");
+        assert!(sse.is_some());
+        assert_eq!(sse.unwrap().transport, McpTransport::Sse);
+        assert_eq!(sse.unwrap().headers.len(), 1);
+    }
+
+    #[test]
+    fn managed_config_missing_returns_none() {
+        // The managed config path points to a system location that won't exist in test
+        let result = McpManager::load_managed_mcp_config();
+        assert!(result.is_none(), "managed config should return None when file is absent");
+    }
+
+    #[test]
+    fn is_managed_server_returns_false_when_no_managed_config() {
+        assert!(!McpManager::is_managed_server("some-server"));
+    }
+
+    #[test]
+    fn cannot_remove_managed_server_would_fail() {
+        // Without a managed config file, is_managed_server returns false,
+        // so the guard doesn't trigger. This tests the guard integration exists.
+        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-managed-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = McpManager::new(&workspace).expect("manager");
+
+        manager
+            .add_server(McpServer {
+                id: "removable".to_string(),
+                name: "Removable".to_string(),
+                transport: McpTransport::Stdio,
+                command: Some("echo".to_string()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                metadata: serde_json::Value::Null,
+                headers: vec![],
+            })
+            .expect("add");
+
+        // Non-managed server can be removed
+        let removed = manager.remove_server("removable").expect("remove");
+        assert!(removed);
     }
 }

@@ -54,6 +54,7 @@ use output::print_json;
 #[derive(Parser)]
 #[command(name = "deepseek")]
 #[command(about = "DeepSeek CLI coding agent", long_about = None)]
+#[command(version)]
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
@@ -834,6 +835,7 @@ enum McpCmd {
 enum McpTransportArg {
     Stdio,
     Http,
+    Sse,
 }
 
 impl McpTransportArg {
@@ -841,6 +843,7 @@ impl McpTransportArg {
         match self {
             Self::Stdio => McpTransport::Stdio,
             Self::Http => McpTransport::Http,
+            Self::Sse => McpTransport::Sse,
         }
     }
 }

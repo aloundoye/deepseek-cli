@@ -375,6 +375,36 @@ impl SlashCommand {
     }
 }
 
+// ── Prompt Suggestions ──────────────────────────────────────────────────────
+
+/// Example prompts shown as grayed-out placeholders when the input area is empty.
+pub const PROMPT_SUGGESTIONS: &[&str] = &[
+    "Explain this project's architecture",
+    "Find and fix bugs in src/",
+    "Add tests for the auth module",
+    "Refactor the database layer",
+    "Review my latest changes",
+];
+
+/// Render prompt suggestion spans for display in the input area.
+/// Returns non-empty spans only when the input is empty.
+pub fn render_prompt_suggestions(is_empty_input: bool) -> Vec<Span<'static>> {
+    if !is_empty_input {
+        return vec![];
+    }
+    let mut spans = Vec::new();
+    for (i, suggestion) in PROMPT_SUGGESTIONS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", Style::default()));
+        }
+        spans.push(Span::styled(
+            suggestion.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UiStatus {
     pub model: String,
@@ -394,6 +424,9 @@ pub struct UiStatus {
     pub working_directory: String,
     #[serde(default)]
     pub pr_review_status: Option<String>,
+    /// Optional PR URL for clickable review badge.
+    #[serde(default)]
+    pub pr_url: Option<String>,
     /// Current agent execution mode label.
     #[serde(default)]
     pub agent_mode: String,
@@ -430,11 +463,11 @@ pub fn render_statusline(status: &UiStatus) -> String {
     } else {
         String::new()
     };
-    let review_part = status
-        .pr_review_status
-        .as_deref()
-        .map(|value| format!(" review={value}"))
-        .unwrap_or_default();
+    let review_part = match (&status.pr_review_status, &status.pr_url) {
+        (Some(s), Some(url)) => format!(" review={s} {url}"),
+        (Some(s), None) => format!(" review={s}"),
+        _ => String::new(),
+    };
     let agent_part = if !status.agent_mode.is_empty() && status.agent_mode != "ArchitectEditorLoop"
     {
         format!(" agent={}", status.agent_mode)
@@ -606,14 +639,18 @@ fn render_statusline_spans(
 
     if let Some(review) = status.pr_review_status.as_deref() {
         let (label, bg) = review_badge(review);
+        let badge_style = Style::default()
+            .fg(Color::Black)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD);
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD),
-        ));
+        if let Some(ref url) = status.pr_url {
+            // OSC 8 hyperlink: \x1b]8;;URL\x1b\\text\x1b]8;;\x1b\\
+            let linked = format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\");
+            spans.push(Span::styled(linked, badge_style));
+        } else {
+            spans.push(Span::styled(label.to_string(), badge_style));
+        }
     }
 
     spans.push(Span::styled(
@@ -5610,6 +5647,32 @@ mod tests {
     }
 
     #[test]
+    fn review_badge_includes_url_in_plain() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            pr_review_status: Some("approved".to_string()),
+            pr_url: Some("https://github.com/org/repo/pull/42".to_string()),
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(line.contains("review=approved"));
+        assert!(line.contains("https://github.com/org/repo/pull/42"));
+    }
+
+    #[test]
+    fn review_badge_no_url_fallback() {
+        let status = UiStatus {
+            model: "deepseek-chat".to_string(),
+            pr_review_status: Some("pending".to_string()),
+            pr_url: None,
+            ..Default::default()
+        };
+        let line = render_statusline(&status);
+        assert!(line.contains("review=pending"));
+        assert!(!line.contains("http"));
+    }
+
+    #[test]
     fn parse_inline_italic() {
         let base = Style::default().fg(Color::White);
         let spans = parse_inline_markdown("hello *world* end", base);
@@ -6471,6 +6534,22 @@ mod tests {
         // Back from SelectCheckpoint closes picker
         let should_close = picker.back();
         assert!(should_close);
+    }
+
+    // ── P2-05: prompt suggestions ────────────────────────────────────────
+
+    #[test]
+    fn prompt_suggestions_shown_when_empty() {
+        let spans = render_prompt_suggestions(true);
+        assert!(!spans.is_empty(), "should show suggestions when input is empty");
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Explain this project"));
+    }
+
+    #[test]
+    fn prompt_suggestions_hidden_when_typing() {
+        let spans = render_prompt_suggestions(false);
+        assert!(spans.is_empty(), "should hide suggestions when input is non-empty");
     }
 }
 

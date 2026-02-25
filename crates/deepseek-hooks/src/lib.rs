@@ -613,6 +613,35 @@ impl HookRuntime {
     }
 }
 
+/// Merge scoped hooks from a skill/command frontmatter into an existing config.
+///
+/// `skill_hooks` maps event names (e.g. "PreToolUse") to lists of shell commands.
+/// Each command is added as a `HookHandler::Command` with a 30-second timeout.
+pub fn merge_skill_hooks(
+    base: &HooksConfig,
+    skill_hooks: &std::collections::HashMap<String, Vec<String>>,
+) -> HooksConfig {
+    let mut merged = base.clone();
+    for (event_name, commands) in skill_hooks {
+        let handlers: Vec<HookDefinition> = commands
+            .iter()
+            .map(|cmd| HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: cmd.clone(),
+                    timeout: 30,
+                }],
+            })
+            .collect();
+        merged
+            .events
+            .entry(event_name.clone())
+            .or_default()
+            .extend(handlers);
+    }
+    merged
+}
+
 fn build_command(path: &Path) -> Command {
     let ext = path
         .extension()
@@ -996,6 +1025,44 @@ mod tests {
             !result.blocked,
             "PostToolUse should not block even with exit 2 and block decision"
         );
+    }
+
+    #[test]
+    fn merge_skill_hooks_adds_to_existing() {
+        let mut events = HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "existing".to_string(),
+                    timeout: 5,
+                }],
+            }],
+        );
+        let base = HooksConfig { events };
+
+        let mut skill_hooks = HashMap::new();
+        skill_hooks.insert(
+            "PreToolUse".to_string(),
+            vec!["echo validate".to_string()],
+        );
+        skill_hooks.insert(
+            "Stop".to_string(),
+            vec!["echo done".to_string()],
+        );
+
+        let merged = merge_skill_hooks(&base, &skill_hooks);
+        assert_eq!(merged.events["PreToolUse"].len(), 2, "should have original + skill hook");
+        assert!(merged.events.contains_key("Stop"), "should add new event");
+    }
+
+    #[test]
+    fn merge_skill_hooks_empty_noop() {
+        let base = HooksConfig::default();
+        let empty = HashMap::new();
+        let merged = merge_skill_hooks(&base, &empty);
+        assert!(merged.events.is_empty());
     }
 
     #[cfg(not(target_os = "windows"))]

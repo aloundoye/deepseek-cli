@@ -27,6 +27,7 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
                 url: args.url,
                 enabled: args.enabled,
                 metadata,
+                headers: Vec::new(),
             };
             let endpoint = server
                 .command
@@ -36,6 +37,7 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
             let transport = match server.transport {
                 McpTransport::Stdio => "stdio",
                 McpTransport::Http => "http",
+                McpTransport::Sse => "sse",
             };
             manager.add_server(server.clone())?;
             append_control_event(
@@ -82,6 +84,7 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
                         match server.transport {
                             McpTransport::Stdio => "stdio",
                             McpTransport::Http => "http",
+                            McpTransport::Sse => "sse",
                         },
                         server.enabled,
                         server

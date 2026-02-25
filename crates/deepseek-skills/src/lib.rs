@@ -219,6 +219,32 @@ impl SkillManager {
     }
 }
 
+// ── Context Budget ─────────────────────────────────────────────────────────
+
+/// Default skill description budget: 2% of 128K context ≈ 2560 tokens ≈ 10240 chars.
+pub const DEFAULT_SKILL_BUDGET_CHARS: usize = 10_240;
+
+/// Trim skill summaries to fit within a character budget.
+/// Skills are processed in order; once the budget is exhausted, remaining
+/// summaries are replaced with a placeholder.
+pub fn apply_context_budget(skills: &[SkillEntry], budget_chars: usize) -> Vec<SkillEntry> {
+    let mut result = skills.to_vec();
+    let mut used = 0_usize;
+    for skill in &mut result {
+        let remaining = budget_chars.saturating_sub(used);
+        if remaining == 0 {
+            skill.summary = "[budget exceeded]".to_string();
+        } else if skill.summary.len() > remaining {
+            let end = remaining.saturating_sub(3);
+            // Ensure we don't split a multi-byte char
+            let safe_end = skill.summary.floor_char_boundary(end);
+            skill.summary = format!("{}...", &skill.summary[..safe_end]);
+        }
+        used += skill.summary.len();
+    }
+    result
+}
+
 // ── Custom Slash Commands ──────────────────────────────────────────────────
 
 /// A custom slash command loaded from `.deepseek/commands/` or `~/.deepseek/commands/`.
@@ -236,6 +262,9 @@ pub struct CustomCommand {
     pub context: String,
     /// The rendered prompt body (after variable substitution).
     pub body: String,
+    /// Scoped lifecycle hooks declared in frontmatter (e.g. `hooks.PreToolUse: echo check`).
+    #[serde(default)]
+    pub hooks: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Load custom slash commands from `.deepseek/commands/` and `~/.deepseek/commands/`.
@@ -302,6 +331,16 @@ fn load_commands_from_dir(dir: &Path, out: &mut Vec<CustomCommand>) {
             .get("context")
             .cloned()
             .unwrap_or_else(|| "normal".to_string());
+        // Parse hooks.* keys from frontmatter
+        let mut hooks = std::collections::HashMap::<String, Vec<String>>::new();
+        for (key, value) in &frontmatter {
+            if let Some(event_name) = key.strip_prefix("hooks.") {
+                hooks
+                    .entry(event_name.to_string())
+                    .or_default()
+                    .push(value.clone());
+            }
+        }
         out.push(CustomCommand {
             name,
             path: path.clone(),
@@ -309,6 +348,7 @@ fn load_commands_from_dir(dir: &Path, out: &mut Vec<CustomCommand>) {
             disable_model_invocation: disable_model,
             context,
             body: body.to_string(),
+            hooks,
         });
     }
 }
@@ -421,5 +461,81 @@ mod tests {
         let (fm, body) = parse_command_frontmatter(raw);
         assert!(fm.is_empty());
         assert_eq!(body, raw);
+    }
+
+    #[test]
+    fn parse_frontmatter_with_hooks() {
+        let raw = "---\ndescription: My cmd\nhooks.PreToolUse: echo check\nhooks.Stop: notify-send done\n---\nBody";
+        let (fm, body) = parse_command_frontmatter(raw);
+        assert_eq!(fm.get("description").unwrap(), "My cmd");
+        assert_eq!(fm.get("hooks.PreToolUse").unwrap(), "echo check");
+        assert_eq!(fm.get("hooks.Stop").unwrap(), "notify-send done");
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn skill_hooks_parsed_into_custom_command() {
+        let workspace = std::env::temp_dir().join(format!(
+            "deepseek-hook-cmd-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let cmd_dir = workspace.join(".deepseek").join("commands");
+        fs::create_dir_all(&cmd_dir).expect("cmd dir");
+
+        fs::write(
+            cmd_dir.join("hooked.md"),
+            "---\ndescription: Hooked command\nhooks.PreToolUse: echo validate\nhooks.PostToolUse: echo log\n---\nDo $ARGUMENTS",
+        )
+        .expect("hooked.md");
+
+        let commands = load_custom_commands(&workspace);
+        let hooked = commands.iter().find(|c| c.name == "hooked").unwrap();
+        assert_eq!(hooked.hooks.len(), 2);
+        assert!(hooked.hooks.contains_key("PreToolUse"));
+        assert!(hooked.hooks.contains_key("PostToolUse"));
+        assert_eq!(hooked.hooks["PreToolUse"], vec!["echo validate"]);
+    }
+
+    #[test]
+    fn apply_context_budget_trims_long_summaries() {
+        let skills: Vec<SkillEntry> = (0..5)
+            .map(|i| SkillEntry {
+                id: format!("s{i}"),
+                name: format!("Skill {i}"),
+                path: PathBuf::from(format!("/tmp/s{i}")),
+                summary: "a".repeat(30),
+                allowed_tools: vec![],
+                scope: SkillScope::BuiltIn,
+            })
+            .collect();
+        let result = apply_context_budget(&skills, 100);
+        // First 3 skills fit (30*3=90), 4th is truncated (10 remaining), 5th is budget exceeded
+        assert_eq!(result[0].summary.len(), 30);
+        assert!(result[3].summary.ends_with("..."));
+        assert_eq!(result[4].summary, "[budget exceeded]");
+    }
+
+    #[test]
+    fn apply_context_budget_no_trim_within_limit() {
+        let skills: Vec<SkillEntry> = (0..3)
+            .map(|i| SkillEntry {
+                id: format!("s{i}"),
+                name: format!("Skill {i}"),
+                path: PathBuf::from(format!("/tmp/s{i}")),
+                summary: "short".to_string(),
+                allowed_tools: vec![],
+                scope: SkillScope::BuiltIn,
+            })
+            .collect();
+        let result = apply_context_budget(&skills, 10_000);
+        for (i, skill) in result.iter().enumerate() {
+            assert_eq!(skill.summary, "short", "skill {i} should be unchanged");
+        }
+    }
+
+    #[test]
+    fn apply_context_budget_empty_skills() {
+        let result = apply_context_budget(&[], 100);
+        assert!(result.is_empty());
     }
 }

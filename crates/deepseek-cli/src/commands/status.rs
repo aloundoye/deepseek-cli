@@ -80,6 +80,7 @@ pub(crate) fn current_ui_status(
         session_turns: projection.transcript.len(),
         working_directory: cwd.display().to_string(),
         pr_review_status,
+        pr_url: None,
         agent_mode: String::new(),
     })
 }
