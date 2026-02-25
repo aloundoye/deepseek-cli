@@ -52,20 +52,21 @@ impl DeepSeekClient {
         Ok(Self { cfg, client })
     }
 
-    fn resolved_endpoint(&self, is_chat: bool, is_fim: bool) -> String {
+    fn resolved_endpoint(&self, is_chat: bool, is_fim: bool, is_strict_tools: bool) -> String {
         let default_ep = "https://api.deepseek.com/chat/completions";
         if self.cfg.endpoint != default_ep && !self.cfg.endpoint.is_empty() {
             return self.cfg.endpoint.clone();
         }
         let base = self.cfg.base_url.trim_end_matches('/');
-        let path = if is_fim {
-            "/beta/completions"
+        let prefix = if self.cfg.openai_compat_prefix { "/v1" } else { "" };
+        let path = if is_fim || is_strict_tools {
+            format!("{prefix}/beta/completions")
         } else if is_chat {
-            "/chat/completions"
+            format!("{prefix}/chat/completions")
         } else {
-            "/completions"
+            format!("{prefix}/completions")
         };
-        format!("{}{}", base, path)
+        format!("{base}{path}")
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: &str) -> Result<LlmResponse> {
@@ -77,7 +78,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, false))
+                .post(&self.resolved_endpoint(false, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -143,8 +144,13 @@ impl DeepSeekClient {
         enable_server_cache: bool,
     ) -> Value {
         let fast_mode = self.cfg.fast_mode;
-        let thinking_enabled = req.model.to_ascii_lowercase().contains("reasoner");
-        let max_cap = if thinking_enabled { 16384 } else { 8192 };
+        let max_cap = model_max_output_tokens(&req.model);
+        if req.max_tokens > max_cap {
+            eprintln!(
+                "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
+                req.max_tokens, req.model, max_cap
+            );
+        }
         let max_tokens = if fast_mode {
             req.max_tokens.min(2048)
         } else {
@@ -295,11 +301,11 @@ impl DeepSeekClient {
             }
         }
 
-        let max_cap = if thinking_enabled { 16384 } else { 8192 };
+        let max_cap = model_max_output_tokens(&req.model);
         let mut payload = json!({
             "model": normalize_deepseek_model(&req.model).unwrap_or(&req.model),
             "messages": messages,
-            "max_tokens": req.max_tokens.min(max_cap as u32),
+            "max_tokens": req.max_tokens.min(max_cap),
             "stream": false
         });
         // DeepSeek API requires temperature/top_p/presence_penalty/frequency_penalty
@@ -359,7 +365,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(true, false))
+                .post(&self.resolved_endpoint(true, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -415,7 +421,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, true))
+                .post(&self.resolved_endpoint(false, true, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -465,7 +471,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, true))
+                .post(&self.resolved_endpoint(false, true, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -572,7 +578,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(true, false))
+                .post(&self.resolved_endpoint(true, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -810,7 +816,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, false))
+                .post(&self.resolved_endpoint(false, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -986,6 +992,15 @@ impl DeepSeekClient {
 fn annotate_cache_control(message: &mut Value) {
     if let Some(obj) = message.as_object_mut() {
         obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+}
+
+/// Returns the maximum output token limit for the given model.
+fn model_max_output_tokens(model: &str) -> u32 {
+    if model.to_ascii_lowercase().contains("reasoner") {
+        deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS
+    } else {
+        deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS
     }
 }
 
@@ -2702,5 +2717,136 @@ mod tests {
     #[test]
     fn http_422_is_not_retryable() {
         assert!(!should_retry_status(StatusCode::UNPROCESSABLE_ENTITY));
+    }
+
+    #[test]
+    fn model_max_output_tokens_reasoner() {
+        assert_eq!(
+            model_max_output_tokens("deepseek-reasoner"),
+            deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(model_max_output_tokens("deepseek-reasoner"), 65536);
+    }
+
+    #[test]
+    fn model_max_output_tokens_chat() {
+        assert_eq!(
+            model_max_output_tokens("deepseek-chat"),
+            deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(model_max_output_tokens("deepseek-chat"), 8192);
+    }
+
+    #[test]
+    fn reasoner_caps_max_tokens_to_65536() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        let req = LlmRequest {
+            unit: deepseek_core::LlmUnit::Planner,
+            prompt: "hello".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            max_tokens: 100_000,
+            non_urgent: false,
+            images: vec![],
+        };
+        let payload = client.build_payload(&req);
+        assert_eq!(payload["max_tokens"], 65536);
+    }
+
+    #[test]
+    fn chat_caps_max_tokens_to_8192() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        let req = LlmRequest {
+            unit: deepseek_core::LlmUnit::Planner,
+            prompt: "hello".to_string(),
+            model: "deepseek-chat".to_string(),
+            max_tokens: 20_000,
+            non_urgent: false,
+            images: vec![],
+        };
+        let payload = client.build_payload(&req);
+        assert_eq!(payload["max_tokens"], 8192);
+    }
+
+    // ── P1-18: resolved_endpoint routing tests ──────────────────────────
+
+    #[test]
+    fn resolved_endpoint_default_chat() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            endpoint: String::new(), // empty triggers computed path
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        assert_eq!(
+            client.resolved_endpoint(true, false, false),
+            "https://api.deepseek.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn resolved_endpoint_fim_routes_to_beta() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            endpoint: String::new(),
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        assert_eq!(
+            client.resolved_endpoint(false, true, false),
+            "https://api.deepseek.com/beta/completions"
+        );
+    }
+
+    #[test]
+    fn resolved_endpoint_strict_tools_routes_to_beta() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            endpoint: String::new(),
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        assert_eq!(
+            client.resolved_endpoint(true, false, true),
+            "https://api.deepseek.com/beta/completions"
+        );
+    }
+
+    #[test]
+    fn resolved_endpoint_openai_compat_adds_v1_prefix() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            endpoint: String::new(),
+            openai_compat_prefix: true,
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        assert_eq!(
+            client.resolved_endpoint(true, false, false),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn resolved_endpoint_custom_endpoint_overrides() {
+        let cfg = LlmConfig {
+            base_url: "https://api.deepseek.com".to_string(),
+            endpoint: "https://custom.example.com/my-api".to_string(),
+            openai_compat_prefix: true,
+            ..Default::default()
+        };
+        let client = DeepSeekClient::new(cfg).unwrap();
+        // Custom endpoint takes priority over everything
+        assert_eq!(
+            client.resolved_endpoint(true, false, false),
+            "https://custom.example.com/my-api"
+        );
     }
 }

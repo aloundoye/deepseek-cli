@@ -11,6 +11,11 @@ pub const DEEPSEEK_V32_CHAT_MODEL: &str = "deepseek-chat";
 pub const DEEPSEEK_V32_REASONER_MODEL: &str = "deepseek-reasoner";
 pub const DEEPSEEK_PROFILE_V32: &str = "v3_2";
 
+/// Maximum output tokens for deepseek-chat (V3 non-thinking).
+pub const DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Maximum output tokens for deepseek-reasoner (thinking/R1).
+pub const DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS: u32 = 65536;
+
 pub fn normalize_deepseek_model(model: &str) -> Option<&'static str> {
     let normalized = model.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -36,6 +41,16 @@ pub fn normalize_deepseek_profile(profile: &str) -> Option<&'static str> {
 
 pub fn runtime_dir(workspace: &Path) -> PathBuf {
     workspace.join(".deepseek")
+}
+
+/// Actions available in the rewind picker menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RewindAction {
+    RestoreCodeAndConversation,
+    RestoreConversationOnly,
+    RestoreCodeOnly,
+    Summarize,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2070,6 +2085,9 @@ pub struct LlmConfig {
     pub max_retries: u8,
     pub retry_base_ms: u64,
     pub stream: bool,
+    /// When true, add `/v1` prefix to API paths for OpenAI SDK compatibility.
+    #[serde(default)]
+    pub openai_compat_prefix: bool,
 }
 
 impl Default for LlmConfig {
@@ -2093,6 +2111,7 @@ impl Default for LlmConfig {
             max_retries: 3,
             retry_base_ms: 400,
             stream: true,
+            openai_compat_prefix: false,
         }
     }
 }

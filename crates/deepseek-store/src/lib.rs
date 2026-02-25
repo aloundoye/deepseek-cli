@@ -332,6 +332,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
             updated_at TEXT NOT NULL
          );",
     ),
+    (
+        9,
+        "CREATE TABLE IF NOT EXISTS persistent_approvals (
+            id INTEGER PRIMARY KEY,
+            tool_name TEXT NOT NULL,
+            command_pattern TEXT NOT NULL,
+            project_hash TEXT NOT NULL,
+            approved_at TEXT NOT NULL,
+            UNIQUE(tool_name, command_pattern, project_hash)
+         );",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -412,6 +423,13 @@ pub struct CheckpointRecord {
     pub snapshot_path: String,
     pub files_count: u64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistentApproval {
+    pub tool_name: String,
+    pub command_pattern: String,
+    pub project_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1236,6 +1254,101 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Delete checkpoints older than `max_age_days`. Returns the number of deleted rows.
+    pub fn delete_old_checkpoints(&self, max_age_days: u32) -> Result<u64> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT snapshot_path FROM checkpoints WHERE created_at < ?1",
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map([&cutoff_str], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let deleted = conn.execute(
+            "DELETE FROM checkpoints WHERE created_at < ?1",
+            [&cutoff_str],
+        )?;
+        for path in &paths {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+        Ok(deleted as u64)
+    }
+
+    // ── Persistent Approvals ────────────────────────────────────────────────
+
+    pub fn insert_persistent_approval(
+        &self,
+        tool_name: &str,
+        command_pattern: &str,
+        project_hash: &str,
+    ) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO persistent_approvals (tool_name, command_pattern, project_hash, approved_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![tool_name, command_pattern, project_hash, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_persistently_approved(
+        &self,
+        tool_name: &str,
+        command: &str,
+        project_hash: &str,
+    ) -> Result<bool> {
+        let conn = self.db()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM persistent_approvals
+             WHERE tool_name = ?1 AND command_pattern = ?2 AND project_hash = ?3",
+            params![tool_name, command, project_hash],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn list_persistent_approvals(
+        &self,
+        project_hash: &str,
+    ) -> Result<Vec<PersistentApproval>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT tool_name, command_pattern, project_hash
+             FROM persistent_approvals WHERE project_hash = ?1",
+        )?;
+        let rows = stmt.query_map([project_hash], |r| {
+            Ok(PersistentApproval {
+                tool_name: r.get(0)?,
+                command_pattern: r.get(1)?,
+                project_hash: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_persistent_approval(
+        &self,
+        tool_name: &str,
+        command_pattern: &str,
+        project_hash: &str,
+    ) -> Result<bool> {
+        let conn = self.db()?;
+        let deleted = conn.execute(
+            "DELETE FROM persistent_approvals
+             WHERE tool_name = ?1 AND command_pattern = ?2 AND project_hash = ?3",
+            params![tool_name, command_pattern, project_hash],
+        )?;
+        Ok(deleted > 0)
     }
 
     pub fn insert_transcript_export(&self, record: &TranscriptExportRecord) -> Result<()> {
@@ -3514,5 +3627,74 @@ mod tests {
         assert_eq!(p1.transcript.len(), 5);
         assert_eq!(p1.usage_input_tokens, p2.usage_input_tokens);
         assert_eq!(p1.plugin_events, p2.plugin_events);
+    }
+
+    // ── P1-12: persistent approvals tests ───────────────────────────────
+
+    #[test]
+    fn insert_and_query_persistent_approval() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-approval-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        store
+            .insert_persistent_approval("bash.run", "npm test", "proj_abc")
+            .expect("insert");
+        assert!(store
+            .is_persistently_approved("bash.run", "npm test", "proj_abc")
+            .expect("query"));
+        assert!(!store
+            .is_persistently_approved("bash.run", "npm test", "proj_other")
+            .expect("other project"));
+    }
+
+    #[test]
+    fn persistent_approval_scoped_to_project() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-scope-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        store
+            .insert_persistent_approval("bash.run", "cargo build", "project_a")
+            .expect("insert");
+        assert!(!store
+            .is_persistently_approved("bash.run", "cargo build", "project_b")
+            .expect("wrong project"));
+    }
+
+    #[test]
+    fn remove_persistent_approval_works() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-remove-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        store
+            .insert_persistent_approval("bash.run", "make", "proj_x")
+            .expect("insert");
+        assert!(store.is_persistently_approved("bash.run", "make", "proj_x").unwrap());
+
+        let removed = store
+            .remove_persistent_approval("bash.run", "make", "proj_x")
+            .expect("remove");
+        assert!(removed);
+        assert!(!store.is_persistently_approved("bash.run", "make", "proj_x").unwrap());
+    }
+
+    #[test]
+    fn list_persistent_approvals_returns_all() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-list-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        store.insert_persistent_approval("bash.run", "npm test", "proj_1").unwrap();
+        store.insert_persistent_approval("bash.run", "npm build", "proj_1").unwrap();
+        store.insert_persistent_approval("bash.run", "npm lint", "proj_1").unwrap();
+
+        let all = store.list_persistent_approvals("proj_1").expect("list");
+        assert_eq!(all.len(), 3);
     }
 }

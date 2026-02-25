@@ -2268,6 +2268,119 @@ impl ChatShell {
     }
 }
 
+// ─── Rewind Picker ──────────────────────────────────────────────────────────
+
+/// Human-readable labels and their corresponding [`RewindAction`] values.
+pub const REWIND_ACTIONS: &[(&str, deepseek_core::RewindAction)] = &[
+    (
+        "Restore code & conversation",
+        deepseek_core::RewindAction::RestoreCodeAndConversation,
+    ),
+    (
+        "Restore conversation only",
+        deepseek_core::RewindAction::RestoreConversationOnly,
+    ),
+    (
+        "Restore code only",
+        deepseek_core::RewindAction::RestoreCodeOnly,
+    ),
+    (
+        "Summarize from here",
+        deepseek_core::RewindAction::Summarize,
+    ),
+    ("Cancel", deepseek_core::RewindAction::Cancel),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewindPickerPhase {
+    SelectCheckpoint,
+    SelectAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindPickerState {
+    pub checkpoints: Vec<deepseek_store::CheckpointRecord>,
+    pub selected_index: usize,
+    pub action_index: usize,
+    pub phase: RewindPickerPhase,
+}
+
+impl RewindPickerState {
+    pub fn new(checkpoints: Vec<deepseek_store::CheckpointRecord>) -> Self {
+        Self {
+            checkpoints,
+            selected_index: 0,
+            action_index: 0,
+            phase: RewindPickerPhase::SelectCheckpoint,
+        }
+    }
+
+    /// Move selection up.
+    pub fn up(&mut self) {
+        let limit = match self.phase {
+            RewindPickerPhase::SelectCheckpoint => self.checkpoints.len(),
+            RewindPickerPhase::SelectAction => REWIND_ACTIONS.len(),
+        };
+        let idx = match self.phase {
+            RewindPickerPhase::SelectCheckpoint => &mut self.selected_index,
+            RewindPickerPhase::SelectAction => &mut self.action_index,
+        };
+        if *idx > 0 {
+            *idx -= 1;
+        } else {
+            *idx = limit.saturating_sub(1);
+        }
+    }
+
+    /// Move selection down.
+    pub fn down(&mut self) {
+        let limit = match self.phase {
+            RewindPickerPhase::SelectCheckpoint => self.checkpoints.len(),
+            RewindPickerPhase::SelectAction => REWIND_ACTIONS.len(),
+        };
+        let idx = match self.phase {
+            RewindPickerPhase::SelectCheckpoint => &mut self.selected_index,
+            RewindPickerPhase::SelectAction => &mut self.action_index,
+        };
+        if *idx + 1 < limit {
+            *idx += 1;
+        } else {
+            *idx = 0;
+        }
+    }
+
+    /// Confirm current selection. Returns `Some(action)` when a final action is chosen.
+    pub fn confirm(&mut self) -> Option<(usize, deepseek_core::RewindAction)> {
+        match self.phase {
+            RewindPickerPhase::SelectCheckpoint => {
+                if self.checkpoints.is_empty() {
+                    return Some((0, deepseek_core::RewindAction::Cancel));
+                }
+                self.phase = RewindPickerPhase::SelectAction;
+                self.action_index = 0;
+                None
+            }
+            RewindPickerPhase::SelectAction => {
+                let (_, action) = REWIND_ACTIONS[self.action_index];
+                Some((self.selected_index, action))
+            }
+        }
+    }
+
+    /// Go back one phase, or return true if we should close the picker.
+    pub fn back(&mut self) -> bool {
+        match self.phase {
+            RewindPickerPhase::SelectAction => {
+                self.phase = RewindPickerPhase::SelectCheckpoint;
+                false
+            }
+            RewindPickerPhase::SelectCheckpoint => true,
+        }
+    }
+}
+
+// ─── Key Bindings ───────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct KeyBindings {
     pub exit: KeyEvent,
@@ -2291,6 +2404,7 @@ pub struct KeyBindings {
     pub switch_model: KeyEvent,
     pub toggle_thinking: KeyEvent,
     pub kill_background: KeyEvent,
+    pub open_editor: KeyEvent,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2317,6 +2431,7 @@ struct KeyBindingsFile {
     switch_model: Option<String>,
     toggle_thinking: Option<String>,
     kill_background: Option<String>,
+    open_editor: Option<String>,
 }
 
 impl Default for KeyBindings {
@@ -2343,6 +2458,7 @@ impl Default for KeyBindings {
             switch_model: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
             toggle_thinking: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
             kill_background: KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            open_editor: KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
         }
     }
 }
@@ -2411,6 +2527,9 @@ impl KeyBindings {
         }
         if let Some(value) = raw.kill_background {
             self.kill_background = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.open_editor {
+            self.open_editor = parse_key_event(&value)?;
         }
         Ok(self)
     }
@@ -4202,6 +4321,24 @@ where
             info_line = "kill background agents: send /background kill-all".to_string();
             input = "/background kill-all".to_string();
             cursor_pos = input.len();
+            continue;
+        }
+        if key == bindings.open_editor {
+            let editor = std::env::var("EDITOR")
+                .or_else(|_| std::env::var("VISUAL"))
+                .unwrap_or_else(|_| "vim".into());
+            let tmp = std::env::temp_dir()
+                .join(format!("deepseek-edit-{}.md", std::process::id()));
+            let _ = std::fs::write(&tmp, &input);
+            crossterm::terminal::disable_raw_mode().ok();
+            let _ = std::process::Command::new(&editor).arg(&tmp).status();
+            crossterm::terminal::enable_raw_mode().ok();
+            if let Ok(text) = std::fs::read_to_string(&tmp) {
+                input = text.trim_end().to_string();
+                cursor_pos = input.len();
+            }
+            let _ = std::fs::remove_file(&tmp);
+            info_line = format!("editor closed ({editor})");
             continue;
         }
         if key == bindings.stop {
@@ -6246,6 +6383,94 @@ mod tests {
         let text: String = line.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("☑"), "checked task should show ☑");
         assert!(text.contains("done item"));
+    }
+
+    // ── P1-02: open_editor keybinding tests ─────────────────────────────
+
+    #[test]
+    fn open_editor_keybinding_default_is_ctrl_g() {
+        let bindings = KeyBindings::default();
+        assert_eq!(bindings.open_editor.code, KeyCode::Char('g'));
+        assert_eq!(bindings.open_editor.modifiers, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn open_editor_keybinding_overridable() {
+        let raw = KeyBindingsFile {
+            open_editor: Some("ctrl+e".to_string()),
+            ..Default::default()
+        };
+        let bindings = KeyBindings::default().apply_overrides(raw).unwrap();
+        assert_eq!(bindings.open_editor.code, KeyCode::Char('e'));
+        assert_eq!(bindings.open_editor.modifiers, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn keybindings_all_fields_have_defaults() {
+        let bindings = KeyBindings::default();
+        // Verify all fields are accessible (compilation test) + spot check
+        assert_eq!(bindings.exit.code, KeyCode::Char('c'));
+        assert_eq!(bindings.submit.code, KeyCode::Enter);
+        assert_eq!(bindings.open_editor.code, KeyCode::Char('g'));
+        assert_eq!(bindings.kill_background.code, KeyCode::Char('f'));
+        assert_eq!(bindings.toggle_thinking.code, KeyCode::Char('t'));
+    }
+
+    // ── P1-01: rewind picker state machine tests ────────────────────────
+
+    #[test]
+    fn rewind_picker_navigation() {
+        let checkpoints = vec![
+            deepseek_store::CheckpointRecord {
+                checkpoint_id: uuid::Uuid::nil(),
+                reason: "a".to_string(),
+                snapshot_path: "/tmp/a".to_string(),
+                files_count: 1,
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+            deepseek_store::CheckpointRecord {
+                checkpoint_id: uuid::Uuid::nil(),
+                reason: "b".to_string(),
+                snapshot_path: "/tmp/b".to_string(),
+                files_count: 2,
+                created_at: "2025-01-02T00:00:00Z".to_string(),
+            },
+        ];
+        let mut picker = RewindPickerState::new(checkpoints);
+        assert_eq!(picker.selected_index, 0);
+        picker.down();
+        assert_eq!(picker.selected_index, 1);
+        picker.down();
+        assert_eq!(picker.selected_index, 0); // wraps
+        picker.up();
+        assert_eq!(picker.selected_index, 1); // wraps back
+    }
+
+    #[test]
+    fn rewind_picker_phase_transition() {
+        let checkpoints = vec![deepseek_store::CheckpointRecord {
+            checkpoint_id: uuid::Uuid::nil(),
+            reason: "cp".to_string(),
+            snapshot_path: "/tmp/cp".to_string(),
+            files_count: 1,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        }];
+        let mut picker = RewindPickerState::new(checkpoints);
+        assert_eq!(picker.phase, RewindPickerPhase::SelectCheckpoint);
+
+        // Confirm transitions to SelectAction
+        let result = picker.confirm();
+        assert!(result.is_none());
+        assert_eq!(picker.phase, RewindPickerPhase::SelectAction);
+
+        // Back returns to SelectCheckpoint
+        let should_close = picker.back();
+        assert!(!should_close);
+        assert_eq!(picker.phase, RewindPickerPhase::SelectCheckpoint);
+
+        // Back from SelectCheckpoint closes picker
+        let should_close = picker.back();
+        assert!(should_close);
     }
 }
 

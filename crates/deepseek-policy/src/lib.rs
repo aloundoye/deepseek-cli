@@ -261,6 +261,9 @@ pub struct PolicyConfig {
     /// Granular permission rules in Tool(specifier) format.
     #[serde(default)]
     pub permission_rules: Vec<PermissionRule>,
+    /// Bash command patterns persistently approved for this project (loaded from store).
+    #[serde(default)]
+    pub persistent_bash_approvals: Vec<String>,
 }
 
 impl Default for PolicyConfig {
@@ -310,6 +313,7 @@ impl Default for PolicyConfig {
             sandbox_wrapper: None,
             permission_mode: PermissionMode::Ask,
             permission_rules: vec![],
+            persistent_bash_approvals: vec![],
         }
     }
 }
@@ -394,6 +398,7 @@ impl PolicyEngine {
                 .filter(|value| !value.is_empty()),
             permission_mode: PermissionMode::from_str_lossy(&cfg.permission_mode.to_string()),
             permission_rules: vec![],
+            persistent_bash_approvals: vec![],
         };
         if let Some(team_policy) = load_team_policy_override() {
             mapped = apply_team_policy_override(mapped, &team_policy);
@@ -467,6 +472,15 @@ impl PolicyEngine {
     }
 
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
+        // Check persistent bash approvals (project-scoped, "don't ask again").
+        if call.name == "bash.run" {
+            if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
+                if self.cfg.persistent_bash_approvals.iter().any(|p| p == cmd) {
+                    return false;
+                }
+            }
+        }
+
         // Check granular permission rules first (they take priority).
         if !self.cfg.permission_rules.is_empty()
             && let Some(decision) = evaluate_permission_rules(&self.cfg.permission_rules, call)
@@ -647,6 +661,11 @@ impl PolicyEngine {
 
     pub fn sandbox_mode(&self) -> &str {
         &self.cfg.sandbox_mode
+    }
+
+    /// Inject persistent bash command approvals (loaded from project store).
+    pub fn set_persistent_bash_approvals(&mut self, approvals: Vec<String>) {
+        self.cfg.persistent_bash_approvals = approvals;
     }
 }
 
@@ -1165,6 +1184,7 @@ mod tests {
             sandbox_wrapper: None,
             permission_mode: PermissionMode::Ask,
             permission_rules: vec![],
+            persistent_bash_approvals: vec![],
         };
         let team = TeamPolicyFile {
             approve_edits: Some("ask".to_string()),
@@ -1978,5 +1998,38 @@ mod tests {
         // On any platform, this should return a path.
         let path = managed_settings_path();
         assert!(path.is_some());
+    }
+
+    // ── P1-12: persistent bash approval tests ───────────────────────────
+
+    #[test]
+    fn policy_with_persistent_approvals_skips_prompt() {
+        let cfg = PolicyConfig {
+            persistent_bash_approvals: vec!["npm test".to_string()],
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let bash = ToolCall {
+            name: "bash.run".to_string(),
+            args: serde_json::json!({"cmd": "npm test"}),
+            requires_approval: false,
+        };
+        assert!(!policy.requires_approval(&bash));
+    }
+
+    #[test]
+    fn persistent_approvals_not_applied_to_edits() {
+        let cfg = PolicyConfig {
+            persistent_bash_approvals: vec!["npm test".to_string()],
+            ..PolicyConfig::default()
+        };
+        let policy = PolicyEngine::new(cfg);
+        let edit = ToolCall {
+            name: "patch.apply".to_string(),
+            args: serde_json::json!({"path": "foo.txt"}),
+            requires_approval: false,
+        };
+        // Edit approval depends on mode, not persistent bash approvals
+        assert!(policy.requires_approval(&edit));
     }
 }

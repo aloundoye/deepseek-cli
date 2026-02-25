@@ -16,3 +16,6 @@ walkdir.workspace = true
 sha2.workspace = true
 deepseek-core = { path = "../deepseek-core" }
 deepseek-store = { path = "../deepseek-store" }
+
+[dev-dependencies]
+rusqlite = { workspace = true }

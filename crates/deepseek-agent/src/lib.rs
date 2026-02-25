@@ -116,8 +116,34 @@ impl AgentEngine {
     ) -> Result<Self> {
         let store = Store::new(workspace)?;
         let observer = Observer::new(workspace, &cfg.telemetry)?;
-        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let mut policy = PolicyEngine::from_app_config(&cfg.policy);
+
+        // Load persistent bash approvals from store.
+        let project_hash = format!("{:x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            workspace.to_string_lossy().as_bytes().hash(&mut h);
+            h.finish()
+        });
+        if let Ok(approvals) = store.list_persistent_approvals(&project_hash) {
+            let bash_approvals: Vec<String> = approvals
+                .iter()
+                .filter(|a| a.tool_name == "bash.run")
+                .map(|a| a.command_pattern.clone())
+                .collect();
+            if !bash_approvals.is_empty() {
+                policy.set_persistent_bash_approvals(bash_approvals);
+            }
+        }
+
         let tool_host = Arc::new(LocalToolHost::new(workspace, policy.clone())?);
+
+        // Best-effort checkpoint cleanup on session start.
+        if cfg.cleanup_period_days > 0 {
+            if let Ok(mem) = deepseek_memory::MemoryManager::new(workspace) {
+                let _ = mem.cleanup_old_checkpoints(cfg.cleanup_period_days);
+            }
+        }
 
         let hooks_config: HooksConfig =
             serde_json::from_value(cfg.hooks.clone()).unwrap_or_default();

@@ -2643,9 +2643,31 @@ pub(crate) fn run_chat_tui(
                     }
                 }
                 SlashCommand::Rewind(args) => {
-                    let to_checkpoint = args.first().cloned();
-                    let checkpoint = rewind_now(cwd, to_checkpoint)?;
-                    format!("rewound to checkpoint {}", checkpoint.checkpoint_id)
+                    if args.is_empty() {
+                        // Show rewind picker (checkpoint list + action menu).
+                        let mem = MemoryManager::new(cwd)?;
+                        let checkpoints = mem.list_checkpoints().unwrap_or_default();
+                        if checkpoints.is_empty() {
+                            "no checkpoints available".to_string()
+                        } else {
+                            let picker = deepseek_ui::RewindPickerState::new(checkpoints);
+                            // Display as numbered list for user to choose
+                            let mut lines: Vec<String> = vec!["Rewind checkpoints:".to_string()];
+                            for (i, cp) in picker.checkpoints.iter().enumerate() {
+                                lines.push(format!(
+                                    "  {}. [{}] {} ({} files)",
+                                    i + 1, cp.created_at, cp.reason, cp.files_count
+                                ));
+                            }
+                            lines.push(String::new());
+                            lines.push("Use /rewind <number> to rewind to a checkpoint.".to_string());
+                            lines.join("\n")
+                        }
+                    } else {
+                        let to_checkpoint = args.first().cloned();
+                        let checkpoint = rewind_now(cwd, to_checkpoint)?;
+                        format!("rewound to checkpoint {}", checkpoint.checkpoint_id)
+                    }
                 }
                 SlashCommand::Export(_) => {
                     let record = MemoryManager::new(cwd)?.export_transcript(

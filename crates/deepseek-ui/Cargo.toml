@@ -15,3 +15,7 @@ signal-hook.workspace = true
 base64.workspace = true
 syntect.workspace = true
 deepseek-core = { path = "../deepseek-core" }
+deepseek-store = { path = "../deepseek-store" }
+
+[dev-dependencies]
+uuid = { workspace = true }

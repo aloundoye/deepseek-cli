@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+/// Result of a rewind action from the rewind picker.
+pub struct RewindResult {
+    pub checkpoint: CheckpointRecord,
+    pub action: deepseek_core::RewindAction,
+    pub code_restored: bool,
+    pub conversation_rewound: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExportFormat {
     Json,
@@ -374,6 +382,44 @@ impl MemoryManager {
 
     pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
         self.store.list_checkpoints()
+    }
+
+    /// Delete checkpoints older than `max_age_days`. Best-effort cleanup.
+    pub fn cleanup_old_checkpoints(&self, max_age_days: u32) -> Result<u64> {
+        self.store.delete_old_checkpoints(max_age_days)
+    }
+
+    /// Execute a rewind action from the rewind picker menu.
+    pub fn rewind_with_action(
+        &self,
+        checkpoint_id: Uuid,
+        action: deepseek_core::RewindAction,
+    ) -> Result<RewindResult> {
+        use deepseek_core::RewindAction;
+        let checkpoint = self
+            .store
+            .load_checkpoint(checkpoint_id)?
+            .ok_or_else(|| anyhow!("checkpoint not found: {checkpoint_id}"))?;
+
+        let code_restored = matches!(
+            action,
+            RewindAction::RestoreCodeAndConversation | RewindAction::RestoreCodeOnly
+        );
+        let conversation_rewound = matches!(
+            action,
+            RewindAction::RestoreCodeAndConversation | RewindAction::RestoreConversationOnly
+        );
+
+        if code_restored {
+            self.rewind_to_checkpoint(checkpoint_id)?;
+        }
+
+        Ok(RewindResult {
+            checkpoint,
+            action,
+            code_restored,
+            conversation_rewound,
+        })
     }
 
     // ── Git Shadow Commits ───────────────────────────────────────────────────
@@ -1156,5 +1202,175 @@ mod tests {
         let (fm, body) = parse_rule_frontmatter(raw);
         assert!(fm.is_null());
         assert_eq!(body, raw);
+    }
+
+    // ── P1-14: checkpoint cleanup tests ─────────────────────────────────
+
+    #[test]
+    fn cleanup_deletes_expired_checkpoints() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-cleanup-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("a.txt"), "data").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        let cp = manager.create_checkpoint("old").expect("checkpoint");
+
+        // Backdate the checkpoint to 40 days ago.
+        let store = deepseek_store::Store::new(&workspace).expect("store");
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(40);
+        let conn = store.db().expect("db");
+        conn.execute(
+            "UPDATE checkpoints SET created_at = ?1 WHERE checkpoint_id = ?2",
+            rusqlite::params![cutoff.to_rfc3339(), cp.checkpoint_id.to_string()],
+        )
+        .expect("backdate");
+
+        let deleted = manager.cleanup_old_checkpoints(30).expect("cleanup");
+        assert_eq!(deleted, 1);
+
+        let remaining = manager.list_checkpoints().expect("list");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn cleanup_keeps_recent_checkpoints() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-keep-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("b.txt"), "data").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        manager.create_checkpoint("fresh").expect("checkpoint");
+
+        let deleted = manager.cleanup_old_checkpoints(30).expect("cleanup");
+        assert_eq!(deleted, 0);
+
+        let remaining = manager.list_checkpoints().expect("list");
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_returns_count() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-count-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("c.txt"), "data").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        let store = deepseek_store::Store::new(&workspace).expect("store");
+
+        // Create 3 checkpoints, backdate all to 50 days ago.
+        for i in 0..3 {
+            let cp = manager
+                .create_checkpoint(&format!("cp-{i}"))
+                .expect("checkpoint");
+            let old = chrono::Utc::now() - chrono::Duration::days(50);
+            let conn = store.db().expect("db");
+            conn.execute(
+                "UPDATE checkpoints SET created_at = ?1 WHERE checkpoint_id = ?2",
+                rusqlite::params![old.to_rfc3339(), cp.checkpoint_id.to_string()],
+            )
+            .expect("backdate");
+        }
+
+        let deleted = manager.cleanup_old_checkpoints(30).expect("cleanup");
+        assert_eq!(deleted, 3);
+    }
+
+    // ── P1-01: rewind action tests ──────────────────────────────────────
+
+    #[test]
+    fn rewind_action_restore_code_and_convo() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-rw-both-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("f.txt"), "original").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        let cp = manager.create_checkpoint("test").expect("checkpoint");
+        fs::write(workspace.join("f.txt"), "mutated").expect("mutate");
+
+        let result = manager
+            .rewind_with_action(
+                cp.checkpoint_id,
+                deepseek_core::RewindAction::RestoreCodeAndConversation,
+            )
+            .expect("rewind");
+
+        assert!(result.code_restored);
+        assert!(result.conversation_rewound);
+        let restored = fs::read_to_string(workspace.join("f.txt")).expect("read");
+        assert_eq!(restored, "original");
+    }
+
+    #[test]
+    fn rewind_action_code_only() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-rw-code-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("g.txt"), "original").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        let cp = manager.create_checkpoint("test").expect("checkpoint");
+        fs::write(workspace.join("g.txt"), "mutated").expect("mutate");
+
+        let result = manager
+            .rewind_with_action(
+                cp.checkpoint_id,
+                deepseek_core::RewindAction::RestoreCodeOnly,
+            )
+            .expect("rewind");
+
+        assert!(result.code_restored);
+        assert!(!result.conversation_rewound);
+        let restored = fs::read_to_string(workspace.join("g.txt")).expect("read");
+        assert_eq!(restored, "original");
+    }
+
+    #[test]
+    fn rewind_action_convo_only() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-rw-convo-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("h.txt"), "original").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        let cp = manager.create_checkpoint("test").expect("checkpoint");
+        fs::write(workspace.join("h.txt"), "mutated").expect("mutate");
+
+        let result = manager
+            .rewind_with_action(
+                cp.checkpoint_id,
+                deepseek_core::RewindAction::RestoreConversationOnly,
+            )
+            .expect("rewind");
+
+        assert!(!result.code_restored);
+        assert!(result.conversation_rewound);
+        // Files should be unchanged (still mutated).
+        let content = fs::read_to_string(workspace.join("h.txt")).expect("read");
+        assert_eq!(content, "mutated");
+    }
+
+    #[test]
+    fn rewind_action_cancel() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mem-rw-cancel-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("j.txt"), "original").expect("seed");
+
+        let manager = MemoryManager::new(&workspace).expect("manager");
+        let cp = manager.create_checkpoint("test").expect("checkpoint");
+        fs::write(workspace.join("j.txt"), "mutated").expect("mutate");
+
+        let result = manager
+            .rewind_with_action(cp.checkpoint_id, deepseek_core::RewindAction::Cancel)
+            .expect("rewind");
+
+        assert!(!result.code_restored);
+        assert!(!result.conversation_rewound);
+        let content = fs::read_to_string(workspace.join("j.txt")).expect("read");
+        assert_eq!(content, "mutated");
     }
 }
