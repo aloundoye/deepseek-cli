@@ -33,7 +33,7 @@ pub fn tool_tier(api_name: &str) -> ToolTier {
 
         // Core: agent-level tools always available
         "user_question" | "spawn_task" | "task_output" | "task_stop" | "kill_shell"
-        | "think_deeply" => ToolTier::Core,
+        | "extended_thinking" | "think_deeply" => ToolTier::Core,
 
         // Contextual: git tools (included in git repos)
         "git_status" | "git_diff" | "git_show" => ToolTier::Contextual,
@@ -266,6 +266,25 @@ mod tests {
         assert_eq!(tool_tier("multi_edit"), ToolTier::Core);
         assert_eq!(tool_tier("user_question"), ToolTier::Core);
         assert_eq!(tool_tier("spawn_task"), ToolTier::Core);
+        assert_eq!(tool_tier("extended_thinking"), ToolTier::Core);
+        assert_eq!(tool_tier("think_deeply"), ToolTier::Core); // alias
+    }
+
+    #[test]
+    fn extended_thinking_tool_exists() {
+        let defs = tool_definitions();
+        let et = defs.iter().find(|t| t.function.name == "extended_thinking");
+        assert!(et.is_some(), "extended_thinking tool should exist in definitions");
+        assert!(
+            et.unwrap().function.description.contains("chain-of-thought"),
+            "description should mention chain-of-thought reasoning"
+        );
+    }
+
+    #[test]
+    fn think_deeply_alias_accepted() {
+        // Both names should resolve to Core tier
+        assert_eq!(tool_tier("extended_thinking"), ToolTier::Core);
         assert_eq!(tool_tier("think_deeply"), ToolTier::Core);
     }
 

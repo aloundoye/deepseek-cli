@@ -13,6 +13,8 @@ pub const DEEPSEEK_PROFILE_V32: &str = "v3_2";
 
 /// Maximum output tokens for deepseek-chat (V3 non-thinking).
 pub const DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Maximum output tokens for deepseek-chat with thinking enabled.
+pub const DEEPSEEK_CHAT_THINKING_MAX_OUTPUT_TOKENS: u32 = 32_768;
 /// Maximum output tokens for deepseek-reasoner (thinking/R1).
 pub const DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS: u32 = 65536;
 
@@ -1368,6 +1370,8 @@ pub enum StreamChunk {
         digest: u64,
         comment_count: usize,
     },
+    /// A security warning detected in tool output (prompt injection, suspicious patterns).
+    SecurityWarning { message: String },
     /// Clear any previously streamed text — the response contains tool calls,
     /// so the interleaved text fragments should be discarded from the display.
     ClearStreamingText,
@@ -1451,6 +1455,10 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "watch_triggered",
             "digest": digest,
             "comment_count": comment_count,
+        }),
+        StreamChunk::SecurityWarning { message } => serde_json::json!({
+            "type": "security_warning",
+            "message": message,
         }),
         StreamChunk::ClearStreamingText => serde_json::json!({
             "type": "clear_streaming_text",
@@ -2340,6 +2348,7 @@ impl ReviewMode {
                 | "web_fetch"
                 | "notebook_read"
                 | "index_query"
+                | "extended_thinking"
                 | "think_deeply"
                 | "spawn_task"
                 | "task_output"

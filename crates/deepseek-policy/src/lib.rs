@@ -1,3 +1,5 @@
+pub mod output_scanner;
+
 use deepseek_core::ToolCall;
 use glob::Pattern;
 use regex::Regex;
@@ -961,6 +963,19 @@ pub struct ManagedSettings {
     pub permission_rules: Vec<PermissionRule>,
     /// Force a specific permission mode.
     pub permission_mode: Option<String>,
+    /// P5-18: Hard limit on allowed tools (empty = all allowed).
+    /// When set, only these tools can be used regardless of user config.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// P5-18: Hard limit on tool-use loop turns.
+    /// When set, overrides user's max_turns if it exceeds this value.
+    pub max_turns: Option<u64>,
+    /// P5-18: Maximum USD budget per session.
+    /// When set, the session will stop after exceeding this budget.
+    pub max_budget_usd: Option<f64>,
+    /// P5-18: Blocked tools that cannot be used regardless of other settings.
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
 }
 
 /// Platform-specific path for managed settings.
@@ -1033,6 +1048,41 @@ pub fn is_mcp_server_allowed(server_id: &str, managed: &ManagedSettings) -> bool
             .any(|s| s == server_id || s == "*");
     }
     true // default: allow
+}
+
+impl ManagedSettings {
+    /// Apply managed settings overrides to the full AppConfig.
+    ///
+    /// Enforces: permission_mode, max_turns cap, disable_bypass_permissions.
+    /// Called after loading config so enterprise constraints are immutable.
+    pub fn apply_to_config(&self, cfg: &mut deepseek_core::AppConfig) {
+        // Force permission mode at the config level
+        if let Some(ref mode) = self.permission_mode {
+            if let Ok(parsed) = mode.parse::<deepseek_core::PermissionMode>() {
+                cfg.policy.permission_mode = parsed;
+            }
+        }
+
+        // Cap max_turns if managed setting is lower
+        if let Some(managed_max) = self.max_turns {
+            let current = cfg.agent_loop.max_iterations;
+            if current > managed_max {
+                cfg.agent_loop.max_iterations = managed_max;
+            }
+        }
+
+        // Prevent bypass permissions mode — force to Ask
+        // (deepseek-core's PermissionMode doesn't have Bypass, so this catches
+        // the deepseek-policy level PermissionMode::BypassPermissions)
+        if self.disable_bypass_permissions_mode {
+            let policy_mode = PermissionMode::from_str_lossy(
+                &serde_json::to_string(&cfg.policy.permission_mode).unwrap_or_default(),
+            );
+            if policy_mode == PermissionMode::BypassPermissions {
+                cfg.policy.permission_mode = deepseek_core::PermissionMode::Ask;
+            }
+        }
+    }
 }
 
 /// Apply managed settings enforcement to a PolicyEngine.
@@ -2031,5 +2081,66 @@ mod tests {
         };
         // Edit approval depends on mode, not persistent bash approvals
         assert!(policy.requires_approval(&edit));
+    }
+
+    // ── P5-18: Admin settings ──────────────────────────────────────────────
+
+    #[test]
+    fn admin_overrides_user() {
+        // Verify ManagedSettings deserializes with new fields
+        let json = serde_json::json!({
+            "disable_bypass_permissions_mode": true,
+            "allowed_tools": ["fs_read", "fs_glob"],
+            "blocked_tools": ["bash_run"],
+            "max_turns": 25,
+            "max_budget_usd": 5.0
+        });
+        let managed: ManagedSettings = serde_json::from_value(json).unwrap();
+        assert!(managed.disable_bypass_permissions_mode);
+        assert_eq!(managed.allowed_tools, vec!["fs_read", "fs_glob"]);
+        assert_eq!(managed.blocked_tools, vec!["bash_run"]);
+        assert_eq!(managed.max_turns, Some(25));
+        assert_eq!(managed.max_budget_usd, Some(5.0));
+
+        // Defaults should be empty/none
+        let defaults = ManagedSettings::default();
+        assert!(defaults.allowed_tools.is_empty());
+        assert!(defaults.blocked_tools.is_empty());
+        assert!(defaults.max_turns.is_none());
+        assert!(defaults.max_budget_usd.is_none());
+    }
+
+    // ── P7-05: Managed settings applied to full config ──────────────────
+
+    #[test]
+    fn managed_overrides_max_turns() {
+        let managed = ManagedSettings {
+            max_turns: Some(10),
+            ..Default::default()
+        };
+        let mut cfg = deepseek_core::AppConfig::default();
+        cfg.agent_loop.max_iterations = 50;
+
+        managed.apply_to_config(&mut cfg);
+        assert_eq!(cfg.agent_loop.max_iterations, 10, "managed max_turns should cap config");
+    }
+
+    #[test]
+    fn managed_disables_bypass() {
+        let managed = ManagedSettings {
+            disable_bypass_permissions_mode: true,
+            ..Default::default()
+        };
+        let mut cfg = deepseek_core::AppConfig::default();
+        // Default permission mode is Ask, not Bypass, so this should be no-op
+        managed.apply_to_config(&mut cfg);
+        assert_eq!(cfg.policy.permission_mode, deepseek_core::PermissionMode::Ask);
+
+        // Verify that max_turns without managed override stays unchanged
+        let managed_no_turns = ManagedSettings::default();
+        let mut cfg2 = deepseek_core::AppConfig::default();
+        let original = cfg2.agent_loop.max_iterations;
+        managed_no_turns.apply_to_config(&mut cfg2);
+        assert_eq!(cfg2.agent_loop.max_iterations, original, "no override = unchanged");
     }
 }

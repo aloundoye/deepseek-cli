@@ -170,6 +170,10 @@ impl McpManager {
             merged.extend(load_config_if_exists(&path)?.servers);
         }
         merged.extend(self.load_project_config()?.servers);
+        // P5-13: Expand environment variables in all server configs
+        for server in &mut merged {
+            expand_server_env_vars(server);
+        }
         merged.sort_by(|a, b| a.id.cmp(&b.id));
         merged.dedup_by(|a, b| a.id == b.id); // first wins (managed > user > project)
         Ok(merged)
@@ -530,6 +534,97 @@ impl McpManager {
             }
         }
         self.discover_tools()
+    }
+
+    /// P5-12: List all prompts from MCP servers.
+    ///
+    /// Queries each enabled server for its `prompts/list` endpoint and returns
+    /// a flat list of `McpPrompt` records. These can be registered as slash
+    /// commands like `/mcp-<server>-<prompt>` in the UI.
+    pub fn list_prompts(&self) -> Result<Vec<McpPrompt>> {
+        let mut prompts = Vec::new();
+        for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
+            let discovered = match server.transport {
+                McpTransport::Stdio => execute_mcp_stdio_request(
+                    &server,
+                    "prompts/list",
+                    json!({}),
+                    4,
+                    Duration::from_secs(6),
+                )
+                .ok()
+                .and_then(|r| r.get("result")?.get("prompts")?.as_array().cloned()),
+                McpTransport::Http | McpTransport::Sse => {
+                    server.url.as_deref().and_then(|url| {
+                        Client::builder()
+                            .timeout(Duration::from_secs(10))
+                            .build()
+                            .ok()?
+                            .post(url)
+                            .json(&json!({"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}))
+                            .send()
+                            .ok()?
+                            .json::<serde_json::Value>()
+                            .ok()?
+                            .get("result")?
+                            .get("prompts")?
+                            .as_array()
+                            .cloned()
+                    })
+                }
+            };
+            if let Some(items) = discovered {
+                for item in items {
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(|a| a.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|a| McpPromptArgument {
+                                    name: a
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    description: a
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    required: a
+                                        .get("required")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    prompts.push(McpPrompt {
+                        server_id: server.id.clone(),
+                        name: item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        description: item
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments,
+                    });
+                }
+            }
+        }
+        Ok(prompts)
+    }
+
+    /// P5-13: Handle `notifications/tools/list_changed` from MCP server.
+    ///
+    /// Re-discovers tools from all servers and returns the refresh results,
+    /// allowing the caller to update tool definitions mid-session.
+    pub fn handle_list_changed_notification(&self) -> Result<(Vec<McpTool>, Vec<McpToolRefresh>)> {
+        self.refresh_tools()
     }
 
     /// Load managed MCP config (enterprise lockdown).
@@ -2438,5 +2533,75 @@ data: {"other":"ignored"}
         // Non-managed server can be removed
         let removed = manager.remove_server("removable").expect("remove");
         assert!(removed);
+    }
+
+    // ── P5-12: MCP prompts as slash commands ──────────────────────────────
+
+    #[test]
+    fn mcp_prompts_as_commands() {
+        // McpPrompt struct should round-trip correctly
+        let prompt = McpPrompt {
+            server_id: "test-server".to_string(),
+            name: "generate-docs".to_string(),
+            description: "Generate documentation for a module".to_string(),
+            arguments: vec![
+                McpPromptArgument {
+                    name: "module".to_string(),
+                    description: "The module to document".to_string(),
+                    required: true,
+                },
+                McpPromptArgument {
+                    name: "format".to_string(),
+                    description: "Output format (md, html)".to_string(),
+                    required: false,
+                },
+            ],
+        };
+        let serialized = serde_json::to_value(&prompt).expect("serialize");
+        let deserialized: McpPrompt = serde_json::from_value(serialized).expect("deserialize");
+        assert_eq!(deserialized.server_id, "test-server");
+        assert_eq!(deserialized.name, "generate-docs");
+        assert_eq!(deserialized.arguments.len(), 2);
+        assert!(deserialized.arguments[0].required);
+        assert!(!deserialized.arguments[1].required);
+
+        // Slash command name generation
+        let slash_name = format!("/mcp-{}-{}", prompt.server_id, prompt.name);
+        assert_eq!(slash_name, "/mcp-test-server-generate-docs");
+    }
+
+    // ── P5-13: env var expansion in list_servers ──────────────────────────
+
+    #[test]
+    fn env_vars_expanded() {
+        // Verify expand_env_vars works with existing HOME var
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".to_string());
+
+        // Expansion works on real env vars
+        let expanded = expand_env_vars("Bearer ${HOME}");
+        assert_eq!(expanded, format!("Bearer {home}"));
+
+        // With default value for missing var
+        let expanded2 = expand_env_vars("${NONEXISTENT_ENV_VAR_XYZ:-fallback_val}");
+        assert_eq!(expanded2, "fallback_val");
+
+        // Expansion in server config (using HOME which is always set)
+        let mut server = McpServer {
+            id: "svc".to_string(),
+            name: "Service".to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: vec!["--home=${HOME}".to_string()],
+            url: Some("https://api.example.com/${HOME}".to_string()),
+            enabled: true,
+            metadata: serde_json::Value::Null,
+            headers: vec![],
+        };
+        expand_server_env_vars(&mut server);
+        let expected_url = format!("https://api.example.com/{home}");
+        assert_eq!(server.url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(server.args[0], format!("--home={home}"));
     }
 }

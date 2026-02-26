@@ -5,9 +5,13 @@
 //! back into `ChatMessage::Tool` for feeding to the next LLM turn.
 
 use deepseek_core::{ChatMessage, LlmToolCall, ToolCall, ToolName, ToolResult};
+use deepseek_policy::output_scanner::{InjectionWarning, OutputScanner};
 
 /// Maximum characters for tool output before truncation.
 pub const MAX_TOOL_OUTPUT_CHARS: usize = 25_000;
+
+/// Maximum characters for MCP tool output before truncation (~25K tokens).
+pub const MCP_MAX_OUTPUT_CHARS: usize = 100_000;
 
 /// Convert an `LlmToolCall` from the API into an internal `ToolCall`.
 ///
@@ -40,15 +44,39 @@ pub fn llm_tool_call_to_internal(call: &LlmToolCall) -> ToolCall {
 /// Convert a `ToolResult` into a `ChatMessage::Tool` for inclusion in the
 /// conversation history sent to the LLM.
 ///
-/// Truncates large outputs to `MAX_TOOL_OUTPUT_CHARS` to prevent context overflow.
-pub fn tool_result_to_message(tool_call_id: &str, result: &ToolResult) -> ChatMessage {
+/// Truncates large outputs to `MAX_TOOL_OUTPUT_CHARS` (or `MCP_MAX_OUTPUT_CHARS`
+/// for MCP tools) to prevent context overflow. When a scanner is provided,
+/// secrets are redacted and injection warnings are returned.
+pub fn tool_result_to_message(
+    tool_call_id: &str,
+    tool_name: &str,
+    result: &ToolResult,
+    scanner: Option<&OutputScanner>,
+) -> (ChatMessage, Vec<InjectionWarning>) {
     let raw = format_tool_output(&result.output, result.success);
-    let content = truncate_output(&raw, MAX_TOOL_OUTPUT_CHARS);
 
-    ChatMessage::Tool {
+    // Use higher limit for MCP tools
+    let max_chars = if tool_name.starts_with("mcp__") {
+        MCP_MAX_OUTPUT_CHARS
+    } else {
+        MAX_TOOL_OUTPUT_CHARS
+    };
+    let mut content = truncate_output(&raw, max_chars);
+
+    // Apply security scanning if available
+    let warnings = if let Some(s) = scanner {
+        let scan = s.scan(&content);
+        content = scan.redacted_output;
+        scan.injection_warnings
+    } else {
+        Vec::new()
+    };
+
+    let msg = ChatMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
         content,
-    }
+    };
+    (msg, warnings)
 }
 
 /// Format a tool error as a `ChatMessage::Tool` with error content.
@@ -204,7 +232,8 @@ mod tests {
             success: true,
             output: serde_json::json!({"content": "file contents here"}),
         };
-        let msg = tool_result_to_message("call_1", &result);
+        let (msg, warnings) = tool_result_to_message("call_1", "fs_read", &result, None);
+        assert!(warnings.is_empty());
         match msg {
             ChatMessage::Tool { tool_call_id, content } => {
                 assert_eq!(tool_call_id, "call_1");
@@ -221,7 +250,7 @@ mod tests {
             success: false,
             output: serde_json::json!({"error": "file not found"}),
         };
-        let msg = tool_result_to_message("call_2", &result);
+        let (msg, _) = tool_result_to_message("call_2", "fs_read", &result, None);
         match msg {
             ChatMessage::Tool { content, .. } => {
                 assert!(content.contains("Error: file not found"));
@@ -238,10 +267,28 @@ mod tests {
             success: true,
             output: serde_json::json!(big),
         };
-        let msg = tool_result_to_message("call_4", &result);
+        let (msg, _) = tool_result_to_message("call_4", "fs_read", &result, None);
         match msg {
             ChatMessage::Tool { content, .. } => {
                 assert!(content.len() < 26_000);
+                assert!(content.contains("[Output truncated"));
+            }
+            _ => panic!("expected Tool message"),
+        }
+    }
+
+    #[test]
+    fn mcp_output_truncated_at_limit() {
+        let big = "x".repeat(120_000);
+        let result = ToolResult {
+            invocation_id: uuid::Uuid::nil(),
+            success: true,
+            output: serde_json::json!(big),
+        };
+        let (msg, _) = tool_result_to_message("call_mcp", "mcp__github__search", &result, None);
+        match msg {
+            ChatMessage::Tool { content, .. } => {
+                assert!(content.len() < 101_000, "MCP output should truncate around 100K");
                 assert!(content.contains("[Output truncated"));
             }
             _ => panic!("expected Tool message"),

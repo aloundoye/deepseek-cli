@@ -1,11 +1,14 @@
 //! System prompts for the tool-use agent loop.
 //!
-//! The `TOOL_USE_SYSTEM_PROMPT` is used when the agent runs in tool-use
-//! mode (Code/Ask/Context).
+//! One stable system prompt with always-included planning/verification guidance.
+//! DeepSeek follows stable system constraints well — a single consistent
+//! instruction set is more robust than dynamically switching tiers.
 
-/// System prompt that makes deepseek-chat behave as an intelligent coding agent
-/// with tool guidance. This prompt is used for the tool-use conversation loop
-/// where the model freely decides which tools to call.
+/// System prompt that makes deepseek-chat behave as an intelligent coding agent.
+///
+/// Contains: tool policy, planning rubric, patch workflow, stop conditions.
+/// This is always the same regardless of task complexity — the model decides
+/// when to plan vs proceed based on the guidance.
 pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, an expert software engineering assistant operating in a terminal.
 
 ## CRITICAL RULES
@@ -22,7 +25,30 @@ pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, an expert software
 - Respond based ONLY on tool results, never from memory.
 
 Tool descriptions contain detailed usage instructions. Read them carefully.
+
+## WORKING PROTOCOL
+For trivial changes (rename, fix typo, add import): just do it. No planning needed.
+
+For anything non-trivial, follow this workflow:
+1. **Read before write**: Use `fs_read` on every file you plan to modify. Understand existing patterns.
+2. **Search before assuming**: Use `fs_glob` and `fs_grep` to find files. Do NOT guess paths.
+3. **Trace impacts**: If changing a type, function signature, or module interface, grep for all call sites first.
+4. **Verify after changes**: Run the build command or test suite after modifications.
+5. **One step at a time**: Make changes incrementally. Verify each file before moving to the next.
+
+For multi-file refactors, migrations, or architectural changes:
+- State your plan briefly BEFORE making changes (which files, in what order, what risks).
+- Modify files in dependency order (dependencies first, dependents after).
+- Run tests after each file change, not just at the end.
+
+### ANTI-PATTERNS
+- Do NOT edit a file you haven't read.
+- Do NOT change a type/interface without grepping for all usages.
+- Do NOT skip running tests after changes.
+- Do NOT make changes beyond what was requested.
 "#;
+
+use crate::complexity::PromptComplexity;
 
 /// Workspace context injected into the system prompt environment section.
 pub struct WorkspaceContext {
@@ -34,7 +60,7 @@ pub struct WorkspaceContext {
 /// Build the complete system prompt for a tool-use session.
 ///
 /// Layers:
-/// 1. Base tool-use prompt
+/// 1. Base tool-use prompt (always includes planning/verification guidance)
 /// 2. Environment context (cwd, git branch, OS)
 /// 3. Project memory (DEEPSEEK.md equivalent)
 /// 4. User system prompt override or append
@@ -78,6 +104,43 @@ pub fn build_tool_use_system_prompt(
     parts.join("\n")
 }
 
+/// Build system prompt with complexity-based additions.
+///
+/// The base prompt always includes the working protocol. For Complex tasks,
+/// we add an explicit "PLAN FIRST" reminder. For Simple, nothing extra.
+/// This is a lightweight nudge, not a different prompt.
+pub fn build_tool_use_system_prompt_with_complexity(
+    project_memory: Option<&str>,
+    system_prompt_override: Option<&str>,
+    system_prompt_append: Option<&str>,
+    workspace_context: Option<&WorkspaceContext>,
+    complexity: PromptComplexity,
+) -> String {
+    let base = build_tool_use_system_prompt(
+        project_memory,
+        system_prompt_override,
+        system_prompt_append,
+        workspace_context,
+    );
+
+    // Don't inject anything if user provided a full system prompt override.
+    if system_prompt_override.is_some() {
+        return base;
+    }
+
+    match complexity {
+        PromptComplexity::Complex => format!("{base}{COMPLEX_REMINDER}"),
+        _ => base,
+    }
+}
+
+/// Brief reminder for complex tasks. The full protocol is already in the base
+/// prompt — this just reinforces it for tasks where skipping planning is risky.
+const COMPLEX_REMINDER: &str = "\n\n\
+## IMPORTANT: This looks like a complex task.\n\
+Follow the WORKING PROTOCOL above strictly. State your plan before making changes.\n\
+Modify files in dependency order and verify after each change.\n";
+
 /// Format the environment section for the system prompt.
 fn format_environment_section(ctx: &WorkspaceContext) -> String {
     let mut section = String::from("\n# Environment\n\n");
@@ -103,14 +166,17 @@ mod tests {
     #[test]
     fn system_prompt_includes_anti_hallucination_rules() {
         let prompt = build_tool_use_system_prompt(None, None, None, None);
-        assert!(
-            prompt.contains("NEVER fabricate"),
-            "prompt should contain anti-hallucination warning"
-        );
-        assert!(
-            prompt.contains("tool results"),
-            "prompt should emphasize responding based on tool results"
-        );
+        assert!(prompt.contains("NEVER fabricate"));
+        assert!(prompt.contains("tool results"));
+    }
+
+    #[test]
+    fn system_prompt_always_includes_working_protocol() {
+        let prompt = build_tool_use_system_prompt(None, None, None, None);
+        assert!(prompt.contains("WORKING PROTOCOL"), "should always include protocol");
+        assert!(prompt.contains("Read before write"), "should include read-first rule");
+        assert!(prompt.contains("ANTI-PATTERNS"), "should include anti-patterns");
+        assert!(prompt.contains("grep for all call sites"), "should include impact tracing");
     }
 
     #[test]
@@ -135,7 +201,6 @@ mod tests {
         );
         assert!(prompt.starts_with("Custom system prompt"));
         assert!(prompt.contains("project memory"));
-        // Should NOT contain the default tool-use prompt
         assert!(!prompt.contains("You are DeepSeek, an expert software"));
     }
 
@@ -171,8 +236,6 @@ mod tests {
         assert!(prompt.contains("OS: linux"));
     }
 
-    // ── Batch 6: System prompt conciseness tests ──
-
     #[test]
     fn system_prompt_is_concise() {
         let line_count = TOOL_USE_SYSTEM_PROMPT.lines().count();
@@ -185,10 +248,52 @@ mod tests {
     #[test]
     fn system_prompt_emphasizes_brevity() {
         let prompt = build_tool_use_system_prompt(None, None, None, None);
-        assert!(
-            prompt.contains("concise") || prompt.contains("Minimize"),
-            "prompt should emphasize brevity"
+        assert!(prompt.contains("concise") || prompt.contains("Minimize"));
+    }
+
+    // ── Complexity injection ──
+
+    #[test]
+    fn complex_task_injects_reminder() {
+        let prompt = build_tool_use_system_prompt_with_complexity(
+            None, None, None, None,
+            PromptComplexity::Complex,
         );
+        assert!(prompt.contains("IMPORTANT"), "complex should get reminder");
+        assert!(prompt.contains("WORKING PROTOCOL"), "should have protocol in base");
+        assert!(prompt.contains("ANTI-PATTERNS"), "should have anti-patterns in base");
+    }
+
+    #[test]
+    fn medium_task_uses_base_prompt_only() {
+        let prompt = build_tool_use_system_prompt_with_complexity(
+            None, None, None, None,
+            PromptComplexity::Medium,
+        );
+        assert!(prompt.contains("WORKING PROTOCOL"), "medium gets base protocol");
+        assert!(!prompt.contains("IMPORTANT: This looks like"), "medium should NOT get reminder");
+    }
+
+    #[test]
+    fn simple_task_uses_base_prompt_only() {
+        let prompt = build_tool_use_system_prompt_with_complexity(
+            None, None, None, None,
+            PromptComplexity::Simple,
+        );
+        assert!(prompt.contains("WORKING PROTOCOL"), "simple gets base protocol");
+        assert!(!prompt.contains("IMPORTANT: This looks like"), "simple should NOT get reminder");
+    }
+
+    #[test]
+    fn override_skips_complexity_injection() {
+        let prompt = build_tool_use_system_prompt_with_complexity(
+            None,
+            Some("Custom prompt"),
+            None,
+            None,
+            PromptComplexity::Complex,
+        );
+        assert!(!prompt.contains("IMPORTANT: This looks like"));
     }
 
     #[test]

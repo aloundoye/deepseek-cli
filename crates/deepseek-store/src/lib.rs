@@ -364,6 +364,16 @@ pub struct UsageSummary {
     pub records: u64,
 }
 
+/// Per-session usage breakdown for `/stats` history display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryEntry {
+    pub session_id: String,
+    pub started_at: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub turn_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageByUnitSummary {
     pub unit: String,
@@ -1094,6 +1104,37 @@ impl Store {
             output_tokens: output_tokens.max(0) as u64,
             records: records.max(0) as u64,
         })
+    }
+
+    /// Return per-session usage breakdown for the last N days.
+    pub fn session_history(&self, last_days: i64) -> Result<Vec<SessionHistoryEntry>> {
+        let conn = self.db()?;
+        let since = Utc::now() - chrono::Duration::days(last_days);
+        let mut stmt = conn.prepare(
+            "SELECT session_id,
+                    MIN(recorded_at) AS started_at,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COUNT(1) AS turn_count
+             FROM usage_ledger
+             WHERE recorded_at >= ?1
+             GROUP BY session_id
+             ORDER BY started_at DESC",
+        )?;
+        let rows = stmt.query_map([since.to_rfc3339()], |r| {
+            Ok(SessionHistoryEntry {
+                session_id: r.get(0)?,
+                started_at: r.get(1)?,
+                input_tokens: r.get::<_, i64>(2)?.max(0) as u64,
+                output_tokens: r.get::<_, i64>(3)?.max(0) as u64,
+                turn_count: r.get::<_, i64>(4)?.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn usage_by_unit(&self, session_id: Uuid) -> Result<Vec<UsageByUnitSummary>> {
@@ -3696,5 +3737,48 @@ mod tests {
 
         let all = store.list_persistent_approvals("proj_1").expect("list");
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn stats_session_history_query() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-hist-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        let conn = store.db().expect("db");
+        let session_a = Uuid::now_v7().to_string();
+        let session_b = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Insert usage records for two sessions
+        conn.execute(
+            "INSERT INTO usage_ledger (session_id, unit, model, input_tokens, cache_hit_tokens, cache_miss_tokens, output_tokens, recorded_at)
+             VALUES (?1, 'chat', 'deepseek-chat', 1000, 0, 0, 500, ?2)",
+            rusqlite::params![&session_a, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO usage_ledger (session_id, unit, model, input_tokens, cache_hit_tokens, cache_miss_tokens, output_tokens, recorded_at)
+             VALUES (?1, 'chat', 'deepseek-chat', 2000, 0, 0, 800, ?2)",
+            rusqlite::params![&session_a, &now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO usage_ledger (session_id, unit, model, input_tokens, cache_hit_tokens, cache_miss_tokens, output_tokens, recorded_at)
+             VALUES (?1, 'chat', 'deepseek-chat', 500, 0, 0, 200, ?2)",
+            rusqlite::params![&session_b, &now],
+        ).unwrap();
+
+        let history = store.session_history(7).expect("session_history");
+        assert!(history.len() >= 2, "should have at least 2 sessions, got {}", history.len());
+
+        let entry_a = history.iter().find(|e| e.session_id == session_a).unwrap();
+        assert_eq!(entry_a.input_tokens, 3000);
+        assert_eq!(entry_a.output_tokens, 1300);
+        assert_eq!(entry_a.turn_count, 2);
+
+        let entry_b = history.iter().find(|e| e.session_id == session_b).unwrap();
+        assert_eq!(entry_b.input_tokens, 500);
+        assert_eq!(entry_b.output_tokens, 200);
+        assert_eq!(entry_b.turn_count, 1);
     }
 }

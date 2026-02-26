@@ -20,6 +20,7 @@ deepseek-tools = { path = "../deepseek-tools" }
 deepseek-subagent = { path = "../deepseek-subagent" }
 deepseek-hooks = { path = "../deepseek-hooks" }
 deepseek-mcp = { path = "../deepseek-mcp" }
+deepseek-skills = { path = "../deepseek-skills" }
 deepseek-diff = { path = "../deepseek-diff" }
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-context = { path = "../deepseek-context" }

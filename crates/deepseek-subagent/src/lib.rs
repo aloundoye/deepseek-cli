@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Result, Context, anyhow};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use uuid::Uuid;
 
@@ -67,14 +69,14 @@ pub struct CustomAgentDef {
 }
 
 /// Load custom agent definitions from .deepseek/agents/*.md and ~/.deepseek/agents/*.md
-pub fn load_agent_defs(workspace: &std::path::Path) -> Result<Vec<CustomAgentDef>> {
+pub fn load_agent_defs(workspace: &Path) -> Result<Vec<CustomAgentDef>> {
     let mut defs = Vec::new();
     let project_dir = workspace.join(".deepseek/agents");
     if project_dir.is_dir() {
         load_agent_defs_from_dir(&project_dir, &mut defs)?;
     }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        let global_dir = std::path::PathBuf::from(home).join(".deepseek/agents");
+        let global_dir = PathBuf::from(home).join(".deepseek/agents");
         if global_dir.is_dir() {
             load_agent_defs_from_dir(&global_dir, &mut defs)?;
         }
@@ -82,7 +84,7 @@ pub fn load_agent_defs(workspace: &std::path::Path) -> Result<Vec<CustomAgentDef
     Ok(defs)
 }
 
-fn load_agent_defs_from_dir(dir: &std::path::Path, out: &mut Vec<CustomAgentDef>) -> Result<()> {
+fn load_agent_defs_from_dir(dir: &Path, out: &mut Vec<CustomAgentDef>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -97,7 +99,7 @@ fn load_agent_defs_from_dir(dir: &std::path::Path, out: &mut Vec<CustomAgentDef>
     Ok(())
 }
 
-fn parse_agent_def(raw: &str, path: &std::path::Path) -> Option<CustomAgentDef> {
+fn parse_agent_def(raw: &str, path: &Path) -> Option<CustomAgentDef> {
     let trimmed = raw.trim();
     if !trimmed.starts_with("---") {
         return None;
@@ -170,6 +172,343 @@ fn parse_agent_def(raw: &str, path: &std::path::Path) -> Option<CustomAgentDef> 
         max_turns,
     })
 }
+
+// ── P5-01: Background Task Registry ──
+
+/// Status of a background subagent task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundTaskStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// A background task entry in the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTaskEntry {
+    pub id: Uuid,
+    pub prompt: String,
+    pub status: BackgroundTaskStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Registry for background subagent tasks.
+///
+/// Manages lifecycle of tasks that run asynchronously while the main
+/// agent loop continues. Results can be retrieved later.
+#[derive(Debug, Clone, Default)]
+pub struct BackgroundTaskRegistry {
+    tasks: Arc<Mutex<HashMap<Uuid, BackgroundTaskEntry>>>,
+}
+
+impl BackgroundTaskRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Submit a task to run in the background.
+    ///
+    /// Returns the task ID immediately. The task runs in a separate thread.
+    pub fn submit<F>(&self, prompt: String, worker: F) -> Uuid
+    where
+        F: FnOnce() -> Result<String> + Send + 'static,
+    {
+        let id = Uuid::now_v7();
+        let entry = BackgroundTaskEntry {
+            id,
+            prompt: prompt.clone(),
+            status: BackgroundTaskStatus::Running,
+            result: None,
+            error: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+        };
+
+        {
+            let mut tasks = self.tasks.lock().expect("background registry lock");
+            tasks.insert(id, entry);
+        }
+
+        let tasks_ref = self.tasks.clone();
+        thread::spawn(move || {
+            let (status, result, error) = match worker() {
+                Ok(output) => (BackgroundTaskStatus::Completed, Some(output), None),
+                Err(e) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
+            };
+            let finished_at = chrono::Utc::now();
+            if let Ok(mut tasks) = tasks_ref.lock() {
+                if let Some(entry) = tasks.get_mut(&id) {
+                    entry.status = status;
+                    entry.result = result;
+                    entry.error = error;
+                    entry.finished_at = Some(finished_at);
+                }
+            }
+        });
+
+        id
+    }
+
+    /// Get the status of a background task.
+    pub fn get(&self, id: Uuid) -> Option<BackgroundTaskEntry> {
+        self.tasks.lock().ok()?.get(&id).cloned()
+    }
+
+    /// List all background tasks.
+    pub fn list(&self) -> Vec<BackgroundTaskEntry> {
+        self.tasks
+            .lock()
+            .map(|tasks| tasks.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get running task count.
+    pub fn running_count(&self) -> usize {
+        self.tasks
+            .lock()
+            .map(|tasks| {
+                tasks
+                    .values()
+                    .filter(|t| t.status == BackgroundTaskStatus::Running)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}
+
+// ── P5-02: Worktree Isolation ──
+
+/// Manages git worktree creation and cleanup for isolated subagent execution.
+pub struct WorktreeIsolation {
+    workspace: PathBuf,
+    worktree_path: PathBuf,
+    created: bool,
+}
+
+impl WorktreeIsolation {
+    /// Create a new isolated worktree for a subagent.
+    pub fn create(workspace: &Path, name: &str) -> Result<Self> {
+        let runtime_dir = workspace.join(".deepseek");
+        let worktrees_dir = runtime_dir.join("worktrees");
+        std::fs::create_dir_all(&worktrees_dir)?;
+
+        let worktree_path = worktrees_dir.join(name);
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+
+        let base_commit = git_stdout(workspace, &["rev-parse", "HEAD"])
+            .context("failed to get HEAD commit for worktree")?;
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["worktree", "add", "--detach"])
+            .arg(&worktree_path)
+            .arg(&base_commit)
+            .output()
+            .context("failed to spawn git worktree add")?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok(Self {
+            workspace: workspace.to_path_buf(),
+            worktree_path,
+            created: true,
+        })
+    }
+
+    /// Get the path to the worktree.
+    pub fn path(&self) -> &Path {
+        &self.worktree_path
+    }
+
+    /// Collect the diff of changes made in the worktree.
+    pub fn collect_diff(&self) -> Result<String> {
+        git_stdout(&self.worktree_path, &["diff", "--binary", "HEAD"])
+    }
+
+    /// Clean up the worktree.
+    pub fn cleanup(&mut self) -> Result<()> {
+        if !self.created {
+            return Ok(());
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.worktree_path)
+            .output()
+            .context("failed to spawn git worktree remove")?;
+
+        if output.status.success() {
+            self.created = false;
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "git worktree remove failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+}
+
+impl Drop for WorktreeIsolation {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .context("failed to spawn git command")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(anyhow!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+// ── P5-03: Persistent Memory ──
+
+/// Get the memory path for a named subagent.
+///
+/// Memory is stored per-project, per-agent:
+/// `~/.deepseek/projects/<hash>/agents/<name>/MEMORY.md`
+pub fn agent_memory_path(workspace: &Path, agent_name: &str) -> PathBuf {
+    let hash = project_hash(workspace);
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".deepseek/projects")
+        .join(&hash)
+        .join("agents")
+        .join(agent_name)
+        .join("MEMORY.md")
+}
+
+/// Load agent memory (first 200 lines) for inclusion in system prompt.
+pub fn load_agent_memory(workspace: &Path, agent_name: &str) -> Option<String> {
+    let path = agent_memory_path(workspace, agent_name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let lines: Vec<&str> = content.lines().take(200).collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn project_hash(workspace: &Path) -> String {
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let path_str = canonical.to_string_lossy();
+    // Simple hash for directory identification
+    let mut hash: u64 = 0;
+    for byte in path_str.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
+    }
+    format!("{hash:016x}")
+}
+
+// ── P5-04: Resumable Subagents ──
+
+/// Path to a subagent's transcript file.
+pub fn transcript_path(workspace: &Path, agent_id: Uuid) -> PathBuf {
+    let hash = project_hash(workspace);
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".deepseek/projects")
+        .join(&hash)
+        .join("subagents")
+        .join(format!("{agent_id}.jsonl"))
+}
+
+/// Append a message to a subagent's transcript.
+pub fn append_transcript(workspace: &Path, agent_id: Uuid, line: &str) -> Result<()> {
+    let path = transcript_path(workspace, agent_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+/// Load a subagent's transcript lines.
+pub fn load_transcript(workspace: &Path, agent_id: Uuid) -> Result<Vec<String>> {
+    let path = transcript_path(workspace, agent_id);
+    let content = std::fs::read_to_string(&path)
+        .context("failed to load subagent transcript")?;
+    Ok(content.lines().map(String::from).collect())
+}
+
+// ── P5-05: Subagent Configuration ──
+
+/// Configuration for subagent execution (auto-compaction, max turns, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    /// Maximum turns for the subagent's tool-use loop.
+    pub max_turns: usize,
+    /// Whether the subagent should compact its context when approaching limits.
+    pub compaction_enabled: bool,
+    /// Model override for the subagent.
+    pub model: Option<String>,
+    /// Tool restrictions — if non-empty, only these tools are available.
+    pub allowed_tools: Vec<String>,
+    /// Tools to exclude from the subagent's toolset.
+    pub disallowed_tools: Vec<String>,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: 30,
+            compaction_enabled: true,
+            model: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+        }
+    }
+}
+
+impl SubagentConfig {
+    /// Build from a CustomAgentDef, falling back to defaults.
+    pub fn from_agent_def(def: &CustomAgentDef) -> Self {
+        Self {
+            max_turns: def.max_turns.map(|n| n as usize).unwrap_or(30),
+            compaction_enabled: true,
+            model: def.model.clone(),
+            allowed_tools: def.tools.clone(),
+            disallowed_tools: def.disallowed_tools.clone(),
+        }
+    }
+}
+
+// ── SubagentManager ──
 
 #[derive(Debug, Clone)]
 pub struct SubagentManager {
@@ -369,7 +708,7 @@ impl TeamState {
 pub struct TeamCoordinator {
     pub manager: SubagentManager,
     pub mode: TeammateMode,
-    pub shared_state: std::sync::Arc<std::sync::Mutex<TeamState>>,
+    pub shared_state: Arc<Mutex<TeamState>>,
 }
 
 impl TeamCoordinator {
@@ -377,7 +716,7 @@ impl TeamCoordinator {
         Self {
             manager: SubagentManager::new(max_concurrency),
             mode,
-            shared_state: std::sync::Arc::new(std::sync::Mutex::new(TeamState::new())),
+            shared_state: Arc::new(Mutex::new(TeamState::new())),
         }
     }
 
@@ -600,5 +939,252 @@ mod tests {
         let state = coordinator.state();
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].from, "lead");
+    }
+
+    // ── P5-01: Background Task Registry Tests ──
+
+    #[test]
+    fn background_task_executes_async() {
+        let registry = BackgroundTaskRegistry::new();
+        let id = registry.submit("test task".to_string(), || {
+            thread::sleep(Duration::from_millis(50));
+            Ok("background result".to_string())
+        });
+
+        // Task should be running immediately
+        let entry = registry.get(id).expect("task should exist");
+        assert_eq!(entry.status, BackgroundTaskStatus::Running);
+
+        // Wait for completion
+        thread::sleep(Duration::from_millis(200));
+
+        let entry = registry.get(id).expect("task should exist");
+        assert_eq!(entry.status, BackgroundTaskStatus::Completed);
+        assert_eq!(entry.result.as_deref(), Some("background result"));
+    }
+
+    #[test]
+    fn background_results_retrievable() {
+        let registry = BackgroundTaskRegistry::new();
+        let id1 = registry.submit("task 1".to_string(), || Ok("result 1".to_string()));
+        let id2 = registry.submit("task 2".to_string(), || Ok("result 2".to_string()));
+
+        thread::sleep(Duration::from_millis(100));
+
+        let all = registry.list();
+        assert_eq!(all.len(), 2);
+
+        let entry1 = registry.get(id1).unwrap();
+        assert_eq!(entry1.result.as_deref(), Some("result 1"));
+        let entry2 = registry.get(id2).unwrap();
+        assert_eq!(entry2.result.as_deref(), Some("result 2"));
+    }
+
+    // ── P5-02: Worktree Isolation Tests ──
+
+    #[test]
+    fn worktree_creates_and_cleans() {
+        let temp = tempfile::tempdir().unwrap();
+        // Initialize a git repo
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+
+        // Need at least one commit for worktree
+        std::fs::write(temp.path().join("test.txt"), "hello\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "initial", "--allow-empty"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let mut wt = WorktreeIsolation::create(temp.path(), "test-agent").unwrap();
+        assert!(wt.path().exists(), "worktree should exist");
+
+        wt.cleanup().unwrap();
+        assert!(!wt.path().exists(), "worktree should be cleaned up");
+    }
+
+    #[test]
+    fn worktree_diff_collected() {
+        let temp = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        std::fs::write(temp.path().join("file.txt"), "original\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(temp.path())
+            .output();
+
+        let mut wt = WorktreeIsolation::create(temp.path(), "diff-test").unwrap();
+
+        // Make a change in the worktree
+        std::fs::write(wt.path().join("file.txt"), "modified\n").unwrap();
+        let diff = wt.collect_diff().unwrap();
+        assert!(
+            diff.contains("modified") || diff.contains("original"),
+            "diff should contain changes"
+        );
+
+        wt.cleanup().unwrap();
+    }
+
+    // ── P5-04: Transcript Tests ──
+
+    #[test]
+    fn transcript_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_id = Uuid::now_v7();
+
+        append_transcript(temp.path(), agent_id, r#"{"role":"user","content":"hello"}"#).unwrap();
+        append_transcript(temp.path(), agent_id, r#"{"role":"assistant","content":"hi"}"#).unwrap();
+
+        let lines = load_transcript(temp.path(), agent_id).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("user"));
+        assert!(lines[1].contains("assistant"));
+    }
+
+    #[test]
+    fn resume_continues_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_id = Uuid::now_v7();
+
+        // Write initial transcript
+        append_transcript(temp.path(), agent_id, r#"{"turn":1}"#).unwrap();
+        append_transcript(temp.path(), agent_id, r#"{"turn":2}"#).unwrap();
+
+        // "Resume" by loading and appending
+        let existing = load_transcript(temp.path(), agent_id).unwrap();
+        assert_eq!(existing.len(), 2);
+
+        append_transcript(temp.path(), agent_id, r#"{"turn":3}"#).unwrap();
+
+        let updated = load_transcript(temp.path(), agent_id).unwrap();
+        assert_eq!(updated.len(), 3);
+    }
+
+    // ── P5-05: SubagentConfig Tests ──
+
+    #[test]
+    fn subagent_inherits_compaction() {
+        let config = SubagentConfig::default();
+        assert!(config.compaction_enabled, "compaction should be enabled by default");
+        assert_eq!(config.max_turns, 30);
+    }
+
+    #[test]
+    fn custom_agent_max_turns_respected() {
+        let def = CustomAgentDef {
+            name: "test".to_string(),
+            description: "test agent".to_string(),
+            prompt: "do stuff".to_string(),
+            tools: vec!["fs_read".to_string()],
+            disallowed_tools: vec!["bash_run".to_string()],
+            model: Some("deepseek-reasoner".to_string()),
+            max_turns: Some(10),
+        };
+        let config = SubagentConfig::from_agent_def(&def);
+        assert_eq!(config.max_turns, 10);
+        assert_eq!(config.model.as_deref(), Some("deepseek-reasoner"));
+        assert_eq!(config.allowed_tools, vec!["fs_read"]);
+        assert_eq!(config.disallowed_tools, vec!["bash_run"]);
+    }
+
+    // ── P5-17: Agent model override and tool restrictions ────────────────
+
+    #[test]
+    fn agent_model_override() {
+        let def = CustomAgentDef {
+            name: "code-reviewer".to_string(),
+            description: "Reviews code quality".to_string(),
+            prompt: "Review code carefully".to_string(),
+            tools: vec![],
+            disallowed_tools: vec![],
+            model: Some("deepseek-chat".to_string()),
+            max_turns: None,
+        };
+        let config = SubagentConfig::from_agent_def(&def);
+        assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(config.max_turns, 30); // default fallback
+        assert!(config.compaction_enabled);
+    }
+
+    #[test]
+    fn agent_tool_restriction() {
+        let def = CustomAgentDef {
+            name: "safe-agent".to_string(),
+            description: "Read-only exploration".to_string(),
+            prompt: "Explore only".to_string(),
+            tools: vec![
+                "fs_read".to_string(),
+                "fs_glob".to_string(),
+                "fs_grep".to_string(),
+            ],
+            disallowed_tools: vec![
+                "bash_run".to_string(),
+                "fs_edit".to_string(),
+                "fs_write".to_string(),
+            ],
+            model: None,
+            max_turns: Some(5),
+        };
+        let config = SubagentConfig::from_agent_def(&def);
+        assert_eq!(config.allowed_tools.len(), 3);
+        assert_eq!(config.disallowed_tools.len(), 3);
+        assert_eq!(config.max_turns, 5);
+        assert!(config.model.is_none());
+    }
+
+    // ── P5-16: Agent defs list/load ──────────────────────────────────────
+
+    #[test]
+    fn agents_list_shows_defs() {
+        let workspace = std::env::temp_dir().join(format!(
+            "deepseek-agents-list-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let agents_dir = workspace.join(".deepseek/agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+
+        std::fs::write(
+            agents_dir.join("explorer.md"),
+            "---\nname: explorer\ndescription: Explores codebase\ntools: [fs_read, fs_glob]\nmax_turns: 10\n---\nExplore the codebase.",
+        )
+        .expect("write agent def");
+
+        std::fs::write(
+            agents_dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews PRs\nmodel: deepseek-reasoner\n---\nReview pull requests carefully.",
+        )
+        .expect("write agent def 2");
+
+        let defs = load_agent_defs(&workspace).expect("load");
+        assert_eq!(defs.len(), 2);
+
+        let explorer = defs.iter().find(|d| d.name == "explorer").unwrap();
+        assert_eq!(explorer.description, "Explores codebase");
+        assert_eq!(explorer.tools, vec!["fs_read", "fs_glob"]);
+        assert_eq!(explorer.max_turns, Some(10));
+
+        let reviewer = defs.iter().find(|d| d.name == "reviewer").unwrap();
+        assert_eq!(reviewer.model.as_deref(), Some("deepseek-reasoner"));
     }
 }

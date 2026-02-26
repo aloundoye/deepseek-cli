@@ -92,6 +92,39 @@ pub type EventCallback = Arc<dyn Fn(EventKind) + Send + Sync>;
 /// The second argument contains the files about to be modified (if known).
 pub type CheckpointCallback = Arc<dyn Fn(&str, &[PathBuf]) -> Result<()> + Send + Sync>;
 
+/// Callback for executing a subagent task (spawn_task tool).
+pub type SubagentWorker = Arc<dyn Fn(SubagentRequest) -> Result<String> + Send + Sync>;
+
+/// Result of invoking a skill (returned by SkillRunner callback).
+#[derive(Debug, Clone)]
+pub struct SkillInvocationResult {
+    /// The rendered skill prompt.
+    pub rendered_prompt: String,
+    /// Whether the skill should run in an isolated context.
+    pub forked: bool,
+    /// Tools allowed (empty = all).
+    pub allowed_tools: Vec<String>,
+    /// Tools disallowed.
+    pub disallowed_tools: Vec<String>,
+    /// Whether model auto-invocation is disabled.
+    pub disable_model_invocation: bool,
+}
+
+/// Callback for looking up and running a skill by name.
+/// Returns `None` if the skill is not found.
+pub type SkillRunner = Arc<dyn Fn(&str, Option<&str>) -> Result<Option<SkillInvocationResult>> + Send + Sync>;
+
+/// Request to spawn a subagent task.
+#[derive(Debug, Clone)]
+pub struct SubagentRequest {
+    pub prompt: String,
+    pub task_name: String,
+    pub subagent_type: String,
+    pub model_override: Option<String>,
+    pub max_turns: Option<usize>,
+    pub run_in_background: bool,
+}
+
 /// Configuration for the tool-use loop.
 pub struct ToolLoopConfig {
     pub model: String,
@@ -103,21 +136,35 @@ pub struct ToolLoopConfig {
     pub read_only: bool,
     /// Thinking configuration — enables chain-of-thought reasoning for the main model.
     pub thinking: Option<deepseek_core::ThinkingConfig>,
-    /// Model name used by `think_deeply` agent-level tool.
-    pub think_deeply_model: String,
+    /// Model name used by `extended_thinking` agent-level tool.
+    pub extended_thinking_model: String,
+    /// Detected complexity of the user prompt.
+    pub complexity: crate::complexity::PromptComplexity,
+    /// Optional worker for executing spawn_task subagents.
+    pub subagent_worker: Option<SubagentWorker>,
+    /// Optional callback for looking up and running skills (slash commands).
+    pub skill_runner: Option<SkillRunner>,
+    /// Workspace root path (for subagent spawning).
+    pub workspace: Option<PathBuf>,
 }
 
 impl Default for ToolLoopConfig {
     fn default() -> Self {
         Self {
             model: deepseek_core::DEEPSEEK_V32_CHAT_MODEL.to_string(),
-            max_tokens: deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS,
+            max_tokens: deepseek_core::DEEPSEEK_CHAT_THINKING_MAX_OUTPUT_TOKENS,
             temperature: None,
             context_window_tokens: 128_000,
             max_turns: DEFAULT_MAX_TURNS,
             read_only: false,
-            thinking: None,
-            think_deeply_model: deepseek_core::DEEPSEEK_V32_REASONER_MODEL.to_string(),
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(
+                crate::complexity::MEDIUM_THINK_BUDGET,
+            )),
+            extended_thinking_model: deepseek_core::DEEPSEEK_V32_REASONER_MODEL.to_string(),
+            complexity: crate::complexity::PromptComplexity::Medium,
+            subagent_worker: None,
+            skill_runner: None,
+            workspace: None,
         }
     }
 }
@@ -138,6 +185,12 @@ pub struct ToolUseLoop<'a> {
     hooks: Option<HookRuntime>,
     event_cb: Option<EventCallback>,
     checkpoint_cb: Option<CheckpointCallback>,
+    /// Evidence-driven escalation signals from tool outputs.
+    /// When the model hits compile errors, test failures, or patch rejections,
+    /// the thinking budget automatically escalates.
+    escalation: crate::complexity::EscalationSignals,
+    /// Pre-compiled output scanner for injection/secret detection.
+    output_scanner: deepseek_policy::output_scanner::OutputScanner,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -165,6 +218,8 @@ impl<'a> ToolUseLoop<'a> {
             hooks: None,
             event_cb: None,
             checkpoint_cb: None,
+            escalation: crate::complexity::EscalationSignals::default(),
+            output_scanner: deepseek_policy::output_scanner::OutputScanner::new(),
         }
     }
 
@@ -359,10 +414,27 @@ impl<'a> ToolUseLoop<'a> {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            // Execute each tool call and collect results
+            // Execute each tool call and collect results.
+            // Scan tool outputs for evidence-driven budget escalation.
+            let mut batch_had_failure = false;
+            let mut batch_had_success = false;
             for llm_call in &response.tool_calls {
                 let records = self.execute_tool_call(llm_call)?;
+                for r in &records {
+                    if r.success {
+                        batch_had_success = true;
+                    } else {
+                        batch_had_failure = true;
+                    }
+                }
                 tool_calls_made.extend(records);
+            }
+
+            // Update escalation signals based on batch outcome
+            if batch_had_success {
+                self.escalation.record_success();
+            } else if batch_had_failure {
+                self.escalation.record_failure();
             }
 
             // Mid-conversation reminder: every N tool calls, inject a brief
@@ -502,6 +574,14 @@ impl<'a> ToolUseLoop<'a> {
         let duration = start.elapsed().as_millis() as u64;
         let success = result.success;
 
+        // Scan tool output for evidence-driven budget escalation signals
+        // (compile errors, test failures, patch rejections, search misses).
+        if let Some(output_str) = result.output.as_str() {
+            self.escalation.scan_tool_output(&llm_call.name, output_str);
+        } else if let Ok(output_text) = serde_json::to_string(&result.output) {
+            self.escalation.scan_tool_output(&llm_call.name, &output_text);
+        }
+
         // Fire PostToolUse hook
         if let Some(ref hooks) = self.hooks {
             let input = HookInput {
@@ -538,9 +618,24 @@ impl<'a> ToolUseLoop<'a> {
             },
         });
 
-        // Convert result to ChatMessage::Tool and append
-        let msg = tool_bridge::tool_result_to_message(&llm_call.id, &result);
+        // Convert result to ChatMessage::Tool and append, scanning for security issues
+        let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+            &llm_call.id,
+            &llm_call.name,
+            &result,
+            Some(&self.output_scanner),
+        );
         self.messages.push(msg);
+
+        // Emit security warnings to user
+        for warning in &injection_warnings {
+            self.emit(deepseek_core::StreamChunk::SecurityWarning {
+                message: format!(
+                    "{:?} — {} (matched: {})",
+                    warning.severity, warning.pattern_name, warning.matched_text
+                ),
+            });
+        }
 
         records.push(ToolCallRecord {
             tool_name: llm_call.name.clone(),
@@ -553,7 +648,7 @@ impl<'a> ToolUseLoop<'a> {
         Ok(records)
     }
 
-    /// Handle agent-level tools (user_question, spawn_task, think_deeply, etc.)
+    /// Handle agent-level tools (user_question, spawn_task, extended_thinking, etc.)
     fn handle_agent_level_tool(
         &mut self,
         llm_call: &LlmToolCall,
@@ -570,11 +665,11 @@ impl<'a> ToolUseLoop<'a> {
         });
 
         let result_content = match llm_call.name.as_str() {
-            "think_deeply" => {
+            "extended_thinking" | "think_deeply" => {
                 // Call the reasoner model for deep analysis
                 let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
                 let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
-                self.handle_think_deeply(question, context)?
+                self.handle_extended_thinking(question, context)?
             }
             "user_question" => {
                 let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("(no question)");
@@ -592,8 +687,14 @@ impl<'a> ToolUseLoop<'a> {
                     format!("Question for user: {question}\n[User response not available in this context. Proceed with your best judgment or state your assumption.]")
                 }
             }
+            "spawn_task" => {
+                self.handle_spawn_task(&args)?
+            }
+            "skill" => {
+                self.handle_skill(&args)?
+            }
             _ => {
-                // Other agent-level tools (spawn_task, skill, etc.) — not yet wired
+                // Other agent-level tools (task_*, etc.) — not yet wired
                 format!("Agent-level tool '{}' is not yet available in tool-use mode. Try a different approach.", llm_call.name)
             }
         };
@@ -620,13 +721,13 @@ impl<'a> ToolUseLoop<'a> {
         }])
     }
 
-    /// Handle the think_deeply tool by calling the reasoner model.
-    fn handle_think_deeply(&self, question: &str, context: &str) -> Result<String> {
+    /// Handle the extended_thinking tool by calling the reasoner model.
+    fn handle_extended_thinking(&self, question: &str, context: &str) -> Result<String> {
         let prompt = format!(
             "Analyze this problem carefully:\n\nQuestion: {question}\n\nContext:\n{context}\n\nProvide a clear, actionable recommendation."
         );
         let request = ChatRequest {
-            model: self.config.think_deeply_model.clone(),
+            model: self.config.extended_thinking_model.clone(),
             messages: vec![
                 ChatMessage::System {
                     content: "You are a deep reasoning engine. Provide thorough analysis and clear recommendations.".to_string(),
@@ -650,7 +751,182 @@ impl<'a> ToolUseLoop<'a> {
         Ok(response.text)
     }
 
+    /// Handle the spawn_task tool by delegating to the subagent worker.
+    fn handle_spawn_task(&self, args: &serde_json::Value) -> Result<String> {
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let task_name = args.get("description")
+            .or_else(|| args.get("task_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("subtask");
+        let subagent_type = args.get("subagent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general-purpose");
+        let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
+        let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let run_in_background = args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if prompt.is_empty() {
+            return Ok("Error: spawn_task requires a 'prompt' argument describing the task.".to_string());
+        }
+
+        let request = SubagentRequest {
+            prompt: prompt.to_string(),
+            task_name: task_name.to_string(),
+            subagent_type: subagent_type.to_string(),
+            model_override,
+            max_turns,
+            run_in_background,
+        };
+
+        if let Some(ref worker) = self.config.subagent_worker {
+            // P5-14: Fire SubagentStart hook
+            if let Some(ref hooks) = self.hooks {
+                let input = HookInput {
+                    event: HookEvent::SubagentStart.as_str().to_string(),
+                    tool_name: Some("spawn_task".to_string()),
+                    tool_input: Some(args.clone()),
+                    tool_result: None,
+                    prompt: Some(prompt.to_string()),
+                    session_type: None,
+                    workspace: self.config.workspace.as_deref().unwrap_or(std::path::Path::new(".")).display().to_string(),
+                };
+                let _ = hooks.fire(HookEvent::SubagentStart, &input);
+            }
+            let result = match worker(request) {
+                Ok(result) => Ok(result),
+                Err(e) => Ok(format!("Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly.")),
+            };
+            // P5-14: Fire SubagentStop hook
+            if let Some(ref hooks) = self.hooks {
+                let input = HookInput {
+                    event: HookEvent::SubagentStop.as_str().to_string(),
+                    tool_name: Some("spawn_task".to_string()),
+                    tool_input: Some(args.clone()),
+                    tool_result: result.as_ref().ok().map(|r| serde_json::Value::String(r.clone())),
+                    prompt: Some(prompt.to_string()),
+                    session_type: None,
+                    workspace: self.config.workspace.as_deref().unwrap_or(std::path::Path::new(".")).display().to_string(),
+                };
+                let _ = hooks.fire(HookEvent::SubagentStop, &input);
+            }
+            result
+        } else {
+            // No worker wired — run inline by providing guidance
+            Ok(format!(
+                "spawn_task is not available in this context. Handle the task directly instead.\n\
+                 Task: {task_name}\n\
+                 Prompt: {prompt}\n\
+                 Use the available tools to accomplish this yourself."
+            ))
+        }
+    }
+
+    /// Handle the skill tool invocation.
+    ///
+    /// Looks up the skill, checks `disable_model_invocation`, and either:
+    /// - For `context: fork`: delegates to subagent_worker for isolated execution
+    /// - For `context: normal`: returns the rendered prompt for inline injection
+    fn handle_skill(&self, args: &serde_json::Value) -> Result<String> {
+        let skill_name = args
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let skill_args = args.get("args").and_then(|v| v.as_str());
+
+        if skill_name.is_empty() {
+            return Ok(
+                "Error: skill tool requires a 'skill' argument with the skill name.".to_string(),
+            );
+        }
+
+        let Some(ref runner) = self.config.skill_runner else {
+            return Ok(format!(
+                "Skill '{skill_name}' is not available in this context. \
+                 Skills require the CLI environment to be properly initialized."
+            ));
+        };
+
+        let result = match runner(skill_name, skill_args) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return Ok(format!(
+                    "Skill '{skill_name}' not found. Check available skills with /skills list."
+                ));
+            }
+            Err(e) => {
+                return Ok(format!("Failed to load skill '{skill_name}': {e}"));
+            }
+        };
+
+        // P5-08: Respect disable-model-invocation flag
+        if result.disable_model_invocation {
+            return Ok(format!(
+                "Skill '{skill_name}' has disable-model-invocation set. \
+                 This skill can only be invoked directly by the user via /{skill_name}, \
+                 not programmatically by the model."
+            ));
+        }
+
+        // P5-06: Forked execution — delegate to subagent for isolated context
+        if result.forked {
+            if let Some(ref worker) = self.config.subagent_worker {
+                let request = SubagentRequest {
+                    prompt: result.rendered_prompt.clone(),
+                    task_name: format!("skill:{skill_name}"),
+                    subagent_type: "general-purpose".to_string(),
+                    model_override: None,
+                    max_turns: None,
+                    run_in_background: false,
+                };
+                return match worker(request) {
+                    Ok(output) => Ok(format!(
+                        "Skill '{skill_name}' (forked) completed:\n{output}"
+                    )),
+                    Err(e) => Ok(format!(
+                        "Skill '{skill_name}' (forked) failed: {e}. \
+                         Try running the skill directly or handle the task yourself."
+                    )),
+                };
+            }
+            // No subagent worker — fall through to inline with a note
+            return Ok(format!(
+                "Skill '{skill_name}' requires forked execution but no subagent worker is available. \
+                 Returning the skill prompt for inline execution:\n\n{}",
+                result.rendered_prompt
+            ));
+        }
+
+        // P5-07: Normal execution — return rendered prompt with tool restriction metadata
+        // The tool restrictions (allowed_tools, disallowed_tools) are advisory here;
+        // they would be enforced if this skill were run in a forked ToolUseLoop.
+        let mut response = format!(
+            "<skill-execution name=\"{skill_name}\">\n{}\n</skill-execution>",
+            result.rendered_prompt
+        );
+
+        if !result.allowed_tools.is_empty() || !result.disallowed_tools.is_empty() {
+            response.push_str("\n\nNote: This skill has tool restrictions. ");
+            if !result.allowed_tools.is_empty() {
+                response.push_str(&format!(
+                    "Allowed tools: {}. ",
+                    result.allowed_tools.join(", ")
+                ));
+            }
+            if !result.disallowed_tools.is_empty() {
+                response.push_str(&format!(
+                    "Do NOT use: {}.",
+                    result.disallowed_tools.join(", ")
+                ));
+            }
+        }
+
+        Ok(response)
+    }
+
     /// Build a ChatRequest from current state.
+    ///
+    /// Applies dynamic thinking budget escalation when consecutive failures
+    /// are detected — giving the model more reasoning power to self-correct.
     fn build_request(&self) -> ChatRequest {
         let tools = if self.config.read_only {
             self.tools
@@ -674,6 +950,16 @@ impl<'a> ToolUseLoop<'a> {
             ToolChoice::auto()
         };
 
+        // Evidence-driven thinking budget: escalate when tool outputs show
+        // compile errors, test failures, or repeated problems.
+        let thinking = self.config.thinking.as_ref().map(|base| {
+            if self.escalation.should_escalate() {
+                deepseek_core::ThinkingConfig::enabled(self.escalation.budget())
+            } else {
+                base.clone()
+            }
+        });
+
         ChatRequest {
             model: self.config.model.clone(),
             messages: self.messages.clone(),
@@ -686,7 +972,7 @@ impl<'a> ToolUseLoop<'a> {
             frequency_penalty: None,
             logprobs: None,
             top_logprobs: None,
-            thinking: self.config.thinking.clone(),
+            thinking,
             images: vec![],
             response_format: None,
         }
@@ -742,6 +1028,7 @@ fn is_read_only_api_name(name: &str) -> bool {
             | "web_fetch"
             | "notebook_read"
             | "index_query"
+            | "extended_thinking"
             | "think_deeply"
             | "user_question"
             | "spawn_task"
@@ -1453,5 +1740,64 @@ mod tests {
 
         // Short text with no path-like patterns should not flag
         assert!(!has_unverified_file_references("Hello, world!", &[]));
+    }
+
+    #[test]
+    fn evidence_driven_escalation_on_tool_failures() {
+        // Simulate: tool outputs contain compile error → model retries → responds.
+        // Escalation signals should detect the error and switch to hard budget.
+        let llm = ScriptedLlm::new(vec![
+            make_tool_response(vec![LlmToolCall {
+                id: "c1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"missing.rs"}"#.to_string(),
+            }]),
+            make_tool_response(vec![LlmToolCall {
+                id: "c2".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"also_missing.rs"}"#.to_string(),
+            }]),
+            make_text_response("Got it."),
+        ]);
+
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    success: false,
+                    output: serde_json::json!("error[E0308]: mismatched types"),
+                },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    success: false,
+                    output: serde_json::json!("test result: FAILED. 0 passed; 1 failed;"),
+                },
+            ],
+            true,
+        ));
+
+        let config = ToolLoopConfig {
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(
+                crate::complexity::DEFAULT_THINK_BUDGET,
+            )),
+            ..Default::default()
+        };
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "You are helpful.".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("Read those files").unwrap();
+        assert_eq!(result.response, "Got it.");
+        assert_eq!(result.turns, 3);
+        // Evidence-driven: escalation detected from tool output content
+        assert!(loop_.escalation.compile_error, "should detect compile error");
+        assert!(loop_.escalation.test_failure, "should detect test failure");
+        assert!(loop_.escalation.should_escalate(), "should be escalated");
+        assert_eq!(loop_.escalation.consecutive_failure_turns, 2);
     }
 }
