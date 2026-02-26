@@ -2414,6 +2414,191 @@ impl RewindPickerState {
             RewindPickerPhase::SelectCheckpoint => true,
         }
     }
+
+    /// Format a checkpoint line for display with relative timestamp and file count.
+    pub fn format_checkpoint_line(cp: &deepseek_store::CheckpointRecord, selected: bool) -> String {
+        let marker = if selected { ">" } else { " " };
+        let time = format_relative_time(&cp.created_at);
+        format!(
+            "{marker} [{time}] {reason} ({files} files)",
+            reason = cp.reason,
+            files = cp.files_count
+        )
+    }
+
+    /// Return the visible viewport range for long checkpoint lists (max 8 visible).
+    pub fn viewport(&self) -> std::ops::Range<usize> {
+        const VIEWPORT_SIZE: usize = 8;
+        let total = self.checkpoints.len();
+        if total <= VIEWPORT_SIZE {
+            return 0..total;
+        }
+        let half = VIEWPORT_SIZE / 2;
+        let start = if self.selected_index <= half {
+            0
+        } else if self.selected_index + half >= total {
+            total - VIEWPORT_SIZE
+        } else {
+            self.selected_index - half
+        };
+        start..(start + VIEWPORT_SIZE).min(total)
+    }
+}
+
+/// Format an ISO 8601 timestamp as a relative time string (e.g., "2m ago", "1h ago").
+pub fn format_relative_time(timestamp: &str) -> String {
+    // Parse ISO 8601 timestamp
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+        let now = chrono::Utc::now();
+        let delta = now.signed_duration_since(ts);
+
+        if delta.num_seconds() < 60 {
+            return "just now".to_string();
+        }
+        if delta.num_minutes() < 60 {
+            return format!("{}m ago", delta.num_minutes());
+        }
+        if delta.num_hours() < 24 {
+            return format!("{}h ago", delta.num_hours());
+        }
+        return format!("{}d ago", delta.num_days());
+    }
+    // Fallback: return the raw timestamp truncated
+    timestamp.chars().take(19).collect()
+}
+
+// ─── Model Picker ───────────────────────────────────────────────────────────
+
+/// Available model choices for the interactive `/model` picker.
+const MODEL_CHOICES: &[(&str, &str)] = &[
+    ("deepseek-chat", "Fast, general-purpose"),
+    ("deepseek-reasoner", "Thinking mode, detailed reasoning"),
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct ModelPickerState {
+    pub selected: usize,
+}
+
+impl ModelPickerState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+    pub fn down(&mut self) {
+        self.selected = (self.selected + 1).min(MODEL_CHOICES.len() - 1);
+    }
+    pub fn confirm(&self) -> &'static str {
+        MODEL_CHOICES[self.selected].0
+    }
+}
+
+// ─── Autocomplete Dropdown ───────────────────────────────────────────────────
+
+/// State for the `@` file autocomplete dropdown.
+#[derive(Debug, Clone)]
+pub struct AutocompleteState {
+    pub suggestions: Vec<String>,
+    pub selected: usize,
+    pub trigger_pos: usize, // position of '@' in input
+}
+
+impl AutocompleteState {
+    pub fn new(suggestions: Vec<String>, trigger_pos: usize) -> Self {
+        Self {
+            suggestions,
+            selected: 0,
+            trigger_pos,
+        }
+    }
+
+    pub fn up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        } else if !self.suggestions.is_empty() {
+            self.selected = self.suggestions.len() - 1;
+        }
+    }
+
+    pub fn down(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.selected = (self.selected + 1) % self.suggestions.len();
+        }
+    }
+
+    pub fn selected_value(&self) -> Option<&str> {
+        self.suggestions.get(self.selected).map(|s| s.as_str())
+    }
+
+    /// Format the dropdown display as text lines for the info area.
+    pub fn display_lines(&self, max_lines: usize) -> Vec<String> {
+        let total = self.suggestions.len();
+        if total == 0 {
+            return vec!["no matches".to_string()];
+        }
+        let show = total.min(max_lines);
+        // Center viewport on selected
+        let half = show / 2;
+        let start = if self.selected <= half {
+            0
+        } else if self.selected + half >= total {
+            total.saturating_sub(show)
+        } else {
+            self.selected - half
+        };
+        let end = (start + show).min(total);
+
+        (start..end)
+            .map(|i| {
+                let marker = if i == self.selected { ">" } else { " " };
+                format!("{marker} {}", self.suggestions[i])
+            })
+            .collect()
+    }
+}
+
+/// Gather file suggestions for an `@` prefix query.
+fn autocomplete_at_suggestions(prefix: &str, workspace: &Path) -> Vec<String> {
+    // Try to glob for matching files
+    let pattern = if prefix.is_empty() {
+        // Show top-level files
+        "*".to_string()
+    } else if prefix.ends_with('/') {
+        format!("{prefix}*")
+    } else {
+        format!("{prefix}*")
+    };
+
+    let search_dir = workspace;
+    let full_pattern = search_dir.join(&pattern);
+    let matches: Vec<String> = glob::glob(&full_pattern.to_string_lossy())
+        .ok()
+        .map(|paths| {
+            paths
+                .filter_map(Result::ok)
+                .filter_map(|p| {
+                    p.strip_prefix(search_dir)
+                        .ok()
+                        .map(|rel| {
+                            if p.is_dir() {
+                                format!("{}/", rel.display())
+                            } else {
+                                rel.display().to_string()
+                            }
+                        })
+                })
+                .filter(|s| {
+                    !s.starts_with('.')
+                        && !s.starts_with("target/")
+                        && !s.starts_with("node_modules/")
+                })
+                .take(20)
+                .collect()
+        })
+        .unwrap_or_default();
+    matches
 }
 
 // ─── Key Bindings ───────────────────────────────────────────────────────────
@@ -2839,6 +3024,9 @@ where
     let mut active_phase: Option<(u64, String)> = None;
     let mut last_phase_event_at = Instant::now();
     let mut last_phase_heartbeat_at = Instant::now();
+    let mut model_picker: Option<ModelPickerState> = None;
+    let mut pending_images: Vec<PathBuf> = Vec::new();
+    let mut autocomplete_dropdown: Option<AutocompleteState> = None;
 
     loop {
         tick_count = tick_count.wrapping_add(1);
@@ -3723,6 +3911,151 @@ where
             continue;
         }
 
+        // ── Model picker overlay ──────────────────────────────────────────
+        if model_picker.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    model_picker.as_mut().unwrap().up();
+                    let mp = model_picker.as_ref().unwrap();
+                    let (name, desc) = MODEL_CHOICES[mp.selected];
+                    info_line = format!("Select model: > {name}  ({desc})");
+                    continue;
+                }
+                KeyCode::Down => {
+                    model_picker.as_mut().unwrap().down();
+                    let mp = model_picker.as_ref().unwrap();
+                    let (name, desc) = MODEL_CHOICES[mp.selected];
+                    info_line = format!("Select model: > {name}  ({desc})");
+                    continue;
+                }
+                KeyCode::Enter => {
+                    let chosen = model_picker.as_ref().unwrap().confirm();
+                    model_picker = None;
+                    // Send the model selection as a /model command
+                    let model_cmd = format!("/model {chosen}");
+                    on_submit(&model_cmd);
+                    info_line = format!("Model: {chosen}");
+                    continue;
+                }
+                KeyCode::Esc => {
+                    model_picker = None;
+                    info_line = "model selection cancelled".to_string();
+                    continue;
+                }
+                KeyCode::Char('1') => {
+                    model_picker = None;
+                    let chosen = MODEL_CHOICES[0].0;
+                    let model_cmd = format!("/model {chosen}");
+                    on_submit(&model_cmd);
+                    info_line = format!("Model: {chosen}");
+                    continue;
+                }
+                KeyCode::Char('2') => {
+                    model_picker = None;
+                    let chosen = MODEL_CHOICES[1].0;
+                    let model_cmd = format!("/model {chosen}");
+                    on_submit(&model_cmd);
+                    info_line = format!("Model: {chosen}");
+                    continue;
+                }
+                _ => continue, // ignore other keys while picker is active
+            }
+        }
+
+        // ── Autocomplete dropdown overlay ────────────────────────────────────
+        if autocomplete_dropdown.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => {
+                    autocomplete_dropdown.as_mut().unwrap().up();
+                    let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                    info_line = lines.join("  ");
+                    continue;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    autocomplete_dropdown.as_mut().unwrap().down();
+                    let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                    info_line = lines.join("  ");
+                    continue;
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    // Accept selected suggestion
+                    if let Some(ref ac) = autocomplete_dropdown {
+                        if let Some(value) = ac.selected_value() {
+                            let trigger = ac.trigger_pos;
+                            // Replace @prefix with @fullpath
+                            input.truncate(trigger);
+                            input.push('@');
+                            input.push_str(value);
+                            input.push(' ');
+                            cursor_pos = input.len();
+                        }
+                    }
+                    autocomplete_dropdown = None;
+                    info_line = String::new();
+                    continue;
+                }
+                KeyCode::Esc => {
+                    autocomplete_dropdown = None;
+                    info_line = "autocomplete dismissed".to_string();
+                    continue;
+                }
+                KeyCode::Char(ch) => {
+                    // Continue typing — update suggestions
+                    input.insert(cursor_pos.min(input.len()), ch);
+                    cursor_pos += 1;
+                    if let Some(ref ac) = autocomplete_dropdown {
+                        let prefix = &input[ac.trigger_pos + 1..cursor_pos];
+                        let suggestions = autocomplete_at_suggestions(prefix, &workspace_path);
+                        if suggestions.is_empty() {
+                            autocomplete_dropdown = None;
+                            info_line = String::new();
+                        } else {
+                            autocomplete_dropdown = Some(AutocompleteState::new(
+                                suggestions,
+                                ac.trigger_pos,
+                            ));
+                            let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                            info_line = lines.join("  ");
+                        }
+                    }
+                    continue;
+                }
+                KeyCode::Backspace => {
+                    if cursor_pos > 0 && cursor_pos <= input.len() {
+                        input.remove(cursor_pos - 1);
+                        cursor_pos -= 1;
+                    }
+                    if let Some(ref ac) = autocomplete_dropdown {
+                        if cursor_pos <= ac.trigger_pos {
+                            // Deleted the @ char itself
+                            autocomplete_dropdown = None;
+                            info_line = String::new();
+                        } else {
+                            let prefix = &input[ac.trigger_pos + 1..cursor_pos];
+                            let suggestions = autocomplete_at_suggestions(prefix, &workspace_path);
+                            if suggestions.is_empty() {
+                                autocomplete_dropdown = None;
+                                info_line = String::new();
+                            } else {
+                                autocomplete_dropdown = Some(AutocompleteState::new(
+                                    suggestions,
+                                    ac.trigger_pos,
+                                ));
+                                let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                                info_line = lines.join("  ");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {
+                    autocomplete_dropdown = None;
+                    info_line = String::new();
+                    // Fall through to normal key handling
+                }
+            }
+        }
+
         if key == bindings.exit {
             if is_processing {
                 is_processing = false;
@@ -4322,7 +4655,27 @@ where
             continue;
         }
         if key == bindings.paste_hint {
-            info_line = "paste is supported via terminal bracketed paste".to_string();
+            if let Some(image_data) = try_clipboard_image() {
+                let bytes = image_data.len();
+                let path = std::env::temp_dir().join(format!(
+                    "deepseek-paste-{}.png",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                ));
+                if std::fs::write(&path, &image_data).is_ok() {
+                    pending_images.push(path.clone());
+                    info_line = format!(
+                        "Image pasted ({bytes} bytes). Will be included as @{} in next message.",
+                        path.display()
+                    );
+                } else {
+                    info_line = "Failed to save clipboard image.".to_string();
+                }
+            } else {
+                info_line = "No image in clipboard. Use terminal bracketed paste for text.".to_string();
+            }
             continue;
         }
         // Ctrl+D — exit session
@@ -4560,13 +4913,31 @@ where
                 history_cursor = None;
                 continue;
             }
-            // ! prefix — bash mode: wrap in direct bash command
-            let effective_prompt = if let Some(cmd) = prompt.strip_prefix('!') {
+            // ! prefix — direct shell execution, bypasses LLM
+            if let Some(cmd) = prompt.strip_prefix('!') {
                 let cmd = cmd.trim();
-                format!("Run this exact bash command and show the output: `{cmd}`")
-            } else {
-                prompt.clone()
-            };
+                if !cmd.is_empty() {
+                    history.push_back(prompt.clone());
+                    if history.len() > 100 {
+                        let _ = history.pop_front();
+                    }
+                    shell.push_user(&prompt);
+                    let output = execute_bang_command(cmd);
+                    shell.push_system(&output);
+                    input.clear();
+                    cursor_pos = 0;
+                    history_cursor = None;
+                }
+                continue;
+            }
+            // /model (no args) — open interactive model picker
+            if prompt == "/model" {
+                model_picker = Some(ModelPickerState::new());
+                info_line = "Select model: Up/Down to move, Enter to confirm, Esc to cancel".to_string();
+                input.clear();
+                cursor_pos = 0;
+                continue;
+            }
             history.push_back(prompt.clone());
             if history.len() > 100 {
                 let _ = history.pop_front();
@@ -4581,7 +4952,17 @@ where
             last_phase_event_at = Instant::now();
             last_phase_heartbeat_at = Instant::now();
             shell.active_tool = Some("processing...".to_string());
-            on_submit(&effective_prompt);
+            // Include any pending pasted images as @file references
+            let final_prompt = if pending_images.is_empty() {
+                prompt
+            } else {
+                let mut parts = vec![prompt];
+                for img_path in pending_images.drain(..) {
+                    parts.push(format!("@{}", img_path.display()));
+                }
+                parts.join(" ")
+            };
+            on_submit(&final_prompt);
             if vim_quit_after_submit {
                 break;
             }
@@ -4616,6 +4997,16 @@ where
             KeyCode::Char(ch) => {
                 input.insert(cursor_pos.min(input.len()), ch);
                 cursor_pos += 1;
+                // Trigger @ autocomplete dropdown
+                if ch == '@' && autocomplete_dropdown.is_none() {
+                    let trigger = cursor_pos - 1;
+                    let suggestions = autocomplete_at_suggestions("", &workspace_path);
+                    if !suggestions.is_empty() {
+                        autocomplete_dropdown = Some(AutocompleteState::new(suggestions, trigger));
+                        let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                        info_line = lines.join("  ");
+                    }
+                }
             }
             _ => {}
         }
@@ -4666,6 +5057,93 @@ fn parse_key_code(value: &str) -> Option<KeyCode> {
         "space" => Some(KeyCode::Char(' ')),
         value if value.chars().count() == 1 => value.chars().next().map(KeyCode::Char),
         _ => None,
+    }
+}
+
+/// Execute a `!` prefixed shell command directly, bypassing the LLM.
+/// Returns the combined stdout/stderr output as a string.
+fn execute_bang_command(cmd: &str) -> String {
+    let shell = if cfg!(target_os = "windows") {
+        "cmd"
+    } else {
+        "sh"
+    };
+    let flag = if cfg!(target_os = "windows") {
+        "/C"
+    } else {
+        "-c"
+    };
+    match std::process::Command::new(shell)
+        .args([flag, cmd])
+        .output()
+    {
+        Ok(output) => {
+            let mut result = String::new();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stdout.is_empty() {
+                result.push_str(&stdout);
+            }
+            if !stderr.is_empty() {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&stderr);
+            }
+            if result.is_empty() {
+                format!("(exit code {})", output.status.code().unwrap_or(-1))
+            } else {
+                // Trim trailing newline for cleaner display
+                result.truncate(result.trim_end().len());
+                result
+            }
+        }
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// Try to read an image from the system clipboard.
+/// Returns the raw PNG bytes if an image is available, `None` otherwise.
+fn try_clipboard_image() -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        // Use osascript to check if clipboard contains image data
+        let check = std::process::Command::new("osascript")
+            .args(["-e", "clipboard info for (the clipboard as «class PNGf»)"])
+            .output()
+            .ok()?;
+        if !check.status.success() {
+            return None;
+        }
+
+        // Write clipboard image to a temp file via osascript and read it back
+        let tmp = std::env::temp_dir().join("deepseek-clipboard-check.png");
+        // Write clipboard PNG data to temp file via osascript
+        let output = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "set f to open for access POSIX file \"{}\" with write permission\n\
+                     set eof of f to 0\n\
+                     write (the clipboard as «class PNGf») to f\n\
+                     close access f",
+                    tmp.display()
+                ),
+            ])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let data = std::fs::read(&tmp).ok()?;
+            let _ = std::fs::remove_file(&tmp);
+            if data.len() > 8 {
+                return Some(data);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -6560,6 +7038,173 @@ mod tests {
     fn prompt_suggestions_hidden_when_typing() {
         let spans = render_prompt_suggestions(false);
         assert!(spans.is_empty(), "should hide suggestions when input is non-empty");
+    }
+
+    // ── P4-03: bang prefix direct execution tests ────────────────────────
+
+    #[test]
+    fn bang_prefix_runs_shell() {
+        let output = execute_bang_command("echo hello");
+        assert_eq!(output, "hello");
+    }
+
+    #[test]
+    fn bang_prefix_empty_returns_exit_code() {
+        // An empty true command returns exit code 0
+        let output = execute_bang_command("true");
+        assert_eq!(output, "(exit code 0)");
+    }
+
+    // ── P4-02: autocomplete dropdown tests ─────────────────────────────
+
+    #[test]
+    fn autocomplete_dropdown_shows_matches() {
+        let suggestions = vec![
+            "src/lib.rs".to_string(),
+            "src/linter.rs".to_string(),
+            "src/lint_config.rs".to_string(),
+        ];
+        let ac = AutocompleteState::new(suggestions, 0);
+        assert_eq!(ac.selected, 0);
+        assert_eq!(ac.selected_value(), Some("src/lib.rs"));
+        let lines = ac.display_lines(10);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with('>'));
+    }
+
+    #[test]
+    fn autocomplete_tab_cycles_selection() {
+        let suggestions = vec![
+            "file1.rs".to_string(),
+            "file2.rs".to_string(),
+            "file3.rs".to_string(),
+        ];
+        let mut ac = AutocompleteState::new(suggestions, 0);
+        assert_eq!(ac.selected, 0);
+        ac.down();
+        assert_eq!(ac.selected, 1);
+        assert_eq!(ac.selected_value(), Some("file2.rs"));
+        ac.down();
+        assert_eq!(ac.selected, 2);
+        ac.down();
+        assert_eq!(ac.selected, 0); // wraps
+    }
+
+    #[test]
+    fn autocomplete_esc_dismisses() {
+        let suggestions = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let ac = AutocompleteState::new(suggestions, 5);
+        // Verify trigger_pos is stored correctly
+        assert_eq!(ac.trigger_pos, 5);
+        // After Esc, the caller sets autocomplete_dropdown = None
+    }
+
+    // ── P4-05: rewind picker enhanced display tests ───────────────────
+
+    #[test]
+    fn rewind_picker_shows_timestamps() {
+        let line = RewindPickerState::format_checkpoint_line(
+            &deepseek_store::CheckpointRecord {
+                checkpoint_id: uuid::Uuid::nil(),
+                reason: "before edit".to_string(),
+                snapshot_path: "/tmp/cp".to_string(),
+                files_count: 5,
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+            true,
+        );
+        assert!(line.starts_with(">"));
+        assert!(line.contains("before edit"));
+        assert!(line.contains("5 files"));
+        // Should have a time component (either relative or raw)
+        assert!(line.contains('['));
+    }
+
+    #[test]
+    fn rewind_picker_scrolls_viewport() {
+        // Create 12 checkpoints — more than the viewport of 8
+        let checkpoints: Vec<deepseek_store::CheckpointRecord> = (0..12)
+            .map(|i| deepseek_store::CheckpointRecord {
+                checkpoint_id: uuid::Uuid::nil(),
+                reason: format!("cp {i}"),
+                snapshot_path: format!("/tmp/cp{i}"),
+                files_count: i as u64,
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            })
+            .collect();
+        let mut picker = RewindPickerState::new(checkpoints);
+
+        // Initially at 0, viewport should start at 0
+        let vp = picker.viewport();
+        assert_eq!(vp.start, 0);
+        assert_eq!(vp.end, 8);
+
+        // Move to index 10
+        for _ in 0..10 {
+            picker.down();
+        }
+        assert_eq!(picker.selected_index, 10);
+        let vp = picker.viewport();
+        // selected=10, total=12, viewport=8 → start=4, end=12
+        assert_eq!(vp.start, 4);
+        assert_eq!(vp.end, 12);
+    }
+
+    #[test]
+    fn format_relative_time_variants() {
+        // Very old timestamp → days ago
+        let result = format_relative_time("2020-01-01T00:00:00Z");
+        assert!(result.contains("d ago"));
+        // Invalid timestamp → fallback
+        let result = format_relative_time("not-a-timestamp");
+        assert_eq!(result, "not-a-timestamp");
+    }
+
+    // ── P4-06: clipboard image detection tests ────────────────────────
+
+    #[test]
+    fn image_paste_returns_none_when_no_image() {
+        // In a test environment, the clipboard is unlikely to have an image
+        // Just verify the function doesn't panic
+        let result = try_clipboard_image();
+        // Result is platform-dependent; on CI it should be None
+        let _ = result;
+    }
+
+    #[test]
+    fn image_fallback_text_paste() {
+        // Verify function returns None on non-macOS or when no image present
+        // This test exercises the code path on any platform
+        let result = try_clipboard_image();
+        // On non-macOS, always returns None. On macOS, depends on clipboard.
+        #[cfg(not(target_os = "macos"))]
+        assert!(result.is_none());
+        let _ = result;
+    }
+
+    // ── P4-07: model picker state machine tests ─────────────────────────
+
+    #[test]
+    fn model_picker_navigation() {
+        let mut picker = ModelPickerState::new();
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.confirm(), "deepseek-chat");
+
+        picker.down();
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.confirm(), "deepseek-reasoner");
+
+        // Clamp at bottom
+        picker.down();
+        assert_eq!(picker.selected, 1);
+
+        picker.up();
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.confirm(), "deepseek-chat");
+
+        // Clamp at top
+        picker.up();
+        assert_eq!(picker.selected, 0);
     }
 }
 

@@ -942,6 +942,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "uuid",
  "walkdir",
 ]
@@ -1058,9 +1059,11 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
+ "chrono",
  "crossterm",
  "deepseek-core",
  "deepseek-store",
+ "glob",
  "ratatui",
  "serde",
  "serde_json",

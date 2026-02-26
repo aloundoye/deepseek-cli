@@ -68,6 +68,43 @@ pub fn is_write_tool(api_name: &str) -> bool {
     )
 }
 
+/// Extract the target file path(s) from a write tool's arguments JSON string.
+/// Returns file paths that the tool will modify, for targeted checkpointing.
+pub fn extract_modified_paths(api_name: &str, args_json: &str) -> Vec<std::path::PathBuf> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    match api_name {
+        "fs_edit" | "fs_write" | "notebook_edit" => {
+            // These tools have a "path" or "file_path" argument
+            for key in &["path", "file_path"] {
+                if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
+                    paths.push(std::path::PathBuf::from(p));
+                }
+            }
+        }
+        "multi_edit" => {
+            // multi_edit has an array of edits, each with a "path"
+            if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                for edit in edits {
+                    if let Some(p) = edit.get("path").and_then(|v| v.as_str()) {
+                        paths.push(std::path::PathBuf::from(p));
+                    }
+                }
+            }
+        }
+        "patch_apply" => {
+            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                paths.push(std::path::PathBuf::from(p));
+            }
+        }
+        // bash_run — can't reliably determine modified files
+        _ => {}
+    }
+    paths
+}
+
 /// Whether a tool name (API-format) is agent-level, meaning it should be
 /// handled by the AgentEngine itself rather than dispatched to LocalToolHost.
 pub fn is_agent_level_tool(api_name: &str) -> bool {
@@ -256,5 +293,35 @@ mod tests {
         };
         let tc = llm_tool_call_to_internal(&llm_call);
         assert_eq!(tc.args, serde_json::json!({}));
+    }
+
+    // ── P4-04: extract_modified_paths tests ─────────────────────────────
+
+    #[test]
+    fn extract_paths_from_fs_edit() {
+        let paths = extract_modified_paths("fs_edit", r#"{"file_path": "/tmp/foo.rs"}"#);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], std::path::PathBuf::from("/tmp/foo.rs"));
+    }
+
+    #[test]
+    fn extract_paths_from_multi_edit() {
+        let paths = extract_modified_paths(
+            "multi_edit",
+            r#"{"edits": [{"path": "a.rs"}, {"path": "b.rs"}]}"#,
+        );
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn extract_paths_bash_returns_empty() {
+        let paths = extract_modified_paths("bash_run", r#"{"command": "rm -rf /"}"#);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn extract_paths_invalid_json() {
+        let paths = extract_modified_paths("fs_edit", "not json");
+        assert!(paths.is_empty());
     }
 }

@@ -336,6 +336,71 @@ impl MemoryManager {
         Ok(record)
     }
 
+    /// Create a checkpoint that only snapshots the specified files instead of the
+    /// entire workspace. Falls back to a full snapshot if `files` is empty.
+    pub fn create_checkpoint_for_files(
+        &self,
+        reason: &str,
+        target_files: &[PathBuf],
+    ) -> Result<CheckpointRecord> {
+        if target_files.is_empty() {
+            return self.create_checkpoint(reason);
+        }
+
+        let checkpoint_id = Uuid::now_v7();
+        let checkpoint_root = runtime_dir(&self.workspace)
+            .join("checkpoints")
+            .join(checkpoint_id.to_string());
+        let snapshot_root = checkpoint_root.join("fs");
+        fs::create_dir_all(&snapshot_root)?;
+
+        let mut count = 0_u64;
+        for file in target_files {
+            if !file.is_file() {
+                continue;
+            }
+            // Skip binary files (heuristic: check first 512 bytes for null bytes)
+            if is_likely_binary(file) {
+                continue;
+            }
+            let rel = if file.is_absolute() {
+                file.strip_prefix(&self.workspace)
+                    .unwrap_or(file.as_path())
+            } else {
+                file.as_path()
+            };
+            let dest = snapshot_root.join(rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if fs::copy(file, &dest).is_ok() {
+                count += 1;
+            }
+        }
+
+        let metadata = serde_json::json!({
+            "checkpoint_id": checkpoint_id,
+            "reason": reason,
+            "files": count,
+            "targeted": true,
+            "created_at": Utc::now().to_rfc3339(),
+        });
+        fs::write(
+            checkpoint_root.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )?;
+
+        let record = CheckpointRecord {
+            checkpoint_id,
+            reason: reason.to_string(),
+            snapshot_path: snapshot_root.to_string_lossy().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            files_count: count,
+        };
+        self.store.insert_checkpoint(&record)?;
+        Ok(record)
+    }
+
     pub fn rewind_to_checkpoint(&self, checkpoint_id: Uuid) -> Result<CheckpointRecord> {
         let record = self
             .store
@@ -923,6 +988,19 @@ fn has_ignored_component(path: &Path) -> bool {
     })
 }
 
+/// Heuristic binary detection: read up to 512 bytes and check for null bytes.
+fn is_likely_binary(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 512];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    buf[..n].contains(&0)
+}
+
 fn truncate_line(input: &str, max_chars: usize) -> String {
     let mut out = input.trim().replace('\n', " ");
     if out.chars().count() <= max_chars {
@@ -1372,5 +1450,51 @@ mod tests {
         assert!(!result.conversation_rewound);
         let content = fs::read_to_string(workspace.join("j.txt")).expect("read");
         assert_eq!(content, "mutated");
+    }
+
+    // ── P4-04: targeted checkpoint tests ────────────────────────────────
+
+    #[test]
+    fn targeted_checkpoint_only_snapshots_specified_files() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace.path();
+        fs::write(workspace.join("a.txt"), "content a").expect("write a");
+        fs::write(workspace.join("b.txt"), "content b").expect("write b");
+        fs::write(workspace.join("c.txt"), "content c").expect("write c");
+
+        let manager = MemoryManager::new(workspace).expect("manager");
+        let target_files = vec![workspace.join("a.txt"), workspace.join("c.txt")];
+        let cp = manager
+            .create_checkpoint_for_files("targeted", &target_files)
+            .expect("checkpoint");
+
+        assert_eq!(cp.files_count, 2); // only a.txt and c.txt
+        assert_eq!(cp.reason, "targeted");
+        // b.txt should NOT be in the snapshot
+        let snapshot = PathBuf::from(&cp.snapshot_path);
+        assert!(snapshot.join("a.txt").exists());
+        assert!(!snapshot.join("b.txt").exists());
+        assert!(snapshot.join("c.txt").exists());
+    }
+
+    #[test]
+    fn targeted_checkpoint_skips_binary() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let workspace = workspace.path();
+        fs::write(workspace.join("text.txt"), "hello").expect("write text");
+        // Create a "binary" file with null bytes
+        fs::write(workspace.join("binary.bin"), b"\x00\x01\x02\x00\xFF").expect("write binary");
+
+        let manager = MemoryManager::new(workspace).expect("manager");
+        let target_files = vec![workspace.join("text.txt"), workspace.join("binary.bin")];
+        let cp = manager
+            .create_checkpoint_for_files("skip-binary", &target_files)
+            .expect("checkpoint");
+
+        // Binary should be skipped
+        assert_eq!(cp.files_count, 1);
+        let snapshot = PathBuf::from(&cp.snapshot_path);
+        assert!(snapshot.join("text.txt").exists());
+        assert!(!snapshot.join("binary.bin").exists());
     }
 }
