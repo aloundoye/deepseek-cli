@@ -189,6 +189,8 @@ pub struct ToolUseLoop<'a> {
     /// When the model hits compile errors, test failures, or patch rejections,
     /// the thinking budget automatically escalates.
     escalation: crate::complexity::EscalationSignals,
+    /// Pre-compiled output scanner for injection/secret detection.
+    output_scanner: deepseek_policy::output_scanner::OutputScanner,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -217,6 +219,7 @@ impl<'a> ToolUseLoop<'a> {
             event_cb: None,
             checkpoint_cb: None,
             escalation: crate::complexity::EscalationSignals::default(),
+            output_scanner: deepseek_policy::output_scanner::OutputScanner::new(),
         }
     }
 
@@ -615,9 +618,24 @@ impl<'a> ToolUseLoop<'a> {
             },
         });
 
-        // Convert result to ChatMessage::Tool and append
-        let msg = tool_bridge::tool_result_to_message(&llm_call.id, &result);
+        // Convert result to ChatMessage::Tool and append, scanning for security issues
+        let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+            &llm_call.id,
+            &llm_call.name,
+            &result,
+            Some(&self.output_scanner),
+        );
         self.messages.push(msg);
+
+        // Emit security warnings to user
+        for warning in &injection_warnings {
+            self.emit(deepseek_core::StreamChunk::SecurityWarning {
+                message: format!(
+                    "{:?} — {} (matched: {})",
+                    warning.severity, warning.pattern_name, warning.matched_text
+                ),
+            });
+        }
 
         records.push(ToolCallRecord {
             tool_name: llm_call.name.clone(),

@@ -1110,7 +1110,9 @@ impl LocalToolHost {
     }
 
     fn run_bash_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
-        if is_isolated_sandbox_mode(&self.sandbox_mode) {
+        if is_isolated_sandbox_mode(&self.sandbox_mode)
+            && detect_container_environment().is_none()
+        {
             return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
         }
         // Apply OS-level sandbox if enabled
@@ -2575,6 +2577,34 @@ fn is_isolated_sandbox_mode(mode: &str) -> bool {
     matches!(mode, "isolated" | "container" | "os-sandbox" | "os_sandbox")
 }
 
+/// Detect if we're already running inside a container environment.
+///
+/// When running inside Docker/Podman/LXC, adding seatbelt/bwrap sandboxing
+/// is redundant, may fail, and adds overhead. This function checks several
+/// indicators and returns the container type if detected.
+pub fn detect_container_environment() -> Option<&'static str> {
+    // Explicit env var override
+    if std::env::var("DEEPSEEK_CONTAINER_MODE").is_ok() {
+        return Some("explicit");
+    }
+    // Docker
+    if Path::new("/.dockerenv").exists() {
+        return Some("docker");
+    }
+    // Podman
+    if Path::new("/run/.containerenv").exists() {
+        return Some("podman");
+    }
+    // Check cgroup for container runtime indicators
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+        let lower = cgroup.to_ascii_lowercase();
+        if lower.contains("docker") || lower.contains("containerd") || lower.contains("lxc") {
+            return Some("cgroup");
+        }
+    }
+    None
+}
+
 fn render_wrapper_template(template: &str, workspace: &Path, cmd: &str) -> Result<String> {
     if !template.contains("{cmd}") {
         return Err(anyhow!(
@@ -3527,6 +3557,10 @@ fn sandbox_wrap_command(
     config: &deepseek_core::SandboxConfig,
 ) -> String {
     if !config.enabled {
+        return cmd.to_string();
+    }
+    // Skip sandbox wrapping if already inside a container
+    if detect_container_environment().is_some() {
         return cmd.to_string();
     }
     // Check if command is excluded
@@ -4776,5 +4810,42 @@ mod tests {
             desc.contains("DO NOT"),
             "bash_run should say DO NOT use for dedicated tool operations"
         );
+    }
+
+    // ── P6-06: Container sandbox detection tests ────────────────────────
+
+    #[test]
+    fn container_env_var_detected_and_skips_sandbox() {
+        // SAFETY: tests in this crate are run with --test-threads=1 for env var safety
+        unsafe { std::env::set_var("DEEPSEEK_CONTAINER_MODE", "1") };
+
+        // Part 1: detect_container_environment returns Some("explicit")
+        let result = detect_container_environment();
+        assert_eq!(result, Some("explicit"));
+
+        // Part 2: sandbox_wrap_command returns raw command when container detected
+        let config = deepseek_core::SandboxConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let wrapped = sandbox_wrap_command(Path::new("/workspace"), "ls -la", &config);
+        assert_eq!(wrapped, "ls -la", "should return raw command when in container");
+
+        unsafe { std::env::remove_var("DEEPSEEK_CONTAINER_MODE") };
+    }
+
+    #[test]
+    fn container_detection_returns_correct_type() {
+        // Verify the function returns known type strings.
+        // On dev machines this returns None (no container), in CI it might return something.
+        let result = detect_container_environment();
+        if let Some(container_type) = result {
+            // Must be one of the known container type labels
+            assert!(
+                ["explicit", "docker", "podman", "cgroup"].contains(&container_type),
+                "unexpected container type: {container_type}"
+            );
+        }
+        // If None, that's also valid (running on bare metal)
     }
 }

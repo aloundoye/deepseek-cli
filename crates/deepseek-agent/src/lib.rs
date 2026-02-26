@@ -106,9 +106,14 @@ impl AgentEngine {
 
     fn new_with_components(
         workspace: &Path,
-        cfg: AppConfig,
+        mut cfg: AppConfig,
         llm: Box<dyn LlmClient + Send + Sync>,
     ) -> Result<Self> {
+        // Apply managed settings overrides (enterprise/team constraints)
+        if let Some(managed) = deepseek_policy::load_managed_settings() {
+            managed.apply_to_config(&mut cfg);
+        }
+
         let store = Store::new(workspace)?;
         let observer = Observer::new(workspace, &cfg.telemetry)?;
         let mut policy = PolicyEngine::from_app_config(&cfg.policy);
@@ -541,10 +546,19 @@ impl AgentEngine {
             loop_.set_hooks(hooks);
         }
 
-        // Wire checkpoint callback — uses targeted snapshots when files are known
+        // Wire checkpoint callback — prefers git shadow commits, falls back to file snapshots
         let ws = self.workspace.clone();
         loop_.set_checkpoint_callback(Arc::new(move |reason, modified_files| {
             if let Ok(mm) = deepseek_memory::MemoryManager::new(&ws) {
+                // Try shadow commit first (lightweight git-based checkpoint)
+                match mm.create_shadow_commit(reason) {
+                    Ok(sc) if sc.git_backed => {
+                        // Shadow commit succeeded — no file copy needed
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                // Fall back to file-based checkpoint
                 if modified_files.is_empty() {
                     mm.create_checkpoint(reason)?;
                 } else {
@@ -837,5 +851,31 @@ mod tests {
         assert!(stripped.contains("Title"));
         assert!(stripped.contains("Hello world"));
         assert!(!stripped.contains("<h1>"));
+    }
+
+    #[test]
+    fn shadow_commit_used_in_checkpoint() {
+        // Verify that MemoryManager::create_shadow_commit exists and returns
+        // the expected ShadowCommit struct. On non-git directories, it should
+        // still return a result (with git_backed=false), allowing fallback.
+        let workspace = std::env::temp_dir().join(format!("shadow-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(workspace.join("test.txt"), "hello").expect("write file");
+
+        let mm = deepseek_memory::MemoryManager::new(&workspace).expect("memory manager");
+        let result = mm.create_shadow_commit("test checkpoint");
+        // In a non-git directory, shadow commit should not be git-backed
+        // (it falls back to file-based internally, or returns an error)
+        match result {
+            Ok(sc) => {
+                assert!(!sc.git_backed, "non-git dir should not produce git-backed shadow commit");
+            }
+            Err(_) => {
+                // Also acceptable: shadow commit fails in non-git dir
+                // and the checkpoint callback falls back to file-based
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

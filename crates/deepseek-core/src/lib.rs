@@ -1370,6 +1370,8 @@ pub enum StreamChunk {
         digest: u64,
         comment_count: usize,
     },
+    /// A security warning detected in tool output (prompt injection, suspicious patterns).
+    SecurityWarning { message: String },
     /// Clear any previously streamed text — the response contains tool calls,
     /// so the interleaved text fragments should be discarded from the display.
     ClearStreamingText,
@@ -1453,6 +1455,10 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "watch_triggered",
             "digest": digest,
             "comment_count": comment_count,
+        }),
+        StreamChunk::SecurityWarning { message } => serde_json::json!({
+            "type": "security_warning",
+            "message": message,
         }),
         StreamChunk::ClearStreamingText => serde_json::json!({
             "type": "clear_streaming_text",

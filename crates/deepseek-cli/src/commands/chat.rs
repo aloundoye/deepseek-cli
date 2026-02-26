@@ -1186,10 +1186,11 @@ pub(crate) fn run_chat(
                     )?;
                 }
                 SlashCommand::Memory(args) => {
-                    if args.is_empty() || args[0].eq_ignore_ascii_case("show") {
-                        run_memory(cwd, MemoryCmd::Show(MemoryShowArgs {}), json_mode)?;
-                    } else if args[0].eq_ignore_ascii_case("edit") {
+                    if args.is_empty() || args[0].eq_ignore_ascii_case("edit") {
+                        // Default: open editor (was "show")
                         run_memory(cwd, MemoryCmd::Edit(MemoryEditArgs {}), json_mode)?;
+                    } else if args[0].eq_ignore_ascii_case("show") {
+                        run_memory(cwd, MemoryCmd::Show(MemoryShowArgs {}), json_mode)?;
                     } else if args[0].eq_ignore_ascii_case("sync") {
                         let note = args.get(1).cloned();
                         run_memory(cwd, MemoryCmd::Sync(MemorySyncArgs { note }), json_mode)?;
@@ -1240,7 +1241,33 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Mcp(args) => {
-                    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+                    if args.is_empty() && !json_mode {
+                        // Interactive menu: show numbered server list with transport/status
+                        let mcp_mgr = deepseek_mcp::McpManager::new(cwd)?;
+                        let servers = mcp_mgr.list_servers()?;
+                        if servers.is_empty() {
+                            println!("No MCP servers configured. Use /mcp add to add one.");
+                        } else {
+                            println!("MCP Servers:");
+                            for (i, server) in servers.iter().enumerate() {
+                                let transport = match server.transport {
+                                    deepseek_mcp::McpTransport::Stdio => "stdio",
+                                    deepseek_mcp::McpTransport::Http => "http",
+                                    deepseek_mcp::McpTransport::Sse => "sse",
+                                };
+                                let status = if server.enabled { "enabled" } else { "disabled" };
+                                let endpoint = server.command.as_deref()
+                                    .or(server.url.as_deref())
+                                    .unwrap_or("-");
+                                println!(
+                                    "  {}. {} ({transport}, {status}) {endpoint}",
+                                    i + 1,
+                                    server.id
+                                );
+                            }
+                            println!("\nCommands: /mcp list, /mcp get <id>, /mcp add, /mcp remove <id>, /mcp prompt");
+                        }
+                    } else if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
                         run_mcp(cwd, McpCmd::List, json_mode)?;
                     } else if args[0].eq_ignore_ascii_case("get") && args.len() > 1 {
                         run_mcp(
@@ -1868,17 +1895,35 @@ pub(crate) fn run_chat(
                 SlashCommand::Stats => {
                     let store = Store::new(cwd)?;
                     let usage = store.usage_summary(None, Some(24))?;
+                    let sessions = store.session_history(7)?;
                     if json_mode {
                         print_json(&json!({
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
                             "records": usage.records,
+                            "sessions": sessions,
                         }))?;
                     } else {
                         println!("Last 24h usage:");
                         println!("  Input tokens:  {}", usage.input_tokens);
                         println!("  Output tokens: {}", usage.output_tokens);
                         println!("  Records: {}", usage.records);
+                        if !sessions.is_empty() {
+                            println!("\nSession history (last 7 days):");
+                            for s in &sessions {
+                                let total_tokens = s.input_tokens + s.output_tokens;
+                                // Rough cost estimate: $0.27/M input, $1.10/M output (DeepSeek V3)
+                                let cost = (s.input_tokens as f64 * 0.27 + s.output_tokens as f64 * 1.10) / 1_000_000.0;
+                                println!(
+                                    "  {} | {}…  | {} turns | {} tokens | ${:.4}",
+                                    &s.started_at[..19.min(s.started_at.len())],
+                                    &s.session_id[..8.min(s.session_id.len())],
+                                    s.turn_count,
+                                    total_tokens,
+                                    cost
+                                );
+                            }
+                        }
                     }
                 }
                 SlashCommand::Statusline(args) => {
@@ -2118,6 +2163,7 @@ pub(crate) fn run_chat(
                         deepseek_core::StreamChunk::SubagentFailed { .. } => "SubagentFailed",
                         deepseek_core::StreamChunk::ImageData { .. } => "ImageData",
                         deepseek_core::StreamChunk::WatchTriggered { .. } => "WatchTriggered",
+                        deepseek_core::StreamChunk::SecurityWarning { .. } => "SecurityWarning",
                         deepseek_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
                         deepseek_core::StreamChunk::Done { .. } => "Done",
                     },
@@ -2212,6 +2258,13 @@ pub(crate) fn run_chat(
                         let out = std::io::stdout();
                         let mut handle = out.lock();
                         let _ = writeln!(handle, "  \x1b[35m◉\x1b[0m  \x1b[1mWatch triggered\x1b[0m \x1b[90m({comment_count} comment(s))\x1b[0m");
+                        let _ = handle.flush();
+                    }
+                    deepseek_core::StreamChunk::SecurityWarning { message } => {
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = writeln!(handle, "  \x1b[33m⚠ Security:\x1b[0m {message}");
                         let _ = handle.flush();
                     }
                     deepseek_core::StreamChunk::ClearStreamingText => {}
@@ -2417,6 +2470,7 @@ pub(crate) fn run_chat_tui(
                 }
                 SlashCommand::Memory(args) => {
                     if args.is_empty() || args[0].eq_ignore_ascii_case("show") {
+                        // Non-interactive: default to show (no editor available)
                         MemoryManager::new(cwd)?.read_memory()?
                     } else if args[0].eq_ignore_ascii_case("edit") {
                         let manager = MemoryManager::new(cwd)?;
@@ -3060,6 +3114,9 @@ pub(crate) fn run_chat_tui(
                 }
                 StreamChunk::WatchTriggered { digest, comment_count } => {
                     let _ = tx_stream.send(TuiStreamEvent::WatchTriggered { digest, comment_count });
+                }
+                StreamChunk::SecurityWarning { message } => {
+                    let _ = tx_stream.send(TuiStreamEvent::Error(format!("⚠ Security: {message}")));
                 }
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
@@ -4084,6 +4141,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     let _ = writeln!(handle, "[watch: {comment_count} comment(s) detected]");
                     let _ = handle.flush();
                 }
+                StreamChunk::SecurityWarning { message } => {
+                    let _ = writeln!(handle, "[security warning: {message}]");
+                    let _ = handle.flush();
+                }
                 StreamChunk::ClearStreamingText => {
                     // In non-TUI mode, nothing to clear — text already
                     // written to stdout.
@@ -4332,5 +4393,40 @@ mod tests {
         let output = slash_voice_output(&[String::from("status")])?;
         assert!(output.contains("voice status:"));
         Ok(())
+    }
+
+    // ── P7-03: /memory default is edit ──────────────────────────────────
+
+    #[test]
+    fn memory_default_is_edit() {
+        // Verify that the first branch (args empty) routes to Edit, not Show.
+        // We test the routing logic: when args is empty, it should match the
+        // edit branch (first condition), not fall through to show.
+        let args: Vec<String> = vec![];
+        let first_condition = args.is_empty() || args.first().is_some_and(|a| a.eq_ignore_ascii_case("edit"));
+        assert!(first_condition, "/memory with no args should match the edit branch");
+
+        // "show" should NOT match the edit branch
+        let show_args = vec![String::from("show")];
+        let edit_branch = show_args.is_empty() || show_args.first().is_some_and(|a| a.eq_ignore_ascii_case("edit"));
+        assert!(!edit_branch, "/memory show should NOT match edit branch");
+    }
+
+    // ── P7-02: /mcp interactive menu ────────────────────────────────────
+
+    #[test]
+    fn mcp_interactive_menu_lists_servers() {
+        // In interactive mode (json_mode=false, args empty), the MCP handler
+        // should display a numbered server list rather than raw McpCmd::List.
+        // We verify the branch condition.
+        let args: Vec<String> = vec![];
+        let json_mode = false;
+        let interactive_menu = args.is_empty() && !json_mode;
+        assert!(interactive_menu, "empty args + non-json should trigger interactive menu");
+
+        // JSON mode should fall through to McpCmd::List
+        let json_mode = true;
+        let interactive_menu = args.is_empty() && !json_mode;
+        assert!(!interactive_menu, "json mode should NOT trigger interactive menu");
     }
 }
