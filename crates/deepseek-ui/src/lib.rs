@@ -2740,8 +2740,10 @@ where
     {
         use std::io::Write;
         let mut out = io::stdout();
-        // Clear screen + scrollback + move cursor home
-        out.write_all(b"\x1b[2J\x1b[3J\x1b[H")?;
+        // Clear screen + move cursor home.
+        // Skip \x1b[3J (clear scrollback) — it's a non-standard xterm extension
+        // that causes issues in VS Code's integrated terminal and other emulators.
+        out.write_all(b"\x1b[2J\x1b[H")?;
 
         // ASCII art logo + info, styled like Claude Code
         let version = env!("CARGO_PKG_VERSION");

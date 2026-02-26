@@ -25,7 +25,7 @@ pub fn classify_intent(input: &IntentInput<'_>) -> TaskIntent {
         return TaskIntent::InspectRepo;
     }
 
-    if input.force_execute || input.mode == ChatMode::Code {
+    if input.force_execute || matches!(input.mode, ChatMode::Code | ChatMode::Pipeline) {
         return TaskIntent::EditCode;
     }
 
@@ -118,6 +118,18 @@ mod tests {
         let intent = classify_intent(&IntentInput {
             prompt: "fix failing test in parser",
             mode: ChatMode::Code,
+            tools: true,
+            force_execute: false,
+            force_plan_only: false,
+        });
+        assert_eq!(intent, TaskIntent::EditCode);
+    }
+
+    #[test]
+    fn classifies_pipeline_as_edit() {
+        let intent = classify_intent(&IntentInput {
+            prompt: "anything",
+            mode: ChatMode::Pipeline,
             tools: true,
             force_execute: false,
             force_plan_only: false,

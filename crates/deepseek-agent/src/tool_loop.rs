@@ -12,10 +12,11 @@
 
 use anyhow::{Result, anyhow};
 use deepseek_core::{
-    ApprovedToolCall, ChatMessage, ChatRequest, LlmToolCall, StreamCallback, StreamChunk,
-    ToolChoice, ToolDefinition, ToolHost, TokenUsage, estimate_message_tokens,
-    strip_prior_reasoning_content,
+    ApprovedToolCall, ChatMessage, ChatRequest, EventKind, LlmToolCall, StreamCallback,
+    StreamChunk, ToolChoice, ToolDefinition, ToolHost, TokenUsage, UserQuestion,
+    estimate_message_tokens, strip_prior_reasoning_content,
 };
+use deepseek_hooks::{HookEvent, HookInput, HookRuntime};
 use deepseek_llm::LlmClient;
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,6 +63,15 @@ pub struct ToolLoopResult {
 /// Returns `true` if approved, `false` if denied.
 pub type ApprovalCallback = Arc<dyn Fn(&deepseek_core::ToolCall) -> Result<bool> + Send + Sync>;
 
+/// Callback for asking the user a question during tool execution.
+pub type UserQuestionCallback = Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
+
+/// Callback for event logging (tool proposed/result events).
+pub type EventCallback = Arc<dyn Fn(EventKind) + Send + Sync>;
+
+/// Callback for creating a checkpoint before destructive tool calls.
+pub type CheckpointCallback = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
 /// Configuration for the tool-use loop.
 pub struct ToolLoopConfig {
     pub model: String,
@@ -98,6 +108,10 @@ pub struct ToolUseLoop<'a> {
     tools: Vec<ToolDefinition>,
     stream_cb: Option<StreamCallback>,
     approval_cb: Option<ApprovalCallback>,
+    user_question_cb: Option<UserQuestionCallback>,
+    hooks: Option<HookRuntime>,
+    event_cb: Option<EventCallback>,
+    checkpoint_cb: Option<CheckpointCallback>,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -121,6 +135,10 @@ impl<'a> ToolUseLoop<'a> {
             tools,
             stream_cb: None,
             approval_cb: None,
+            user_question_cb: None,
+            hooks: None,
+            event_cb: None,
+            checkpoint_cb: None,
         }
     }
 
@@ -132,6 +150,26 @@ impl<'a> ToolUseLoop<'a> {
     /// Set the approval callback for tool permission prompts.
     pub fn set_approval_callback(&mut self, cb: ApprovalCallback) {
         self.approval_cb = Some(cb);
+    }
+
+    /// Set the user question callback for interactive prompts.
+    pub fn set_user_question_callback(&mut self, cb: UserQuestionCallback) {
+        self.user_question_cb = Some(cb);
+    }
+
+    /// Set the hook runtime for pre/post tool-use hooks.
+    pub fn set_hooks(&mut self, hooks: HookRuntime) {
+        self.hooks = Some(hooks);
+    }
+
+    /// Set the event callback for logging tool proposed/result events.
+    pub fn set_event_callback(&mut self, cb: EventCallback) {
+        self.event_cb = Some(cb);
+    }
+
+    /// Set the checkpoint callback invoked before destructive tool calls.
+    pub fn set_checkpoint_callback(&mut self, cb: CheckpointCallback) {
+        self.checkpoint_cb = Some(cb);
     }
 
     /// Initialize from existing conversation history (for multi-turn).
@@ -284,7 +322,7 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
-    /// Execute a single tool call, handling approval flow.
+    /// Execute a single tool call, handling approval flow, hooks, events, and checkpoints.
     fn execute_tool_call(
         &mut self,
         llm_call: &LlmToolCall,
@@ -305,6 +343,52 @@ impl<'a> ToolUseLoop<'a> {
             tool_name: llm_call.name.clone(),
             args_summary: args_summary.clone(),
         });
+
+        // Fire PreToolUse hook
+        if let Some(ref hooks) = self.hooks {
+            let input = HookInput {
+                event: HookEvent::PreToolUse.as_str().to_string(),
+                tool_name: Some(llm_call.name.clone()),
+                tool_input: Some(tool_call.args.clone()),
+                tool_result: None,
+                prompt: None,
+                session_type: None,
+                workspace: String::new(),
+            };
+            let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
+            if hook_result.blocked {
+                let duration = start.elapsed().as_millis() as u64;
+                self.emit(StreamChunk::ToolCallEnd {
+                    tool_name: llm_call.name.clone(),
+                    duration_ms: duration,
+                    success: false,
+                    summary: "blocked by hook".to_string(),
+                });
+                self.messages.push(tool_bridge::tool_error_to_message(
+                    &llm_call.id,
+                    "Tool call blocked by pre-tool-use hook. Try a different approach.",
+                ));
+                records.push(ToolCallRecord {
+                    tool_name: llm_call.name.clone(),
+                    tool_call_id: llm_call.id.clone(),
+                    args_summary,
+                    success: false,
+                    duration_ms: duration,
+                });
+                return Ok(records);
+            }
+        }
+
+        // Log ToolProposedV1 event
+        if let Some(ref cb) = self.event_cb {
+            cb(EventKind::ToolProposedV1 {
+                proposal: deepseek_core::ToolProposal {
+                    invocation_id: uuid::Uuid::nil(),
+                    call: tool_call.clone(),
+                    approved: false,
+                },
+            });
+        }
 
         // Propose the tool call (checks policy)
         let proposal = self.tool_host.propose(tool_call);
@@ -342,6 +426,13 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
+        // Create checkpoint before destructive tool calls
+        if tool_bridge::is_write_tool(&llm_call.name)
+            && let Some(ref cp) = self.checkpoint_cb
+        {
+            let _ = cp("before tool execution");
+        }
+
         // Execute the approved tool
         let approved_call = ApprovedToolCall {
             invocation_id: proposal.invocation_id,
@@ -351,6 +442,31 @@ impl<'a> ToolUseLoop<'a> {
 
         let duration = start.elapsed().as_millis() as u64;
         let success = result.success;
+
+        // Fire PostToolUse hook
+        if let Some(ref hooks) = self.hooks {
+            let input = HookInput {
+                event: HookEvent::PostToolUse.as_str().to_string(),
+                tool_name: Some(llm_call.name.clone()),
+                tool_input: Some(serde_json::json!({})),
+                tool_result: Some(result.output.clone()),
+                prompt: None,
+                session_type: None,
+                workspace: String::new(),
+            };
+            let _ = hooks.fire(HookEvent::PostToolUse, &input);
+        }
+
+        // Log ToolResultV1 event
+        if let Some(ref cb) = self.event_cb {
+            cb(EventKind::ToolResultV1 {
+                result: deepseek_core::ToolResult {
+                    invocation_id: result.invocation_id,
+                    success: result.success,
+                    output: result.output.clone(),
+                },
+            });
+        }
 
         self.emit(StreamChunk::ToolCallEnd {
             tool_name: llm_call.name.clone(),
@@ -402,9 +518,20 @@ impl<'a> ToolUseLoop<'a> {
                 self.handle_think_deeply(question, context)?
             }
             "user_question" => {
-                // For now, return a note that the user needs to respond
                 let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("(no question)");
-                format!("Question for user: {question}\n[User response not available in this context. Proceed with your best judgment or state your assumption.]")
+                let options: Vec<String> = args.get("options")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if let Some(ref cb) = self.user_question_cb {
+                    let uq = UserQuestion { question: question.to_string(), options };
+                    match cb(uq) {
+                        Some(answer) => format!("User response: {answer}"),
+                        None => format!("Question for user: {question}\n[User cancelled. Proceed with your best judgment.]"),
+                    }
+                } else {
+                    format!("Question for user: {question}\n[User response not available in this context. Proceed with your best judgment or state your assumption.]")
+                }
             }
             _ => {
                 // Other agent-level tools (spawn_task, skill, etc.) — not yet wired

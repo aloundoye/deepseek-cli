@@ -117,7 +117,7 @@ fn parse_chat_mode_name(raw: &str) -> Option<ChatMode> {
         "code" => Some(ChatMode::Code),
         "architect" | "plan" => Some(ChatMode::Architect),
         "context" => Some(ChatMode::Context),
-        "agent" => Some(ChatMode::Agent),
+        "pipeline" => Some(ChatMode::Pipeline),
         _ => None,
     }
 }
@@ -128,7 +128,7 @@ fn chat_mode_name(mode: ChatMode) -> &'static str {
         ChatMode::Code => "code",
         ChatMode::Architect => "architect",
         ChatMode::Context => "context",
-        ChatMode::Agent => "agent",
+        ChatMode::Pipeline => "pipeline",
     }
 }
 
@@ -4613,6 +4613,7 @@ mod tests {
         assert_eq!(parse_chat_mode_name("architect"), Some(ChatMode::Architect));
         assert_eq!(parse_chat_mode_name("plan"), Some(ChatMode::Architect));
         assert_eq!(parse_chat_mode_name("context"), Some(ChatMode::Context));
+        assert_eq!(parse_chat_mode_name("pipeline"), Some(ChatMode::Pipeline));
         assert_eq!(parse_chat_mode_name("invalid"), None);
     }
 

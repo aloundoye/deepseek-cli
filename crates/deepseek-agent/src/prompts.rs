@@ -6,7 +6,7 @@
 
 /// System prompt that makes deepseek-chat behave as an intelligent coding agent
 /// with tool guidance. This prompt is used for the tool-use conversation loop
-/// (P3 architecture) where the model freely decides which tools to call.
+/// where the model freely decides which tools to call.
 pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, a powerful coding agent that helps users with software engineering tasks. You operate in a terminal environment and have access to tools for reading files, editing code, running commands, searching, and more.
 
 ## Core principles
@@ -33,6 +33,21 @@ pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, a powerful coding 
 - **web_fetch**: Fetch and process content from a URL.
 - **user_question**: Ask the user a clarifying question.
 
+## Workflow guidance
+
+- After making file edits, run relevant tests or linters to verify correctness.
+- Use git_status to check repository state before committing.
+- For multi-file changes, edit all files first, then verify once at the end.
+- When tests fail, read the error output carefully and fix the root cause — do not blindly retry.
+
+## Safety rules
+
+- Never modify the .git directory directly.
+- Check that a file exists before editing it (fs_read first).
+- Use fs_edit for targeted changes, not fs_write (which overwrites the entire file).
+- Be careful with destructive bash commands (rm, git reset, etc.) — confirm with the user first.
+- Do NOT guess file contents or paths. Always verify with tools.
+
 ## Working approach
 
 - **Simple tasks**: Act directly — read the relevant file, make the edit, verify.
@@ -40,29 +55,40 @@ pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, a powerful coding 
 - **Debugging**: Read error messages carefully, search for relevant code, form a hypothesis, verify with tools.
 - **After edits**: Run the project's test suite or at minimum check that the edit is syntactically valid.
 
-## Important constraints
+## Optimization tips
 
-- Do NOT guess file contents or paths. Always verify with tools.
-- Do NOT make changes to files you haven't read in this conversation.
-- Do NOT use bash_run for operations that have dedicated tools (reading, searching, editing files).
-- Minimize the number of tool calls by being targeted in your searches.
+- Keep tool call arguments concise — avoid sending unnecessary data.
+- Prefer fewer, targeted tool calls over many exploratory ones.
 - When reading large files, use line ranges to focus on relevant sections.
+- Do NOT use bash_run for operations that have dedicated tools (reading, searching, editing files).
 "#;
+
+/// Workspace context injected into the system prompt environment section.
+pub struct WorkspaceContext {
+    pub cwd: String,
+    pub git_branch: Option<String>,
+    pub os: String,
+}
 
 /// Build the complete system prompt for a tool-use session.
 ///
 /// Layers:
 /// 1. Base tool-use prompt
-/// 2. Project memory (DEEPSEEK.md equivalent)
-/// 3. User system prompt override or append
+/// 2. Environment context (cwd, git branch, OS)
+/// 3. Project memory (DEEPSEEK.md equivalent)
+/// 4. User system prompt override or append
 pub fn build_tool_use_system_prompt(
     project_memory: Option<&str>,
     system_prompt_override: Option<&str>,
     system_prompt_append: Option<&str>,
+    workspace_context: Option<&WorkspaceContext>,
 ) -> String {
     // If the user provides a complete override, use it directly
     if let Some(override_prompt) = system_prompt_override {
         let mut prompt = override_prompt.to_string();
+        if let Some(ctx) = workspace_context {
+            prompt.push_str(&format_environment_section(ctx));
+        }
         if let Some(memory) = project_memory {
             prompt.push_str("\n\n# Project Instructions\n\n");
             prompt.push_str(memory);
@@ -72,19 +98,34 @@ pub fn build_tool_use_system_prompt(
 
     let mut parts = vec![TOOL_USE_SYSTEM_PROMPT.to_string()];
 
-    if let Some(memory) = project_memory {
-        if !memory.is_empty() {
-            parts.push(format!("\n# Project Instructions (DEEPSEEK.md)\n\n{memory}"));
-        }
+    if let Some(ctx) = workspace_context {
+        parts.push(format_environment_section(ctx));
     }
 
-    if let Some(append) = system_prompt_append {
-        if !append.is_empty() {
-            parts.push(format!("\n# Additional Instructions\n\n{append}"));
-        }
+    if let Some(memory) = project_memory
+        && !memory.is_empty()
+    {
+        parts.push(format!("\n# Project Instructions (DEEPSEEK.md)\n\n{memory}"));
+    }
+
+    if let Some(append) = system_prompt_append
+        && !append.is_empty()
+    {
+        parts.push(format!("\n# Additional Instructions\n\n{append}"));
     }
 
     parts.join("\n")
+}
+
+/// Format the environment section for the system prompt.
+fn format_environment_section(ctx: &WorkspaceContext) -> String {
+    let mut section = String::from("\n# Environment\n\n");
+    section.push_str(&format!("- Working directory: {}\n", ctx.cwd));
+    if let Some(ref branch) = ctx.git_branch {
+        section.push_str(&format!("- Git branch: {branch}\n"));
+    }
+    section.push_str(&format!("- OS: {}\n", ctx.os));
+    section
 }
 
 #[cfg(test)]
@@ -93,7 +134,7 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_tool_guidance() {
-        let prompt = build_tool_use_system_prompt(None, None, None);
+        let prompt = build_tool_use_system_prompt(None, None, None, None);
         assert!(prompt.contains("fs_read"));
         assert!(prompt.contains("fs_edit"));
         assert!(prompt.contains("bash_run"));
@@ -106,6 +147,7 @@ mod tests {
             Some("Always use snake_case in Rust code."),
             None,
             None,
+            None,
         );
         assert!(prompt.contains("Always use snake_case in Rust code."));
         assert!(prompt.contains("Project Instructions"));
@@ -116,6 +158,7 @@ mod tests {
         let prompt = build_tool_use_system_prompt(
             Some("project memory"),
             Some("Custom system prompt"),
+            None,
             None,
         );
         assert!(prompt.starts_with("Custom system prompt"));
@@ -130,6 +173,7 @@ mod tests {
             None,
             None,
             Some("Extra rule: always add tests."),
+            None,
         );
         assert!(prompt.contains("You are DeepSeek, a powerful coding agent"));
         assert!(prompt.contains("Extra rule: always add tests."));
@@ -138,7 +182,33 @@ mod tests {
 
     #[test]
     fn system_prompt_empty_memory_not_added() {
-        let prompt = build_tool_use_system_prompt(Some(""), None, None);
+        let prompt = build_tool_use_system_prompt(Some(""), None, None, None);
         assert!(!prompt.contains("Project Instructions"));
+    }
+
+    #[test]
+    fn system_prompt_includes_workspace_context() {
+        let ctx = WorkspaceContext {
+            cwd: "/home/user/project".to_string(),
+            git_branch: Some("main".to_string()),
+            os: "linux".to_string(),
+        };
+        let prompt = build_tool_use_system_prompt(None, None, None, Some(&ctx));
+        assert!(prompt.contains("/home/user/project"));
+        assert!(prompt.contains("Git branch: main"));
+        assert!(prompt.contains("OS: linux"));
+    }
+
+    #[test]
+    fn system_prompt_environment_section_no_branch() {
+        let ctx = WorkspaceContext {
+            cwd: "/tmp/test".to_string(),
+            git_branch: None,
+            os: "macos".to_string(),
+        };
+        let prompt = build_tool_use_system_prompt(None, None, None, Some(&ctx));
+        assert!(prompt.contains("/tmp/test"));
+        assert!(!prompt.contains("Git branch"));
+        assert!(prompt.contains("OS: macos"));
     }
 }

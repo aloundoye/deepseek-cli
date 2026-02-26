@@ -59,6 +59,15 @@ pub fn tool_error_to_message(tool_call_id: &str, error: &str) -> ChatMessage {
     }
 }
 
+/// Whether a tool name (API-format) is a write/destructive tool that warrants
+/// creating a checkpoint before execution.
+pub fn is_write_tool(api_name: &str) -> bool {
+    matches!(
+        api_name,
+        "fs_edit" | "fs_write" | "bash_run" | "multi_edit" | "patch_apply" | "notebook_edit"
+    )
+}
+
 /// Whether a tool name (API-format) is agent-level, meaning it should be
 /// handled by the AgentEngine itself rather than dispatched to LocalToolHost.
 pub fn is_agent_level_tool(api_name: &str) -> bool {
@@ -222,6 +231,20 @@ mod tests {
             }
             _ => panic!("expected Tool message"),
         }
+    }
+
+    #[test]
+    fn is_write_tool_identifies_correctly() {
+        assert!(super::is_write_tool("fs_edit"));
+        assert!(super::is_write_tool("fs_write"));
+        assert!(super::is_write_tool("bash_run"));
+        assert!(super::is_write_tool("multi_edit"));
+        assert!(super::is_write_tool("patch_apply"));
+        assert!(super::is_write_tool("notebook_edit"));
+        assert!(!super::is_write_tool("fs_read"));
+        assert!(!super::is_write_tool("fs_glob"));
+        assert!(!super::is_write_tool("git_status"));
+        assert!(!super::is_write_tool("user_question"));
     }
 
     #[test]
