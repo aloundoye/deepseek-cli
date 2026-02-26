@@ -211,7 +211,7 @@ pub enum SlashCommand {
     ChatMode(Option<String>),
     Init,
     Clear,
-    Compact,
+    Compact(Option<String>),
     Memory(Vec<String>),
     Config,
     Model(Option<String>),
@@ -299,7 +299,7 @@ impl SlashCommand {
             "chat-mode" | "chat_mode" => Self::ChatMode(args.first().cloned()),
             "init" => Self::Init,
             "clear" => Self::Clear,
-            "compact" => Self::Compact,
+            "compact" => Self::Compact(args.first().cloned()),
             "memory" => Self::Memory(args),
             "config" => Self::Config,
             "model" => Self::Model(args.first().cloned()),
@@ -5237,6 +5237,14 @@ mod tests {
                 "deepseek".to_string(),
                 "cli".to_string()
             ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/compact"),
+            Some(SlashCommand::Compact(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/compact authentication"),
+            Some(SlashCommand::Compact(Some("authentication".to_string())))
         );
     }
 

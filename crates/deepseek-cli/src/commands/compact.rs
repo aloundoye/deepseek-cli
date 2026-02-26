@@ -21,7 +21,11 @@ pub(crate) struct CompactSummary {
     pub(crate) token_delta_estimate: i64,
 }
 
-pub(crate) fn compact_now(cwd: &Path, from_turn: Option<u64>) -> Result<CompactSummary> {
+pub(crate) fn compact_now(
+    cwd: &Path,
+    from_turn: Option<u64>,
+    focus: Option<&str>,
+) -> Result<CompactSummary> {
     let store = Store::new(cwd)?;
     let session = store
         .load_latest_session()?
@@ -48,23 +52,19 @@ pub(crate) fn compact_now(cwd: &Path, from_turn: Option<u64>) -> Result<CompactS
     let summary_id = Uuid::now_v7();
     let full_text = selected.join("\n");
     let before_tokens = estimate_tokens(&full_text);
-    let summary_lines = selected
-        .iter()
-        .take(12)
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.len() > 200 {
-                format!("- {}...", &trimmed[..200])
-            } else {
-                format!("- {trimmed}")
-            }
-        })
-        .collect::<Vec<_>>();
+
+    // When a focus topic is provided, prioritize lines mentioning the topic
+    let summary_lines = build_compact_summary_lines(&selected, focus);
+
+    let focus_header = focus
+        .map(|f| format!("\nfocus: {f}"))
+        .unwrap_or_default();
     let summary = format!(
-        "Compaction summary {}\nfrom_turn: {}\nto_turn: {}\n\n{}",
+        "Compaction summary {}\nfrom_turn: {}\nto_turn: {}{}\n\n{}",
         summary_id,
         from_turn,
         transcript_len,
+        focus_header,
         summary_lines.join("\n")
     );
     let token_delta_estimate = before_tokens as i64 - estimate_tokens(&summary) as i64;
@@ -90,6 +90,41 @@ pub(crate) fn compact_now(cwd: &Path, from_turn: Option<u64>) -> Result<CompactS
         to_turn: transcript_len,
         token_delta_estimate,
     })
+}
+
+/// Build summary lines for compaction. When a focus topic is provided,
+/// relevant lines are placed first, and the budget is increased for them.
+fn build_compact_summary_lines(selected: &[String], focus: Option<&str>) -> Vec<String> {
+    let format_line = |line: &str| {
+        let trimmed = line.trim();
+        if trimmed.len() > 200 {
+            format!("- {}...", &trimmed[..trimmed.floor_char_boundary(200)])
+        } else {
+            format!("- {trimmed}")
+        }
+    };
+
+    if let Some(topic) = focus {
+        let topic_lower = topic.to_ascii_lowercase();
+        let (relevant, other): (Vec<_>, Vec<_>) = selected
+            .iter()
+            .partition(|line| line.to_ascii_lowercase().contains(&topic_lower));
+
+        let mut lines = Vec::new();
+        // Give focus lines more budget (up to 16), then fill with others (up to 8)
+        for line in relevant.iter().take(16) {
+            lines.push(format_line(line));
+        }
+        if !lines.is_empty() && !other.is_empty() {
+            lines.push(format!("--- (non-{topic} context) ---"));
+        }
+        for line in other.iter().take(8) {
+            lines.push(format_line(line));
+        }
+        lines
+    } else {
+        selected.iter().take(12).map(|l| format_line(l)).collect()
+    }
 }
 
 pub(crate) fn rewind_now(
@@ -209,23 +244,18 @@ pub(crate) fn run_compact(cwd: &Path, args: CompactArgs, json_mode: bool) -> Res
     let summary_id = Uuid::now_v7();
     let full_text = selected.join("\n");
     let before_tokens = estimate_tokens(&full_text);
-    let summary_lines = selected
-        .iter()
-        .take(12)
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.len() > 200 {
-                format!("- {}...", &trimmed[..200])
-            } else {
-                format!("- {trimmed}")
-            }
-        })
-        .collect::<Vec<_>>();
+    let summary_lines = build_compact_summary_lines(&selected, args.focus.as_deref());
+    let focus_header = args
+        .focus
+        .as_deref()
+        .map(|f| format!("\nfocus: {f}"))
+        .unwrap_or_default();
     let summary = format!(
-        "Compaction summary {}\nfrom_turn: {}\nto_turn: {}\n\n{}",
+        "Compaction summary {}\nfrom_turn: {}\nto_turn: {}{}\n\n{}",
         summary_id,
         from_turn,
         transcript_len,
+        focus_header,
         summary_lines.join("\n")
     );
     let after_tokens = estimate_tokens(&summary);
@@ -349,4 +379,57 @@ pub(crate) fn should_auto_compact(cfg: &AppConfig, transcript: &[String]) -> boo
     let threshold = cfg.context.auto_compact_threshold;
     let ratio = estimated_tokens as f64 / usable as f64;
     ratio >= threshold as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_compact_summary_lines_no_focus() {
+        let lines: Vec<String> = (1..=20)
+            .map(|i| format!("turn {i} content"))
+            .collect();
+        let result = build_compact_summary_lines(&lines, None);
+        assert_eq!(result.len(), 12, "should take up to 12 lines without focus");
+        assert!(result[0].contains("turn 1"));
+    }
+
+    #[test]
+    fn build_compact_summary_lines_with_focus() {
+        let lines = vec![
+            "setup database".to_string(),
+            "fix authentication bug".to_string(),
+            "update database schema".to_string(),
+            "refactor logging".to_string(),
+            "add database migration".to_string(),
+            "update readme".to_string(),
+        ];
+        let result = build_compact_summary_lines(&lines, Some("database"));
+        // Relevant lines first: "setup database", "update database schema", "add database migration"
+        assert!(result[0].contains("database"));
+        assert!(result[1].contains("database"));
+        assert!(result[2].contains("database"));
+        // Then separator and non-relevant lines
+        assert!(result.iter().any(|l| l.contains("non-database context")));
+    }
+
+    #[test]
+    fn build_compact_summary_lines_focus_case_insensitive() {
+        let lines = vec![
+            "fix AUTH bug".to_string(),
+            "update tests".to_string(),
+            "auth module refactored".to_string(),
+        ];
+        let result = build_compact_summary_lines(&lines, Some("auth"));
+        assert!(result[0].contains("AUTH"));
+        assert!(result[1].contains("auth"));
+    }
+
+    #[test]
+    fn build_compact_summary_lines_empty() {
+        let lines: Vec<String> = vec![];
+        let result = build_compact_summary_lines(&lines, Some("anything"));
+        assert!(result.is_empty());
+    }
 }

@@ -7,9 +7,12 @@ mod gather_context;
 mod intent;
 pub mod linter;
 mod r#loop;
+pub mod prompts;
 pub mod run_engine;
 mod repo_map_v2;
 mod team;
+pub mod tool_bridge;
+pub mod tool_loop;
 mod verify;
 pub mod watch;
 
@@ -28,7 +31,7 @@ use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_store::Store;
 use deepseek_subagent::SubagentTask;
-use deepseek_tools::LocalToolHost;
+use deepseek_tools::{LocalToolHost, tool_definitions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +48,8 @@ pub enum ChatMode {
     Code,
     Architect,
     Context,
+    /// Tool-use conversation loop (P3). The model freely calls tools until done.
+    Agent,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -422,6 +427,63 @@ impl AgentEngine {
         })
     }
 
+    /// Run the tool-use conversation loop (P3 architecture).
+    ///
+    /// The model freely decides which tools to call at each step, enabling
+    /// fluid think→act→observe behavior instead of the rigid pipeline.
+    fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
+        let project_memory = deepseek_memory::MemoryManager::new(&self.workspace)
+            .ok()
+            .and_then(|mm| mm.read_combined_memory().ok());
+
+        let system_prompt = prompts::build_tool_use_system_prompt(
+            project_memory.as_deref(),
+            options.system_prompt_override.as_deref(),
+            options.system_prompt_append.as_deref(),
+        );
+
+        let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
+        let config = tool_loop::ToolLoopConfig {
+            model: self.cfg.llm.base_model.clone(),
+            max_tokens: deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS,
+            temperature: Some(self.cfg.llm.temperature),
+            context_window_tokens: self.cfg.llm.context_window_tokens,
+            max_turns: self.max_turns.unwrap_or(tool_loop::DEFAULT_MAX_TURNS as u64) as usize,
+            read_only,
+        };
+
+        let mut loop_ = tool_loop::ToolUseLoop::new(
+            self.llm.as_ref(),
+            self.tool_host.clone(),
+            config,
+            system_prompt,
+            tool_definitions(),
+        );
+
+        if let Ok(guard) = self.stream_callback.lock() {
+            if let Some(ref cb) = *guard {
+                loop_.set_stream_callback(cb.clone());
+            }
+        }
+
+        if !options.chat_history.is_empty() {
+            loop_ = loop_.with_history(options.chat_history.clone());
+        }
+
+        let result = loop_.run(prompt)?;
+
+        if !result.tool_calls_made.is_empty() {
+            self.observer.verbose_log(&format!(
+                "tool-use loop: {} turns, {} tool calls, {} prompt tokens",
+                result.turns,
+                result.tool_calls_made.len(),
+                result.usage.prompt_tokens,
+            ));
+        }
+
+        Ok(result.response)
+    }
+
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
         let task_intent = intent::classify_intent(&intent::IntentInput {
@@ -446,7 +508,10 @@ impl AgentEngine {
             },
         });
 
-        let result = if task_intent == intent::TaskIntent::ArchitectOnly {
+        let result = if options.mode == ChatMode::Agent {
+            // Tool-use conversation loop (P3) — model freely calls tools
+            self.run_tool_use_loop(&prompt_enriched, &options)
+        } else if task_intent == intent::TaskIntent::ArchitectOnly {
             run_engine::run(self, &prompt_enriched, &options)
         } else if task_intent == intent::TaskIntent::InspectRepo {
             self.analyze_with_options(&prompt_enriched, options)
