@@ -122,6 +122,12 @@ pub struct HookDefinition {
     pub matcher: Option<String>,
     /// The hook handlers to run.
     pub hooks: Vec<HookHandler>,
+    /// When true, this hook fires only once per session, then is skipped.
+    #[serde(default)]
+    pub once: bool,
+    /// When true, this hook is disabled and will not fire.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// A hook handler — how to execute the hook.
@@ -242,6 +248,14 @@ pub struct HookRun {
     pub blocked: bool,
 }
 
+/// Permission decision from a PermissionRequest hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
 /// Aggregate result of running all hooks for an event.
 #[derive(Debug, Clone, Default)]
 pub struct HookResult {
@@ -254,6 +268,8 @@ pub struct HookResult {
     pub updated_input: Option<serde_json::Value>,
     /// Additional context from hooks.
     pub additional_context: Vec<String>,
+    /// Permission decision from a PermissionRequest hook (allow/deny/ask).
+    pub permission_decision: Option<PermissionDecision>,
 }
 
 // ── Legacy types (backward compat with existing callers) ─────────────────────
@@ -298,7 +314,22 @@ impl HookRuntime {
 
         let mut result = HookResult::default();
 
-        for def in &defs {
+        for (def_idx, def) in defs.iter().enumerate() {
+            // Skip disabled hooks.
+            if def.disabled {
+                continue;
+            }
+
+            // Skip once-fired hooks.
+            if def.once {
+                let once_key = format!("{event_key}:{def_idx}");
+                let mut fired = self.once_fired.lock().expect("once_fired lock");
+                if fired.contains(&once_key) {
+                    continue;
+                }
+                fired.insert(once_key);
+            }
+
             // Check matcher — if set, the input must match.
             if let Some(ref matcher) = def.matcher {
                 let matches = match event {
@@ -338,6 +369,15 @@ impl HookRuntime {
                 }
                 if let Some(ref ctx) = run.output.additional_context {
                     result.additional_context.push(ctx.clone());
+                }
+                // Parse permission decision from PermissionRequest hooks.
+                if let Some(ref pd) = run.output.permission_decision {
+                    result.permission_decision = match pd.as_str() {
+                        "allow" => Some(PermissionDecision::Allow),
+                        "deny" => Some(PermissionDecision::Deny),
+                        "ask" => Some(PermissionDecision::Ask),
+                        _ => None,
+                    };
                 }
                 result.runs.push(run);
 
@@ -631,6 +671,8 @@ pub fn merge_skill_hooks(
                     command: cmd.clone(),
                     timeout: 30,
                 }],
+            once: false,
+            disabled: false,
             })
             .collect();
         merged
@@ -754,6 +796,8 @@ mod tests {
                     command: "echo '{}'".to_string(),
                     timeout: 5,
                 }],
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -797,6 +841,8 @@ mod tests {
                     command: "exit 2".to_string(),
                     timeout: 5,
                 }],
+            once: false,
+            disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -825,6 +871,8 @@ mod tests {
                     command: "exit 0".to_string(),
                     timeout: 5,
                 }],
+            once: false,
+            disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -901,6 +949,8 @@ mod tests {
                         .to_string(),
                     timeout: 5,
                 }],
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -937,6 +987,8 @@ mod tests {
                     command: r#"echo '{"updatedInput":{"path":"modified.txt"}}'"#.to_string(),
                     timeout: 5,
                 }],
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -972,6 +1024,8 @@ mod tests {
                         .to_string(),
                     timeout: 5,
                 }],
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -1007,6 +1061,8 @@ mod tests {
                         .to_string(),
                     timeout: 5,
                 }],
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -1038,6 +1094,8 @@ mod tests {
                     command: "existing".to_string(),
                     timeout: 5,
                 }],
+            once: false,
+            disabled: false,
             }],
         );
         let base = HooksConfig { events };
@@ -1077,6 +1135,8 @@ mod tests {
                     command: "sleep 10".to_string(),
                     timeout: 1,
                 }],
+            once: false,
+            disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -1101,6 +1161,180 @@ mod tests {
         assert!(
             result.runs[0].timed_out,
             "hook should report timed_out=true"
+        );
+    }
+
+    // ── P5-10: once + disabled tests ──
+
+    #[test]
+    fn hook_once_fires_only_once() {
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "echo '{}'".to_string(),
+                    timeout: 5,
+                }],
+                once: true,
+                disabled: false,
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("fs_read".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+
+        // First fire — should execute
+        let result1 = rt.fire(HookEvent::PreToolUse, &input);
+        assert_eq!(result1.runs.len(), 1, "first fire should execute once-hook");
+
+        // Second fire — should skip (already fired)
+        let result2 = rt.fire(HookEvent::PreToolUse, &input);
+        assert_eq!(result2.runs.len(), 0, "second fire should skip once-hook");
+    }
+
+    #[test]
+    fn hook_disabled_skipped() {
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: "echo '{}'".to_string(),
+                    timeout: 5,
+                }],
+                once: false,
+                disabled: true,
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("fs_read".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        assert_eq!(result.runs.len(), 0, "disabled hook should be skipped");
+    }
+
+    // ── P5-11: Permission decision tests ──
+
+    #[test]
+    fn permission_hook_allows() {
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "PermissionRequest".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: r#"echo '{"permissionDecision":"allow"}'"#.to_string(),
+                    timeout: 5,
+                }],
+                once: false,
+                disabled: false,
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PermissionRequest".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+
+        let result = rt.fire(HookEvent::PermissionRequest, &input);
+        assert_eq!(
+            result.permission_decision,
+            Some(PermissionDecision::Allow),
+            "hook should return Allow permission decision"
+        );
+    }
+
+    #[test]
+    fn permission_hook_denies() {
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "PermissionRequest".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Command {
+                    command: r#"echo '{"permissionDecision":"deny","decision":"block","reason":"policy violation"}' && exit 2"#.to_string(),
+                    timeout: 5,
+                }],
+                once: false,
+                disabled: false,
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PermissionRequest".to_string(),
+            tool_name: Some("bash_run".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+
+        let result = rt.fire(HookEvent::PermissionRequest, &input);
+        assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
+        assert!(result.blocked, "deny decision should also block");
+    }
+
+    // ── P5-09: Agent handler test ──
+
+    #[test]
+    fn agent_handler_spawns_subagent() {
+        let mut events = std::collections::HashMap::new();
+        events.insert(
+            "PreToolUse".to_string(),
+            vec![HookDefinition {
+                matcher: None,
+                hooks: vec![HookHandler::Agent {
+                    agent: "validator".to_string(),
+                    model: None,
+                    tools: vec!["fs_read".to_string()],
+                }],
+                once: false,
+                disabled: false,
+            }],
+        );
+        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let input = HookInput {
+            event: "PreToolUse".to_string(),
+            tool_name: Some("fs_write".to_string()),
+            tool_input: None,
+            tool_result: None,
+            prompt: None,
+            session_type: None,
+            workspace: "/tmp".to_string(),
+        };
+
+        let result = rt.fire(HookEvent::PreToolUse, &input);
+        // Agent handler currently records delegation intent
+        assert_eq!(result.runs.len(), 1);
+        assert!(!result.blocked, "agent handler should not block by default");
+        // The additional_context should contain the agent delegation intent
+        assert!(
+            !result.additional_context.is_empty(),
+            "agent handler should inject context about delegation"
         );
     }
 }

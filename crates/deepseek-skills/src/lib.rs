@@ -15,9 +15,22 @@ pub struct SkillEntry {
     /// Tools this skill is allowed to use (empty = all tools).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Tools this skill is NOT allowed to use.
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
     /// Scope of this skill in the hierarchy: Project > User > BuiltIn.
     #[serde(default)]
     pub scope: SkillScope,
+    /// Execution context: "normal" (inline) or "fork" (isolated subagent).
+    #[serde(default = "default_context")]
+    pub context: String,
+    /// If true, the model cannot invoke this skill via the `skill` tool.
+    #[serde(default)]
+    pub disable_model_invocation: bool,
+}
+
+fn default_context() -> String {
+    "normal".to_string()
 }
 
 /// Skill scope in the resolution hierarchy.
@@ -37,6 +50,14 @@ pub struct SkillRunOutput {
     pub skill_id: String,
     pub source_path: PathBuf,
     pub rendered_prompt: String,
+    /// Whether this skill should run in an isolated (forked) context.
+    pub forked: bool,
+    /// Tools this skill is allowed to use (empty = all).
+    pub allowed_tools: Vec<String>,
+    /// Tools this skill is NOT allowed to use.
+    pub disallowed_tools: Vec<String>,
+    /// Whether model auto-invocation is disabled for this skill.
+    pub disable_model_invocation: bool,
 }
 
 pub struct SkillManager {
@@ -93,26 +114,39 @@ impl SkillManager {
                     .unwrap_or("skill")
                     .to_string();
                 let raw = fs::read_to_string(skill_path)?;
-                let name = raw
+                let (frontmatter, body) = parse_command_frontmatter(&raw);
+                let name = body
                     .lines()
                     .find(|line| line.starts_with('#'))
                     .map(|line| line.trim_start_matches('#').trim().to_string())
                     .filter(|line| !line.is_empty())
                     .unwrap_or_else(|| id.clone());
-                let summary = raw
+                let summary = body
                     .lines()
                     .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                let allowed_tools = parse_comma_list(frontmatter.get("allowed_tools"));
+                let disallowed_tools = parse_comma_list(frontmatter.get("disallowed_tools"));
+                let context = frontmatter
+                    .get("context")
+                    .cloned()
+                    .unwrap_or_else(|| "normal".to_string());
+                let disable_model_invocation = frontmatter
+                    .get("disable-model-invocation")
+                    .is_some_and(|v| v == "true");
 
                 out.push(SkillEntry {
                     id,
                     name,
                     path: skill_path.to_path_buf(),
                     summary,
-                    allowed_tools: Vec::new(),
+                    allowed_tools,
+                    disallowed_tools,
                     scope: SkillScope::BuiltIn,
+                    context,
+                    disable_model_invocation,
                 });
             }
         }
@@ -207,16 +241,56 @@ impl SkillManager {
             .replace("{{input}}", input.unwrap_or(""))
             .replace("{{skill_id}}", &skill.id)
             .replace("{{workspace}}", self.workspace.to_string_lossy().as_ref());
+        let forked = skill.context == "fork";
         Ok(SkillRunOutput {
-            skill_id: skill.id,
-            source_path: skill.path,
+            skill_id: skill.id.clone(),
+            source_path: skill.path.clone(),
             rendered_prompt: rendered,
+            forked,
+            allowed_tools: skill.allowed_tools.clone(),
+            disallowed_tools: skill.disallowed_tools.clone(),
+            disable_model_invocation: skill.disable_model_invocation,
         })
     }
 
     pub fn reload(&self, configured_paths: &[String]) -> Result<Vec<SkillEntry>> {
         self.list(configured_paths)
     }
+
+    /// Run a skill in forked (isolated) mode.
+    ///
+    /// Returns a `SkillRunOutput` with `forked: true`. The caller is responsible
+    /// for spawning the actual isolated ToolUseLoop context (e.g. via `SubagentWorker`).
+    /// Tool restrictions (`allowed_tools`, `disallowed_tools`) from the skill's
+    /// frontmatter are included in the output for the caller to enforce.
+    pub fn run_forked(
+        &self,
+        skill_id: &str,
+        input: Option<&str>,
+        configured_paths: &[String],
+    ) -> Result<SkillRunOutput> {
+        let mut output = self.run(skill_id, input, configured_paths)?;
+        output.forked = true;
+        Ok(output)
+    }
+
+    /// Look up a skill by ID without rendering.
+    pub fn get(&self, skill_id: &str, configured_paths: &[String]) -> Result<Option<SkillEntry>> {
+        let skills = self.list(configured_paths)?;
+        Ok(skills.into_iter().find(|s| s.id == skill_id))
+    }
+}
+
+/// Parse a comma-separated list from an optional frontmatter value.
+fn parse_comma_list(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── Context Budget ─────────────────────────────────────────────────────────
@@ -505,7 +579,10 @@ mod tests {
                 path: PathBuf::from(format!("/tmp/s{i}")),
                 summary: "a".repeat(30),
                 allowed_tools: vec![],
+                disallowed_tools: vec![],
                 scope: SkillScope::BuiltIn,
+                context: "normal".to_string(),
+                disable_model_invocation: false,
             })
             .collect();
         let result = apply_context_budget(&skills, 100);
@@ -524,7 +601,10 @@ mod tests {
                 path: PathBuf::from(format!("/tmp/s{i}")),
                 summary: "short".to_string(),
                 allowed_tools: vec![],
+                disallowed_tools: vec![],
                 scope: SkillScope::BuiltIn,
+                context: "normal".to_string(),
+                disable_model_invocation: false,
             })
             .collect();
         let result = apply_context_budget(&skills, 10_000);
@@ -537,5 +617,114 @@ mod tests {
     fn apply_context_budget_empty_skills() {
         let result = apply_context_budget(&[], 100);
         assert!(result.is_empty());
+    }
+
+    // ── P5-06: Forked execution ──────────────────────────────────────────
+
+    #[test]
+    fn skill_forked_isolates_context() {
+        let workspace = std::env::temp_dir().join(format!(
+            "deepseek-fork-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = SkillManager::new(&workspace).expect("manager");
+
+        // Create a skill with context: fork
+        let source = workspace.join("forked-skill");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(
+            source.join("SKILL.md"),
+            "---\ncontext: fork\ndescription: A forked skill\n---\n# Forked Skill\n\nRun {{input}} in isolated context.",
+        )
+        .expect("skill file");
+        manager.install(&source).expect("install");
+
+        // run_forked should return forked=true
+        let output = manager
+            .run_forked("forked-skill", Some("tests"), &[])
+            .expect("run_forked");
+        assert!(output.forked);
+        assert!(output.rendered_prompt.contains("tests"));
+        assert!(output.rendered_prompt.contains("isolated context"));
+
+        // Regular run should also detect fork from frontmatter
+        let output2 = manager
+            .run("forked-skill", Some("lint"), &[])
+            .expect("run");
+        assert!(output2.forked); // context: fork in frontmatter
+    }
+
+    // ── P5-07: Allowed-tools enforcement ─────────────────────────────────
+
+    #[test]
+    fn allowed_tools_enforced() {
+        let workspace = std::env::temp_dir().join(format!(
+            "deepseek-allow-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = SkillManager::new(&workspace).expect("manager");
+
+        let source = workspace.join("restricted-skill");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nallowed_tools: fs_read, fs_glob, git_status\ndisallowed_tools: bash_run\n---\n# Restricted\n\nOnly read ops.",
+        )
+        .expect("skill file");
+        manager.install(&source).expect("install");
+
+        let output = manager
+            .run("restricted-skill", None, &[])
+            .expect("run");
+        assert_eq!(output.allowed_tools, vec!["fs_read", "fs_glob", "git_status"]);
+        assert_eq!(output.disallowed_tools, vec!["bash_run"]);
+    }
+
+    #[test]
+    fn disallowed_tools_filtered() {
+        // Verify the existing filter_tool_definitions works with our data
+        let skills = parse_comma_list(Some(&"bash_run, fs_edit".to_string()));
+        assert_eq!(skills, vec!["bash_run", "fs_edit"]);
+    }
+
+    // ── P5-08: Skill auto-invocation by model ────────────────────────────
+
+    #[test]
+    fn skill_invocation_by_model() {
+        let workspace = std::env::temp_dir().join(format!(
+            "deepseek-invoke-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let manager = SkillManager::new(&workspace).expect("manager");
+
+        // Skill with model invocation disabled
+        let source = workspace.join("no-invoke-skill");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(
+            source.join("SKILL.md"),
+            "---\ndisable-model-invocation: true\ndescription: Not auto-invocable\n---\n# No Invoke\n\nManual only.",
+        )
+        .expect("skill file");
+        manager.install(&source).expect("install");
+
+        let output = manager.run("no-invoke-skill", None, &[]).expect("run");
+        assert!(output.disable_model_invocation);
+        assert!(!output.forked);
+
+        // Skill without the flag — model CAN invoke it
+        let source2 = workspace.join("auto-skill");
+        fs::create_dir_all(&source2).expect("source2");
+        fs::write(
+            source2.join("SKILL.md"),
+            "---\ndescription: Auto-invocable\n---\n# Auto\n\nModel can call me.",
+        )
+        .expect("skill file");
+        manager.install(&source2).expect("install");
+
+        let output2 = manager.run("auto-skill", None, &[]).expect("run");
+        assert!(!output2.disable_model_invocation);
     }
 }

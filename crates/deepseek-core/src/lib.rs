@@ -13,6 +13,8 @@ pub const DEEPSEEK_PROFILE_V32: &str = "v3_2";
 
 /// Maximum output tokens for deepseek-chat (V3 non-thinking).
 pub const DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Maximum output tokens for deepseek-chat with thinking enabled.
+pub const DEEPSEEK_CHAT_THINKING_MAX_OUTPUT_TOKENS: u32 = 32_768;
 /// Maximum output tokens for deepseek-reasoner (thinking/R1).
 pub const DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS: u32 = 65536;
 
@@ -2340,6 +2342,7 @@ impl ReviewMode {
                 | "web_fetch"
                 | "notebook_read"
                 | "index_query"
+                | "extended_thinking"
                 | "think_deeply"
                 | "spawn_task"
                 | "task_output"

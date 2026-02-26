@@ -2291,17 +2291,18 @@ Using dedicated tools provides structured output, better error handling, and cle
                 }),
             },
         },
-        // ── think_deeply: R1 consultation for complex subproblems ──
+        // ── extended_thinking: R1 consultation for complex subproblems ──
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
-                name: "think_deeply".to_string(),
-                description: "Consult a deep reasoning model (R1) for expert analysis on a \
-                              complex subproblem. Use when you encounter: repeated failures on \
-                              the same approach, architectural decisions with multiple valid \
-                              options, complex error analysis needing root cause identification, \
-                              or task decomposition for multi-step changes. Returns strategic \
-                              advice — you keep control and execute the recommended approach."
+                name: "extended_thinking".to_string(),
+                description: "Escalate to deep reasoning model for problems requiring extensive \
+                              chain-of-thought beyond the main model's thinking budget. Use when \
+                              you encounter: repeated failures on the same approach, architectural \
+                              decisions with multiple valid options, complex error analysis needing \
+                              root cause identification, or task decomposition for multi-step \
+                              changes. Returns strategic advice — you keep control and execute \
+                              the recommended approach."
                     .to_string(),
                 strict: None,
                 parameters: json!({
@@ -2529,7 +2530,7 @@ pub const AGENT_LEVEL_TOOLS: &[&str] = &[
     "exit_plan_mode",
     "skill",
     "kill_shell",
-    "think_deeply",
+    "extended_thinking",
 ];
 
 fn should_skip_rel_path(path: &Path) -> bool {

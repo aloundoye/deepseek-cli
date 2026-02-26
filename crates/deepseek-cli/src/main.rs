@@ -42,6 +42,7 @@ use commands::review::run_review;
 use commands::search::run_search;
 use commands::serve::{run_completions, run_native_host, run_serve};
 use commands::session::{run_session_cmd, SessionCmd};
+use commands::agents::run_agents;
 use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
@@ -344,6 +345,11 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         command: SkillsCmd,
+    },
+    /// Manage custom agent definitions (list, show, create).
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCmd,
     },
     /// Deterministic session replay.
     Replay {
@@ -987,6 +993,22 @@ struct SkillRunArgs {
     input: Option<String>,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     execute: bool,
+}
+
+#[derive(Subcommand)]
+enum AgentsCmd {
+    /// List all custom agent definitions.
+    List,
+    /// Show details for a specific agent.
+    Show {
+        /// Agent name to show.
+        name: String,
+    },
+    /// Create a new agent definition from template.
+    Create {
+        /// Name for the new agent.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1667,6 +1689,7 @@ fn run() -> Result<()> {
         Commands::Mcp { command } => run_mcp(&cwd, command, cli.json),
         Commands::Git { command } => run_git(&cwd, command, cli.json),
         Commands::Skills { command } => run_skills(&cwd, command, cli.json),
+        Commands::Agents { command } => run_agents(&cwd, command, cli.json),
         Commands::Replay { command } => run_replay(&cwd, command, cli.json),
         Commands::Background { command } => run_background(&cwd, command, cli.json),
         Commands::Visual { command } => run_visual(&cwd, command, cli.json),

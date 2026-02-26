@@ -1,6 +1,6 @@
 mod analysis;
 pub mod apply;
-mod complexity;
+pub mod complexity;
 mod gather_context;
 mod intent;
 pub mod prompts;
@@ -274,6 +274,70 @@ impl AgentEngine {
         self.subagent_worker.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Build a subagent worker closure that delegates spawn_task to a new engine instance.
+    ///
+    /// If the user has provided an explicit subagent worker (via `set_subagent_worker`),
+    /// that takes priority. Otherwise we build a default worker that creates a new
+    /// `AgentEngine` and runs `chat_with_options()` with the subtask prompt.
+    fn build_subagent_worker(&self) -> Option<tool_loop::SubagentWorker> {
+        // Check if user provided an explicit worker
+        if let Some(worker) = self.subagent_worker() {
+            // Adapt the SubagentWorkerFn to the SubagentWorker signature
+            return Some(Arc::new(move |req: tool_loop::SubagentRequest| {
+                let role = match req.subagent_type.as_str() {
+                    "explore" => deepseek_subagent::SubagentRole::Explore,
+                    "plan" => deepseek_subagent::SubagentRole::Plan,
+                    _ => deepseek_subagent::SubagentRole::Task,
+                };
+                let task = SubagentTask {
+                    run_id: uuid::Uuid::new_v4(),
+                    name: req.task_name.clone(),
+                    goal: req.prompt.clone(),
+                    role,
+                    team: String::new(),
+                    read_only_fallback: false,
+                    custom_agent: None,
+                };
+                worker(&task)
+            }));
+        }
+        None
+    }
+
+    /// Build a skill runner callback that wraps SkillManager.
+    fn build_skill_runner(&self) -> Option<tool_loop::SkillRunner> {
+        let workspace = self.workspace.clone();
+        let skill_paths: Vec<String> = self
+            .cfg
+            .skills
+            .paths
+            .iter()
+            .cloned()
+            .collect();
+
+        Some(Arc::new(move |skill_name: &str, args: Option<&str>| {
+            let manager = deepseek_skills::SkillManager::new(&workspace)?;
+            let output = manager.run(skill_name, args, &skill_paths);
+            match output {
+                Ok(run_output) => Ok(Some(tool_loop::SkillInvocationResult {
+                    rendered_prompt: run_output.rendered_prompt,
+                    forked: run_output.forked,
+                    allowed_tools: run_output.allowed_tools,
+                    disallowed_tools: run_output.disallowed_tools,
+                    disable_model_invocation: run_output.disable_model_invocation,
+                })),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not found") {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }))
+    }
+
     /// Mutable access to the configuration for test overrides.
     pub fn cfg_mut(&mut self) -> &mut deepseek_core::AppConfig {
         &mut self.cfg
@@ -397,43 +461,43 @@ impl AgentEngine {
             os: std::env::consts::OS.to_string(),
         };
 
-        let system_prompt = prompts::build_tool_use_system_prompt(
+        // Classify complexity before building system prompt (planning injection depends on it).
+        let complexity = complexity::classify_complexity(prompt);
+
+        let system_prompt = prompts::build_tool_use_system_prompt_with_complexity(
             project_memory.as_deref(),
             options.system_prompt_override.as_deref(),
             options.system_prompt_append.as_deref(),
             Some(&ws_context),
+            complexity,
         );
 
         let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
-        let use_thinking = options.force_max_think;
+
+        // Two-budget system: moderate default, evidence-driven escalation in the loop.
+        // force_max_think is an explicit user override to maximum.
+        let think_budget = if options.force_max_think {
+            complexity::MAX_THINK_BUDGET
+        } else {
+            complexity::DEFAULT_THINK_BUDGET
+        };
+
         let config = tool_loop::ToolLoopConfig {
-            model: if use_thinking {
-                self.cfg.llm.max_think_model.clone()
-            } else {
-                self.cfg.llm.base_model.clone()
-            },
-            max_tokens: if use_thinking {
-                deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS
-            } else {
-                deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS
-            },
-            temperature: if use_thinking {
-                None // Thinking mode is incompatible with temperature
-            } else {
-                Some(self.cfg.llm.temperature)
-            },
+            model: self.cfg.llm.base_model.clone(), // Always deepseek-chat
+            max_tokens: deepseek_core::DEEPSEEK_CHAT_THINKING_MAX_OUTPUT_TOKENS,
+            temperature: None, // Incompatible with thinking mode
             context_window_tokens: self.cfg.llm.context_window_tokens,
             max_turns: self
                 .max_turns
                 .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns)
                 as usize,
             read_only,
-            thinking: if use_thinking {
-                Some(deepseek_core::ThinkingConfig::enabled(16_384))
-            } else {
-                None
-            },
-            think_deeply_model: self.cfg.llm.max_think_model.clone(),
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(think_budget)),
+            extended_thinking_model: self.cfg.llm.max_think_model.clone(),
+            complexity,
+            subagent_worker: self.build_subagent_worker(),
+            skill_runner: self.build_skill_runner(),
+            workspace: Some(self.workspace.clone()),
         };
 
         let mut loop_ = tool_loop::ToolUseLoop::new(

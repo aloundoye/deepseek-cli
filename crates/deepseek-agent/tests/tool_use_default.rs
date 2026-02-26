@@ -691,6 +691,73 @@ fn tools_false_uses_analysis_path() -> Result<()> {
     Ok(())
 }
 
+/// Default tool-use loop always has thinking enabled (adaptive thinking).
+#[test]
+fn default_tool_loop_has_thinking_enabled() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![(
+            "call_1",
+            "fs_read",
+            r#"{"path":"src/main.rs"}"#,
+        )]),
+        text_response("Done."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "What's in this project?",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    // Thinking should always be enabled by default
+    let thinking = requests[0].thinking.as_ref().expect("thinking should be enabled by default");
+    assert!(thinking.budget_tokens.unwrap_or(0) > 0, "thinking budget should be positive");
+    Ok(())
+}
+
+/// force_max_think overrides thinking budget to maximum (65536).
+#[test]
+fn force_max_think_overrides_budget() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![(
+            "call_1",
+            "fs_read",
+            r#"{"path":"src/main.rs"}"#,
+        )]),
+        text_response("Done."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "fix typo",
+        ChatOptions {
+            tools: true,
+            force_max_think: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    let thinking = requests[0].thinking.as_ref().expect("thinking should be enabled with force_max_think");
+    // force_max_think should use COMPLEX_THINK_BUDGET * 2 = 65536 (max budget)
+    assert_eq!(thinking.budget_tokens, Some(65536), "force_max_think should use maximum budget");
+    Ok(())
+}
+
 /// Tool loop with thinking mode (reasoning_content preserved).
 #[test]
 fn tool_loop_with_thinking_mode() -> Result<()> {
@@ -721,4 +788,125 @@ fn tool_loop_with_thinking_mode() -> Result<()> {
 
     assert!(output.contains("prints hello"));
     Ok(())
+}
+
+// ── spawn_task tests ──
+
+/// When spawn_task is called with a worker, the worker is invoked.
+#[test]
+fn spawn_task_calls_worker() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let worker_called = Arc::new(Mutex::new(false));
+    let worker_called_clone = worker_called.clone();
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            // Turn 1: LLM calls spawn_task
+            tool_call_response(vec![(
+                "call_1",
+                "spawn_task",
+                r#"{"prompt":"analyze the project","description":"explore project","subagent_type":"explore"}"#,
+            )]),
+            // Turn 2: respond with results
+            text_response("The subagent analyzed the project."),
+        ],
+    )?;
+
+    // Wire a subagent worker
+    let worker: Arc<dyn Fn(&deepseek_subagent::SubagentTask) -> Result<String> + Send + Sync> =
+        Arc::new(move |task| {
+            *worker_called_clone.lock().unwrap() = true;
+            Ok(format!("Subagent completed: {}", task.goal))
+        });
+    engine.set_subagent_worker(worker);
+
+    let output = engine.chat_with_options(
+        "Analyze this project",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(*worker_called.lock().unwrap(), "subagent worker should have been called");
+    assert!(!output.is_empty());
+    Ok(())
+}
+
+/// When spawn_task is called without a worker, it falls back gracefully.
+#[test]
+fn spawn_task_without_worker_falls_back() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            // Turn 1: LLM calls spawn_task (no worker wired)
+            tool_call_response(vec![(
+                "call_1",
+                "spawn_task",
+                r#"{"prompt":"explore the code","description":"code exploration","subagent_type":"explore"}"#,
+            )]),
+            // Turn 2: respond
+            text_response("I'll explore the code directly."),
+        ],
+    )?;
+
+    // No worker set — should fall back gracefully
+    let output = engine.chat_with_options(
+        "Explore the code",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(!output.is_empty());
+    Ok(())
+}
+
+/// spawn_task correctly maps subagent_type to SubagentRole.
+#[test]
+fn spawn_task_role_maps_correctly() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let captured_role = Arc::new(Mutex::new(String::new()));
+    let captured_role_clone = captured_role.clone();
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "spawn_task",
+                r#"{"prompt":"plan the implementation","description":"plan task","subagent_type":"plan"}"#,
+            )]),
+            text_response("Planning complete."),
+        ],
+    )?;
+
+    let worker: Arc<dyn Fn(&deepseek_subagent::SubagentTask) -> Result<String> + Send + Sync> =
+        Arc::new(move |task| {
+            *captured_role_clone.lock().unwrap() = format!("{:?}", task.role);
+            Ok("Done".to_string())
+        });
+    engine.set_subagent_worker(worker);
+
+    let _output = engine.chat_with_options(
+        "Plan the implementation",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let role = captured_role.lock().unwrap();
+    assert_eq!(*role, "Plan", "subagent_type 'plan' should map to SubagentRole::Plan");
+    Ok(()
+    )
 }

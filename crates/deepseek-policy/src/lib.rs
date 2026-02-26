@@ -961,6 +961,19 @@ pub struct ManagedSettings {
     pub permission_rules: Vec<PermissionRule>,
     /// Force a specific permission mode.
     pub permission_mode: Option<String>,
+    /// P5-18: Hard limit on allowed tools (empty = all allowed).
+    /// When set, only these tools can be used regardless of user config.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// P5-18: Hard limit on tool-use loop turns.
+    /// When set, overrides user's max_turns if it exceeds this value.
+    pub max_turns: Option<u64>,
+    /// P5-18: Maximum USD budget per session.
+    /// When set, the session will stop after exceeding this budget.
+    pub max_budget_usd: Option<f64>,
+    /// P5-18: Blocked tools that cannot be used regardless of other settings.
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
 }
 
 /// Platform-specific path for managed settings.
@@ -2031,5 +2044,32 @@ mod tests {
         };
         // Edit approval depends on mode, not persistent bash approvals
         assert!(policy.requires_approval(&edit));
+    }
+
+    // ── P5-18: Admin settings ──────────────────────────────────────────────
+
+    #[test]
+    fn admin_overrides_user() {
+        // Verify ManagedSettings deserializes with new fields
+        let json = serde_json::json!({
+            "disable_bypass_permissions_mode": true,
+            "allowed_tools": ["fs_read", "fs_glob"],
+            "blocked_tools": ["bash_run"],
+            "max_turns": 25,
+            "max_budget_usd": 5.0
+        });
+        let managed: ManagedSettings = serde_json::from_value(json).unwrap();
+        assert!(managed.disable_bypass_permissions_mode);
+        assert_eq!(managed.allowed_tools, vec!["fs_read", "fs_glob"]);
+        assert_eq!(managed.blocked_tools, vec!["bash_run"]);
+        assert_eq!(managed.max_turns, Some(25));
+        assert_eq!(managed.max_budget_usd, Some(5.0));
+
+        // Defaults should be empty/none
+        let defaults = ManagedSettings::default();
+        assert!(defaults.allowed_tools.is_empty());
+        assert!(defaults.blocked_tools.is_empty());
+        assert!(defaults.max_turns.is_none());
+        assert!(defaults.max_budget_usd.is_none());
     }
 }

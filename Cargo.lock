@@ -724,6 +724,7 @@ dependencies = [
  "deepseek-memory",
  "deepseek-observe",
  "deepseek-policy",
+ "deepseek-skills",
  "deepseek-store",
  "deepseek-subagent",
  "deepseek-testkit",
@@ -1007,6 +1008,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 

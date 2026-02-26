@@ -1,4 +1,5 @@
 pub(crate) mod admin;
+pub(crate) mod agents;
 pub(crate) mod autopilot;
 pub(crate) mod background;
 pub(crate) mod chat;
