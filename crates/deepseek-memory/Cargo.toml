@@ -19,3 +19,4 @@ deepseek-store = { path = "../deepseek-store" }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
+tempfile = "3"

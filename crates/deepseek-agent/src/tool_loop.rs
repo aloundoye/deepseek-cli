@@ -18,6 +18,7 @@ use deepseek_core::{
 };
 use deepseek_hooks::{HookEvent, HookInput, HookRuntime};
 use deepseek_llm::LlmClient;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -70,7 +71,8 @@ pub type UserQuestionCallback = Arc<dyn Fn(UserQuestion) -> Option<String> + Sen
 pub type EventCallback = Arc<dyn Fn(EventKind) + Send + Sync>;
 
 /// Callback for creating a checkpoint before destructive tool calls.
-pub type CheckpointCallback = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+/// The second argument contains the files about to be modified (if known).
+pub type CheckpointCallback = Arc<dyn Fn(&str, &[PathBuf]) -> Result<()> + Send + Sync>;
 
 /// Configuration for the tool-use loop.
 pub struct ToolLoopConfig {
@@ -430,7 +432,8 @@ impl<'a> ToolUseLoop<'a> {
         if tool_bridge::is_write_tool(&llm_call.name)
             && let Some(ref cp) = self.checkpoint_cb
         {
-            let _ = cp("before tool execution");
+            let modified = tool_bridge::extract_modified_paths(&llm_call.name, &llm_call.arguments);
+            let _ = cp("before tool execution", &modified);
         }
 
         // Execute the approved tool

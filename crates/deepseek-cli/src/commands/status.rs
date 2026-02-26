@@ -386,27 +386,160 @@ pub(crate) fn run_context(cwd: &Path, json_mode: bool) -> Result<()> {
             }
         }))?;
     } else {
-        println!("Context Window Inspector");
-        println!("========================");
-        println!("Window size:       {} tokens", context_window);
-        println!("Compact threshold: {:.0}%", compact_threshold * 100.0);
-        println!("Session tokens:    {session_tokens}");
-        println!("Utilization:       {utilization:.1}%");
-        println!("Compactions:       {compactions}");
-        println!();
-        println!("Breakdown:");
-        println!("  System prompt:       ~{system_prompt_tokens} tokens");
-        println!("  Memory (DEEPSEEK.md): ~{memory_tokens} tokens");
-        println!("  Conversation:         ~{conversation_tokens} tokens");
-        if planner_tokens > 0 {
-            println!("    Planner:            {planner_tokens} tokens");
-        }
-        if executor_tokens > 0 {
-            println!("    Executor:           {executor_tokens} tokens");
-        }
-        if utilization > (compact_threshold as f64 * 100.0) {
-            println!("\n⚠ Context is above compact threshold. Use /compact to free space.");
-        }
+        render_context_bar(&ContextBreakdown {
+            total: context_window,
+            system: system_prompt_tokens,
+            memory: memory_tokens,
+            conversation: conversation_tokens,
+            planner: planner_tokens,
+            executor: executor_tokens,
+            compactions: compactions as u64,
+            compact_threshold,
+        });
     }
     Ok(())
+}
+
+struct ContextBreakdown {
+    total: u64,
+    system: u64,
+    memory: u64,
+    conversation: u64,
+    planner: u64,
+    executor: u64,
+    compactions: u64,
+    compact_threshold: f32,
+}
+
+/// Render a colored ASCII bar graph for context window usage.
+#[allow(clippy::too_many_arguments)]
+fn render_context_bar(b: &ContextBreakdown) {
+    let ContextBreakdown {
+        total,
+        system,
+        memory,
+        conversation,
+        planner,
+        executor,
+        compactions,
+        compact_threshold,
+    } = *b;
+    let bar_width: u64 = 40;
+    let used = system + memory + conversation;
+    let available = total.saturating_sub(used);
+
+    let pct = if total > 0 {
+        (used as f64 / total as f64 * 100.0) as u64
+    } else {
+        0
+    };
+
+    // Compute character widths for each segment
+    let sys_chars = if total > 0 {
+        (system as f64 / total as f64 * bar_width as f64).round() as u64
+    } else {
+        0
+    };
+    let mem_chars = if total > 0 {
+        (memory as f64 / total as f64 * bar_width as f64).round() as u64
+    } else {
+        0
+    };
+    let conv_chars = if total > 0 {
+        (conversation as f64 / total as f64 * bar_width as f64).round() as u64
+    } else {
+        0
+    };
+    let filled = sys_chars + mem_chars + conv_chars;
+    let avail_chars = bar_width.saturating_sub(filled);
+
+    // Use ANSI colors: blue=system, cyan=memory, green=conversation, dark_gray=available
+    let sys_bar = "█".repeat(sys_chars as usize);
+    let mem_bar = "█".repeat(mem_chars as usize);
+    let conv_bar = "█".repeat(conv_chars as usize);
+    let avail_bar = "░".repeat(avail_chars as usize);
+
+    println!("Context Window Inspector");
+    println!("========================");
+    println!(
+        "\n  [\x1b[34m{sys_bar}\x1b[36m{mem_bar}\x1b[32m{conv_bar}\x1b[90m{avail_bar}\x1b[0m] {pct}% ({used}/{}K tokens)",
+        total / 1000
+    );
+    println!(
+        "  \x1b[34m████\x1b[0m System prompt:    ~{}K",
+        system / 1000
+    );
+    println!(
+        "  \x1b[36m████\x1b[0m Memory:           ~{}K",
+        memory / 1000
+    );
+    println!(
+        "  \x1b[32m████\x1b[0m Conversation:     ~{}K",
+        conversation / 1000
+    );
+    if planner > 0 {
+        println!("       Planner:          {planner}");
+    }
+    if executor > 0 {
+        println!("       Executor:         {executor}");
+    }
+    println!(
+        "  \x1b[90m░░░░\x1b[0m Available:        ~{}K",
+        available / 1000
+    );
+    println!("\n  Compactions: {compactions}");
+
+    let threshold_pct = compact_threshold as f64 * 100.0;
+    if (pct as f64) > threshold_pct {
+        println!(
+            "\n  \x1b[33m⚠ Context is above compact threshold ({threshold_pct:.0}%). Use /compact to free space.\x1b[0m"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_grid_renders_bar() {
+        // Verify rendering doesn't panic with typical inputs
+        render_context_bar(&ContextBreakdown {
+            total: 128_000,
+            system: 1_200,
+            memory: 500,
+            conversation: 10_000,
+            planner: 0,
+            executor: 0,
+            compactions: 0,
+            compact_threshold: 0.95,
+        });
+    }
+
+    #[test]
+    fn context_grid_percentages() {
+        // Zero total should not panic
+        render_context_bar(&ContextBreakdown {
+            total: 0,
+            system: 0,
+            memory: 0,
+            conversation: 0,
+            planner: 0,
+            executor: 0,
+            compactions: 0,
+            compact_threshold: 0.95,
+        });
+        // Full usage triggers threshold warning
+        render_context_bar(&ContextBreakdown {
+            total: 100_000,
+            system: 50_000,
+            memory: 10_000,
+            conversation: 40_000,
+            planner: 20_000,
+            executor: 20_000,
+            compactions: 3,
+            compact_threshold: 0.50,
+        });
+    }
+
 }

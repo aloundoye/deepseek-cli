@@ -508,11 +508,15 @@ impl AgentEngine {
             loop_.set_hooks(hooks);
         }
 
-        // Wire checkpoint callback
+        // Wire checkpoint callback — uses targeted snapshots when files are known
         let ws = self.workspace.clone();
-        loop_.set_checkpoint_callback(Arc::new(move |reason| {
+        loop_.set_checkpoint_callback(Arc::new(move |reason, modified_files| {
             if let Ok(mm) = deepseek_memory::MemoryManager::new(&ws) {
-                mm.create_checkpoint(reason)?;
+                if modified_files.is_empty() {
+                    mm.create_checkpoint(reason)?;
+                } else {
+                    mm.create_checkpoint_for_files(reason, modified_files)?;
+                }
             }
             Ok(())
         }));
