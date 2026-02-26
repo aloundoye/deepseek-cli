@@ -114,7 +114,7 @@ fn parse_diff_args(args: &[String]) -> (bool, bool) {
 fn parse_chat_mode_name(raw: &str) -> Option<ChatMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "ask" => Some(ChatMode::Ask),
-        "code" | "architect" | "plan" | "pipeline" => Some(ChatMode::Code),
+        "code" | "plan" => Some(ChatMode::Code),
         "context" => Some(ChatMode::Context),
         _ => None,
     }
@@ -1016,7 +1016,7 @@ pub(crate) fn run_chat(
         {
             last_watch_digest = Some(digest);
             prompt_owned
-                .push_str("\n\nAUTO_WATCH_CONTEXT_V1\nDetected comment hints in workspace:\n");
+                .push_str("\n\nAUTO_WATCH_CONTEXT\nDetected comment hints in workspace:\n");
             prompt_owned.push_str(&hints);
             prompt_owned.push_str("\nAUTO_WATCH_CONTEXT_END");
         }
@@ -1030,7 +1030,6 @@ pub(crate) fn run_chat(
                             "/help",
                             "/ask",
                             "/code",
-                            "/architect",
                             "/chat-mode",
                             "/init",
                             "/clear",
@@ -1120,14 +1119,6 @@ pub(crate) fn run_chat(
                         println!("chat mode set to code");
                     }
                 }
-                SlashCommand::Architect(_args) => {
-                    active_chat_mode = ChatMode::Code;
-                    if json_mode {
-                        print_json(&json!({"mode": "code"}))?;
-                    } else {
-                        println!("chat mode set to code");
-                    }
-                }
                 SlashCommand::ChatMode(mode) => {
                     let Some(raw_mode) = mode else {
                         if json_mode {
@@ -1160,7 +1151,7 @@ pub(crate) fn run_chat(
                     let version_id = manager.sync_memory_version("init")?;
                     append_control_event(
                         cwd,
-                        EventKind::MemorySyncedV1 {
+                        EventKind::MemorySynced {
                             version_id,
                             path: path.to_string_lossy().to_string(),
                             note: "init".to_string(),
@@ -1511,7 +1502,7 @@ pub(crate) fn run_chat(
                     };
                     crate::context::append_control_event(
                         cwd,
-                        deepseek_core::EventKind::TurnRevertedV1 { turns_dropped: 1 },
+                        deepseek_core::EventKind::TurnReverted { turns_dropped: 1 },
                     )?;
                     let output = format!("Reverted 1 conversation turn. {checkpoint_msg}");
                     if json_mode {
@@ -1530,7 +1521,7 @@ pub(crate) fn run_chat(
                     force_max_think = matches!(normalized.as_str(), "high" | "max");
                     append_control_event(
                         cwd,
-                        EventKind::EffortChangedV1 {
+                        EventKind::EffortChanged {
                             level: normalized.clone(),
                         },
                     )?;
@@ -2288,7 +2279,7 @@ pub(crate) fn run_chat(
                     }
                     let mut auto_prompt =
                         "Resolve the following TODO/FIXME/AI comments detected in the workspace:".to_string();
-                    auto_prompt.push_str("\n\nAUTO_WATCH_CONTEXT_V1\n");
+                    auto_prompt.push_str("\n\nAUTO_WATCH_CONTEXT\n");
                     auto_prompt.push_str(&hints);
                     auto_prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
 
@@ -2379,7 +2370,7 @@ pub(crate) fn run_chat_tui(
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /ask /code /architect /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /git /settings /load /save /paste /voice /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Help => "commands: /help /ask /code /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /git /settings /load /save /paste /voice /desktop /todos /chrome /vim".to_string(),
                 SlashCommand::Ask(_) => {
                     if let Ok(mut guard) = active_mode_for_closure.lock() {
                         *guard = ChatMode::Ask;
@@ -2387,12 +2378,6 @@ pub(crate) fn run_chat_tui(
                     "chat mode set to ask".to_string()
                 }
                 SlashCommand::Code(_) => {
-                    if let Ok(mut guard) = active_mode_for_closure.lock() {
-                        *guard = ChatMode::Code;
-                    }
-                    "chat mode set to code".to_string()
-                }
-                SlashCommand::Architect(_) => {
                     if let Ok(mut guard) = active_mode_for_closure.lock() {
                         *guard = ChatMode::Code;
                     }
@@ -2439,7 +2424,7 @@ pub(crate) fn run_chat_tui(
                         let checkpoint = manager.create_checkpoint("memory_edit")?;
                         append_control_event(
                             cwd,
-                            EventKind::CheckpointCreatedV1 {
+                            EventKind::CheckpointCreated {
                                 checkpoint_id: checkpoint.checkpoint_id,
                                 reason: checkpoint.reason.clone(),
                                 files_count: checkpoint.files_count,
@@ -2455,7 +2440,7 @@ pub(crate) fn run_chat_tui(
                         let version_id = manager.sync_memory_version("edit")?;
                         append_control_event(
                             cwd,
-                            EventKind::MemorySyncedV1 {
+                            EventKind::MemorySynced {
                                 version_id,
                                 path: path.to_string_lossy().to_string(),
                                 note: "edit".to_string(),
@@ -2471,7 +2456,7 @@ pub(crate) fn run_chat_tui(
                         let version_id = manager.sync_memory_version(&note)?;
                         append_control_event(
                             cwd,
-                            EventKind::MemorySyncedV1 {
+                            EventKind::MemorySynced {
                                 version_id,
                                 path: manager.memory_path().to_string_lossy().to_string(),
                                 note,
@@ -2682,7 +2667,7 @@ pub(crate) fn run_chat_tui(
                     };
                     crate::context::append_control_event(
                         cwd,
-                        deepseek_core::EventKind::TurnRevertedV1 { turns_dropped: 1 },
+                        deepseek_core::EventKind::TurnReverted { turns_dropped: 1 },
                     )?;
                     format!("Reverted 1 conversation turn. {checkpoint_msg}")
                 }
@@ -2991,7 +2976,7 @@ pub(crate) fn run_chat_tui(
             {
                 *guard = Some(digest);
                 prompt
-                    .push_str("\n\nAUTO_WATCH_CONTEXT_V1\nDetected comment hints in workspace:\n");
+                    .push_str("\n\nAUTO_WATCH_CONTEXT\nDetected comment hints in workspace:\n");
                 prompt.push_str(&hints);
                 prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
             }
@@ -4275,10 +4260,10 @@ mod tests {
     fn parse_chat_mode_name_supports_expected_aliases() {
         assert_eq!(parse_chat_mode_name("ask"), Some(ChatMode::Ask));
         assert_eq!(parse_chat_mode_name("code"), Some(ChatMode::Code));
-        assert_eq!(parse_chat_mode_name("architect"), Some(ChatMode::Code));
         assert_eq!(parse_chat_mode_name("plan"), Some(ChatMode::Code));
         assert_eq!(parse_chat_mode_name("context"), Some(ChatMode::Context));
-        assert_eq!(parse_chat_mode_name("pipeline"), Some(ChatMode::Code));
+        assert_eq!(parse_chat_mode_name("architect"), None);
+        assert_eq!(parse_chat_mode_name("pipeline"), None);
         assert_eq!(parse_chat_mode_name("invalid"), None);
     }
 

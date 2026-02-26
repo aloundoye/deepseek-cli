@@ -151,7 +151,6 @@ pub enum SlashCommand {
     Help,
     Ask(Vec<String>),
     Code(Vec<String>),
-    Architect(Vec<String>),
     ChatMode(Option<String>),
     Init,
     Clear,
@@ -239,7 +238,6 @@ impl SlashCommand {
             "help" => Self::Help,
             "ask" => Self::Ask(args),
             "code" => Self::Code(args),
-            "architect" => Self::Architect(args),
             "chat-mode" | "chat_mode" => Self::ChatMode(args.first().cloned()),
             "init" => Self::Init,
             "clear" => Self::Clear,
@@ -5378,9 +5376,10 @@ mod tests {
             SlashCommand::parse("/code"),
             Some(SlashCommand::Code(vec![]))
         );
+        // /architect was removed — parses as unknown command
         assert_eq!(
             SlashCommand::parse("/architect"),
-            Some(SlashCommand::Architect(vec![]))
+            Some(SlashCommand::Unknown { name: "architect".to_string(), args: vec![] })
         );
         assert_eq!(
             SlashCommand::parse("/chat-mode ask"),

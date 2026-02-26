@@ -1,8 +1,7 @@
 //! System prompts for the tool-use agent loop.
 //!
-//! The `TOOL_USE_SYSTEM_PROMPT` is used when the agent runs in fluid tool-use
-//! mode (Code/Ask/Context). The architect/editor pipeline retains its own
-//! specialized prompts.
+//! The `TOOL_USE_SYSTEM_PROMPT` is used when the agent runs in tool-use
+//! mode (Code/Ask/Context).
 
 /// System prompt that makes deepseek-chat behave as an intelligent coding agent
 /// with tool guidance. This prompt is used for the tool-use conversation loop

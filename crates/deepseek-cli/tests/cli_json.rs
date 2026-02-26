@@ -2220,12 +2220,7 @@ fn handle_mock_llm_connection(stream: &mut TcpStream) -> std::io::Result<()> {
 
     let prompt =
         extract_prompt_from_request_body(&body).unwrap_or_else(|| "mock prompt".to_string());
-    let body_text = String::from_utf8_lossy(&body);
-    let content = if body_text.contains("ARCHITECT_PLAN_V1") {
-        "ARCHITECT_PLAN_V1\nPLAN|Summarize the request and return a safe response\nVERIFY|git status --short\nNO_EDIT|true|No file edits required for this request.\nARCHITECT_PLAN_END\n".to_string()
-    } else {
-        format!("Mock response: {prompt}")
-    };
+    let content = format!("Mock response: {prompt}");
     let payload = serde_json::json!({
         "choices": [
             {

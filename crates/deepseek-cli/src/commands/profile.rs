@@ -139,7 +139,7 @@ pub(crate) fn run_profile(cwd: &Path, args: ProfileArgs, json_mode: bool) -> Res
     })?;
     append_control_event(
         cwd,
-        EventKind::ProfileCapturedV1 {
+        EventKind::ProfileCaptured {
             profile_id,
             summary: summary.clone(),
             elapsed_ms,

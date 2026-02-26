@@ -336,7 +336,7 @@ fn add_remote_profile(
     })?;
     append_control_event(
         cwd,
-        EventKind::RemoteEnvConfiguredV1 {
+        EventKind::RemoteEnvConfigured {
             profile_id,
             name: args.name,
             endpoint: args.endpoint,
@@ -420,7 +420,7 @@ fn remote_logs(cwd: &Path, store: &Store, args: RemoteEnvLogsArgs) -> Result<ser
 
     append_control_event(
         cwd,
-        EventKind::TelemetryEventV1 {
+        EventKind::TelemetryEvent {
             name: "kpi.remote.logs_tail".to_string(),
             properties: json!({
                 "job_id": job_id,
@@ -479,7 +479,7 @@ fn execute_remote_command(
             .to_string();
         append_control_event(
             cwd,
-            EventKind::RemoteEnvExecutionStartedV1 {
+            EventKind::RemoteEnvExecutionStarted {
                 execution_id,
                 profile_id: profile.profile_id,
                 mode: mode.to_string(),
@@ -489,7 +489,7 @@ fn execute_remote_command(
         )?;
         append_control_event(
             cwd,
-            EventKind::TelemetryEventV1 {
+            EventKind::TelemetryEvent {
                 name: "kpi.remote.exec_started".to_string(),
                 properties: json!({
                     "mode": mode,
@@ -511,7 +511,7 @@ fn execute_remote_command(
 
     append_control_event(
         cwd,
-        EventKind::RemoteEnvExecutionStartedV1 {
+        EventKind::RemoteEnvExecutionStarted {
             execution_id,
             profile_id: profile.profile_id,
             mode: mode.to_string(),
@@ -527,7 +527,7 @@ fn execute_remote_command(
 
     append_control_event(
         cwd,
-        EventKind::RemoteEnvExecutionCompletedV1 {
+        EventKind::RemoteEnvExecutionCompleted {
             execution_id,
             profile_id: profile.profile_id,
             mode: mode.to_string(),
@@ -539,7 +539,7 @@ fn execute_remote_command(
     )?;
     append_control_event(
         cwd,
-        EventKind::TelemetryEventV1 {
+        EventKind::TelemetryEvent {
             name: "kpi.remote.exec_finished".to_string(),
             properties: json!({
                 "mode": mode,

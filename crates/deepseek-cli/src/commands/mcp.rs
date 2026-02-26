@@ -42,7 +42,7 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
             manager.add_server(server.clone())?;
             append_control_event(
                 cwd,
-                EventKind::McpServerAddedV1 {
+                EventKind::McpServerAdded {
                     server_id: server.id.clone(),
                     transport: transport.to_string(),
                     endpoint,
@@ -111,7 +111,7 @@ pub(crate) fn run_mcp(cwd: &Path, cmd: McpCmd, json_mode: bool) -> Result<()> {
             if removed {
                 append_control_event(
                     cwd,
-                    EventKind::McpServerRemovedV1 {
+                    EventKind::McpServerRemoved {
                         server_id: args.server_id.clone(),
                     },
                 )?;
@@ -165,7 +165,7 @@ pub(crate) fn emit_mcp_discovery_events(
         for tool_name in &refresh.added {
             append_control_event(
                 cwd,
-                EventKind::McpToolDiscoveredV1 {
+                EventKind::McpToolDiscovered {
                     server_id: refresh.server_id.clone(),
                     tool_name: tool_name.clone(),
                 },

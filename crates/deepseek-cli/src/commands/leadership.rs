@@ -1086,13 +1086,13 @@ fn collect_audit_summary(cwd: &Path, audit_window_hours: u64) -> AuditSummary {
         *counts.entry(event_type).or_insert(0) += 1;
 
         match envelope.kind {
-            EventKind::ToolProposedV1 { .. } => {
+            EventKind::ToolProposed { .. } => {
                 proposed_tools = proposed_tools.saturating_add(1);
             }
-            EventKind::ToolApprovedV1 { .. } => {
+            EventKind::ToolApproved { .. } => {
                 approved_tools = approved_tools.saturating_add(1);
             }
-            EventKind::VerificationRunV1 { success, .. } => {
+            EventKind::VerificationRun { success, .. } => {
                 if !success {
                     summary.failed_verifications = summary.failed_verifications.saturating_add(1);
                 }

@@ -4,7 +4,7 @@ mod complexity;
 mod gather_context;
 mod intent;
 pub mod prompts;
-mod repo_map_v2;
+mod repo_map;
 mod shared;
 mod team;
 pub mod tool_bridge;
@@ -12,7 +12,7 @@ pub mod tool_loop;
 mod verify;
 pub mod watch;
 
-pub use repo_map_v2::clear_tag_cache;
+pub use repo_map::clear_tag_cache;
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -519,7 +519,7 @@ impl AgentEngine {
         }
 
         // Record User Turn
-        self.append_event_best_effort(EventKind::ChatTurnV1 {
+        self.append_event_best_effort(EventKind::ChatTurn {
             message: ChatMessage::User {
                 content: prompt_enriched.clone(),
             },
@@ -536,7 +536,7 @@ impl AgentEngine {
 
         if let Ok(text) = &result {
             // Record Assistant Turn
-            self.append_event_best_effort(EventKind::ChatTurnV1 {
+            self.append_event_best_effort(EventKind::ChatTurn {
                 message: ChatMessage::Assistant {
                     content: Some(text.clone()),
                     reasoning_content: None,
@@ -569,7 +569,7 @@ impl AgentEngine {
 
     #[allow(dead_code)]
     pub(crate) fn record_usage(&self, model: &str, usage: &deepseek_core::TokenUsage) {
-        self.append_event_best_effort(EventKind::UsageUpdatedV1 {
+        self.append_event_best_effort(EventKind::UsageUpdated {
             unit: deepseek_core::LlmUnit::Model(model.to_string()),
             model: model.to_string(),
             input_tokens: usage.prompt_tokens,
@@ -699,7 +699,7 @@ fn enrich_prompt_with_urls(prompt: &str, enabled: bool) -> String {
     }
 
     format!(
-        "{prompt}\n\nAUTO_URL_CONTEXT_V1\n{}\nAUTO_URL_CONTEXT_END",
+        "{prompt}\n\nAUTO_URL_CONTEXT\n{}\nAUTO_URL_CONTEXT_END",
         rows.join("\n---\n")
     )
 }

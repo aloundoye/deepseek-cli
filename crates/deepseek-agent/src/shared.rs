@@ -3,14 +3,14 @@
 //! Functions relocated here from `architect.rs` during the pipeline removal
 //! rewrite. `gather_context.rs` depends on `build_repo_map`.
 
-use crate::repo_map_v2;
+use crate::repo_map;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Build a repo-map string for the given workspace.
 ///
-/// Tries the tree-sitter-based V2 repo map first; falls back to a simple
+/// Tries the tree-sitter-based repo map first; falls back to a simple
 /// file-listing heuristic ranked by git status and prompt keyword overlap.
 pub fn build_repo_map(
     workspace: &Path,
@@ -18,10 +18,10 @@ pub fn build_repo_map(
     max_files: usize,
     additional_dirs: &[PathBuf],
 ) -> String {
-    let v2_rows =
-        repo_map_v2::build_repo_map_v2(workspace, user_prompt, max_files, additional_dirs);
-    if !v2_rows.is_empty() {
-        return repo_map_v2::render_repo_map(&v2_rows);
+    let rows =
+        repo_map::build_repo_map(workspace, user_prompt, max_files, additional_dirs);
+    if !rows.is_empty() {
+        return repo_map::render_repo_map(&rows);
     }
 
     let mut files = tracked_files(workspace);

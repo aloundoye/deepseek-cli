@@ -76,7 +76,7 @@ pub(crate) fn compact_now(
     fs::write(summary_path, summary)?;
     append_control_event(
         cwd,
-        EventKind::ContextCompactedV1 {
+        EventKind::ContextCompacted {
             summary_id,
             from_turn,
             to_turn: transcript_len,
@@ -145,7 +145,7 @@ pub(crate) fn rewind_now(
     let checkpoint = memory.rewind_to_checkpoint(checkpoint_id)?;
     append_control_event(
         cwd,
-        EventKind::CheckpointRewoundV1 {
+        EventKind::CheckpointRewound {
             checkpoint_id: checkpoint.checkpoint_id,
             reason: checkpoint.reason.clone(),
         },
@@ -183,7 +183,7 @@ pub(crate) fn run_rewind(cwd: &Path, args: RewindArgs, json_mode: bool) -> Resul
     let checkpoint = memory.rewind_to_checkpoint(checkpoint_id)?;
     append_control_event(
         cwd,
-        EventKind::CheckpointRewoundV1 {
+        EventKind::CheckpointRewound {
             checkpoint_id: checkpoint.checkpoint_id,
             reason: checkpoint.reason.clone(),
         },
@@ -292,7 +292,7 @@ pub(crate) fn run_compact(cwd: &Path, args: CompactArgs, json_mode: bool) -> Res
     fs::write(&summary_path, summary)?;
     append_control_event(
         cwd,
-        EventKind::ContextCompactedV1 {
+        EventKind::ContextCompacted {
             summary_id,
             from_turn,
             to_turn: transcript_len,

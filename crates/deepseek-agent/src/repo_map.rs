@@ -14,7 +14,7 @@ pub struct RepoMapEntry {
     pub symbol_hints: Vec<String>,
 }
 
-pub fn build_repo_map_v2(
+pub fn build_repo_map(
     workspace: &Path,
     prompt: &str,
     max_lines: usize,

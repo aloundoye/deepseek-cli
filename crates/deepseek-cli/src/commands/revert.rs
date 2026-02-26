@@ -28,7 +28,7 @@ pub(crate) fn run_revert(cwd: &Path, args: RevertArgs, json_mode: bool) -> Resul
     
     append_control_event(
         cwd,
-        EventKind::TurnRevertedV1 {
+        EventKind::TurnReverted {
             turns_dropped: turns,
         },
     )?;

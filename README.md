@@ -212,7 +212,7 @@ Notable architecture/runtime defaults:
 - Optional team-lane composition (`--teammate-mode`) runs lane pipelines in isolated worktrees and merges lane patches deterministically.
 - Tool/function-calling orchestration is the default execution backbone (tool-use loop).
 - Analysis/review commands use a separate non-edit path and do not mutate files.
-- Ask/context analysis prompts use deterministic `AUTO_CONTEXT_BOOTSTRAP_V1` repo context and return initial analysis before limited follow-up questions.
+- Ask/context analysis prompts use deterministic `AUTO_CONTEXT_BOOTSTRAP` repo context and return initial analysis before limited follow-up questions.
 - Repo-oriented prompts without a detected repository return: `No repository detected. Run from project root or pass --repo <path>.`
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
 - Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).

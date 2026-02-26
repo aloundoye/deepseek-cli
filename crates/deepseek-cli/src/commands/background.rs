@@ -119,7 +119,7 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
                 .ok_or_else(|| anyhow!("background job not found: {}", args.job_id))?;
             append_control_event(
                 cwd,
-                EventKind::BackgroundJobResumedV1 {
+                EventKind::BackgroundJobResumed {
                     job_id,
                     reference: job.reference.clone(),
                 },
@@ -190,7 +190,7 @@ pub(crate) fn background_payload(cwd: &Path, cmd: BackgroundCmd) -> Result<serde
             store.upsert_background_job(&job)?;
             append_control_event(
                 cwd,
-                EventKind::BackgroundJobStoppedV1 {
+                EventKind::BackgroundJobStopped {
                     job_id,
                     reason: "manual_stop".to_string(),
                 },
@@ -315,13 +315,13 @@ pub(crate) fn spawn_background_process(
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
         session_id: session.session_id,
-        kind: EventKind::BackgroundJobStartedV1 {
+        kind: EventKind::BackgroundJobStarted {
             job_id,
             kind: kind.to_string(),
             reference: reference.clone(),
         },
     })?;
-    // Replay projection currently stores '{}' for BackgroundJobStartedV1 metadata.
+    // Replay projection currently stores '{}' for BackgroundJobStarted metadata.
     // Re-apply the richer metadata payload after emitting the canonical event.
     store.upsert_background_job(&record)?;
 

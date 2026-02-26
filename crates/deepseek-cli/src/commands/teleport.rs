@@ -262,7 +262,7 @@ fn export_bundle(cwd: &Path, args: TeleportExportArgs) -> Result<TeleportExecuti
 
     append_control_event(
         cwd,
-        EventKind::TeleportBundleCreatedV1 {
+        EventKind::TeleportBundleCreated {
             bundle_id,
             path: output_path.to_string_lossy().to_string(),
         },
@@ -310,7 +310,7 @@ fn import_bundle(cwd: &Path, input: &str) -> Result<TeleportExecution> {
                     seq_no: store.next_seq_no(session_id)?,
                     at: Utc::now(),
                     session_id,
-                    kind: EventKind::ChatTurnV1 { message },
+                    kind: EventKind::ChatTurn { message },
                 })?;
                 replayed = replayed.saturating_add(1);
             }
@@ -322,7 +322,7 @@ fn import_bundle(cwd: &Path, input: &str) -> Result<TeleportExecution> {
                     seq_no: store.next_seq_no(session_id)?,
                     at: Utc::now(),
                     session_id,
-                    kind: EventKind::TurnAddedV1 {
+                    kind: EventKind::TurnAdded {
                         role: "imported".to_string(),
                         content: content.to_string(),
                     },
@@ -336,7 +336,7 @@ fn import_bundle(cwd: &Path, input: &str) -> Result<TeleportExecution> {
         seq_no: store.next_seq_no(session_id)?,
         at: Utc::now(),
         session_id,
-        kind: EventKind::SessionResumedV1 {
+        kind: EventKind::SessionResumed {
             session_id,
             events_replayed: replayed,
         },
@@ -387,7 +387,7 @@ fn create_handoff_link(cwd: &Path, args: TeleportLinkArgs) -> Result<TeleportExe
 
     append_control_event(
         cwd,
-        EventKind::TeleportHandoffLinkCreatedV1 {
+        EventKind::TeleportHandoffLinkCreated {
             handoff_id,
             session_id,
             expires_at: descriptor.expires_at.clone(),
@@ -395,7 +395,7 @@ fn create_handoff_link(cwd: &Path, args: TeleportLinkArgs) -> Result<TeleportExe
     )?;
     append_control_event(
         cwd,
-        EventKind::TelemetryEventV1 {
+        EventKind::TelemetryEvent {
             name: "kpi.teleport.link_created".to_string(),
             properties: json!({
                 "handoff_id": handoff_id,
@@ -475,7 +475,7 @@ fn record_handoff_consume(
 ) -> Result<()> {
     append_control_event(
         cwd,
-        EventKind::TeleportHandoffLinkConsumedV1 {
+        EventKind::TeleportHandoffLinkConsumed {
             handoff_id: descriptor.handoff_id,
             session_id: descriptor.session_id,
             success,
@@ -484,7 +484,7 @@ fn record_handoff_consume(
     )?;
     append_control_event(
         cwd,
-        EventKind::TelemetryEventV1 {
+        EventKind::TelemetryEvent {
             name: "kpi.teleport.link_consume".to_string(),
             properties: json!({
                 "handoff_id": descriptor.handoff_id,

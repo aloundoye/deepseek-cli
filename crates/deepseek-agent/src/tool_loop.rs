@@ -437,9 +437,9 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
-        // Log ToolProposedV1 event
+        // Log ToolProposed event
         if let Some(ref cb) = self.event_cb {
-            cb(EventKind::ToolProposedV1 {
+            cb(EventKind::ToolProposed {
                 proposal: deepseek_core::ToolProposal {
                     invocation_id: uuid::Uuid::nil(),
                     call: tool_call.clone(),
@@ -516,9 +516,9 @@ impl<'a> ToolUseLoop<'a> {
             let _ = hooks.fire(HookEvent::PostToolUse, &input);
         }
 
-        // Log ToolResultV1 event
+        // Log ToolResult event
         if let Some(ref cb) = self.event_cb {
-            cb(EventKind::ToolResultV1 {
+            cb(EventKind::ToolResult {
                 result: deepseek_core::ToolResult {
                     invocation_id: result.invocation_id,
                     success: result.success,
