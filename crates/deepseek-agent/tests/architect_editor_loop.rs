@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use deepseek_agent::{AgentEngine, ChatOptions};
+use deepseek_agent::{AgentEngine, ChatMode, ChatOptions};
 use deepseek_core::{ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback};
 use deepseek_llm::LlmClient;
 use std::collections::VecDeque;
@@ -160,6 +160,7 @@ fn single_file_edit_succeeds() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -185,6 +186,7 @@ fn multi_file_edit_succeeds() -> Result<()> {
         "Update both files",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -212,6 +214,7 @@ fn patch_fails_to_apply_then_recovers() -> Result<()> {
         "Fix demo",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -290,6 +293,7 @@ fn tests_fail_then_recovers() -> Result<()> {
         "Fix demo and verify",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     );
@@ -326,6 +330,7 @@ fn need_context_round_trip_succeeds() -> Result<()> {
         "Update middle line of app.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -375,6 +380,7 @@ fn no_edit_response_exits_early() -> Result<()> {
         "Check if demo.txt needs changes",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -443,6 +449,7 @@ fn lint_loop_runs_when_configured() -> Result<()> {
         "Add hello to demo.rs",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -498,6 +505,7 @@ fn lint_skipped_when_disabled() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -556,6 +564,7 @@ fn commit_proposal_accepted() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -624,6 +633,7 @@ fn commit_proposal_declined() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -685,6 +695,7 @@ fn commit_proposal_custom_message() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -798,6 +809,7 @@ fn finish_reason_content_filter_stops_architect() -> Result<()> {
         "Edit demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     );
@@ -848,6 +860,7 @@ fn finish_reason_length_emits_warning() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     )?;
@@ -909,6 +922,7 @@ fn max_iterations_emits_done_with_reason() -> Result<()> {
         "Edit demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     );
@@ -973,6 +987,7 @@ fn identical_plans_trigger_dedup_stop() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     );
@@ -1055,6 +1070,7 @@ fn different_plans_do_not_trigger_dedup() -> Result<()> {
         "Update demo.txt",
         ChatOptions {
             tools: true,
+            mode: ChatMode::Pipeline,
             ..Default::default()
         },
     );

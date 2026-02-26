@@ -670,6 +670,9 @@ struct CompactArgs {
     from_turn: Option<u64>,
     #[arg(long)]
     yes: bool,
+    /// Focus topic — compaction preserves context related to this topic.
+    #[arg(long)]
+    focus: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

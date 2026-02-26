@@ -117,6 +117,7 @@ fn parse_chat_mode_name(raw: &str) -> Option<ChatMode> {
         "code" => Some(ChatMode::Code),
         "architect" | "plan" => Some(ChatMode::Architect),
         "context" => Some(ChatMode::Context),
+        "pipeline" => Some(ChatMode::Pipeline),
         _ => None,
     }
 }
@@ -127,6 +128,7 @@ fn chat_mode_name(mode: ChatMode) -> &'static str {
         ChatMode::Code => "code",
         ChatMode::Architect => "architect",
         ChatMode::Context => "context",
+        ChatMode::Pipeline => "pipeline",
     }
 }
 
@@ -1172,12 +1174,13 @@ pub(crate) fn run_chat(
                         println!("chat buffer cleared");
                     }
                 }
-                SlashCommand::Compact => {
+                SlashCommand::Compact(focus) => {
                     run_compact(
                         cwd,
                         CompactArgs {
                             from_turn: None,
                             yes: false,
+                            focus,
                         },
                         json_mode,
                     )?;
@@ -2531,8 +2534,8 @@ pub(crate) fn run_chat_tui(
                     format!("initialized memory at {}", path.display())
                 }
                 SlashCommand::Clear => "cleared".to_string(),
-                SlashCommand::Compact => {
-                    let summary = compact_now(cwd, None)?;
+                SlashCommand::Compact(focus) => {
+                    let summary = compact_now(cwd, None, focus.as_deref())?;
                     format!(
                         "compacted turns {}..{} summary_id={} token_delta={}",
                         summary.from_turn,
@@ -4610,6 +4613,7 @@ mod tests {
         assert_eq!(parse_chat_mode_name("architect"), Some(ChatMode::Architect));
         assert_eq!(parse_chat_mode_name("plan"), Some(ChatMode::Architect));
         assert_eq!(parse_chat_mode_name("context"), Some(ChatMode::Context));
+        assert_eq!(parse_chat_mode_name("pipeline"), Some(ChatMode::Pipeline));
         assert_eq!(parse_chat_mode_name("invalid"), None);
     }
 

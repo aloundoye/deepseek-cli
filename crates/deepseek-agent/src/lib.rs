@@ -7,9 +7,12 @@ mod gather_context;
 mod intent;
 pub mod linter;
 mod r#loop;
+pub mod prompts;
 pub mod run_engine;
 mod repo_map_v2;
 mod team;
+pub mod tool_bridge;
+pub mod tool_loop;
 mod verify;
 pub mod watch;
 
@@ -28,7 +31,7 @@ use deepseek_observe::Observer;
 use deepseek_policy::PolicyEngine;
 use deepseek_store::Store;
 use deepseek_subagent::SubagentTask;
-use deepseek_tools::LocalToolHost;
+use deepseek_tools::{LocalToolHost, tool_definitions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,11 +43,13 @@ type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatMode {
-    Ask,
+    Ask,          // Read-only, tool-use loop (read_only=true)
     #[default]
-    Code,
-    Architect,
-    Context,
+    Code,         // Default: tool-use loop (full capability)
+    Architect,    // Plan-only output via run_engine
+    Context,      // Read-only, tool-use loop (read_only=true)
+    /// Explicit old pipeline: Architect→Editor→Apply→Verify state machine.
+    Pipeline,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -422,15 +427,116 @@ impl AgentEngine {
         })
     }
 
+    /// Run the tool-use conversation loop (P3 architecture).
+    ///
+    /// The model freely decides which tools to call at each step, enabling
+    /// fluid think→act→observe behavior instead of the rigid pipeline.
+    fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
+        let project_memory = deepseek_memory::MemoryManager::new(&self.workspace)
+            .ok()
+            .and_then(|mm| mm.read_combined_memory().ok());
+
+        // Build workspace context for environment section in system prompt
+        let git_branch = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&self.workspace)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
+        let ws_context = prompts::WorkspaceContext {
+            cwd: self.workspace.display().to_string(),
+            git_branch,
+            os: std::env::consts::OS.to_string(),
+        };
+
+        let system_prompt = prompts::build_tool_use_system_prompt(
+            project_memory.as_deref(),
+            options.system_prompt_override.as_deref(),
+            options.system_prompt_append.as_deref(),
+            Some(&ws_context),
+        );
+
+        let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
+        let config = tool_loop::ToolLoopConfig {
+            model: self.cfg.llm.base_model.clone(),
+            max_tokens: deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS,
+            temperature: Some(self.cfg.llm.temperature),
+            context_window_tokens: self.cfg.llm.context_window_tokens,
+            max_turns: self.max_turns.unwrap_or(tool_loop::DEFAULT_MAX_TURNS as u64) as usize,
+            read_only,
+        };
+
+        let mut loop_ = tool_loop::ToolUseLoop::new(
+            self.llm.as_ref(),
+            self.tool_host.clone(),
+            config,
+            system_prompt,
+            tool_definitions(),
+        );
+
+        // Wire stream callback
+        if let Ok(guard) = self.stream_callback.lock()
+            && let Some(ref cb) = *guard
+        {
+            loop_.set_stream_callback(cb.clone());
+        }
+
+        // Wire approval handler (bridge FnMut → Fn via Mutex)
+        if let Ok(mut guard) = self.approval_handler.lock()
+            && let Some(handler) = guard.take()
+        {
+            let handler = Arc::new(Mutex::new(handler));
+            loop_.set_approval_callback(Arc::new(move |call| {
+                let mut h = handler.lock().map_err(|_| anyhow!("approval handler mutex poisoned"))?;
+                h(call)
+            }));
+        }
+
+        // Wire user question handler
+        if let Ok(mut guard) = self.user_question_handler.lock()
+            && let Some(handler) = guard.take()
+        {
+            loop_.set_user_question_callback(handler);
+        }
+
+        // Wire hooks — create a new runtime with the same config for the loop
+        {
+            let hooks_config: deepseek_hooks::HooksConfig =
+                serde_json::from_value(self.cfg.hooks.clone()).unwrap_or_default();
+            let hooks = deepseek_hooks::HookRuntime::new(&self.workspace, hooks_config);
+            loop_.set_hooks(hooks);
+        }
+
+        // Wire checkpoint callback
+        let ws = self.workspace.clone();
+        loop_.set_checkpoint_callback(Arc::new(move |reason| {
+            if let Ok(mm) = deepseek_memory::MemoryManager::new(&ws) {
+                mm.create_checkpoint(reason)?;
+            }
+            Ok(())
+        }));
+
+        if !options.chat_history.is_empty() {
+            loop_ = loop_.with_history(options.chat_history.clone());
+        }
+
+        let result = loop_.run(prompt)?;
+
+        if !result.tool_calls_made.is_empty() {
+            self.observer.verbose_log(&format!(
+                "tool-use loop: {} turns, {} tool calls, {} prompt tokens",
+                result.turns,
+                result.tool_calls_made.len(),
+                result.usage.prompt_tokens,
+            ));
+        }
+
+        Ok(result.response)
+    }
+
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
-        let task_intent = intent::classify_intent(&intent::IntentInput {
-            prompt: &prompt_enriched,
-            mode: options.mode,
-            tools: options.tools,
-            force_execute: options.force_execute,
-            force_plan_only: options.force_plan_only,
-        });
 
         // Load chat history from the store if possible
         if let Ok(Some(session)) = self.store.load_latest_session() {
@@ -446,14 +552,27 @@ impl AgentEngine {
             },
         });
 
-        let result = if task_intent == intent::TaskIntent::ArchitectOnly {
-            run_engine::run(self, &prompt_enriched, &options)
-        } else if task_intent == intent::TaskIntent::InspectRepo {
-            self.analyze_with_options(&prompt_enriched, options)
-        } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
-            team::run(self, &prompt_enriched, &options)
-        } else {
-            run_engine::run(self, &prompt_enriched, &options)
+        let result = match options.mode {
+            ChatMode::Pipeline => {
+                // Explicit old pipeline (Architect→Editor→Apply→Verify)
+                run_engine::run(self, &prompt_enriched, &options)
+            }
+            ChatMode::Architect => {
+                // Plan-only output via old pipeline
+                run_engine::run(self, &prompt_enriched, &options)
+            }
+            _ if !options.tools => {
+                // No tools requested → use the analysis path (read-only Q&A)
+                self.analyze_with_options(&prompt_enriched, options)
+            }
+            _ => {
+                // Code, Ask, Context → tool-use loop
+                if should_run_team_orchestration(self, &prompt_enriched, &options) {
+                    team::run(self, &prompt_enriched, &options)
+                } else {
+                    self.run_tool_use_loop(&prompt_enriched, &options)
+                }
+            }
         };
 
         if let Ok(text) = &result {

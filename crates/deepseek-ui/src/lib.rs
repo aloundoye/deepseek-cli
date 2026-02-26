@@ -211,7 +211,7 @@ pub enum SlashCommand {
     ChatMode(Option<String>),
     Init,
     Clear,
-    Compact,
+    Compact(Option<String>),
     Memory(Vec<String>),
     Config,
     Model(Option<String>),
@@ -299,7 +299,7 @@ impl SlashCommand {
             "chat-mode" | "chat_mode" => Self::ChatMode(args.first().cloned()),
             "init" => Self::Init,
             "clear" => Self::Clear,
-            "compact" => Self::Compact,
+            "compact" => Self::Compact(args.first().cloned()),
             "memory" => Self::Memory(args),
             "config" => Self::Config,
             "model" => Self::Model(args.first().cloned()),
@@ -2740,8 +2740,10 @@ where
     {
         use std::io::Write;
         let mut out = io::stdout();
-        // Clear screen + scrollback + move cursor home
-        out.write_all(b"\x1b[2J\x1b[3J\x1b[H")?;
+        // Clear screen + move cursor home.
+        // Skip \x1b[3J (clear scrollback) — it's a non-standard xterm extension
+        // that causes issues in VS Code's integrated terminal and other emulators.
+        out.write_all(b"\x1b[2J\x1b[H")?;
 
         // ASCII art logo + info, styled like Claude Code
         let version = env!("CARGO_PKG_VERSION");
@@ -5237,6 +5239,14 @@ mod tests {
                 "deepseek".to_string(),
                 "cli".to_string()
             ]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/compact"),
+            Some(SlashCommand::Compact(None))
+        );
+        assert_eq!(
+            SlashCommand::parse("/compact authentication"),
+            Some(SlashCommand::Compact(Some("authentication".to_string())))
         );
     }
 

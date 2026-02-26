@@ -1445,6 +1445,7 @@ fn parse_chat_mode(value: &str) -> ChatMode {
         "ask" => ChatMode::Ask,
         "architect" => ChatMode::Architect,
         "context" => ChatMode::Context,
+        "pipeline" => ChatMode::Pipeline,
         _ => ChatMode::Code,
     }
 }
