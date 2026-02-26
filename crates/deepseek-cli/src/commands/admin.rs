@@ -687,7 +687,7 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
             let info = manager.install(Path::new(&args.source))?;
             append_control_event(
                 cwd,
-                EventKind::PluginInstalledV1 {
+                EventKind::PluginInstalled {
                     plugin_id: info.manifest.id.clone(),
                     version: info.manifest.version.clone(),
                 },
@@ -702,7 +702,7 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
             manager.remove(&args.plugin_id)?;
             append_control_event(
                 cwd,
-                EventKind::PluginRemovedV1 {
+                EventKind::PluginRemoved {
                     plugin_id: args.plugin_id.clone(),
                 },
             )?;
@@ -716,7 +716,7 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
             manager.enable(&args.plugin_id)?;
             append_control_event(
                 cwd,
-                EventKind::PluginEnabledV1 {
+                EventKind::PluginEnabled {
                     plugin_id: args.plugin_id.clone(),
                 },
             )?;
@@ -730,7 +730,7 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
             manager.disable(&args.plugin_id)?;
             append_control_event(
                 cwd,
-                EventKind::PluginDisabledV1 {
+                EventKind::PluginDisabled {
                     plugin_id: args.plugin_id.clone(),
                 },
             )?;
@@ -767,7 +767,7 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
                 .or_else(|_| manager.search_catalog("", &cfg.plugins.catalog))?;
             append_control_event(
                 cwd,
-                EventKind::PluginCatalogSyncedV1 {
+                EventKind::PluginCatalogSynced {
                     source: cfg.plugins.catalog.index_url,
                     total: catalog.len(),
                     verified_count: catalog.iter().filter(|p| p.verified).count(),
@@ -819,7 +819,7 @@ pub(crate) fn run_plugins(cwd: &Path, cmd: PluginCmd, json_mode: bool) -> Result
             let result = manager.verify_catalog_plugin(&args.plugin_id, &cfg.plugins.catalog)?;
             append_control_event(
                 cwd,
-                EventKind::PluginVerifiedV1 {
+                EventKind::PluginVerified {
                     plugin_id: result.plugin_id.clone(),
                     verified: result.verified,
                     reason: result.reason.clone(),

@@ -8,13 +8,13 @@
 ### Gap 1: Missing Event Types (foundation — other features depend on events)
 
 **Spec reference:** Section 4.8 "Event Store and Deterministic Replay" — "All session events are appended to events.jsonl"
-Section 2.12 — "Every mode change is recorded as PermissionModeChangedV1"
+Section 2.12 — "Every mode change is recorded as PermissionModeChanged"
 Section 4.1 — "All transitions are recorded as events"
 
 **Current behavior:** EventKind enum has 57 event types but is missing:
-- `SessionStartedV1` (no explicit session-start event)
-- `SessionResumedV1` (no explicit session-resume event)
-- `ToolDeniedV1` (no explicit tool-denial event)
+- `SessionStarted` (no explicit session-start event)
+- `SessionResumed` (no explicit session-resume event)
+- `ToolDenied` (no explicit tool-denial event)
 
 **Target behavior:** Add 3 new event variants to EventKind.
 

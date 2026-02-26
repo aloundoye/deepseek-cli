@@ -134,7 +134,7 @@ mod tests {
             seq_no: 1,
             at: Utc::now(),
             session_id: Uuid::now_v7(),
-            kind: EventKind::TurnAddedV1 {
+            kind: EventKind::TurnAdded {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             },

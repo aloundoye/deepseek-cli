@@ -81,7 +81,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
 
     append_control_event(
         cwd,
-        EventKind::ReviewStartedV1 {
+        EventKind::ReviewStarted {
             review_id,
             preset: focus.to_string(),
             target: target.clone(),
@@ -104,7 +104,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
             Ok(payload) => {
                 let _ = append_control_event(
                     cwd,
-                    EventKind::TelemetryEventV1 {
+                    EventKind::TelemetryEvent {
                         name: "kpi.review.strict_parse".to_string(),
                         properties: json!({"success": true}),
                     },
@@ -114,7 +114,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
             Err(err) => {
                 let _ = append_control_event(
                     cwd,
-                    EventKind::TelemetryEventV1 {
+                    EventKind::TelemetryEvent {
                         name: "kpi.review.strict_parse".to_string(),
                         properties: json!({
                             "success": false,
@@ -149,7 +149,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
 
         append_control_event(
             cwd,
-            EventKind::ReviewCompletedV1 {
+            EventKind::ReviewCompleted {
                 review_id,
                 findings_count,
                 critical_count,
@@ -170,7 +170,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
                 Ok(summary) => {
                     let _ = append_control_event(
                         cwd,
-                        EventKind::TelemetryEventV1 {
+                        EventKind::TelemetryEvent {
                             name: "kpi.review.publish".to_string(),
                             properties: json!({
                                 "success": true,
@@ -186,7 +186,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
                 Err(err) => {
                     let _ = append_control_event(
                         cwd,
-                        EventKind::TelemetryEventV1 {
+                        EventKind::TelemetryEvent {
                             name: "kpi.review.publish".to_string(),
                             properties: json!({
                                 "success": false,
@@ -201,7 +201,7 @@ pub(crate) fn run_review(cwd: &Path, args: ReviewArgs, json_mode: bool) -> Resul
             };
             append_control_event(
                 cwd,
-                EventKind::ReviewPublishedV1 {
+                EventKind::ReviewPublished {
                     review_id,
                     pr_number,
                     comments_published: summary.inline_comments as u64

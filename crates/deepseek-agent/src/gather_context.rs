@@ -134,7 +134,7 @@ pub fn gather_for_prompt(
     let repo_map_lines = repo_map.lines().count();
     let repo_map_estimated_tokens = estimate_tokens(&repo_map);
 
-    let mut lines = vec!["AUTO_CONTEXT_BOOTSTRAP_V1".to_string()];
+    let mut lines = vec!["AUTO_CONTEXT_BOOTSTRAP".to_string()];
     lines.push(format!("workspace={}", repo_root.display()));
     lines.push(format!("repoish_prompt=true mode={mode:?}"));
     lines.push(format!(

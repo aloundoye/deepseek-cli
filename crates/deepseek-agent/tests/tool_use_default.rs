@@ -164,7 +164,7 @@ fn default_code_mode_uses_tool_loop() -> Result<()> {
 }
 
 /// The tool-use loop reads a file, edits it, then responds.
-/// Uses force_execute mode which auto-approves write tools.
+/// Uses bypassPermissions mode which auto-approves write tools.
 #[test]
 fn tool_loop_reads_then_edits_file() -> Result<()> {
     let temp = tempfile::tempdir()?;

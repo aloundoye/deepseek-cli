@@ -712,7 +712,7 @@ impl LocalToolHost {
                     seq_no: seq,
                     at: chrono::Utc::now(),
                     session_id: uuid::Uuid::nil(),
-                    kind: deepseek_core::EventKind::WebSearchExecutedV1 {
+                    kind: deepseek_core::EventKind::WebSearchExecuted {
                         query: query.to_string(),
                         results_count,
                         cached: false,
@@ -3621,7 +3621,7 @@ impl LocalToolHost {
             seq_no,
             at: Utc::now(),
             session_id: session.session_id,
-            kind: EventKind::HookExecutedV1 {
+            kind: EventKind::HookExecuted {
                 phase: phase.to_string(),
                 hook_path: hook_path.to_string_lossy().to_string(),
                 success,
@@ -3645,7 +3645,7 @@ impl LocalToolHost {
             seq_no,
             at: Utc::now(),
             session_id: session.session_id,
-            kind: EventKind::VisualArtifactCapturedV1 {
+            kind: EventKind::VisualArtifactCaptured {
                 artifact_id: Uuid::now_v7(),
                 path: path.to_string(),
                 mime: mime.to_string(),
@@ -3666,7 +3666,7 @@ impl LocalToolHost {
             seq_no: self.store.next_seq_no(session.session_id)?,
             at: Utc::now(),
             session_id: session.session_id,
-            kind: EventKind::CheckpointCreatedV1 {
+            kind: EventKind::CheckpointCreated {
                 checkpoint_id: checkpoint.checkpoint_id,
                 reason: checkpoint.reason,
                 files_count: checkpoint.files_count,
@@ -3933,7 +3933,7 @@ mod tests {
 
         let events_path = runtime_dir(&workspace).join("events.jsonl");
         let events = fs::read_to_string(events_path).expect("events");
-        assert!(events.contains("VisualArtifactCapturedV1"));
+        assert!(events.contains("VisualArtifactCaptured"));
     }
 
     #[test]

@@ -146,7 +146,7 @@ fn build_system_prompt(
         let mut base = vec![
             role,
             "Assume you are operating inside the current repository unless explicitly told otherwise.",
-            "Use AUTO_CONTEXT_BOOTSTRAP_V1 as primary context and provide analysis immediately.",
+            "Use AUTO_CONTEXT_BOOTSTRAP as primary context and provide analysis immediately.",
             "Output sections in this exact order: Initial Analysis, Key Findings, Follow-ups.",
             "Follow-ups must be targeted and capped to at most 2 questions.",
             "Do not ask broad requests for more context before giving initial analysis.",

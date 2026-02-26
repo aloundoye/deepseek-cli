@@ -27,7 +27,7 @@ pub(crate) fn run_export(cwd: &Path, args: ExportArgs, json_mode: bool) -> Resul
     let record = memory.export_transcript(format, output.as_deref(), session)?;
     append_control_event(
         cwd,
-        EventKind::TranscriptExportedV1 {
+        EventKind::TranscriptExported {
             export_id: record.export_id,
             format: record.format.clone(),
             output_path: record.output_path.clone(),
@@ -64,7 +64,7 @@ pub(crate) fn run_memory(cwd: &Path, cmd: MemoryCmd, json_mode: bool) -> Result<
             let checkpoint = manager.create_checkpoint("memory_edit")?;
             append_control_event(
                 cwd,
-                EventKind::CheckpointCreatedV1 {
+                EventKind::CheckpointCreated {
                     checkpoint_id: checkpoint.checkpoint_id,
                     reason: checkpoint.reason.clone(),
                     files_count: checkpoint.files_count,
@@ -79,7 +79,7 @@ pub(crate) fn run_memory(cwd: &Path, cmd: MemoryCmd, json_mode: bool) -> Result<
             let version_id = manager.sync_memory_version("edit")?;
             append_control_event(
                 cwd,
-                EventKind::MemorySyncedV1 {
+                EventKind::MemorySynced {
                     version_id,
                     path: path.to_string_lossy().to_string(),
                     note: "edit".to_string(),
@@ -102,7 +102,7 @@ pub(crate) fn run_memory(cwd: &Path, cmd: MemoryCmd, json_mode: bool) -> Result<
             let version_id = manager.sync_memory_version(&note)?;
             append_control_event(
                 cwd,
-                EventKind::MemorySyncedV1 {
+                EventKind::MemorySynced {
                     version_id,
                     path: path.to_string_lossy().to_string(),
                     note: note.clone(),

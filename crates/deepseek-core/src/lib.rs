@@ -154,12 +154,11 @@ pub struct PlanStep {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RunState {
     Context,
-    Architect,
+    Planning,
     GatherEvidence,
     Subagents,
-    Editor,
-    Apply,
-    Verify,
+    Executing,
+    Completed,
     Recover,
     Final,
 }
@@ -583,13 +582,13 @@ fn parse_event_kind_compat_value(kind_value: serde_json::Value) -> Result<EventK
     // Handle well-known removed/renamed event types explicitly.
     match kind_type {
         "RouterDecisionV1" => {
-            return Ok(EventKind::TelemetryEventV1 {
+            return Ok(EventKind::TelemetryEvent {
                 name: "legacy.router_decision".to_string(),
                 properties: payload,
             });
         }
         "RouterEscalationV1" => {
-            return Ok(EventKind::TelemetryEventV1 {
+            return Ok(EventKind::TelemetryEvent {
                 name: "legacy.router_escalation".to_string(),
                 properties: payload,
             });
@@ -621,7 +620,7 @@ fn parse_event_kind_compat_value(kind_value: serde_json::Value) -> Result<EventK
 
     // Last resort: wrap in a telemetry event so sessions with unknown future
     // event types can still load rather than crashing.
-    Ok(EventKind::TelemetryEventV1 {
+    Ok(EventKind::TelemetryEvent {
         name: format!("unknown.{}", kind_type),
         properties: payload,
     })
@@ -647,70 +646,87 @@ pub fn parse_event_envelope_compat(raw: &str) -> Result<EventEnvelope> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
-    TurnAddedV1 {
+    #[serde(alias = "TurnAddedV1")]
+    TurnAdded {
         role: String,
         content: String,
     },
     /// Structured chat turn with full tool_call data for accurate session resume.
-    ChatTurnV1 {
+    #[serde(alias = "ChatTurnV1")]
+    ChatTurn {
         message: ChatMessage,
     },
     /// Reverts the session to a prior state by dropping N turns.
-    TurnRevertedV1 {
+    #[serde(alias = "TurnRevertedV1")]
+    TurnReverted {
         turns_dropped: u32,
     },
-    SessionStateChangedV1 {
+    #[serde(alias = "SessionStateChangedV1")]
+    SessionStateChanged {
         from: SessionState,
         to: SessionState,
     },
-    PlanCreatedV1 {
+    #[serde(alias = "PlanCreatedV1")]
+    PlanCreated {
         plan: Plan,
     },
-    PlanRevisedV1 {
+    #[serde(alias = "PlanRevisedV1")]
+    PlanRevised {
         plan: Plan,
     },
-    RunStartedV1 {
+    #[serde(alias = "RunStartedV1")]
+    RunStarted {
         run_id: Uuid,
         prompt: String,
     },
-    RunStateChangedV1 {
+    #[serde(alias = "RunStateChangedV1")]
+    RunStateChanged {
         run_id: Uuid,
         from: RunState,
         to: RunState,
     },
-    RunCompletedV1 {
+    #[serde(alias = "RunCompletedV1")]
+    RunCompleted {
         run_id: Uuid,
         success: bool,
     },
-    StepMarkedV1 {
+    #[serde(alias = "StepMarkedV1")]
+    StepMarked {
         step_id: Uuid,
         done: bool,
         note: String,
     },
-    ToolProposedV1 {
+    #[serde(alias = "ToolProposedV1")]
+    ToolProposed {
         proposal: ToolProposal,
     },
-    ToolApprovedV1 {
+    #[serde(alias = "ToolApprovedV1")]
+    ToolApproved {
         invocation_id: Uuid,
     },
-    ToolResultV1 {
+    #[serde(alias = "ToolResultV1")]
+    ToolResult {
         result: ToolResult,
     },
-    PatchStagedV1 {
+    #[serde(alias = "PatchStagedV1")]
+    PatchStaged {
         patch_id: Uuid,
         base_sha256: String,
     },
-    PatchAppliedV1 {
+    #[serde(alias = "PatchAppliedV1")]
+    PatchApplied {
         patch_id: Uuid,
         applied: bool,
         conflicts: Vec<String>,
     },
-    VerificationRunV1 {
+    #[serde(alias = "VerificationRunV1")]
+    VerificationRun {
         command: String,
         success: bool,
         output: String,
     },
-    CommitProposalV1 {
+    #[serde(alias = "CommitProposalV1")]
+    CommitProposal {
         files: Vec<String>,
         touched_files: u64,
         loc_delta: u64,
@@ -718,20 +734,25 @@ pub enum EventKind {
         verify_status: String,
         suggested_message: String,
     },
-    PluginInstalledV1 {
+    #[serde(alias = "PluginInstalledV1")]
+    PluginInstalled {
         plugin_id: String,
         version: String,
     },
-    PluginRemovedV1 {
+    #[serde(alias = "PluginRemovedV1")]
+    PluginRemoved {
         plugin_id: String,
     },
-    PluginEnabledV1 {
+    #[serde(alias = "PluginEnabledV1")]
+    PluginEnabled {
         plugin_id: String,
     },
-    PluginDisabledV1 {
+    #[serde(alias = "PluginDisabledV1")]
+    PluginDisabled {
         plugin_id: String,
     },
-    UsageUpdatedV1 {
+    #[serde(alias = "UsageUpdatedV1")]
+    UsageUpdated {
         unit: LlmUnit,
         model: String,
         input_tokens: u64,
@@ -739,200 +760,241 @@ pub enum EventKind {
         cache_miss_tokens: u64,
         output_tokens: u64,
     },
-    ContextCompactedV1 {
+    #[serde(alias = "ContextCompactedV1")]
+    ContextCompacted {
         summary_id: Uuid,
         from_turn: u64,
         to_turn: u64,
         token_delta_estimate: i64,
         replay_pointer: String,
     },
-    AutopilotRunStartedV1 {
+    #[serde(alias = "AutopilotRunStartedV1")]
+    AutopilotRunStarted {
         run_id: Uuid,
         prompt: String,
     },
-    AutopilotRunHeartbeatV1 {
+    #[serde(alias = "AutopilotRunHeartbeatV1")]
+    AutopilotRunHeartbeat {
         run_id: Uuid,
         completed_iterations: u64,
         failed_iterations: u64,
         consecutive_failures: u64,
         last_error: Option<String>,
     },
-    AutopilotRunStoppedV1 {
+    #[serde(alias = "AutopilotRunStoppedV1")]
+    AutopilotRunStopped {
         run_id: Uuid,
         stop_reason: String,
         completed_iterations: u64,
         failed_iterations: u64,
     },
-    PluginCatalogSyncedV1 {
+    #[serde(alias = "PluginCatalogSyncedV1")]
+    PluginCatalogSynced {
         source: String,
         total: usize,
         verified_count: usize,
     },
-    PluginVerifiedV1 {
+    #[serde(alias = "PluginVerifiedV1")]
+    PluginVerified {
         plugin_id: String,
         verified: bool,
         reason: String,
     },
-    CheckpointCreatedV1 {
+    #[serde(alias = "CheckpointCreatedV1")]
+    CheckpointCreated {
         checkpoint_id: Uuid,
         reason: String,
         files_count: u64,
         snapshot_path: String,
     },
-    CheckpointRewoundV1 {
+    #[serde(alias = "CheckpointRewoundV1")]
+    CheckpointRewound {
         checkpoint_id: Uuid,
         reason: String,
     },
-    TranscriptExportedV1 {
+    #[serde(alias = "TranscriptExportedV1")]
+    TranscriptExported {
         export_id: Uuid,
         format: String,
         output_path: String,
     },
-    McpServerAddedV1 {
+    #[serde(alias = "McpServerAddedV1")]
+    McpServerAdded {
         server_id: String,
         transport: String,
         endpoint: String,
     },
-    McpServerRemovedV1 {
+    #[serde(alias = "McpServerRemovedV1")]
+    McpServerRemoved {
         server_id: String,
     },
-    McpToolDiscoveredV1 {
+    #[serde(alias = "McpToolDiscoveredV1")]
+    McpToolDiscovered {
         server_id: String,
         tool_name: String,
     },
-    SubagentSpawnedV1 {
+    #[serde(alias = "SubagentSpawnedV1")]
+    SubagentSpawned {
         run_id: Uuid,
         name: String,
         goal: String,
     },
-    SubagentCompletedV1 {
+    #[serde(alias = "SubagentCompletedV1")]
+    SubagentCompleted {
         run_id: Uuid,
         output: String,
     },
-    SubagentFailedV1 {
+    #[serde(alias = "SubagentFailedV1")]
+    SubagentFailed {
         run_id: Uuid,
         error: String,
     },
-    CostUpdatedV1 {
+    #[serde(alias = "CostUpdatedV1")]
+    CostUpdated {
         input_tokens: u64,
         output_tokens: u64,
         estimated_cost_usd: f64,
     },
-    EffortChangedV1 {
+    #[serde(alias = "EffortChangedV1")]
+    EffortChanged {
         level: String,
     },
-    ProfileCapturedV1 {
+    #[serde(alias = "ProfileCapturedV1")]
+    ProfileCaptured {
         profile_id: Uuid,
         summary: String,
         elapsed_ms: u64,
     },
-    MemorySyncedV1 {
+    #[serde(alias = "MemorySyncedV1")]
+    MemorySynced {
         version_id: Uuid,
         path: String,
         note: String,
     },
-    HookExecutedV1 {
+    #[serde(alias = "HookExecutedV1")]
+    HookExecuted {
         phase: String,
         hook_path: String,
         success: bool,
         timed_out: bool,
         exit_code: Option<i32>,
     },
-    SessionForkedV1 {
+    #[serde(alias = "SessionForkedV1")]
+    SessionForked {
         from_session_id: Uuid,
         to_session_id: Uuid,
     },
-    PermissionModeChangedV1 {
+    #[serde(alias = "PermissionModeChangedV1")]
+    PermissionModeChanged {
         from: String,
         to: String,
     },
-    WebSearchExecutedV1 {
+    #[serde(alias = "WebSearchExecutedV1")]
+    WebSearchExecuted {
         query: String,
         results_count: u64,
         cached: bool,
     },
-    ReviewStartedV1 {
+    #[serde(alias = "ReviewStartedV1")]
+    ReviewStarted {
         review_id: Uuid,
         preset: String,
         target: String,
     },
-    ReviewCompletedV1 {
+    #[serde(alias = "ReviewCompletedV1")]
+    ReviewCompleted {
         review_id: Uuid,
         findings_count: u64,
         critical_count: u64,
     },
-    ReviewPublishedV1 {
+    #[serde(alias = "ReviewPublishedV1")]
+    ReviewPublished {
         review_id: Uuid,
         pr_number: u64,
         comments_published: u64,
         dry_run: bool,
     },
-    TaskCreatedV1 {
+    #[serde(alias = "TaskCreatedV1")]
+    TaskCreated {
         task_id: Uuid,
         title: String,
         priority: u32,
     },
-    TaskCompletedV1 {
+    #[serde(alias = "TaskCompletedV1")]
+    TaskCompleted {
         task_id: Uuid,
         outcome: String,
     },
-    ArtifactBundledV1 {
+    #[serde(alias = "ArtifactBundledV1")]
+    ArtifactBundled {
         task_id: Uuid,
         artifact_path: String,
         files: Vec<String>,
     },
-    TelemetryEventV1 {
+    #[serde(alias = "TelemetryEventV1")]
+    TelemetryEvent {
         name: String,
         properties: serde_json::Value,
     },
-    BackgroundJobStartedV1 {
+    #[serde(alias = "BackgroundJobStartedV1")]
+    BackgroundJobStarted {
         job_id: Uuid,
         kind: String,
         reference: String,
     },
-    BackgroundJobResumedV1 {
+    #[serde(alias = "BackgroundJobResumedV1")]
+    BackgroundJobResumed {
         job_id: Uuid,
         reference: String,
     },
-    BackgroundJobStoppedV1 {
+    #[serde(alias = "BackgroundJobStoppedV1")]
+    BackgroundJobStopped {
         job_id: Uuid,
         reason: String,
     },
-    SkillLoadedV1 {
+    #[serde(alias = "SkillLoadedV1")]
+    SkillLoaded {
         skill_id: String,
         source_path: String,
     },
-    ReplayExecutedV1 {
+    #[serde(alias = "ReplayExecutedV1")]
+    ReplayExecuted {
         session_id: Uuid,
         deterministic: bool,
         events_replayed: u64,
     },
-    PromptCacheHitV1 {
+    #[serde(alias = "PromptCacheHitV1")]
+    PromptCacheHit {
         cache_key: String,
         model: String,
     },
-    OffPeakScheduledV1 {
+    #[serde(alias = "OffPeakScheduledV1")]
+    OffPeakScheduled {
         reason: String,
         resume_after: String,
     },
-    VisualArtifactCapturedV1 {
+    #[serde(alias = "VisualArtifactCapturedV1")]
+    VisualArtifactCaptured {
         artifact_id: Uuid,
         path: String,
         mime: String,
     },
-    RemoteEnvConfiguredV1 {
+    #[serde(alias = "RemoteEnvConfiguredV1")]
+    RemoteEnvConfigured {
         profile_id: Uuid,
         name: String,
         endpoint: String,
     },
-    RemoteEnvExecutionStartedV1 {
+    #[serde(alias = "RemoteEnvExecutionStartedV1")]
+    RemoteEnvExecutionStarted {
         execution_id: Uuid,
         profile_id: Uuid,
         mode: String,
         background: bool,
         reference: String,
     },
-    RemoteEnvExecutionCompletedV1 {
+    #[serde(alias = "RemoteEnvExecutionCompletedV1")]
+    RemoteEnvExecutionCompleted {
         execution_id: Uuid,
         profile_id: Uuid,
         mode: String,
@@ -941,71 +1003,87 @@ pub enum EventKind {
         background: bool,
         reference: String,
     },
-    TeleportBundleCreatedV1 {
+    #[serde(alias = "TeleportBundleCreatedV1")]
+    TeleportBundleCreated {
         bundle_id: Uuid,
         path: String,
     },
-    TeleportHandoffLinkCreatedV1 {
+    #[serde(alias = "TeleportHandoffLinkCreatedV1")]
+    TeleportHandoffLinkCreated {
         handoff_id: Uuid,
         session_id: Uuid,
         expires_at: String,
     },
-    TeleportHandoffLinkConsumedV1 {
+    #[serde(alias = "TeleportHandoffLinkConsumedV1")]
+    TeleportHandoffLinkConsumed {
         handoff_id: Uuid,
         session_id: Uuid,
         success: bool,
         reason: String,
     },
-    SessionStartedV1 {
+    #[serde(alias = "SessionStartedV1")]
+    SessionStarted {
         session_id: Uuid,
         workspace: String,
     },
-    SessionResumedV1 {
+    #[serde(alias = "SessionResumedV1")]
+    SessionResumed {
         session_id: Uuid,
         events_replayed: u64,
     },
-    ToolDeniedV1 {
+    #[serde(alias = "ToolDeniedV1")]
+    ToolDenied {
         invocation_id: Uuid,
         tool_name: String,
         reason: String,
     },
-    NotebookEditedV1 {
+    #[serde(alias = "NotebookEditedV1")]
+    NotebookEdited {
         path: String,
         operation: String,
         cell_index: u64,
         cell_type: Option<String>,
     },
-    PdfTextExtractedV1 {
+    #[serde(alias = "PdfTextExtractedV1")]
+    PdfTextExtracted {
         path: String,
         pages: String,
         text_length: u64,
     },
-    IdeSessionStartedV1 {
+    #[serde(alias = "IdeSessionStartedV1")]
+    IdeSessionStarted {
         transport: String,
         client_info: String,
     },
-    TurnLimitExceededV1 {
+    #[serde(alias = "TurnLimitExceededV1")]
+    TurnLimitExceeded {
         limit: u64,
         actual: u64,
     },
-    BudgetExceededV1 {
+    #[serde(alias = "BudgetExceededV1")]
+    BudgetExceeded {
         limit_usd: f64,
         actual_usd: f64,
     },
-    TaskUpdatedV1 {
+    #[serde(alias = "TaskUpdatedV1")]
+    TaskUpdated {
         task_id: String,
         status: String,
     },
-    TaskDeletedV1 {
+    #[serde(alias = "TaskDeletedV1")]
+    TaskDeleted {
         task_id: String,
     },
-    EnterPlanModeV1 {
+    #[serde(alias = "EnterPlanModeV1")]
+    EnterPlanMode {
         session_id: Uuid,
     },
-    ExitPlanModeV1 {
+    #[serde(alias = "ExitPlanModeV1")]
+    ExitPlanMode {
         session_id: Uuid,
     },
-    ProviderSelectedV1 {
+    #[serde(alias = "ProviderSelectedV1")]
+    ProviderSelected {
         provider: String,
         model: String,
     },
@@ -1017,149 +1095,149 @@ impl EventKind {
     pub fn category(&self) -> &'static str {
         match self {
             // Session lifecycle
-            Self::SessionStartedV1 { .. }
-            | Self::SessionResumedV1 { .. }
-            | Self::SessionStateChangedV1 { .. }
-            | Self::SessionForkedV1 { .. } => "session",
+            Self::SessionStarted { .. }
+            | Self::SessionResumed { .. }
+            | Self::SessionStateChanged { .. }
+            | Self::SessionForked { .. } => "session",
 
             // Run lifecycle
-            Self::RunStartedV1 { .. }
-            | Self::RunStateChangedV1 { .. }
-            | Self::RunCompletedV1 { .. } => "run",
+            Self::RunStarted { .. }
+            | Self::RunStateChanged { .. }
+            | Self::RunCompleted { .. } => "run",
 
             // Chat / transcript
-            Self::TurnAddedV1 { .. }
-            | Self::ChatTurnV1 { .. }
-            | Self::TurnRevertedV1 { .. }
-            | Self::ContextCompactedV1 { .. }
-            | Self::EffortChangedV1 { .. }
-            | Self::PermissionModeChangedV1 { .. }
-            | Self::TurnLimitExceededV1 { .. }
-            | Self::BudgetExceededV1 { .. } => "chat",
+            Self::TurnAdded { .. }
+            | Self::ChatTurn { .. }
+            | Self::TurnReverted { .. }
+            | Self::ContextCompacted { .. }
+            | Self::EffortChanged { .. }
+            | Self::PermissionModeChanged { .. }
+            | Self::TurnLimitExceeded { .. }
+            | Self::BudgetExceeded { .. } => "chat",
 
             // Tool invocations
-            Self::ToolProposedV1 { .. }
-            | Self::ToolApprovedV1 { .. }
-            | Self::ToolResultV1 { .. }
-            | Self::ToolDeniedV1 { .. } => "tool",
+            Self::ToolProposed { .. }
+            | Self::ToolApproved { .. }
+            | Self::ToolResult { .. }
+            | Self::ToolDenied { .. } => "tool",
 
             // Plans
-            Self::PlanCreatedV1 { .. }
-            | Self::PlanRevisedV1 { .. }
-            | Self::StepMarkedV1 { .. }
-            | Self::EnterPlanModeV1 { .. }
-            | Self::ExitPlanModeV1 { .. } => "plan",
+            Self::PlanCreated { .. }
+            | Self::PlanRevised { .. }
+            | Self::StepMarked { .. }
+            | Self::EnterPlanMode { .. }
+            | Self::ExitPlanMode { .. } => "plan",
 
             // Tasks
-            Self::TaskCreatedV1 { .. }
-            | Self::TaskCompletedV1 { .. }
-            | Self::TaskUpdatedV1 { .. }
-            | Self::TaskDeletedV1 { .. } => "task",
+            Self::TaskCreated { .. }
+            | Self::TaskCompleted { .. }
+            | Self::TaskUpdated { .. }
+            | Self::TaskDeleted { .. } => "task",
 
             // Model/provider selection
-            Self::ProviderSelectedV1 { .. } => "model",
+            Self::ProviderSelected { .. } => "model",
 
             // Patches (diff/apply)
-            Self::PatchStagedV1 { .. } | Self::PatchAppliedV1 { .. } => "patch",
+            Self::PatchStaged { .. } | Self::PatchApplied { .. } => "patch",
 
             // Plugins
-            Self::PluginInstalledV1 { .. }
-            | Self::PluginRemovedV1 { .. }
-            | Self::PluginEnabledV1 { .. }
-            | Self::PluginDisabledV1 { .. }
-            | Self::PluginCatalogSyncedV1 { .. }
-            | Self::PluginVerifiedV1 { .. } => "plugin",
+            Self::PluginInstalled { .. }
+            | Self::PluginRemoved { .. }
+            | Self::PluginEnabled { .. }
+            | Self::PluginDisabled { .. }
+            | Self::PluginCatalogSynced { .. }
+            | Self::PluginVerified { .. } => "plugin",
 
             // Usage / cost tracking
-            Self::UsageUpdatedV1 { .. }
-            | Self::CostUpdatedV1 { .. }
-            | Self::PromptCacheHitV1 { .. } => "usage",
+            Self::UsageUpdated { .. }
+            | Self::CostUpdated { .. }
+            | Self::PromptCacheHit { .. } => "usage",
 
             // Autopilot
-            Self::AutopilotRunStartedV1 { .. }
-            | Self::AutopilotRunHeartbeatV1 { .. }
-            | Self::AutopilotRunStoppedV1 { .. } => "autopilot",
+            Self::AutopilotRunStarted { .. }
+            | Self::AutopilotRunHeartbeat { .. }
+            | Self::AutopilotRunStopped { .. } => "autopilot",
 
             // Subagent orchestration
-            Self::SubagentSpawnedV1 { .. }
-            | Self::SubagentCompletedV1 { .. }
-            | Self::SubagentFailedV1 { .. } => "subagent",
+            Self::SubagentSpawned { .. }
+            | Self::SubagentCompleted { .. }
+            | Self::SubagentFailed { .. } => "subagent",
 
             // Background jobs
-            Self::BackgroundJobStartedV1 { .. }
-            | Self::BackgroundJobResumedV1 { .. }
-            | Self::BackgroundJobStoppedV1 { .. } => "background",
+            Self::BackgroundJobStarted { .. }
+            | Self::BackgroundJobResumed { .. }
+            | Self::BackgroundJobStopped { .. } => "background",
 
             // MCP
-            Self::McpServerAddedV1 { .. }
-            | Self::McpServerRemovedV1 { .. }
-            | Self::McpToolDiscoveredV1 { .. } => "mcp",
+            Self::McpServerAdded { .. }
+            | Self::McpServerRemoved { .. }
+            | Self::McpToolDiscovered { .. } => "mcp",
 
             // Skills
-            Self::SkillLoadedV1 { .. } => "skill",
+            Self::SkillLoaded { .. } => "skill",
 
             // Hooks
-            Self::HookExecutedV1 { .. } => "hook",
+            Self::HookExecuted { .. } => "hook",
 
             // Memory
-            Self::MemorySyncedV1 { .. } => "memory",
+            Self::MemorySynced { .. } => "memory",
 
             // Profile / benchmark
-            Self::ProfileCapturedV1 { .. } => "profile",
+            Self::ProfileCaptured { .. } => "profile",
 
             // Verification
-            Self::VerificationRunV1 { .. } => "verification",
+            Self::VerificationRun { .. } => "verification",
 
             // Git workflow guidance
-            Self::CommitProposalV1 { .. } => "git",
+            Self::CommitProposal { .. } => "git",
 
             // Checkpoint / rewind
-            Self::CheckpointCreatedV1 { .. } | Self::CheckpointRewoundV1 { .. } => "checkpoint",
+            Self::CheckpointCreated { .. } | Self::CheckpointRewound { .. } => "checkpoint",
 
             // Export
-            Self::TranscriptExportedV1 { .. } => "export",
+            Self::TranscriptExported { .. } => "export",
 
             // Web search
-            Self::WebSearchExecutedV1 { .. } => "web",
+            Self::WebSearchExecuted { .. } => "web",
 
             // Review
-            Self::ReviewStartedV1 { .. }
-            | Self::ReviewCompletedV1 { .. }
-            | Self::ReviewPublishedV1 { .. } => "review",
+            Self::ReviewStarted { .. }
+            | Self::ReviewCompleted { .. }
+            | Self::ReviewPublished { .. } => "review",
 
             // Artifact bundling
-            Self::ArtifactBundledV1 { .. } => "artifact",
+            Self::ArtifactBundled { .. } => "artifact",
 
             // Telemetry
-            Self::TelemetryEventV1 { .. } => "telemetry",
+            Self::TelemetryEvent { .. } => "telemetry",
 
             // Replay
-            Self::ReplayExecutedV1 { .. } => "replay",
+            Self::ReplayExecuted { .. } => "replay",
 
             // Scheduling
-            Self::OffPeakScheduledV1 { .. } => "scheduling",
+            Self::OffPeakScheduled { .. } => "scheduling",
 
             // Visual testing
-            Self::VisualArtifactCapturedV1 { .. } => "visual",
+            Self::VisualArtifactCaptured { .. } => "visual",
 
             // Remote environments
-            Self::RemoteEnvConfiguredV1 { .. }
-            | Self::RemoteEnvExecutionStartedV1 { .. }
-            | Self::RemoteEnvExecutionCompletedV1 { .. } => "remote_env",
+            Self::RemoteEnvConfigured { .. }
+            | Self::RemoteEnvExecutionStarted { .. }
+            | Self::RemoteEnvExecutionCompleted { .. } => "remote_env",
 
             // Teleport
-            Self::TeleportBundleCreatedV1 { .. }
-            | Self::TeleportHandoffLinkCreatedV1 { .. }
-            | Self::TeleportHandoffLinkConsumedV1 { .. } => "teleport",
+            Self::TeleportBundleCreated { .. }
+            | Self::TeleportHandoffLinkCreated { .. }
+            | Self::TeleportHandoffLinkConsumed { .. } => "teleport",
 
             // Notebook
-            Self::NotebookEditedV1 { .. } => "notebook",
+            Self::NotebookEdited { .. } => "notebook",
 
             // PDF
-            Self::PdfTextExtractedV1 { .. } => "pdf",
+            Self::PdfTextExtracted { .. } => "pdf",
 
             // IDE
-            Self::IdeSessionStartedV1 { .. } => "ide",
+            Self::IdeSessionStarted { .. } => "ide",
         }
     }
 
@@ -2820,15 +2898,15 @@ mod tests {
     #[test]
     fn new_event_types_round_trip_via_serde() {
         let events = vec![
-            EventKind::SessionStartedV1 {
+            EventKind::SessionStarted {
                 session_id: Uuid::now_v7(),
                 workspace: "/tmp/test".to_string(),
             },
-            EventKind::SessionResumedV1 {
+            EventKind::SessionResumed {
                 session_id: Uuid::now_v7(),
                 events_replayed: 42,
             },
-            EventKind::ToolDeniedV1 {
+            EventKind::ToolDenied {
                 invocation_id: Uuid::now_v7(),
                 tool_name: "bash.run".to_string(),
                 reason: "locked mode".to_string(),
@@ -2948,16 +3026,16 @@ mod tests {
     fn event_kind_all_variants_have_category() {
         // Verify a representative from each category returns a non-empty string
         let events = vec![
-            EventKind::SessionStartedV1 {
+            EventKind::SessionStarted {
                 session_id: Uuid::nil(),
                 workspace: String::new(),
             },
-            EventKind::ChatTurnV1 {
+            EventKind::ChatTurn {
                 message: ChatMessage::User {
                     content: String::new(),
                 },
             },
-            EventKind::ToolProposedV1 {
+            EventKind::ToolProposed {
                 proposal: ToolProposal {
                     invocation_id: Uuid::nil(),
                     call: ToolCall {
@@ -2968,15 +3046,15 @@ mod tests {
                     approved: false,
                 },
             },
-            EventKind::TaskCreatedV1 {
+            EventKind::TaskCreated {
                 task_id: Uuid::nil(),
                 title: String::new(),
                 priority: 0,
             },
-            EventKind::PluginEnabledV1 {
+            EventKind::PluginEnabled {
                 plugin_id: String::new(),
             },
-            EventKind::HookExecutedV1 {
+            EventKind::HookExecuted {
                 phase: String::new(),
                 hook_path: String::new(),
                 success: true,
@@ -3000,7 +3078,7 @@ mod tests {
         let raw = r#"{"type":"RouterDecisionV1","payload":{"decision":"v3","score":0.91}}"#;
         let kind = parse_event_kind_compat(raw).expect("compat parse");
         match kind {
-            EventKind::TelemetryEventV1 { name, properties } => {
+            EventKind::TelemetryEvent { name, properties } => {
                 assert_eq!(name, "legacy.router_decision");
                 assert_eq!(properties["decision"], "v3");
                 assert_eq!(properties["score"], 0.91);
@@ -3018,7 +3096,7 @@ mod tests {
         );
         let envelope = parse_event_envelope_compat(&raw).expect("compat envelope parse");
         match envelope.kind {
-            EventKind::TelemetryEventV1 { name, properties } => {
+            EventKind::TelemetryEvent { name, properties } => {
                 assert_eq!(name, "legacy.router_escalation");
                 assert_eq!(properties["reason"], "repeat failures");
             }

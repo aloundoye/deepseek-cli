@@ -156,7 +156,7 @@ fn repoish_prompt_injects_auto_context_bootstrap_packet() -> Result<()> {
     let guard = state.lock().map_err(|_| anyhow!("state poisoned"))?;
     assert_eq!(guard.chat_requests.len(), 1);
     let user = first_user_message(&guard.chat_requests[0]);
-    assert!(user.contains("AUTO_CONTEXT_BOOTSTRAP_V1"));
+    assert!(user.contains("AUTO_CONTEXT_BOOTSTRAP"));
     assert!(user.contains("ROOT_TREE_SNAPSHOT"));
     assert!(user.contains("README_EXCERPT"));
     Ok(())

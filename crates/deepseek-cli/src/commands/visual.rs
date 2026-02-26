@@ -240,7 +240,7 @@ fn visual_show_payload(
 
     append_control_event(
         cwd,
-        EventKind::TelemetryEventV1 {
+        EventKind::TelemetryEvent {
             name: "kpi.visual.display_mode".to_string(),
             properties: json!({
                 "display_mode": display_mode,

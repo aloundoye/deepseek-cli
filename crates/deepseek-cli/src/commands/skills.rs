@@ -47,7 +47,7 @@ pub(crate) fn run_skills(cwd: &Path, cmd: SkillsCmd, json_mode: bool) -> Result<
             })?;
             append_control_event(
                 cwd,
-                EventKind::SkillLoadedV1 {
+                EventKind::SkillLoaded {
                     skill_id: installed.id.clone(),
                     source_path: installed.path.to_string_lossy().to_string(),
                 },

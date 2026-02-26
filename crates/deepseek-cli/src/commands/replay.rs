@@ -42,7 +42,7 @@ pub(crate) fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<
             let events_replayed = events.len() as u64;
             let tool_results_replayed = events
                 .iter()
-                .filter(|event| matches!(event.kind, EventKind::ToolResultV1 { .. }))
+                .filter(|event| matches!(event.kind, EventKind::ToolResult { .. }))
                 .count() as u64;
             let payload = json!({
                 "session_id": session_id,
@@ -64,7 +64,7 @@ pub(crate) fn run_replay(cwd: &Path, cmd: ReplayCmd, json_mode: bool) -> Result<
             })?;
             append_control_event(
                 cwd,
-                EventKind::ReplayExecutedV1 {
+                EventKind::ReplayExecuted {
                     session_id,
                     deterministic: args.deterministic,
                     events_replayed,
@@ -122,15 +122,15 @@ pub(crate) fn validate_replay_events(events: &[EventEnvelope]) -> ReplayValidati
         }
         last_seq = event.seq_no;
         match &event.kind {
-            EventKind::ToolProposedV1 { proposal } => {
+            EventKind::ToolProposed { proposal } => {
                 if proposal.approved {
                     proposed.insert(proposal.invocation_id);
                 }
             }
-            EventKind::ToolApprovedV1 { invocation_id } => {
+            EventKind::ToolApproved { invocation_id } => {
                 approved.insert(*invocation_id);
             }
-            EventKind::ToolResultV1 { result } => {
+            EventKind::ToolResult { result } => {
                 results.insert(result.invocation_id);
             }
             _ => {}

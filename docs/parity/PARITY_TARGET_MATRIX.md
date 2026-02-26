@@ -19,7 +19,7 @@ Every `Feature ID` must map to at least one automated test or CI gate.
 | workflow.git_passthrough | workflow | `/git` passthrough helper provides deterministic command execution and clear usage | `crates/deepseek-cli/src/commands/chat.rs` tests |
 | workflow.profile.load_save | workflow | `/load` and `/save` round-trip chat profile state deterministically | `crates/deepseek-cli/src/commands/chat.rs` tests |
 | workflow.voice.capability_probe | workflow | `/voice status` exposes deterministic capability probe with graceful fallback | `crates/deepseek-cli/src/commands/chat.rs` tests |
-| workflow.watch_files.hints | workflow | `--watch-files` injects bounded `AUTO_WATCH_CONTEXT_V1` hints when repo markers change | `crates/deepseek-cli/src/commands/chat.rs` tests |
+| workflow.watch_files.hints | workflow | `--watch-files` injects bounded `AUTO_WATCH_CONTEXT` hints when repo markers change | `crates/deepseek-cli/src/commands/chat.rs` tests |
 | workflow.detect_urls.enrichment | workflow | `--detect-urls` enriches prompts with bounded URL extracts before model call | `crates/deepseek-agent/src/lib.rs` tests |
 | inspect.bootstrap.analysis_first | context | Repo-ish prompts bootstrap context and respond analysis-first | `crates/deepseek-agent/tests/runtime_conformance.rs` |
 | ui.phase_visibility | ui | Phase start/end visibly streamed | `crates/deepseek-ui/src/lib.rs` tests |

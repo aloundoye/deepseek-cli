@@ -1528,9 +1528,9 @@ impl Store {
                     continue;
                 };
                 match kind {
-                    EventKind::SubagentSpawnedV1 { run_id, .. }
-                    | EventKind::SubagentCompletedV1 { run_id, .. }
-                    | EventKind::SubagentFailedV1 { run_id, .. } => {
+                    EventKind::SubagentSpawned { run_id, .. }
+                    | EventKind::SubagentCompleted { run_id, .. }
+                    | EventKind::SubagentFailed { run_id, .. } => {
                         session_run_ids.insert(run_id.to_string());
                     }
                     _ => {}
@@ -2085,7 +2085,7 @@ impl Store {
             seq_no: seq,
             at: Utc::now(),
             session_id: from_session_id,
-            kind: EventKind::SessionForkedV1 {
+            kind: EventKind::SessionForked {
                 from_session_id,
                 to_session_id: new_id,
             },
@@ -2431,7 +2431,7 @@ impl Store {
 
     fn project_event(&self, conn: &Connection, event: &EventEnvelope) -> Result<()> {
         match &event.kind {
-            EventKind::SessionStateChangedV1 { to, .. } => {
+            EventKind::SessionStateChanged { to, .. } => {
                 conn.execute(
                     "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE session_id = ?3",
                     params![
@@ -2441,10 +2441,10 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::PlanCreatedV1 { plan } | EventKind::PlanRevisedV1 { plan } => {
+            EventKind::PlanCreated { plan } | EventKind::PlanRevised { plan } => {
                 self.save_plan(event.session_id, plan)?;
             }
-            EventKind::ToolApprovedV1 { invocation_id } => {
+            EventKind::ToolApproved { invocation_id } => {
                 conn.execute(
                     "INSERT INTO approvals_ledger (session_id, invocation_id, approved_at) VALUES (?1, ?2, ?3)",
                     params![
@@ -2454,7 +2454,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::VerificationRunV1 {
+            EventKind::VerificationRun {
                 command,
                 success,
                 output,
@@ -2470,7 +2470,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::UsageUpdatedV1 {
+            EventKind::UsageUpdated {
                 unit,
                 model,
                 input_tokens,
@@ -2493,7 +2493,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::ContextCompactedV1 {
+            EventKind::ContextCompacted {
                 summary_id,
                 from_turn,
                 to_turn,
@@ -2515,7 +2515,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::AutopilotRunStartedV1 { run_id, prompt } => {
+            EventKind::AutopilotRunStarted { run_id, prompt } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO autopilot_runs
                      (run_id, session_id, prompt, status, stop_reason, completed_iterations, failed_iterations,
@@ -2530,7 +2530,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::AutopilotRunHeartbeatV1 {
+            EventKind::AutopilotRunHeartbeat {
                 run_id,
                 completed_iterations,
                 failed_iterations,
@@ -2551,7 +2551,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::AutopilotRunStoppedV1 {
+            EventKind::AutopilotRunStopped {
                 run_id,
                 stop_reason,
                 completed_iterations,
@@ -2570,7 +2570,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::HookExecutedV1 {
+            EventKind::HookExecuted {
                 phase,
                 hook_path,
                 success,
@@ -2591,7 +2591,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::CheckpointCreatedV1 {
+            EventKind::CheckpointCreated {
                 checkpoint_id,
                 reason,
                 files_count,
@@ -2609,7 +2609,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::CheckpointRewoundV1 {
+            EventKind::CheckpointRewound {
                 checkpoint_id,
                 reason,
             } => {
@@ -2618,7 +2618,7 @@ impl Store {
                     params![reason, checkpoint_id.to_string()],
                 )?;
             }
-            EventKind::TranscriptExportedV1 {
+            EventKind::TranscriptExported {
                 export_id,
                 format,
                 output_path,
@@ -2635,7 +2635,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::McpServerAddedV1 {
+            EventKind::McpServerAdded {
                 server_id,
                 transport,
                 endpoint,
@@ -2652,14 +2652,14 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::McpServerRemovedV1 { server_id } => {
+            EventKind::McpServerRemoved { server_id } => {
                 conn.execute("DELETE FROM mcp_servers WHERE server_id = ?1", [server_id])?;
                 conn.execute(
                     "DELETE FROM mcp_tools_cache WHERE server_id = ?1",
                     [server_id],
                 )?;
             }
-            EventKind::McpToolDiscoveredV1 {
+            EventKind::McpToolDiscovered {
                 server_id,
                 tool_name,
             } => {
@@ -2669,7 +2669,7 @@ impl Store {
                     params![server_id, tool_name, Utc::now().to_rfc3339()],
                 )?;
             }
-            EventKind::SubagentSpawnedV1 { run_id, name, goal } => {
+            EventKind::SubagentSpawned { run_id, name, goal } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO subagent_runs (run_id, name, goal, status, output, error, created_at, updated_at)
                      VALUES (?1, ?2, ?3, 'running', NULL, NULL, ?4, ?5)",
@@ -2682,19 +2682,19 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::SubagentCompletedV1 { run_id, output } => {
+            EventKind::SubagentCompleted { run_id, output } => {
                 conn.execute(
                     "UPDATE subagent_runs SET status='completed', output=?1, error=NULL, updated_at=?2 WHERE run_id=?3",
                     params![output, Utc::now().to_rfc3339(), run_id.to_string()],
                 )?;
             }
-            EventKind::SubagentFailedV1 { run_id, error } => {
+            EventKind::SubagentFailed { run_id, error } => {
                 conn.execute(
                     "UPDATE subagent_runs SET status='failed', output=NULL, error=?1, updated_at=?2 WHERE run_id=?3",
                     params![error, Utc::now().to_rfc3339(), run_id.to_string()],
                 )?;
             }
-            EventKind::CostUpdatedV1 {
+            EventKind::CostUpdated {
                 input_tokens,
                 output_tokens,
                 estimated_cost_usd,
@@ -2711,7 +2711,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::ProfileCapturedV1 {
+            EventKind::ProfileCaptured {
                 profile_id,
                 summary,
                 elapsed_ms,
@@ -2728,7 +2728,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::MemorySyncedV1 {
+            EventKind::MemorySynced {
                 version_id,
                 path,
                 note,
@@ -2746,7 +2746,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::BackgroundJobStartedV1 {
+            EventKind::BackgroundJobStarted {
                 job_id,
                 kind,
                 reference,
@@ -2763,13 +2763,13 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::BackgroundJobResumedV1 { job_id, reference } => {
+            EventKind::BackgroundJobResumed { job_id, reference } => {
                 conn.execute(
                     "UPDATE background_jobs SET status='running', reference=?1, updated_at=?2 WHERE job_id=?3",
                     params![reference, Utc::now().to_rfc3339(), job_id.to_string()],
                 )?;
             }
-            EventKind::BackgroundJobStoppedV1 { job_id, reason } => {
+            EventKind::BackgroundJobStopped { job_id, reason } => {
                 conn.execute(
                     "UPDATE background_jobs SET status='stopped', metadata_json=?1, updated_at=?2 WHERE job_id=?3",
                     params![
@@ -2779,7 +2779,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::SkillLoadedV1 {
+            EventKind::SkillLoaded {
                 skill_id,
                 source_path,
             } => {
@@ -2789,7 +2789,7 @@ impl Store {
                     params![skill_id, skill_id, source_path, Utc::now().to_rfc3339()],
                 )?;
             }
-            EventKind::ReplayExecutedV1 {
+            EventKind::ReplayExecuted {
                 session_id,
                 deterministic,
                 events_replayed,
@@ -2807,14 +2807,14 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::PromptCacheHitV1 { cache_key, model } => {
+            EventKind::PromptCacheHit { cache_key, model } => {
                 conn.execute(
                     "INSERT INTO provider_metrics (provider, model, cache_key, cache_hit, latency_ms, recorded_at)
                      VALUES ('deepseek', ?1, ?2, 1, 0, ?3)",
                     params![model, cache_key, Utc::now().to_rfc3339()],
                 )?;
             }
-            EventKind::OffPeakScheduledV1 {
+            EventKind::OffPeakScheduled {
                 reason,
                 resume_after,
             } => {
@@ -2824,7 +2824,7 @@ impl Store {
                     params![format!("{reason}:{resume_after}"), Utc::now().to_rfc3339()],
                 )?;
             }
-            EventKind::VisualArtifactCapturedV1 {
+            EventKind::VisualArtifactCaptured {
                 artifact_id,
                 path,
                 mime,
@@ -2840,7 +2840,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::RemoteEnvConfiguredV1 {
+            EventKind::RemoteEnvConfigured {
                 profile_id,
                 name,
                 endpoint,
@@ -2856,9 +2856,9 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::RemoteEnvExecutionStartedV1 { .. }
-            | EventKind::RemoteEnvExecutionCompletedV1 { .. } => {}
-            EventKind::TeleportBundleCreatedV1 { bundle_id, path } => {
+            EventKind::RemoteEnvExecutionStarted { .. }
+            | EventKind::RemoteEnvExecutionCompleted { .. } => {}
+            EventKind::TeleportBundleCreated { bundle_id, path } => {
                 conn.execute(
                     "INSERT INTO replay_cassettes (cassette_id, session_id, deterministic, events_count, payload_json, created_at)
                      VALUES (?1, ?2, 1, 0, ?3, ?4)",
@@ -2870,9 +2870,9 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::TeleportHandoffLinkCreatedV1 { .. }
-            | EventKind::TeleportHandoffLinkConsumedV1 { .. } => {}
-            EventKind::PermissionModeChangedV1 { from, to } => {
+            EventKind::TeleportHandoffLinkCreated { .. }
+            | EventKind::TeleportHandoffLinkConsumed { .. } => {}
+            EventKind::PermissionModeChanged { from, to } => {
                 conn.execute(
                     "INSERT INTO permission_mode_log (session_id, from_mode, to_mode, changed_at)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -2884,7 +2884,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::TaskCreatedV1 {
+            EventKind::TaskCreated {
                 task_id,
                 title,
                 priority,
@@ -2902,13 +2902,13 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::TaskCompletedV1 { task_id, outcome } => {
+            EventKind::TaskCompleted { task_id, outcome } => {
                 conn.execute(
                     "UPDATE task_queue SET status = 'completed', outcome = ?1, updated_at = ?2 WHERE task_id = ?3",
                     params![outcome, Utc::now().to_rfc3339(), task_id.to_string()],
                 )?;
             }
-            EventKind::ReviewStartedV1 {
+            EventKind::ReviewStarted {
                 review_id,
                 preset,
                 target,
@@ -2925,7 +2925,7 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::ReviewCompletedV1 {
+            EventKind::ReviewCompleted {
                 review_id,
                 findings_count,
                 critical_count,
@@ -2939,8 +2939,8 @@ impl Store {
                     ],
                 )?;
             }
-            EventKind::ReviewPublishedV1 { .. } => {}
-            EventKind::ArtifactBundledV1 {
+            EventKind::ReviewPublished { .. } => {}
+            EventKind::ArtifactBundled {
                 task_id,
                 artifact_path,
                 files,
@@ -2971,7 +2971,7 @@ fn append_lock() -> &'static Mutex<()> {
 #[derive(Debug, Default, Clone)]
 pub struct RebuildProjection {
     pub transcript: Vec<String>,
-    /// Structured chat messages for accurate session resume (from ChatTurnV1 events).
+    /// Structured chat messages for accurate session resume (from ChatTurn events).
     pub chat_messages: Vec<ChatMessage>,
     pub latest_plan: Option<Plan>,
     pub step_status: Vec<(Uuid, bool, String)>,
@@ -2994,46 +2994,46 @@ pub struct RebuildProjection {
 
 fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
     match &event.kind {
-        EventKind::TurnAddedV1 { role, content } => {
+        EventKind::TurnAdded { role, content } => {
             proj.transcript.push(format!("{role}: {content}"))
         }
-        EventKind::ChatTurnV1 { message } => {
+        EventKind::ChatTurn { message } => {
             proj.chat_messages.push(message.clone());
         }
-        EventKind::TurnRevertedV1 { turns_dropped } => {
+        EventKind::TurnReverted { turns_dropped } => {
             let keep_chat = proj.chat_messages.len().saturating_sub(*turns_dropped as usize);
             proj.chat_messages.truncate(keep_chat);
             let keep_transcript = proj.transcript.len().saturating_sub(*turns_dropped as usize);
             proj.transcript.truncate(keep_transcript);
         }
-        EventKind::PlanCreatedV1 { plan } | EventKind::PlanRevisedV1 { plan } => {
+        EventKind::PlanCreated { plan } | EventKind::PlanRevised { plan } => {
             proj.latest_plan = Some(plan.clone())
         }
-        EventKind::StepMarkedV1 {
+        EventKind::StepMarked {
             step_id,
             done,
             note,
         } => proj.step_status.push((*step_id, *done, note.clone())),
-        EventKind::PatchStagedV1 { patch_id, .. } => proj.staged_patches.push(*patch_id),
-        EventKind::PatchAppliedV1 {
+        EventKind::PatchStaged { patch_id, .. } => proj.staged_patches.push(*patch_id),
+        EventKind::PatchApplied {
             patch_id, applied, ..
         } => {
             if *applied {
                 proj.applied_patches.push(*patch_id)
             }
         }
-        EventKind::ToolProposedV1 { proposal } => {
+        EventKind::ToolProposed { proposal } => {
             proj.tool_invocations.push(proposal.invocation_id)
         }
-        EventKind::ToolApprovedV1 { invocation_id } => {
+        EventKind::ToolApproved { invocation_id } => {
             proj.approved_invocations.push(*invocation_id)
         }
-        EventKind::SessionStateChangedV1 { to, .. } => proj.state = Some(to.clone()),
-        EventKind::PluginInstalledV1 { plugin_id, .. }
-        | EventKind::PluginRemovedV1 { plugin_id }
-        | EventKind::PluginEnabledV1 { plugin_id }
-        | EventKind::PluginDisabledV1 { plugin_id } => proj.plugin_events.push(plugin_id.clone()),
-        EventKind::UsageUpdatedV1 {
+        EventKind::SessionStateChanged { to, .. } => proj.state = Some(to.clone()),
+        EventKind::PluginInstalled { plugin_id, .. }
+        | EventKind::PluginRemoved { plugin_id }
+        | EventKind::PluginEnabled { plugin_id }
+        | EventKind::PluginDisabled { plugin_id } => proj.plugin_events.push(plugin_id.clone()),
+        EventKind::UsageUpdated {
             input_tokens,
             cache_hit_tokens,
             cache_miss_tokens,
@@ -3045,98 +3045,98 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             proj.usage_cache_miss_tokens = proj.usage_cache_miss_tokens.saturating_add(*cache_miss_tokens);
             proj.usage_output_tokens = proj.usage_output_tokens.saturating_add(*output_tokens);
         }
-        EventKind::ContextCompactedV1 { .. } => {
+        EventKind::ContextCompacted { .. } => {
             proj.compaction_events = proj.compaction_events.saturating_add(1)
         }
-        EventKind::AutopilotRunStartedV1 { run_id, .. } => proj.autopilot_runs.push(*run_id),
-        EventKind::PermissionModeChangedV1 { to, .. } => proj.permission_mode = Some(to.clone()),
-        EventKind::TaskCreatedV1 { task_id, .. } => proj.task_ids.push(*task_id),
-        EventKind::ReviewStartedV1 { review_id, .. } => proj.review_ids.push(*review_id),
+        EventKind::AutopilotRunStarted { run_id, .. } => proj.autopilot_runs.push(*run_id),
+        EventKind::PermissionModeChanged { to, .. } => proj.permission_mode = Some(to.clone()),
+        EventKind::TaskCreated { task_id, .. } => proj.task_ids.push(*task_id),
+        EventKind::ReviewStarted { review_id, .. } => proj.review_ids.push(*review_id),
         _ => {}
     }
 }
 
 fn event_kind_name(kind: &EventKind) -> &'static str {
     match kind {
-        EventKind::TurnAddedV1 { .. } => "TurnAdded@v1",
-        EventKind::ChatTurnV1 { .. } => "ChatTurn@v1",
-        EventKind::TurnRevertedV1 { .. } => "TurnReverted@v1",
-        EventKind::SessionStateChangedV1 { .. } => "SessionStateChanged@v1",
-        EventKind::RunStartedV1 { .. } => "RunStarted@v1",
-        EventKind::RunStateChangedV1 { .. } => "RunStateChanged@v1",
-        EventKind::RunCompletedV1 { .. } => "RunCompleted@v1",
-        EventKind::PlanCreatedV1 { .. } => "PlanCreated@v1",
-        EventKind::PlanRevisedV1 { .. } => "PlanRevised@v1",
-        EventKind::StepMarkedV1 { .. } => "StepMarked@v1",
-        EventKind::ToolProposedV1 { .. } => "ToolProposed@v1",
-        EventKind::ToolApprovedV1 { .. } => "ToolApproved@v1",
-        EventKind::ToolResultV1 { .. } => "ToolResult@v1",
-        EventKind::PatchStagedV1 { .. } => "PatchStaged@v1",
-        EventKind::PatchAppliedV1 { .. } => "PatchApplied@v1",
-        EventKind::VerificationRunV1 { .. } => "VerificationRun@v1",
-        EventKind::CommitProposalV1 { .. } => "CommitProposal@v1",
-        EventKind::PluginInstalledV1 { .. } => "PluginInstalled@v1",
-        EventKind::PluginRemovedV1 { .. } => "PluginRemoved@v1",
-        EventKind::PluginEnabledV1 { .. } => "PluginEnabled@v1",
-        EventKind::PluginDisabledV1 { .. } => "PluginDisabled@v1",
-        EventKind::UsageUpdatedV1 { .. } => "UsageUpdated@v1",
-        EventKind::ContextCompactedV1 { .. } => "ContextCompacted@v1",
-        EventKind::AutopilotRunStartedV1 { .. } => "AutopilotRunStarted@v1",
-        EventKind::AutopilotRunHeartbeatV1 { .. } => "AutopilotRunHeartbeat@v1",
-        EventKind::AutopilotRunStoppedV1 { .. } => "AutopilotRunStopped@v1",
-        EventKind::PluginCatalogSyncedV1 { .. } => "PluginCatalogSynced@v1",
-        EventKind::PluginVerifiedV1 { .. } => "PluginVerified@v1",
-        EventKind::HookExecutedV1 { .. } => "HookExecuted@v1",
-        EventKind::SessionForkedV1 { .. } => "SessionForked@v1",
-        EventKind::CheckpointCreatedV1 { .. } => "CheckpointCreated@v1",
-        EventKind::CheckpointRewoundV1 { .. } => "CheckpointRewound@v1",
-        EventKind::TranscriptExportedV1 { .. } => "TranscriptExported@v1",
-        EventKind::McpServerAddedV1 { .. } => "McpServerAdded@v1",
-        EventKind::McpServerRemovedV1 { .. } => "McpServerRemoved@v1",
-        EventKind::McpToolDiscoveredV1 { .. } => "McpToolDiscovered@v1",
-        EventKind::SubagentSpawnedV1 { .. } => "SubagentSpawned@v1",
-        EventKind::SubagentCompletedV1 { .. } => "SubagentCompleted@v1",
-        EventKind::SubagentFailedV1 { .. } => "SubagentFailed@v1",
-        EventKind::CostUpdatedV1 { .. } => "CostUpdated@v1",
-        EventKind::EffortChangedV1 { .. } => "EffortChanged@v1",
-        EventKind::ProfileCapturedV1 { .. } => "ProfileCaptured@v1",
-        EventKind::MemorySyncedV1 { .. } => "MemorySynced@v1",
-        EventKind::BackgroundJobStartedV1 { .. } => "BackgroundJobStarted@v1",
-        EventKind::BackgroundJobResumedV1 { .. } => "BackgroundJobResumed@v1",
-        EventKind::BackgroundJobStoppedV1 { .. } => "BackgroundJobStopped@v1",
-        EventKind::SkillLoadedV1 { .. } => "SkillLoaded@v1",
-        EventKind::ReplayExecutedV1 { .. } => "ReplayExecuted@v1",
-        EventKind::PromptCacheHitV1 { .. } => "PromptCacheHit@v1",
-        EventKind::OffPeakScheduledV1 { .. } => "OffPeakScheduled@v1",
-        EventKind::VisualArtifactCapturedV1 { .. } => "VisualArtifactCaptured@v1",
-        EventKind::RemoteEnvConfiguredV1 { .. } => "RemoteEnvConfigured@v1",
-        EventKind::RemoteEnvExecutionStartedV1 { .. } => "RemoteEnvExecutionStarted@v1",
-        EventKind::RemoteEnvExecutionCompletedV1 { .. } => "RemoteEnvExecutionCompleted@v1",
-        EventKind::TeleportBundleCreatedV1 { .. } => "TeleportBundleCreated@v1",
-        EventKind::TeleportHandoffLinkCreatedV1 { .. } => "TeleportHandoffLinkCreated@v1",
-        EventKind::TeleportHandoffLinkConsumedV1 { .. } => "TeleportHandoffLinkConsumed@v1",
-        EventKind::TelemetryEventV1 { .. } => "TelemetryEvent@v1",
-        EventKind::PermissionModeChangedV1 { .. } => "PermissionModeChanged@v1",
-        EventKind::WebSearchExecutedV1 { .. } => "WebSearchExecuted@v1",
-        EventKind::ReviewStartedV1 { .. } => "ReviewStarted@v1",
-        EventKind::ReviewCompletedV1 { .. } => "ReviewCompleted@v1",
-        EventKind::ReviewPublishedV1 { .. } => "ReviewPublished@v1",
-        EventKind::TaskCreatedV1 { .. } => "TaskCreated@v1",
-        EventKind::TaskCompletedV1 { .. } => "TaskCompleted@v1",
-        EventKind::ArtifactBundledV1 { .. } => "ArtifactBundled@v1",
-        EventKind::SessionStartedV1 { .. } => "SessionStarted@v1",
-        EventKind::SessionResumedV1 { .. } => "SessionResumed@v1",
-        EventKind::ToolDeniedV1 { .. } => "ToolDenied@v1",
-        EventKind::NotebookEditedV1 { .. } => "NotebookEdited@v1",
-        EventKind::PdfTextExtractedV1 { .. } => "PdfTextExtracted@v1",
-        EventKind::IdeSessionStartedV1 { .. } => "IdeSessionStarted@v1",
-        EventKind::TurnLimitExceededV1 { .. } => "TurnLimitExceeded@v1",
-        EventKind::BudgetExceededV1 { .. } => "BudgetExceeded@v1",
-        EventKind::TaskUpdatedV1 { .. } => "TaskUpdated@v1",
-        EventKind::TaskDeletedV1 { .. } => "TaskDeleted@v1",
-        EventKind::EnterPlanModeV1 { .. } => "EnterPlanMode@v1",
-        EventKind::ExitPlanModeV1 { .. } => "ExitPlanMode@v1",
-        EventKind::ProviderSelectedV1 { .. } => "ProviderSelected@v1",
+        EventKind::TurnAdded { .. } => "TurnAdded@v1",
+        EventKind::ChatTurn { .. } => "ChatTurn@v1",
+        EventKind::TurnReverted { .. } => "TurnReverted@v1",
+        EventKind::SessionStateChanged { .. } => "SessionStateChanged@v1",
+        EventKind::RunStarted { .. } => "RunStarted@v1",
+        EventKind::RunStateChanged { .. } => "RunStateChanged@v1",
+        EventKind::RunCompleted { .. } => "RunCompleted@v1",
+        EventKind::PlanCreated { .. } => "PlanCreated@v1",
+        EventKind::PlanRevised { .. } => "PlanRevised@v1",
+        EventKind::StepMarked { .. } => "StepMarked@v1",
+        EventKind::ToolProposed { .. } => "ToolProposed@v1",
+        EventKind::ToolApproved { .. } => "ToolApproved@v1",
+        EventKind::ToolResult { .. } => "ToolResult@v1",
+        EventKind::PatchStaged { .. } => "PatchStaged@v1",
+        EventKind::PatchApplied { .. } => "PatchApplied@v1",
+        EventKind::VerificationRun { .. } => "VerificationRun@v1",
+        EventKind::CommitProposal { .. } => "CommitProposal@v1",
+        EventKind::PluginInstalled { .. } => "PluginInstalled@v1",
+        EventKind::PluginRemoved { .. } => "PluginRemoved@v1",
+        EventKind::PluginEnabled { .. } => "PluginEnabled@v1",
+        EventKind::PluginDisabled { .. } => "PluginDisabled@v1",
+        EventKind::UsageUpdated { .. } => "UsageUpdated@v1",
+        EventKind::ContextCompacted { .. } => "ContextCompacted@v1",
+        EventKind::AutopilotRunStarted { .. } => "AutopilotRunStarted@v1",
+        EventKind::AutopilotRunHeartbeat { .. } => "AutopilotRunHeartbeat@v1",
+        EventKind::AutopilotRunStopped { .. } => "AutopilotRunStopped@v1",
+        EventKind::PluginCatalogSynced { .. } => "PluginCatalogSynced@v1",
+        EventKind::PluginVerified { .. } => "PluginVerified@v1",
+        EventKind::HookExecuted { .. } => "HookExecuted@v1",
+        EventKind::SessionForked { .. } => "SessionForked@v1",
+        EventKind::CheckpointCreated { .. } => "CheckpointCreated@v1",
+        EventKind::CheckpointRewound { .. } => "CheckpointRewound@v1",
+        EventKind::TranscriptExported { .. } => "TranscriptExported@v1",
+        EventKind::McpServerAdded { .. } => "McpServerAdded@v1",
+        EventKind::McpServerRemoved { .. } => "McpServerRemoved@v1",
+        EventKind::McpToolDiscovered { .. } => "McpToolDiscovered@v1",
+        EventKind::SubagentSpawned { .. } => "SubagentSpawned@v1",
+        EventKind::SubagentCompleted { .. } => "SubagentCompleted@v1",
+        EventKind::SubagentFailed { .. } => "SubagentFailed@v1",
+        EventKind::CostUpdated { .. } => "CostUpdated@v1",
+        EventKind::EffortChanged { .. } => "EffortChanged@v1",
+        EventKind::ProfileCaptured { .. } => "ProfileCaptured@v1",
+        EventKind::MemorySynced { .. } => "MemorySynced@v1",
+        EventKind::BackgroundJobStarted { .. } => "BackgroundJobStarted@v1",
+        EventKind::BackgroundJobResumed { .. } => "BackgroundJobResumed@v1",
+        EventKind::BackgroundJobStopped { .. } => "BackgroundJobStopped@v1",
+        EventKind::SkillLoaded { .. } => "SkillLoaded@v1",
+        EventKind::ReplayExecuted { .. } => "ReplayExecuted@v1",
+        EventKind::PromptCacheHit { .. } => "PromptCacheHit@v1",
+        EventKind::OffPeakScheduled { .. } => "OffPeakScheduled@v1",
+        EventKind::VisualArtifactCaptured { .. } => "VisualArtifactCaptured@v1",
+        EventKind::RemoteEnvConfigured { .. } => "RemoteEnvConfigured@v1",
+        EventKind::RemoteEnvExecutionStarted { .. } => "RemoteEnvExecutionStarted@v1",
+        EventKind::RemoteEnvExecutionCompleted { .. } => "RemoteEnvExecutionCompleted@v1",
+        EventKind::TeleportBundleCreated { .. } => "TeleportBundleCreated@v1",
+        EventKind::TeleportHandoffLinkCreated { .. } => "TeleportHandoffLinkCreated@v1",
+        EventKind::TeleportHandoffLinkConsumed { .. } => "TeleportHandoffLinkConsumed@v1",
+        EventKind::TelemetryEvent { .. } => "TelemetryEvent@v1",
+        EventKind::PermissionModeChanged { .. } => "PermissionModeChanged@v1",
+        EventKind::WebSearchExecuted { .. } => "WebSearchExecuted@v1",
+        EventKind::ReviewStarted { .. } => "ReviewStarted@v1",
+        EventKind::ReviewCompleted { .. } => "ReviewCompleted@v1",
+        EventKind::ReviewPublished { .. } => "ReviewPublished@v1",
+        EventKind::TaskCreated { .. } => "TaskCreated@v1",
+        EventKind::TaskCompleted { .. } => "TaskCompleted@v1",
+        EventKind::ArtifactBundled { .. } => "ArtifactBundled@v1",
+        EventKind::SessionStarted { .. } => "SessionStarted@v1",
+        EventKind::SessionResumed { .. } => "SessionResumed@v1",
+        EventKind::ToolDenied { .. } => "ToolDenied@v1",
+        EventKind::NotebookEdited { .. } => "NotebookEdited@v1",
+        EventKind::PdfTextExtracted { .. } => "PdfTextExtracted@v1",
+        EventKind::IdeSessionStarted { .. } => "IdeSessionStarted@v1",
+        EventKind::TurnLimitExceeded { .. } => "TurnLimitExceeded@v1",
+        EventKind::BudgetExceeded { .. } => "BudgetExceeded@v1",
+        EventKind::TaskUpdated { .. } => "TaskUpdated@v1",
+        EventKind::TaskDeleted { .. } => "TaskDeleted@v1",
+        EventKind::EnterPlanMode { .. } => "EnterPlanMode@v1",
+        EventKind::ExitPlanMode { .. } => "ExitPlanMode@v1",
+        EventKind::ProviderSelected { .. } => "ProviderSelected@v1",
     }
 }
 
@@ -3168,7 +3168,7 @@ mod tests {
             seq_no: 1,
             at: Utc::now(),
             session_id: session.session_id,
-            kind: EventKind::TurnAddedV1 {
+            kind: EventKind::TurnAdded {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             },
@@ -3211,7 +3211,7 @@ mod tests {
                     seq_no: seq,
                     at: Utc::now(),
                     session_id,
-                    kind: EventKind::TurnAddedV1 {
+                    kind: EventKind::TurnAdded {
                         role: "user".to_string(),
                         content: format!("msg {i}"),
                     },
@@ -3330,7 +3330,7 @@ mod tests {
                 seq_no: 1,
                 at: Utc::now(),
                 session_id: s1.session_id,
-                kind: EventKind::SubagentSpawnedV1 {
+                kind: EventKind::SubagentSpawned {
                     run_id: run1,
                     name: "planner".to_string(),
                     goal: "plan".to_string(),
@@ -3342,7 +3342,7 @@ mod tests {
                 seq_no: 2,
                 at: Utc::now(),
                 session_id: s1.session_id,
-                kind: EventKind::SubagentCompletedV1 {
+                kind: EventKind::SubagentCompleted {
                     run_id: run1,
                     output: "done".to_string(),
                 },
@@ -3353,7 +3353,7 @@ mod tests {
                 seq_no: 1,
                 at: Utc::now(),
                 session_id: s2.session_id,
-                kind: EventKind::SubagentSpawnedV1 {
+                kind: EventKind::SubagentSpawned {
                     run_id: run2,
                     name: "executor".to_string(),
                     goal: "exec".to_string(),
@@ -3406,7 +3406,7 @@ mod tests {
                         seq_no: seq,
                         at: Utc::now(),
                         session_id: sid,
-                        kind: EventKind::TurnAddedV1 {
+                        kind: EventKind::TurnAdded {
                             role: "user".to_string(),
                             content: format!("thread {t} msg {i}"),
                         },
@@ -3462,7 +3462,7 @@ mod tests {
                     seq_no: 1,
                     at: Utc::now(),
                     session_id,
-                    kind: EventKind::TurnAddedV1 {
+                    kind: EventKind::TurnAdded {
                         role: "user".to_string(),
                         content: "persisted".to_string(),
                     },
@@ -3505,7 +3505,7 @@ mod tests {
                 seq_no: 1,
                 at: Utc::now(),
                 session_id: session.session_id,
-                kind: EventKind::TurnAddedV1 {
+                kind: EventKind::TurnAdded {
                     role: "user".to_string(),
                     content: "compat".to_string(),
                 },
@@ -3516,7 +3516,7 @@ mod tests {
                 seq_no: 2,
                 at: Utc::now(),
                 session_id: session.session_id,
-                kind: EventKind::PluginEnabledV1 {
+                kind: EventKind::PluginEnabled {
                     plugin_id: "demo".to_string(),
                 },
             })
@@ -3553,10 +3553,10 @@ mod tests {
 
         // Insert events of different types in a known order
         let event_specs: Vec<(u64, EventKind)> = vec![
-            (1, EventKind::TurnAddedV1 { role: "user".to_string(), content: "first".to_string() }),
-            (2, EventKind::TurnAddedV1 { role: "assistant".to_string(), content: "second".to_string() }),
-            (3, EventKind::PluginEnabledV1 { plugin_id: "plug-a".to_string() }),
-            (4, EventKind::TurnAddedV1 { role: "user".to_string(), content: "third".to_string() }),
+            (1, EventKind::TurnAdded { role: "user".to_string(), content: "first".to_string() }),
+            (2, EventKind::TurnAdded { role: "assistant".to_string(), content: "second".to_string() }),
+            (3, EventKind::PluginEnabled { plugin_id: "plug-a".to_string() }),
+            (4, EventKind::TurnAdded { role: "user".to_string(), content: "third".to_string() }),
         ];
 
         for (seq, kind) in &event_specs {
@@ -3572,8 +3572,8 @@ mod tests {
 
         // Rebuild and verify insertion order is preserved
         let rebuilt = store.rebuild_from_events(sid).expect("rebuild");
-        assert_eq!(rebuilt.transcript.len(), 3); // 3 TurnAddedV1
-        assert_eq!(rebuilt.plugin_events.len(), 1); // 1 PluginEnabledV1
+        assert_eq!(rebuilt.transcript.len(), 3); // 3 TurnAdded
+        assert_eq!(rebuilt.plugin_events.len(), 1); // 1 PluginEnabled
         assert!(rebuilt.transcript[0].contains("first"));
         assert!(rebuilt.transcript[1].contains("second"));
         assert!(rebuilt.transcript[2].contains("third"));
@@ -3610,7 +3610,7 @@ mod tests {
                     seq_no: i,
                     at: Utc::now(),
                     session_id: sid,
-                    kind: EventKind::TurnAddedV1 {
+                    kind: EventKind::TurnAdded {
                         role: if i % 2 == 1 { "user" } else { "assistant" }.to_string(),
                         content: format!("msg-{i}"),
                     },

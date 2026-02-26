@@ -23,7 +23,7 @@ This matrix reflects runtime behavior after the tool-use loop migration (P3.5).
 
 | Area | Status | Runtime Truth |
 |---|---|---|
-| Architect contract enforcement | DONE | Strict `ARCHITECT_PLAN_V1` parsing with bounded repair retries. |
+| Architect contract enforcement | REMOVED | Legacy pipeline removed; tool-use loop is the default execution path. |
 | Editor contract enforcement | DONE | Strict unified-diff or `NEED_CONTEXT` parsing with bounded repair retries. |
 | File scope bounds | DONE | Max files/bytes per iteration and architect-file whitelist enforcement. |
 | Path safety | DONE | Absolute paths, repo-root escapes, and `.git/` mutations are rejected at apply phase. |
@@ -51,7 +51,7 @@ This matrix reflects runtime behavior after the tool-use loop migration (P3.5).
 | Removed legacy break-glass flag | DONE | `--allow-r1-drive-tools` is not part of current CLI behavior. |
 | Loop configuration | DONE | `[agent_loop]` controls iteration/retry/bounds/verify timeout + classifier/context/safety knobs. |
 | Router configuration cleanup | DONE | Active runtime/router config removed; only legacy read-compat event decode remains for historical logs. |
-| Auto context bootstrap for ask/context | DONE | Repo-ish prompts inject deterministic `AUTO_CONTEXT_BOOTSTRAP_V1` packet, plus baseline audit for vague codebase checks. |
+| Auto context bootstrap for ask/context | DONE | Repo-ish prompts inject deterministic `AUTO_CONTEXT_BOOTSTRAP` packet, plus baseline audit for vague codebase checks. |
 | Explicit no-repo error for repo-ish inspect | DONE | Returns `No repository detected. Run from project root or pass --repo <path>.` instead of generic clarification loops. |
 | Ask/context follow-up hardening | DONE | Ask/context responses provide initial analysis first and enforce max 1–2 targeted follow-ups (1 for vague codebase checks). |
 | Explicit commit intent workflow | DONE | Verify-pass never auto-commits; user commits explicitly via `/commit` or git subcommands. |

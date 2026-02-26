@@ -280,7 +280,7 @@ fn emit_spawned(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec) {
         name: lane_name.clone(),
         goal: lane_goal.clone(),
     });
-    engine.append_event_best_effort(EventKind::SubagentSpawnedV1 {
+    engine.append_event_best_effort(EventKind::SubagentSpawned {
         run_id,
         name: lane_name,
         goal: lane_goal,
@@ -303,7 +303,7 @@ fn emit_completed(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec, patch: &s
         name: lane_name.clone(),
         summary: summary.clone(),
     });
-    engine.append_event_best_effort(EventKind::SubagentCompletedV1 {
+    engine.append_event_best_effort(EventKind::SubagentCompleted {
         run_id,
         output: summary,
     });
@@ -317,7 +317,7 @@ fn emit_failed(engine: &AgentEngine, run_id: Uuid, lane: &LaneSpec, error: &str)
         name: lane_name.clone(),
         error: lane_error.clone(),
     });
-    engine.append_event_best_effort(EventKind::SubagentFailedV1 {
+    engine.append_event_best_effort(EventKind::SubagentFailed {
         run_id,
         error: lane_error,
     });

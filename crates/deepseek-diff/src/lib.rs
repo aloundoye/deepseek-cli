@@ -184,7 +184,7 @@ impl PatchStore {
             seq_no,
             at: Utc::now(),
             session_id: session.session_id,
-            kind: EventKind::PatchStagedV1 {
+            kind: EventKind::PatchStaged {
                 patch_id: patch.patch_id,
                 base_sha256: patch.base_sha256.clone(),
             },

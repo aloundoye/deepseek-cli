@@ -139,7 +139,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
         session_id: session.session_id,
-        kind: EventKind::AutopilotRunStartedV1 {
+        kind: EventKind::AutopilotRunStarted {
             run_id,
             prompt: args.prompt.clone(),
         },
@@ -148,7 +148,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
         session_id: session.session_id,
-        kind: EventKind::BackgroundJobStartedV1 {
+        kind: EventKind::BackgroundJobStarted {
             job_id: run_id,
             kind: "autopilot".to_string(),
             reference: run_id.to_string(),
@@ -201,7 +201,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
         session_id: session.session_id,
-        kind: EventKind::AutopilotRunHeartbeatV1 {
+        kind: EventKind::AutopilotRunHeartbeat {
             run_id,
             completed_iterations,
             failed_iterations,
@@ -283,7 +283,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
                 seq_no: store.next_seq_no(session.session_id)?,
                 at: Utc::now(),
                 session_id: session.session_id,
-                kind: EventKind::AutopilotRunHeartbeatV1 {
+                kind: EventKind::AutopilotRunHeartbeat {
                     run_id,
                     completed_iterations,
                     failed_iterations,
@@ -412,7 +412,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
             seq_no: store.next_seq_no(session.session_id)?,
             at: Utc::now(),
             session_id: session.session_id,
-            kind: EventKind::AutopilotRunHeartbeatV1 {
+            kind: EventKind::AutopilotRunHeartbeat {
                 run_id,
                 completed_iterations,
                 failed_iterations,
@@ -482,7 +482,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
         session_id: session.session_id,
-        kind: EventKind::AutopilotRunStoppedV1 {
+        kind: EventKind::AutopilotRunStopped {
             run_id,
             stop_reason: stop_reason.clone(),
             completed_iterations,
@@ -493,7 +493,7 @@ pub(crate) fn run_autopilot(cwd: &Path, args: AutopilotStartArgs, json_mode: boo
         seq_no: store.next_seq_no(session.session_id)?,
         at: Utc::now(),
         session_id: session.session_id,
-        kind: EventKind::BackgroundJobStoppedV1 {
+        kind: EventKind::BackgroundJobStopped {
             job_id: run_id,
             reason: stop_reason.clone(),
         },

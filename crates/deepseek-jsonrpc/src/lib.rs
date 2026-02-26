@@ -341,13 +341,13 @@ impl IdeRpcHandler {
                 content: prompt.clone(),
             });
 
-        // Record the prompt as a ChatTurnV1 event.
+        // Record the prompt as a ChatTurn event.
         let seq = self.store.next_seq_no(session_id)?;
         self.store.append_event(&deepseek_core::EventEnvelope {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id,
-            kind: EventKind::ChatTurnV1 {
+            kind: EventKind::ChatTurn {
                 message: ChatMessage::User {
                     content: prompt.clone(),
                 },
@@ -453,7 +453,7 @@ impl IdeRpcHandler {
                 seq_no: seq,
                 at: chrono::Utc::now(),
                 session_id,
-                kind: EventKind::ChatTurnV1 {
+                kind: EventKind::ChatTurn {
                     message: ChatMessage::Assistant {
                         content: Some(output.clone()),
                         reasoning_content: None,
@@ -595,7 +595,7 @@ impl IdeRpcHandler {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id,
-            kind: EventKind::TeleportBundleCreatedV1 {
+            kind: EventKind::TeleportBundleCreated {
                 bundle_id,
                 path: output_path.to_string_lossy().to_string(),
             },
@@ -663,7 +663,7 @@ impl IdeRpcHandler {
                 seq_no: seq,
                 at: chrono::Utc::now(),
                 session_id,
-                kind: EventKind::ChatTurnV1 {
+                kind: EventKind::ChatTurn {
                     message: message.clone(),
                 },
             })?;
@@ -678,7 +678,7 @@ impl IdeRpcHandler {
                 seq_no: seq,
                 at: chrono::Utc::now(),
                 session_id,
-                kind: EventKind::SessionResumedV1 {
+                kind: EventKind::SessionResumed {
                     session_id,
                     events_replayed: chat_messages.len() as u64,
                 },
@@ -739,7 +739,7 @@ impl IdeRpcHandler {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id,
-            kind: EventKind::TeleportHandoffLinkCreatedV1 {
+            kind: EventKind::TeleportHandoffLinkCreated {
                 handoff_id,
                 session_id,
                 expires_at: expires_at.clone(),
@@ -790,7 +790,7 @@ impl IdeRpcHandler {
                 seq_no: seq,
                 at: chrono::Utc::now(),
                 session_id: descriptor.session_id,
-                kind: EventKind::TeleportHandoffLinkConsumedV1 {
+                kind: EventKind::TeleportHandoffLinkConsumed {
                     handoff_id,
                     session_id: descriptor.session_id,
                     success: false,
@@ -812,7 +812,7 @@ impl IdeRpcHandler {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id: descriptor.session_id,
-            kind: EventKind::TeleportHandoffLinkConsumedV1 {
+            kind: EventKind::TeleportHandoffLinkConsumed {
                 handoff_id,
                 session_id: descriptor.session_id,
                 success: true,
@@ -855,7 +855,7 @@ impl IdeRpcHandler {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id: parsed,
-            kind: EventKind::SessionResumedV1 {
+            kind: EventKind::SessionResumed {
                 session_id: parsed,
                 events_replayed,
             },
@@ -940,7 +940,7 @@ impl IdeRpcHandler {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id,
-            kind: EventKind::ToolApprovedV1 { invocation_id },
+            kind: EventKind::ToolApproved { invocation_id },
         })?;
 
         Ok(serde_json::json!({
@@ -1001,7 +1001,7 @@ impl IdeRpcHandler {
             seq_no: seq,
             at: chrono::Utc::now(),
             session_id,
-            kind: EventKind::PatchAppliedV1 {
+            kind: EventKind::PatchApplied {
                 patch_id,
                 applied: true,
                 conflicts: vec![],

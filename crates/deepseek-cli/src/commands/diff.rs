@@ -53,7 +53,7 @@ pub(crate) fn run_apply(cwd: &Path, args: ApplyArgs, json_mode: bool) -> Result<
     let checkpoint = MemoryManager::new(cwd)?.create_checkpoint("patch_apply")?;
     append_control_event(
         cwd,
-        EventKind::CheckpointCreatedV1 {
+        EventKind::CheckpointCreated {
             checkpoint_id: checkpoint.checkpoint_id,
             reason: checkpoint.reason.clone(),
             files_count: checkpoint.files_count,

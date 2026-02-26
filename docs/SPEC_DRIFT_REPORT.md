@@ -12,9 +12,9 @@
 **Spec reference:** Section 4.8 "All session events are appended to events.jsonl"
 
 **What was missing:**
-- `SessionStartedV1` — no explicit session-start event
-- `SessionResumedV1` — no explicit session-resume event
-- `ToolDeniedV1` — no explicit tool-denial event
+- `SessionStarted` — no explicit session-start event
+- `SessionResumed` — no explicit session-resume event
+- `ToolDenied` — no explicit tool-denial event
 
 **Fix applied:**
 - Added 3 new variants to `EventKind` enum in `crates/deepseek-core/src/lib.rs:513-524`
