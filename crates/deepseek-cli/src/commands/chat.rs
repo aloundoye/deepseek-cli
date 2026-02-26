@@ -114,10 +114,8 @@ fn parse_diff_args(args: &[String]) -> (bool, bool) {
 fn parse_chat_mode_name(raw: &str) -> Option<ChatMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "ask" => Some(ChatMode::Ask),
-        "code" => Some(ChatMode::Code),
-        "architect" | "plan" => Some(ChatMode::Architect),
+        "code" | "architect" | "plan" | "pipeline" => Some(ChatMode::Code),
         "context" => Some(ChatMode::Context),
-        "pipeline" => Some(ChatMode::Pipeline),
         _ => None,
     }
 }
@@ -126,9 +124,7 @@ fn chat_mode_name(mode: ChatMode) -> &'static str {
     match mode {
         ChatMode::Ask => "ask",
         ChatMode::Code => "code",
-        ChatMode::Architect => "architect",
         ChatMode::Context => "context",
-        ChatMode::Pipeline => "pipeline",
     }
 }
 
@@ -457,13 +453,30 @@ fn slash_lint_output(cwd: &Path, args: &[String], cfg: Option<&AppConfig>) -> Re
         return slash_run_output(cwd, &[args.join(" ")]);
     }
 
-    // Try configured lint commands from AppConfig.agent_loop.lint (derive per changed files)
+    // Try configured lint commands from AppConfig.agent_loop.lint
     if let Some(cfg) = cfg {
         let lint_cfg = &cfg.agent_loop.lint;
         if lint_cfg.enabled && !lint_cfg.commands.is_empty() {
             let changed = changed_file_list(cwd);
-            let commands =
-                deepseek_agent::linter::derive_lint_commands(lint_cfg, &changed);
+            // Derive matching lint commands for the changed file extensions
+            let mut commands = Vec::new();
+            for file in &changed {
+                let ext = file.rsplit('.').next().unwrap_or("");
+                let lang = match ext {
+                    "rs" => "rust",
+                    "py" => "python",
+                    "js" | "jsx" => "javascript",
+                    "ts" | "tsx" => "typescript",
+                    "go" => "go",
+                    "java" => "java",
+                    _ => ext,
+                };
+                if let Some(cmd) = lint_cfg.commands.get(lang) {
+                    if !commands.contains(cmd) {
+                        commands.push(cmd.clone());
+                    }
+                }
+            }
             if !commands.is_empty() {
                 let mut results = Vec::new();
                 for cmd in &commands {
@@ -927,8 +940,6 @@ pub(crate) fn run_chat(
         .and_then(|v| v.model.as_deref())
         .map(is_max_think_selection)
         .unwrap_or(false);
-    let force_execute = cli.map(|v| v.force_execute).unwrap_or(false);
-    let force_plan_only = cli.map(|v| v.plan_only).unwrap_or(false);
     let teammate_mode = cli.and_then(|v| v.teammate_mode.clone());
     let repo_root_override = cli.and_then(|v| v.repo.clone());
     let watch_files_enabled = cli.map(|value| value.watch_files).unwrap_or(false);
@@ -949,8 +960,6 @@ pub(crate) fn run_chat(
             allow_tools,
             &cfg,
             force_max_think,
-            force_execute,
-            force_plan_only,
             teammate_mode.clone(),
             repo_root_override.clone(),
             debug_context,
@@ -1112,11 +1121,11 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Architect(_args) => {
-                    active_chat_mode = ChatMode::Architect;
+                    active_chat_mode = ChatMode::Code;
                     if json_mode {
-                        print_json(&json!({"mode": "architect"}))?;
+                        print_json(&json!({"mode": "code"}))?;
                     } else {
-                        println!("chat mode set to architect");
+                        println!("chat mode set to code");
                     }
                 }
                 SlashCommand::ChatMode(mode) => {
@@ -1141,7 +1150,7 @@ pub(crate) fn run_chat(
                         )?;
                     } else {
                         println!(
-                            "unsupported chat mode: {raw_mode} (use ask|code|architect|context)"
+                            "unsupported chat mode: {raw_mode} (use ask|code|context)"
                         );
                     }
                 }
@@ -2079,8 +2088,6 @@ pub(crate) fn run_chat(
                                     repo_root_override: repo_root_override.clone(),
                                     debug_context,
                                     mode: active_chat_mode,
-                                    force_execute,
-                                    force_plan_only,
                                     teammate_mode: teammate_mode.clone(),
                                     detect_urls,
                                     watch_files: watch_files_enabled,
@@ -2112,19 +2119,6 @@ pub(crate) fn run_chat(
                     "type": match &chunk {
                         deepseek_core::StreamChunk::ContentDelta(_) => "ContentDelta",
                         deepseek_core::StreamChunk::ReasoningDelta(_) => "ReasoningDelta",
-                        deepseek_core::StreamChunk::ArchitectStarted { .. } => "ArchitectStarted",
-                        deepseek_core::StreamChunk::ArchitectCompleted { .. } => "ArchitectCompleted",
-                        deepseek_core::StreamChunk::EditorStarted { .. } => "EditorStarted",
-                        deepseek_core::StreamChunk::EditorCompleted { .. } => "EditorCompleted",
-                        deepseek_core::StreamChunk::ApplyStarted { .. } => "ApplyStarted",
-                        deepseek_core::StreamChunk::ApplyCompleted { .. } => "ApplyCompleted",
-                        deepseek_core::StreamChunk::VerifyStarted { .. } => "VerifyStarted",
-                        deepseek_core::StreamChunk::VerifyCompleted { .. } => "VerifyCompleted",
-                        deepseek_core::StreamChunk::LintStarted { .. } => "LintStarted",
-                        deepseek_core::StreamChunk::LintCompleted { .. } => "LintCompleted",
-                        deepseek_core::StreamChunk::CommitProposal { .. } => "CommitProposal",
-                        deepseek_core::StreamChunk::CommitCompleted { .. } => "CommitCompleted",
-                        deepseek_core::StreamChunk::CommitSkipped => "CommitSkipped",
                         deepseek_core::StreamChunk::ToolCallStart { .. } => "ToolCallStart",
                         deepseek_core::StreamChunk::ToolCallEnd { .. } => "ToolCallEnd",
                         deepseek_core::StreamChunk::ModeTransition { .. } => "ModeTransition",
@@ -2140,18 +2134,6 @@ pub(crate) fn run_chat(
                         deepseek_core::StreamChunk::ContentDelta(text) | deepseek_core::StreamChunk::ReasoningDelta(text) => {
                             serde_json::json!({ "text": text })
                         },
-                        deepseek_core::StreamChunk::ArchitectStarted { iteration } => serde_json::json!({ "iteration": iteration }),
-                        deepseek_core::StreamChunk::ArchitectCompleted { iteration, files, no_edit } => serde_json::json!({ "iteration": iteration, "files": files, "no_edit": no_edit }),
-                        deepseek_core::StreamChunk::EditorStarted { iteration, files } => serde_json::json!({ "iteration": iteration, "files": files }),
-                        deepseek_core::StreamChunk::EditorCompleted { iteration, status } => serde_json::json!({ "iteration": iteration, "status": status }),
-                        deepseek_core::StreamChunk::ApplyStarted { iteration } => serde_json::json!({ "iteration": iteration }),
-                        deepseek_core::StreamChunk::ApplyCompleted { iteration, success, summary } => serde_json::json!({ "iteration": iteration, "success": success, "summary": summary }),
-                        deepseek_core::StreamChunk::VerifyStarted { iteration, commands } => serde_json::json!({ "iteration": iteration, "commands": commands }),
-                        deepseek_core::StreamChunk::VerifyCompleted { iteration, success, summary } => serde_json::json!({ "iteration": iteration, "success": success, "summary": summary }),
-                        deepseek_core::StreamChunk::LintStarted { iteration, commands } => serde_json::json!({ "iteration": iteration, "commands": commands }),
-                        deepseek_core::StreamChunk::LintCompleted { iteration, success, fixed, remaining } => serde_json::json!({ "iteration": iteration, "success": success, "fixed": fixed, "remaining": remaining }),
-                        deepseek_core::StreamChunk::CommitProposal { files, touched_files, loc_delta, verify_commands, verify_status, suggested_message } => serde_json::json!({ "files": files, "touched_files": touched_files, "loc_delta": loc_delta, "verify_commands": verify_commands, "verify_status": verify_status, "suggested_message": suggested_message }),
-                        deepseek_core::StreamChunk::CommitCompleted { sha, message } => serde_json::json!({ "sha": sha, "message": message }),
                         deepseek_core::StreamChunk::ToolCallStart { tool_name, args_summary } => serde_json::json!({ "tool_name": tool_name, "args_summary": args_summary }),
                         deepseek_core::StreamChunk::ToolCallEnd { tool_name, duration_ms, success, summary } => serde_json::json!({ "tool_name": tool_name, "duration_ms": duration_ms, "success": success, "summary": summary }),
                         deepseek_core::StreamChunk::ModeTransition { from, to, reason } => serde_json::json!({ "from": from, "to": to, "reason": reason }),
@@ -2180,96 +2162,6 @@ pub(crate) fn run_chat(
                         }
                     }
                     deepseek_core::StreamChunk::ReasoningDelta(_) => {}
-                    deepseek_core::StreamChunk::ArchitectStarted { iteration: _ } => {
-                        crate::md_render::print_phase("◉", "Planning", "understanding context and defining plan");
-                    }
-                    deepseek_core::StreamChunk::ArchitectCompleted {
-                        files,
-                        no_edit,
-                        ..
-                    } => {
-                        let detail = if no_edit { "no changes needed".to_string() } else { format!("{files} file(s) selected") };
-                        crate::md_render::print_phase_done(true, "Plan complete", &detail);
-                    }
-                    deepseek_core::StreamChunk::EditorStarted { files, .. } => {
-                        crate::md_render::print_phase("◉", "Editing", &format!("{files} file(s)"));
-                    }
-                    deepseek_core::StreamChunk::EditorCompleted { status, .. } => {
-                        let success = status != "error";
-                        crate::md_render::print_phase_done(success, "Edit complete", &status);
-                    }
-                    deepseek_core::StreamChunk::ApplyStarted { .. } => {
-                        crate::md_render::print_phase("◉", "Applying", "writing changes to disk");
-                    }
-                    deepseek_core::StreamChunk::ApplyCompleted {
-                        success,
-                        ..
-                    } => {
-                        crate::md_render::print_phase_done(success, "Apply complete", "");
-                    }
-                    deepseek_core::StreamChunk::VerifyStarted {
-                        commands,
-                        ..
-                    } => {
-                        if !commands.is_empty() {
-                            crate::md_render::print_phase("◉", "Verifying", &commands.join(", "));
-                        }
-                    }
-                    deepseek_core::StreamChunk::VerifyCompleted {
-                        success,
-                        ..
-                    } => {
-                        let label = if success { "Verification passed" } else { "Verification failed" };
-                        crate::md_render::print_phase_done(success, label, "");
-                    }
-                    deepseek_core::StreamChunk::LintStarted {
-                        commands,
-                        ..
-                    } => {
-                        if !commands.is_empty() {
-                            crate::md_render::print_phase("◉", "Linting", &commands.join(", "));
-                        }
-                    }
-                    deepseek_core::StreamChunk::LintCompleted {
-                        success,
-                        ..
-                    } => {
-                        crate::md_render::print_phase_done(success, "Lint complete", "");
-                    }
-                    deepseek_core::StreamChunk::CommitProposal {
-                        files,
-                        touched_files,
-                        loc_delta,
-                        suggested_message,
-                        ..
-                    } => {
-                        use std::io::Write as _;
-                        let out = std::io::stdout();
-                        let mut handle = out.lock();
-                        let _ = writeln!(
-                            handle,
-                            "\n  \x1b[33m◆\x1b[0m  \x1b[1mCommit Proposal\x1b[0m — {} file(s), +{} LoC",
-                            touched_files, loc_delta
-                        );
-                        for f in &files {
-                            let _ = writeln!(handle, "     \x1b[90m•\x1b[0m {f}");
-                        }
-                        let _ = writeln!(
-                            handle,
-                            "     \x1b[90mmessage:\x1b[0m \"{suggested_message}\""
-                        );
-                        let _ = handle.flush();
-                    }
-                    deepseek_core::StreamChunk::CommitCompleted { sha, message } => {
-                        crate::md_render::print_phase_done(true, "Committed", &format!("{} — {}", &sha[..7.min(sha.len())], message));
-                    }
-                    deepseek_core::StreamChunk::CommitSkipped => {
-                        use std::io::Write as _;
-                        let out = std::io::stdout();
-                        let mut handle = out.lock();
-                        let _ = writeln!(handle, "  \x1b[90m◦  Commit skipped\x1b[0m");
-                        let _ = handle.flush();
-                    }
                     deepseek_core::StreamChunk::ToolCallStart { tool_name, args_summary } => {
                         crate::md_render::print_phase("⚡", &tool_name, &args_summary);
                     }
@@ -2355,8 +2247,6 @@ pub(crate) fn run_chat(
                 repo_root_override: repo_root_override.clone(),
                 debug_context,
                 mode: active_chat_mode,
-                force_execute,
-                force_plan_only,
                 teammate_mode: teammate_mode.clone(),
                 detect_urls,
                 watch_files: watch_files_enabled,
@@ -2411,8 +2301,6 @@ pub(crate) fn run_chat(
                             repo_root_override: repo_root_override.clone(),
                             debug_context,
                             mode: active_chat_mode,
-                            force_execute,
-                            force_plan_only,
                             teammate_mode: teammate_mode.clone(),
                             detect_urls,
                             watch_files: true,
@@ -2435,8 +2323,6 @@ pub(crate) fn run_chat_tui(
     allow_tools: bool,
     cfg: &AppConfig,
     initial_force_max_think: bool,
-    force_execute: bool,
-    force_plan_only: bool,
     teammate_mode: Option<String>,
     repo_root_override: Option<PathBuf>,
     debug_context: bool,
@@ -2508,9 +2394,9 @@ pub(crate) fn run_chat_tui(
                 }
                 SlashCommand::Architect(_) => {
                     if let Ok(mut guard) = active_mode_for_closure.lock() {
-                        *guard = ChatMode::Architect;
+                        *guard = ChatMode::Code;
                     }
-                    "chat mode set to architect".to_string()
+                    "chat mode set to code".to_string()
                 }
                 SlashCommand::ChatMode(mode) => {
                     if let Some(raw_mode) = mode {
@@ -2520,7 +2406,7 @@ pub(crate) fn run_chat_tui(
                             }
                             format!("chat mode set to {}", chat_mode_name(parsed))
                         } else {
-                            format!("unsupported chat mode: {raw_mode} (ask|code|architect|context)")
+                            format!("unsupported chat mode: {raw_mode} (ask|code|context)")
                         }
                     } else if let Ok(guard) = active_mode_for_closure.lock() {
                         format!("current chat mode: {}", chat_mode_name(*guard))
@@ -3134,105 +3020,6 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ReasoningDelta(s) => {
                     let _ = tx_stream.send(TuiStreamEvent::ReasoningDelta(s));
                 }
-                StreamChunk::ArchitectStarted { iteration } => {
-                    let _ = tx_stream.send(TuiStreamEvent::ArchitectStarted { iteration });
-                }
-                StreamChunk::ArchitectCompleted {
-                    iteration,
-                    files,
-                    no_edit,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::ArchitectCompleted {
-                        iteration,
-                        files,
-                        no_edit,
-                    });
-                }
-                StreamChunk::EditorStarted { iteration, files } => {
-                    let _ = tx_stream.send(TuiStreamEvent::EditorStarted { iteration, files });
-                }
-                StreamChunk::EditorCompleted { iteration, status } => {
-                    let _ = tx_stream.send(TuiStreamEvent::EditorCompleted { iteration, status });
-                }
-                StreamChunk::ApplyStarted { iteration } => {
-                    let _ = tx_stream.send(TuiStreamEvent::ApplyStarted { iteration });
-                }
-                StreamChunk::ApplyCompleted {
-                    iteration,
-                    success,
-                    summary,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::ApplyCompleted {
-                        iteration,
-                        success,
-                        summary,
-                    });
-                }
-                StreamChunk::VerifyStarted {
-                    iteration,
-                    commands,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::VerifyStarted {
-                        iteration,
-                        commands,
-                    });
-                }
-                StreamChunk::VerifyCompleted {
-                    iteration,
-                    success,
-                    summary,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::VerifyCompleted {
-                        iteration,
-                        success,
-                        summary,
-                    });
-                }
-                StreamChunk::LintStarted {
-                    iteration,
-                    commands,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::LintStarted {
-                        iteration,
-                        commands,
-                    });
-                }
-                StreamChunk::LintCompleted {
-                    iteration,
-                    success,
-                    fixed,
-                    remaining,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::LintCompleted {
-                        iteration,
-                        success,
-                        fixed,
-                        remaining,
-                    });
-                }
-                StreamChunk::CommitProposal {
-                    files,
-                    touched_files,
-                    loc_delta,
-                    verify_commands,
-                    verify_status,
-                    suggested_message,
-                } => {
-                    let _ = tx_stream.send(TuiStreamEvent::CommitProposal {
-                        files,
-                        touched_files,
-                        loc_delta,
-                        verify_commands,
-                        verify_status,
-                        suggested_message,
-                    });
-                }
-                StreamChunk::CommitCompleted { sha, message } => {
-                    let _ = tx_stream.send(TuiStreamEvent::CommitCompleted { sha, message });
-                }
-                StreamChunk::CommitSkipped => {
-                    let _ = tx_stream.send(TuiStreamEvent::CommitSkipped);
-                }
                 StreamChunk::ToolCallStart {
                     tool_name,
                     args_summary,
@@ -3307,8 +3094,6 @@ pub(crate) fn run_chat_tui(
                             repo_root_override: prompt_repo_root_override.clone(),
                             debug_context,
                             mode: mode_for_turn,
-                            force_execute,
-                            force_plan_only,
                             teammate_mode: teammate_mode_for_turn.clone(),
                             detect_urls,
                             watch_files: watch_files_enabled,
@@ -4257,126 +4042,6 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     let _ = text;
                     // In text mode, reasoning is not shown
                 }
-                StreamChunk::ArchitectStarted { iteration } => {
-                    let _ = writeln!(handle, "\n[phase] architect started (iter {iteration})");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ArchitectCompleted {
-                    iteration,
-                    files,
-                    no_edit,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[phase] architect completed (iter {iteration}) files={files} no_edit={no_edit}"
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::EditorStarted { iteration, files } => {
-                    let _ = writeln!(handle, "[phase] editor started (iter {iteration}) files={files}");
-                    let _ = handle.flush();
-                }
-                StreamChunk::EditorCompleted { iteration, status } => {
-                    let _ = writeln!(handle, "[phase] editor completed (iter {iteration}) status={status}");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ApplyStarted { iteration } => {
-                    let _ = writeln!(handle, "[phase] apply started (iter {iteration})");
-                    let _ = handle.flush();
-                }
-                StreamChunk::ApplyCompleted {
-                    iteration,
-                    success,
-                    summary,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[phase] apply {} (iter {iteration}) {}",
-                        if success { "ok" } else { "failed" },
-                        summary.replace('\n', " ")
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::VerifyStarted {
-                    iteration,
-                    commands,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[phase] verify started (iter {iteration}) {}",
-                        commands.join(" | ")
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::VerifyCompleted {
-                    iteration,
-                    success,
-                    summary,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[phase] verify {} (iter {iteration}) {}",
-                        if success { "ok" } else { "failed" },
-                        summary.replace('\n', " ")
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::LintStarted {
-                    iteration,
-                    commands,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[phase] lint started (iter {iteration}) {}",
-                        commands.join(" | ")
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::LintCompleted {
-                    iteration,
-                    success,
-                    fixed,
-                    remaining,
-                } => {
-                    let _ = writeln!(
-                        handle,
-                        "[phase] lint {} (iter {iteration}) fixed={fixed} remaining={remaining}",
-                        if success { "ok" } else { "failed" },
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::CommitProposal {
-                    files,
-                    touched_files,
-                    loc_delta,
-                    verify_commands,
-                    verify_status,
-                    suggested_message,
-                } => {
-                    let _ = verify_commands;
-                    let _ = verify_status;
-                    let _ = writeln!(
-                        handle,
-                        "[commit] ready files={} touched={} loc={} message=\"{}\"",
-                        files.join(","),
-                        touched_files,
-                        loc_delta,
-                        suggested_message
-                    );
-                    let _ = writeln!(
-                        handle,
-                        "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
-                    );
-                    let _ = handle.flush();
-                }
-                StreamChunk::CommitCompleted { sha, message } => {
-                    let _ = writeln!(handle, "[commit] completed sha={sha} message=\"{message}\"");
-                    let _ = handle.flush();
-                }
-                StreamChunk::CommitSkipped => {
-                    let _ = writeln!(handle, "[commit] skipped by user");
-                    let _ = handle.flush();
-                }
                 StreamChunk::ToolCallStart {
                     tool_name,
                     args_summary,
@@ -4610,10 +4275,10 @@ mod tests {
     fn parse_chat_mode_name_supports_expected_aliases() {
         assert_eq!(parse_chat_mode_name("ask"), Some(ChatMode::Ask));
         assert_eq!(parse_chat_mode_name("code"), Some(ChatMode::Code));
-        assert_eq!(parse_chat_mode_name("architect"), Some(ChatMode::Architect));
-        assert_eq!(parse_chat_mode_name("plan"), Some(ChatMode::Architect));
+        assert_eq!(parse_chat_mode_name("architect"), Some(ChatMode::Code));
+        assert_eq!(parse_chat_mode_name("plan"), Some(ChatMode::Code));
         assert_eq!(parse_chat_mode_name("context"), Some(ChatMode::Context));
-        assert_eq!(parse_chat_mode_name("pipeline"), Some(ChatMode::Pipeline));
+        assert_eq!(parse_chat_mode_name("pipeline"), Some(ChatMode::Code));
         assert_eq!(parse_chat_mode_name("invalid"), None);
     }
 
@@ -4651,7 +4316,7 @@ mod tests {
         let save = slash_save_profile_output(
             root,
             &[String::from("roundtrip")],
-            ChatMode::Architect,
+            ChatMode::Code,
             true,
             true,
             &additional_dirs,
@@ -4660,7 +4325,7 @@ mod tests {
 
         let (mode, read_only, thinking, dirs, load_msg) =
             slash_load_profile_output(root, &[String::from("roundtrip")])?;
-        assert_eq!(mode, ChatMode::Architect);
+        assert_eq!(mode, ChatMode::Code);
         assert!(read_only);
         assert!(thinking);
         assert_eq!(dirs, additional_dirs);

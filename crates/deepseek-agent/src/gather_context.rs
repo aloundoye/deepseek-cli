@@ -1,5 +1,5 @@
 use crate::ChatMode;
-use crate::architect;
+use crate::shared;
 use deepseek_core::AppConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -561,7 +561,7 @@ fn build_repo_map_summary(
     max_lines: usize,
     additional_dirs: &[PathBuf],
 ) -> String {
-    let summary = architect::build_repo_map(workspace, prompt, max_lines.max(1), additional_dirs);
+    let summary = shared::build_repo_map(workspace, prompt, max_lines.max(1), additional_dirs);
     summary
         .lines()
         .take(max_lines.max(1))

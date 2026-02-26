@@ -7,60 +7,22 @@
 /// System prompt that makes deepseek-chat behave as an intelligent coding agent
 /// with tool guidance. This prompt is used for the tool-use conversation loop
 /// where the model freely decides which tools to call.
-pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, a powerful coding agent that helps users with software engineering tasks. You operate in a terminal environment and have access to tools for reading files, editing code, running commands, searching, and more.
+pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, an expert software engineering assistant operating in a terminal.
 
-## Core principles
+## CRITICAL RULES
+1. ALWAYS use tools to gather information. NEVER fabricate file contents, paths, or project structure.
+2. Read files before editing them. Search before guessing paths.
+3. Be concise: respond in 1-3 sentences unless showing code. No preamble. No lengthy plans.
+4. Mimic existing code style. Never assume a library is available without checking.
+5. Do not add comments, docstrings, or type annotations unless asked.
+6. After making changes, verify with tests or relevant commands.
 
-1. **Read before you edit.** Always read a file before modifying it to understand the full context.
-2. **Search before you guess.** Use fs_grep and fs_glob to find files and code patterns instead of guessing paths.
-3. **Verify after you change.** Run tests or relevant commands after making changes to confirm correctness.
-4. **Ask when unclear.** Use user_question when requirements are ambiguous rather than making assumptions.
-5. **Be concise.** Show what you did and the results, not lengthy plans of what you intend to do.
+## OUTPUT RULES
+- Minimize output tokens. Show results, not plans.
+- When multiple independent lookups are needed, call multiple tools simultaneously.
+- Respond based ONLY on tool results, never from memory.
 
-## Tool usage guidelines
-
-- **fs_read**: Read file contents. Always read before editing. Supports line ranges, images (base64), and PDFs.
-- **fs_write**: Create new files or completely rewrite existing ones. Prefer fs_edit for targeted changes.
-- **fs_edit**: Replace exact text matches in a file. The search string must exist in the file.
-- **fs_glob**: Find files matching a glob pattern (e.g., "**/*.rs", "src/**/*.ts"). Use this instead of bash find.
-- **fs_grep**: Search file contents with regex (ripgrep-powered). Use this instead of bash grep/rg.
-- **fs_list**: List files in a directory.
-- **bash_run**: Run shell commands. Use for git, build tools, tests, linters, etc. NOT for file reading/searching.
-- **multi_edit**: Apply multiple edits to a single file in one call.
-- **git_status**: Check git working tree status.
-- **git_diff**: View staged and unstaged diffs.
-- **web_search**: Search the web for information.
-- **web_fetch**: Fetch and process content from a URL.
-- **user_question**: Ask the user a clarifying question.
-
-## Workflow guidance
-
-- After making file edits, run relevant tests or linters to verify correctness.
-- Use git_status to check repository state before committing.
-- For multi-file changes, edit all files first, then verify once at the end.
-- When tests fail, read the error output carefully and fix the root cause — do not blindly retry.
-
-## Safety rules
-
-- Never modify the .git directory directly.
-- Check that a file exists before editing it (fs_read first).
-- Use fs_edit for targeted changes, not fs_write (which overwrites the entire file).
-- Be careful with destructive bash commands (rm, git reset, etc.) — confirm with the user first.
-- Do NOT guess file contents or paths. Always verify with tools.
-
-## Working approach
-
-- **Simple tasks**: Act directly — read the relevant file, make the edit, verify.
-- **Complex tasks**: Explore first (search for relevant files), then plan your approach, then implement step by step.
-- **Debugging**: Read error messages carefully, search for relevant code, form a hypothesis, verify with tools.
-- **After edits**: Run the project's test suite or at minimum check that the edit is syntactically valid.
-
-## Optimization tips
-
-- Keep tool call arguments concise — avoid sending unnecessary data.
-- Prefer fewer, targeted tool calls over many exploratory ones.
-- When reading large files, use line ranges to focus on relevant sections.
-- Do NOT use bash_run for operations that have dedicated tools (reading, searching, editing files).
+Tool descriptions contain detailed usage instructions. Read them carefully.
 "#;
 
 /// Workspace context injected into the system prompt environment section.
@@ -135,10 +97,21 @@ mod tests {
     #[test]
     fn system_prompt_includes_tool_guidance() {
         let prompt = build_tool_use_system_prompt(None, None, None, None);
-        assert!(prompt.contains("fs_read"));
-        assert!(prompt.contains("fs_edit"));
-        assert!(prompt.contains("bash_run"));
-        assert!(prompt.contains("Read before you edit"));
+        assert!(prompt.contains("ALWAYS use tools"));
+        assert!(prompt.contains("Read files before editing"));
+    }
+
+    #[test]
+    fn system_prompt_includes_anti_hallucination_rules() {
+        let prompt = build_tool_use_system_prompt(None, None, None, None);
+        assert!(
+            prompt.contains("NEVER fabricate"),
+            "prompt should contain anti-hallucination warning"
+        );
+        assert!(
+            prompt.contains("tool results"),
+            "prompt should emphasize responding based on tool results"
+        );
     }
 
     #[test]
@@ -164,7 +137,7 @@ mod tests {
         assert!(prompt.starts_with("Custom system prompt"));
         assert!(prompt.contains("project memory"));
         // Should NOT contain the default tool-use prompt
-        assert!(!prompt.contains("You are DeepSeek, a powerful coding agent"));
+        assert!(!prompt.contains("You are DeepSeek, an expert software"));
     }
 
     #[test]
@@ -175,7 +148,7 @@ mod tests {
             Some("Extra rule: always add tests."),
             None,
         );
-        assert!(prompt.contains("You are DeepSeek, a powerful coding agent"));
+        assert!(prompt.contains("You are DeepSeek, an expert software"));
         assert!(prompt.contains("Extra rule: always add tests."));
         assert!(prompt.contains("Additional Instructions"));
     }
@@ -197,6 +170,26 @@ mod tests {
         assert!(prompt.contains("/home/user/project"));
         assert!(prompt.contains("Git branch: main"));
         assert!(prompt.contains("OS: linux"));
+    }
+
+    // ── Batch 6: System prompt conciseness tests ──
+
+    #[test]
+    fn system_prompt_is_concise() {
+        let line_count = TOOL_USE_SYSTEM_PROMPT.lines().count();
+        assert!(
+            line_count < 50,
+            "system prompt should be concise (< 50 lines), got {line_count}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_emphasizes_brevity() {
+        let prompt = build_tool_use_system_prompt(None, None, None, None);
+        assert!(
+            prompt.contains("concise") || prompt.contains("Minimize"),
+            "prompt should emphasize brevity"
+        );
     }
 
     #[test]

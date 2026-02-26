@@ -1247,65 +1247,6 @@ pub enum StreamChunk {
     ContentDelta(String),
     /// A reasoning/thinking text delta.
     ReasoningDelta(String),
-    /// Architect phase started.
-    ArchitectStarted { iteration: u64 },
-    /// Architect phase completed.
-    ArchitectCompleted {
-        iteration: u64,
-        files: u32,
-        no_edit: bool,
-    },
-    /// Editor phase started.
-    EditorStarted { iteration: u64, files: u32 },
-    /// Editor phase completed.
-    EditorCompleted { iteration: u64, status: String },
-    /// Apply phase started.
-    ApplyStarted { iteration: u64 },
-    /// Apply phase completed.
-    ApplyCompleted {
-        iteration: u64,
-        success: bool,
-        summary: String,
-    },
-    /// Lint phase started (between Apply and Verify).
-    LintStarted {
-        iteration: u64,
-        commands: Vec<String>,
-    },
-    /// Lint phase completed.
-    LintCompleted {
-        iteration: u64,
-        success: bool,
-        fixed: u32,
-        remaining: u32,
-    },
-    /// Verify phase started.
-    VerifyStarted {
-        iteration: u64,
-        commands: Vec<String>,
-    },
-    /// Verify phase completed.
-    VerifyCompleted {
-        iteration: u64,
-        success: bool,
-        summary: String,
-    },
-    /// Verify passed and the runtime is ready for an explicit user commit.
-    CommitProposal {
-        files: Vec<String>,
-        touched_files: u32,
-        loc_delta: u32,
-        verify_commands: Vec<String>,
-        verify_status: String,
-        suggested_message: String,
-    },
-    /// Commit completed (user accepted the proposal).
-    CommitCompleted {
-        sha: String,
-        message: String,
-    },
-    /// Commit skipped by user choice.
-    CommitSkipped,
     /// A tool call has started execution.
     ToolCallStart {
         tool_name: String,
@@ -1368,116 +1309,6 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
         StreamChunk::ReasoningDelta(text) => serde_json::json!({
             "type": "reasoning_delta",
             "text": text,
-        }),
-        StreamChunk::ArchitectStarted { iteration } => serde_json::json!({
-            "type": "phase",
-            "phase": "architect_started",
-            "iteration": iteration,
-        }),
-        StreamChunk::ArchitectCompleted {
-            iteration,
-            files,
-            no_edit,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "architect_completed",
-            "iteration": iteration,
-            "files": files,
-            "no_edit": no_edit,
-        }),
-        StreamChunk::EditorStarted { iteration, files } => serde_json::json!({
-            "type": "phase",
-            "phase": "editor_started",
-            "iteration": iteration,
-            "files": files,
-        }),
-        StreamChunk::EditorCompleted { iteration, status } => serde_json::json!({
-            "type": "phase",
-            "phase": "editor_completed",
-            "iteration": iteration,
-            "status": status,
-        }),
-        StreamChunk::ApplyStarted { iteration } => serde_json::json!({
-            "type": "phase",
-            "phase": "apply_started",
-            "iteration": iteration,
-        }),
-        StreamChunk::ApplyCompleted {
-            iteration,
-            success,
-            summary,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "apply_completed",
-            "iteration": iteration,
-            "success": success,
-            "summary": summary,
-        }),
-        StreamChunk::LintStarted {
-            iteration,
-            commands,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "lint_started",
-            "iteration": iteration,
-            "commands": commands,
-        }),
-        StreamChunk::LintCompleted {
-            iteration,
-            success,
-            fixed,
-            remaining,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "lint_completed",
-            "iteration": iteration,
-            "success": success,
-            "fixed": fixed,
-            "remaining": remaining,
-        }),
-        StreamChunk::VerifyStarted {
-            iteration,
-            commands,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "verify_started",
-            "iteration": iteration,
-            "commands": commands,
-        }),
-        StreamChunk::VerifyCompleted {
-            iteration,
-            success,
-            summary,
-        } => serde_json::json!({
-            "type": "phase",
-            "phase": "verify_completed",
-            "iteration": iteration,
-            "success": success,
-            "summary": summary,
-        }),
-        StreamChunk::CommitProposal {
-            files,
-            touched_files,
-            loc_delta,
-            verify_commands,
-            verify_status,
-            suggested_message,
-        } => serde_json::json!({
-            "type": "commit_proposal",
-            "files": files,
-            "touched_files": touched_files,
-            "loc_delta": loc_delta,
-            "verify_commands": verify_commands,
-            "verify_status": verify_status,
-            "suggested_message": suggested_message,
-        }),
-        StreamChunk::CommitCompleted { sha, message } => serde_json::json!({
-            "type": "commit_completed",
-            "sha": sha,
-            "message": message,
-        }),
-        StreamChunk::CommitSkipped => serde_json::json!({
-            "type": "commit_skipped",
         }),
         StreamChunk::ToolCallStart {
             tool_name,
@@ -1714,7 +1545,7 @@ pub struct FunctionDefinition {
 }
 
 /// Controls how the model picks tools.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolChoice {
     /// "none", "auto", or "required"
@@ -1727,7 +1558,7 @@ pub enum ToolChoice {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolChoiceFunction {
     pub name: String,
 }
@@ -1855,6 +1686,9 @@ fn default_cleanup_period_days() -> u32 {
 }
 fn default_respect_gitignore() -> bool {
     true
+}
+fn default_tool_loop_max_turns() -> u64 {
+    50
 }
 fn default_agent_loop_max_iterations() -> u64 {
     6
@@ -2169,6 +2003,9 @@ pub struct AgentLoopConfig {
     pub team: TeamOrchestrationConfig,
     #[serde(default)]
     pub lint: LintConfig,
+    /// Maximum turns (LLM calls) for the tool-use loop. Defaults to 50.
+    #[serde(default = "default_tool_loop_max_turns")]
+    pub tool_loop_max_turns: u64,
 }
 
 impl Default for AgentLoopConfig {
@@ -2201,6 +2038,7 @@ impl Default for AgentLoopConfig {
             apply_strategy: ApplyStrategy::default(),
             team: TeamOrchestrationConfig::default(),
             lint: LintConfig::default(),
+            tool_loop_max_turns: default_tool_loop_max_turns(),
         }
     }
 }

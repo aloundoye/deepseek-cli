@@ -15,8 +15,8 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `base_model` | string | `"deepseek-chat"` | Model used for Editor mode (diff generation) |
-| `max_think_model` | string | `"deepseek-reasoner"` | Model used for Architect mode (planning, reasoning) |
+| `base_model` | string | `"deepseek-chat"` | Default model for tool-use loop and Editor mode |
+| `max_think_model` | string | `"deepseek-reasoner"` | Thinking model for Architect mode, `/thinking`, and `think_deeply` tool |
 | `provider` | string | `"deepseek"` | LLM provider identifier |
 | `profile` | string | `"v3_2"` | Active model profile |
 | `context_window_tokens` | int | `128000` | Maximum context window (raise for long-context use) |
@@ -31,11 +31,12 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 | `retry_base_ms` | int | `400` | Exponential backoff base |
 | `stream` | bool | `true` | Enable streaming responses |
 
-## `agent_loop` — Run Engine
+## `agent_loop` — Agent Loop
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_iterations` | int | `6` | Maximum Architect→Editor→Apply→Verify iterations |
+| `tool_loop_max_turns` | int | `50` | Maximum LLM calls in the tool-use loop (default mode) |
+| `max_iterations` | int | `6` | Maximum Architect→Editor→Apply→Verify iterations (pipeline mode) |
 | `architect_parse_retries` | int | `2` | Retries for parsing Architect output |
 | `editor_parse_retries` | int | `2` | Retries for parsing Editor output |
 | `max_files_per_iteration` | int | `12` | Maximum files per edit iteration |

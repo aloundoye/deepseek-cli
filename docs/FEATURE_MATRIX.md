@@ -1,14 +1,15 @@
 # DeepSeek CLI Feature Matrix
 
-Updated: 2026-02-23
+Updated: 2026-02-26
 
-This matrix reflects runtime behavior after the full Architect->Editor->Apply->Verify migration.
+This matrix reflects runtime behavior after the tool-use loop migration (P3.5).
 
 ## 1. Core Agent Architecture
 
 | Area | Status | Runtime Truth |
 |---|---|---|
-| Single execution path | DONE | Edit-execution uses only `Architect (R1) -> Editor (V3) -> Apply -> Verify`. |
+| Tool-use loop (default) | DONE | Code/Ask/Context modes use a fluid think→act→observe loop where the LLM decides which tools to call. |
+| Pipeline mode (legacy) | DONE | Available via `--mode pipeline` or `--force-execute`. Uses `Architect (R1) → Editor (V3) → Apply → Verify`. |
 | Legacy mode router in execution loop | REMOVED | No runtime fallback/escalation path is used for edit execution. |
 | Legacy R1 tool-driving mode | REMOVED | No R1 JSON-intent drive-tools path in the execution loop. |
 | Deterministic edit contract | DONE | Unified diff is the only accepted edit payload from Editor (with bounded `NEED_CONTEXT|...` requests). |
@@ -73,6 +74,6 @@ This matrix reflects runtime behavior after the full Architect->Editor->Apply->V
 
 | Topic | Current Position |
 |---|---|
-| Aider-style parity | Achieved for core edit execution model (architect/editor split + deterministic apply/verify). |
-| Claude-like unified reasoning+tools in one model | Not applicable with DeepSeek split; runtime uses explicit two-role pipeline instead. |
-| Tool-calling as execution backbone | Intentionally not used in core edit loop. |
+| Aider-style parity | Achieved for core edit execution model (architect/editor split + deterministic apply/verify) via pipeline mode. |
+| Claude-like unified reasoning+tools in one model | Achieved via tool-use loop with thinking mode (`deepseek-reasoner` with tools). |
+| Tool-calling as execution backbone | Default execution mode. LLM freely calls tools in a think→act→observe loop. |
