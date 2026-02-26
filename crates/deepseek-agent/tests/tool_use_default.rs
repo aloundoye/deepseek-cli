@@ -12,7 +12,7 @@ use deepseek_llm::LlmClient;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ── Scripted LLM that returns tool calls ──
 
@@ -369,6 +369,60 @@ fn context_mode_restricts_to_read_only() -> Result<()> {
     Ok(())
 }
 
+// ── Capturing LLM variant (records requests for inspection) ──
+
+struct CapturingLlm {
+    responses: Mutex<VecDeque<LlmResponse>>,
+    captured_requests: Arc<Mutex<Vec<ChatRequest>>>,
+}
+
+impl CapturingLlm {
+    fn new(responses: Vec<LlmResponse>) -> (Self, Arc<Mutex<Vec<ChatRequest>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                captured_requests: captured.clone(),
+            },
+            captured,
+        )
+    }
+}
+
+impl LlmClient for CapturingLlm {
+    fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse> {
+        Err(anyhow!("complete() not used"))
+    }
+    fn complete_streaming(&self, _req: &LlmRequest, _cb: StreamCallback) -> Result<LlmResponse> {
+        Err(anyhow!("complete_streaming() not used"))
+    }
+    fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
+        self.captured_requests.lock().unwrap().push(req.clone());
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow!("capturing llm exhausted"))
+    }
+    fn complete_chat_streaming(
+        &self,
+        req: &ChatRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        self.complete_chat(req)
+    }
+    fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> Result<LlmResponse> {
+        Err(anyhow!("complete_fim() not used"))
+    }
+    fn complete_fim_streaming(
+        &self,
+        _req: &deepseek_core::FimRequest,
+        _cb: StreamCallback,
+    ) -> Result<LlmResponse> {
+        Err(anyhow!("complete_fim_streaming() not used"))
+    }
+}
+
 /// When the LLM keeps making tool calls beyond max_turns, the loop stops gracefully.
 #[test]
 fn tool_loop_handles_max_turns() -> Result<()> {
@@ -402,5 +456,269 @@ fn tool_loop_handles_max_turns() -> Result<()> {
     // Should have stopped due to max turns, returning empty response
     // (max_turns stop doesn't produce text)
     assert!(output.is_empty() || output.contains("done"));
+    Ok(())
+}
+
+// ── Batch 7: New integration tests ──
+
+/// Tool descriptions in the LLM request are enriched (long, behavioral instructions).
+#[test]
+fn tool_descriptions_are_enriched_in_request() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![(
+            "call_1",
+            "fs_read",
+            r#"{"path":"src/main.rs"}"#,
+        )]),
+        text_response("Done."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Read file",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty(), "should have captured at least one request");
+    let first_req = &requests[0];
+    // Find fs_read tool in the request tools
+    let fs_read_tool = first_req
+        .tools
+        .iter()
+        .find(|t| t.function.name == "fs_read")
+        .expect("fs_read should be in tools");
+    assert!(
+        fs_read_tool.function.description.len() >= 200,
+        "fs_read description should be enriched (>=200 chars), got {}",
+        fs_read_tool.function.description.len()
+    );
+    assert!(
+        fs_read_tool.function.description.contains("MUST"),
+        "fs_read description should contain behavioral instructions"
+    );
+    Ok(())
+}
+
+/// First turn of tool-use loop uses tool_choice=required.
+#[test]
+fn first_turn_tool_choice_required() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![(
+            "call_1",
+            "fs_read",
+            r#"{"path":"src/main.rs"}"#,
+        )]),
+        text_response("Read the file."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "What's in this project?",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    // First request should have tool_choice=required
+    assert_eq!(
+        requests[0].tool_choice,
+        deepseek_core::ToolChoice::required(),
+        "first turn should force tool_choice=required"
+    );
+    Ok(())
+}
+
+/// Subsequent turns (after tool results) use tool_choice=auto.
+#[test]
+fn subsequent_turns_tool_choice_auto() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    fs::write(temp.path().join("test.txt"), "data\n")?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        // Turn 1: tool call
+        tool_call_response(vec![(
+            "call_1",
+            "fs_read",
+            r#"{"path":"test.txt"}"#,
+        )]),
+        // Turn 2: text response (after tool results in messages)
+        text_response("File read successfully."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Read test.txt",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(requests.len() >= 2, "should have at least 2 LLM calls");
+    // Second request should have tool_choice=auto (because tool results exist)
+    assert_eq!(
+        requests[1].tool_choice,
+        deepseek_core::ToolChoice::auto(),
+        "subsequent turn should use tool_choice=auto"
+    );
+    Ok(())
+}
+
+/// Ask mode uses read-only tools (no fs_edit, fs_write, bash_run in tool list).
+#[test]
+fn ask_mode_uses_read_only_tools() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![(
+            "call_1",
+            "fs_read",
+            r#"{"path":"src/main.rs"}"#,
+        )]),
+        text_response("It's a Rust project."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "What language is this?",
+        ChatOptions {
+            tools: true,
+            mode: ChatMode::Ask,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    let tool_names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    // Read-only tools should be present
+    assert!(tool_names.contains(&"fs_read"), "should have fs_read");
+    assert!(tool_names.contains(&"fs_glob"), "should have fs_glob");
+    assert!(tool_names.contains(&"fs_grep"), "should have fs_grep");
+    // Write tools should NOT be present
+    assert!(!tool_names.contains(&"fs_edit"), "should not have fs_edit");
+    assert!(!tool_names.contains(&"fs_write"), "should not have fs_write");
+    assert!(!tool_names.contains(&"bash_run"), "should not have bash_run");
+    Ok(())
+}
+
+/// Context mode also uses read-only tools.
+#[test]
+fn context_mode_uses_read_only_tools() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        text_response("Project overview."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Describe this project",
+        ChatOptions {
+            tools: true,
+            mode: ChatMode::Context,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    let tool_names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert!(!tool_names.contains(&"fs_edit"), "Context mode should not have fs_edit");
+    assert!(!tool_names.contains(&"bash_run"), "Context mode should not have bash_run");
+    Ok(())
+}
+
+/// When tools=false, the analysis path is used (no tools in request).
+#[test]
+fn tools_false_uses_analysis_path() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        text_response("Analysis complete."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let output = engine.chat_with_options(
+        "What is 2+2?",
+        ChatOptions {
+            tools: false,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Analysis complete"));
+    // Analysis path should have been used (check captured requests)
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    // With tools=false, the request should have no tools
+    assert!(
+        requests[0].tools.is_empty(),
+        "analysis path should not include tools"
+    );
+    Ok(())
+}
+
+/// Tool loop with thinking mode (reasoning_content preserved).
+#[test]
+fn tool_loop_with_thinking_mode() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    fs::write(temp.path().join("src/main.rs"), "fn main() { println!(\"hello\"); }\n")?;
+
+    // Simulate thinking mode response (with reasoning_content)
+    let mut response = tool_call_response(vec![(
+        "call_1",
+        "fs_read",
+        r#"{"path":"src/main.rs"}"#,
+    )]);
+    response.reasoning_content = "Let me think about which file to read...".to_string();
+
+    let mut final_response = text_response("The main function prints hello.");
+    final_response.reasoning_content = "Based on the file contents...".to_string();
+
+    let engine = build_engine(temp.path(), vec![response, final_response])?;
+
+    let output = engine.chat_with_options(
+        "What does the main function do?",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("prints hello"));
     Ok(())
 }

@@ -1277,7 +1277,26 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "fs_read".to_string(),
-                description: "Read the contents of a file. Returns file content with line numbers. For images, returns base64. For PDFs, extracts text.".to_string(),
+                description: "Reads a file from the filesystem and returns its contents with line numbers.\n\n\
+## CRITICAL RULES\n\
+- You MUST call fs_read BEFORE making any claims about a file's contents. NEVER guess or fabricate what a file contains.\n\
+- You MUST call fs_read BEFORE calling fs_edit on any file. The edit tool requires an exact string match, so you need to see the current content first.\n\
+- DO NOT use bash_run with cat, head, tail, or sed to read files — use this tool instead. It provides structured output with line numbers and metadata.\n\n\
+## Usage\n\
+- By default reads the entire file (up to max_bytes, default 1MB).\n\
+- For large files, use start_line and end_line to read specific sections. This is especially useful when you already know which lines to inspect.\n\
+- Returns line-numbered content in the format `  N→content` for easy reference.\n\
+- For binary files (images), returns base64-encoded content with MIME type metadata.\n\
+- For PDF files, extracts text content. Use the `pages` parameter (e.g. '1-5') for large PDFs.\n\n\
+## When to use\n\
+- Before editing any file (ALWAYS)\n\
+- To verify file contents before making claims about them\n\
+- To understand existing code before suggesting modifications\n\
+- To check current state after making edits\n\n\
+## When NOT to use\n\
+- To search for content across many files — use fs_grep instead\n\
+- To find files by name pattern — use fs_glob instead\n\
+- To list directory contents — use fs_list instead".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1311,7 +1330,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "fs_write".to_string(),
-                description: "Write content to a file. Creates the file and parent directories if they don't exist. Prefer fs_edit for modifying existing files.".to_string(),
+                description: "Creates or completely overwrites a file with the specified content. Creates parent directories automatically if they don't exist.\n\n\
+## CRITICAL RULES\n\
+- ALWAYS prefer fs_edit over fs_write for modifying existing files. fs_write replaces the ENTIRE file content, which is dangerous for partial changes.\n\
+- If the file already exists, you MUST have read it with fs_read first to understand what will be overwritten.\n\
+- NEVER write files that contain secrets, credentials, API keys, or sensitive data.\n\n\
+## When to use\n\
+- Creating new files that don't exist yet\n\
+- Complete rewrites where fs_edit would require too many individual replacements\n\
+- Writing generated content (configs, boilerplate, test fixtures)\n\n\
+## When NOT to use\n\
+- Making targeted changes to existing files — use fs_edit instead\n\
+- Making multiple small edits across a file — use fs_edit or multi_edit instead".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1333,7 +1363,23 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "fs_edit".to_string(),
-                description: "Edit a file by replacing an exact string match. The 'search' string must appear in the file. By default replaces all occurrences; set 'all' to false for first-only.".to_string(),
+                description: "Performs exact string replacement in a file. The search string must match EXACTLY — including whitespace, indentation, and line endings.\n\n\
+## CRITICAL RULES\n\
+- You MUST call fs_read on the file BEFORE using fs_edit. The search string must be copied exactly from the file's current content. If you guess the content, the edit will fail.\n\
+- The search string must be unique enough to match only the intended location. If the search matches multiple places, all occurrences are replaced by default (set 'all': false for first-only).\n\
+- Preserve the exact indentation (tabs/spaces) as shown in the fs_read output. The line number prefix (e.g. '  42→') is NOT part of the file content — do not include it in the search string.\n\n\
+## When to use\n\
+- Making targeted changes to existing files (the preferred editing approach)\n\
+- Renaming variables, functions, or identifiers\n\
+- Updating specific code blocks, imports, or configuration values\n\
+- Any modification where you want to change only part of a file\n\n\
+## When NOT to use\n\
+- Creating new files — use fs_write instead\n\
+- Complete file rewrites — use fs_write instead\n\
+- Editing multiple files at once — use multi_edit instead\n\n\
+## Tips\n\
+- If the search string is not unique, include more surrounding context (extra lines above/below) to make it unique.\n\
+- After editing, consider reading the file again to verify the change was applied correctly.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1363,7 +1409,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "fs_list".to_string(),
-                description: "List files and directories in the given directory.".to_string(),
+                description: "Lists files and directories in a single directory level. Returns names, types (file/dir), and sizes.\n\n\
+## When to use\n\
+- To see what's in a directory before navigating deeper\n\
+- To discover project structure at the top level\n\
+- Quick check of a specific directory's immediate contents\n\n\
+## When NOT to use\n\
+- For recursive file searching — use fs_glob with a pattern like '**/*.rs' instead\n\
+- For searching file contents — use fs_grep instead\n\
+- To read a specific file — use fs_read instead".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1381,7 +1435,24 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "fs_glob".to_string(),
-                description: "Find files matching a glob pattern. Returns matching file paths.".to_string(),
+                description: "Fast file pattern matching that finds files by name/path pattern. Returns matching file paths sorted by modification time.\n\n\
+## CRITICAL RULES\n\
+- ALWAYS use fs_glob for finding files by name. NEVER use bash_run with find or ls for file discovery.\n\
+- Use this tool when you need to locate files before reading or editing them.\n\n\
+## Pattern examples\n\
+- '**/*.rs' — all Rust files recursively\n\
+- 'src/**/*.ts' — TypeScript files under src/\n\
+- '*.json' — JSON files in root only\n\
+- '**/test_*.py' — Python test files anywhere\n\
+- 'Cargo.toml' — exact file name anywhere (if base is '.')\n\n\
+## When to use\n\
+- Finding files by extension or name pattern\n\
+- Discovering project structure (e.g. all config files, all test files)\n\
+- Locating a file when you know part of its name but not the full path\n\n\
+## When NOT to use\n\
+- Searching file CONTENTS — use fs_grep instead (fs_glob only matches file paths)\n\
+- Listing a single directory — use fs_list for simpler directory listing\n\
+- Reading file contents — use fs_read after finding the path".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1411,7 +1482,23 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "fs_grep".to_string(),
-                description: "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers.".to_string(),
+                description: "Searches file contents using regex patterns. Returns matching lines with file paths and line numbers. Built on ripgrep for fast, accurate results.\n\n\
+## CRITICAL RULES\n\
+- ALWAYS use fs_grep for searching file contents. NEVER use bash_run with grep, rg, ag, or ack — this tool is faster and provides structured output.\n\
+- Supports full regex syntax (e.g. 'log.*Error', 'function\\s+\\w+', 'impl\\s+Display').\n\n\
+## When to use\n\
+- Finding where a function, class, variable, or string is defined or used\n\
+- Searching for error messages, log patterns, or specific code constructs\n\
+- Finding all usages of an API or import across the codebase\n\
+- Locating TODO/FIXME/HACK comments\n\n\
+## When NOT to use\n\
+- Finding files by name pattern — use fs_glob instead (fs_grep searches contents, not names)\n\
+- Reading a specific file — use fs_read instead\n\
+- Listing directory contents — use fs_list instead\n\n\
+## Tips\n\
+- Use the 'glob' parameter to narrow the search to specific file types (e.g. '**/*.rs' for Rust files only)\n\
+- Use case_sensitive: false for case-insensitive searches\n\
+- Results include file path, line number, and matching line content".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1445,7 +1532,31 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "bash_run".to_string(),
-                description: "Execute a shell command and return stdout/stderr. Use for git, build, test, and other terminal commands.".to_string(),
+                description: "Executes a shell command in the workspace directory and returns stdout/stderr.\n\n\
+## CRITICAL RULES\n\
+- DO NOT use bash_run for operations that have dedicated tools:\n\
+  - Reading files: use fs_read (NOT cat, head, tail, less)\n\
+  - Searching file contents: use fs_grep (NOT grep, rg, ag, ack)\n\
+  - Finding files: use fs_glob (NOT find, ls -R, fd)\n\
+  - Editing files: use fs_edit or multi_edit (NOT sed, awk, perl -i)\n\
+  - Writing files: use fs_write (NOT echo >, cat <<EOF, tee)\n\
+  - Git status: use git_status (NOT git status)\n\
+  - Git diff: use git_diff (NOT git diff)\n\
+Using dedicated tools provides structured output, better error handling, and clearer audit trail.\n\n\
+## USE bash_run for\n\
+- Building projects: cargo build, npm run build, make\n\
+- Running tests: cargo test, pytest, npm test\n\
+- Package management: cargo add, npm install, pip install\n\
+- Git operations beyond status/diff: git commit, git push, git log, git branch\n\
+- System commands: docker, curl (for APIs), env checks, process management\n\
+- Language-specific tools: rustfmt, eslint --fix, black\n\
+- Any command that doesn't have a dedicated tool equivalent\n\n\
+## Tips\n\
+- Always provide a 'description' so the user understands what the command does\n\
+- Commands time out after 120 seconds by default. Set a higher timeout for long builds.\n\
+- Use run_in_background: true for long-running commands (builds, test suites). Use task_output to check results later.\n\
+- Quote file paths with spaces using double quotes\n\
+- Prefer absolute paths to avoid directory confusion".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1475,7 +1586,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "multi_edit".to_string(),
-                description: "Apply edits across multiple files with checkpoint support. Each file entry contains a path and edits array with search/replace pairs.".to_string(),
+                description: "Apply multiple search/replace edits across one or more files in a single atomic operation. Each file entry contains a path and an array of edits.\n\n\
+## CRITICAL RULES\n\
+- You MUST have read each file with fs_read before editing it. Search strings must exactly match current file content.\n\
+- Same rules as fs_edit apply to each individual edit: exact string match required, preserve indentation.\n\n\
+## When to use\n\
+- Making related changes across multiple files (e.g. renaming a function and updating all call sites)\n\
+- Applying several edits to the same file in one operation\n\
+- Refactoring that touches many files simultaneously\n\n\
+## When NOT to use\n\
+- Single edit to a single file — use fs_edit instead (simpler)\n\
+- Creating new files — use fs_write instead\n\
+- Complete file rewrites — use fs_write instead".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1511,7 +1633,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "git_status".to_string(),
-                description: "Show the working tree status (git status --short).".to_string(),
+                description: "Shows the working tree status (staged, unstaged, untracked files) in short format. Use this to see what files have been modified before committing or to verify the result of your changes. Prefer this over bash_run with 'git status'.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1524,7 +1646,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "git_diff".to_string(),
-                description: "Show changes in the working directory (git diff).".to_string(),
+                description: "Shows the unified diff of all unstaged changes in the working directory. Use this to review what has changed before staging or committing. Prefer this over bash_run with 'git diff'. For staged changes, use bash_run with 'git diff --cached'.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1537,7 +1659,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_fetch".to_string(),
-                description: "Fetch content from a URL and return it as text. HTML is stripped to plain text.".to_string(),
+                description: "Fetches content from a URL and returns it as text. HTML is automatically stripped to plain text.\n\n\
+## When to use\n\
+- Fetching documentation, API references, or web pages referenced by the user\n\
+- Downloading configuration or data files from URLs\n\
+- Checking API endpoints or service responses\n\n\
+## Limitations\n\
+- Will fail for authenticated/private URLs (Google Docs, Confluence, Jira, private GitHub repos)\n\
+- HTTP URLs are automatically upgraded to HTTPS\n\
+- Large pages may be truncated at max_bytes (default 500KB)".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1563,7 +1693,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "web_search".to_string(),
-                description: "Search the web and return results with titles, URLs, and snippets.".to_string(),
+                description: "Searches the web and returns results with titles, URLs, and snippets. Use for finding documentation, looking up APIs, researching error messages, or getting up-to-date information beyond the model's training data.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1585,7 +1715,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "notebook_read".to_string(),
-                description: "Read a Jupyter notebook (.ipynb), returning cell summaries with type and source preview.".to_string(),
+                description: "Read a Jupyter notebook (.ipynb file), returning all cells with their type (code/markdown), source content, and output summaries. Use this to understand notebook structure before making edits with notebook_edit.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1603,7 +1733,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "notebook_edit".to_string(),
-                description: "Edit a cell in a Jupyter notebook. Supports replace, insert, and delete operations.".to_string(),
+                description: "Edit a cell in a Jupyter notebook (.ipynb file). Supports replace (overwrite cell content), insert (add new cell), and delete operations. You MUST read the notebook with notebook_read first to know the cell indices and current content.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1639,7 +1769,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "git_show".to_string(),
-                description: "Show a git object (commit, tag, tree, or blob). Use to inspect specific commits, files at a revision, or diff between commits.".to_string(),
+                description: "Show a git object (commit, tag, tree, or blob). Use to inspect commit details, view files at specific revisions (e.g. 'HEAD:src/main.rs'), or compare changes between commits (e.g. 'main..feature'). For current working directory changes, use git_diff instead.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1657,7 +1787,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "index_query".to_string(),
-                description: "Full-text search the code index. Returns matching file paths and snippets ranked by relevance.".to_string(),
+                description: "Full-text semantic search across the code index. Returns matching file paths and snippets ranked by relevance. Use for conceptual searches (e.g. 'authentication middleware') when you don't know the exact string. For exact pattern matching, use fs_grep instead.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1679,7 +1809,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "patch_stage".to_string(),
-                description: "Stage a unified diff as a patch for later application. Returns a patch_id for use with patch_apply.".to_string(),
+                description: "Stage a unified diff as a patch for later application. Returns a patch_id for use with patch_apply. Use this for complex multi-file changes where you want to prepare a patch first and apply it atomically. For simple edits, prefer fs_edit or multi_edit instead.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1701,7 +1831,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "patch_apply".to_string(),
-                description: "Apply a previously staged patch by its ID. Returns whether the patch was applied successfully and any conflicts.".to_string(),
+                description: "Apply a previously staged patch by its patch_id (from patch_stage). Returns success/failure and any conflicts. Always stage with patch_stage first before applying.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1719,7 +1849,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "diagnostics_check".to_string(),
-                description: "Run language-specific diagnostics (cargo check, tsc, ruff, etc.) on the project or a specific path. Auto-detects the appropriate checker.".to_string(),
+                description: "Run language-specific diagnostics (cargo check, tsc, ruff, etc.) on the project or a specific path. Auto-detects the appropriate checker based on project files. Use this after making changes to verify they compile and pass basic checks. Prefer this over running build commands manually with bash_run when you just need to check for errors.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1738,7 +1868,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "chrome_navigate".to_string(),
-                description: "Navigate a Chrome browser to a URL. Requires Chrome to be running with remote debugging enabled (--remote-debugging-port=9222).".to_string(),
+                description: "Navigate a Chrome browser to a URL. Requires Chrome to be running with remote debugging enabled (--remote-debugging-port=9222). Use for web development testing, taking screenshots of web pages, or automating browser interactions.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1760,7 +1890,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "chrome_click".to_string(),
-                description: "Click an element on the page by CSS selector.".to_string(),
+                description: "Click an element on the current Chrome page by CSS selector. Use after chrome_navigate to interact with page elements. Requires Chrome remote debugging.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1782,7 +1912,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "chrome_type_text".to_string(),
-                description: "Type text into an input element selected by CSS selector.".to_string(),
+                description: "Type text into an input element on the current Chrome page, selected by CSS selector. Use for filling forms, search boxes, or any text input. Requires Chrome remote debugging.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1808,7 +1938,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "chrome_screenshot".to_string(),
-                description: "Capture a screenshot of the current page. Returns the image as base64.".to_string(),
+                description: "Capture a screenshot of the current Chrome page. Returns the image as base64. Use for visual verification of web changes, debugging UI issues, or documenting current state. Requires Chrome remote debugging.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1831,7 +1961,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "chrome_read_console".to_string(),
-                description: "Read the browser's console log entries.".to_string(),
+                description: "Read the browser's console log entries. Use to check for JavaScript errors, warnings, or debug output after navigating to a page. Requires Chrome remote debugging.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1849,7 +1979,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "chrome_evaluate".to_string(),
-                description: "Evaluate a JavaScript expression in the browser and return the result.".to_string(),
+                description: "Evaluate a JavaScript expression in the Chrome browser and return the result. Use for querying DOM state, checking variable values, or running custom JavaScript. Requires Chrome remote debugging.".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1872,7 +2002,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "user_question".to_string(),
-                description: "Ask the user a question and wait for their response. Use this when you need clarification, a decision, or user input to proceed.".to_string(),
+                description: "Ask the user a question and wait for their response. Use when requirements are genuinely ambiguous or you need a decision to proceed.\n\n\
+## CRITICAL RULES\n\
+- Do NOT ask to confirm actions the user already explicitly requested. If they said 'fix the bug', just fix it.\n\
+- Do NOT ask permission before using tools. Just use them.\n\
+- DO ask when: there are multiple valid approaches and user preference matters, requirements are unclear, you need information that isn't in the codebase.\n\n\
+## Tips\n\
+- Provide 'options' when the choices are clear-cut, so the user can pick quickly\n\
+- Keep questions concise and specific — ask one thing at a time".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1948,7 +2085,16 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "spawn_task".to_string(),
-                description: "Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it. Launch multiple agents concurrently whenever possible to maximize performance.".to_string(),
+                description: "Launch a specialized sub-agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities.\n\n\
+## Agent types\n\
+- 'explore': Fast codebase search/read — use for finding files, searching code, answering questions about the codebase\n\
+- 'plan': Design implementation approaches — returns step-by-step plans with architectural considerations\n\
+- 'bash': Command execution — for build, test, deploy tasks that need many sequential commands\n\
+- 'general-purpose': Full capabilities — for complex multi-step tasks requiring all tools\n\n\
+## Tips\n\
+- Launch multiple agents concurrently when tasks are independent (use separate calls)\n\
+- Use run_in_background: true for tasks that don't block your current work\n\
+- Provide clear, detailed prompts so the agent can work autonomously".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -4558,5 +4704,76 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    // ── Batch 5: Tool description enrichment tests ──────────────────────
+
+    #[test]
+    fn tool_descriptions_are_sufficiently_detailed() {
+        let tools = tool_definitions();
+        let core_tools = [
+            "fs_read", "fs_write", "fs_edit", "fs_list", "fs_glob", "fs_grep", "bash_run",
+            "multi_edit",
+        ];
+        for name in &core_tools {
+            let tool = tools
+                .iter()
+                .find(|t| t.function.name == *name)
+                .unwrap_or_else(|| panic!("tool {name} not found"));
+            assert!(
+                tool.function.description.len() >= 200,
+                "tool {name} description is only {} chars (expected ≥200): {}",
+                tool.function.description.len(),
+                &tool.function.description[..tool.function.description.len().min(80)]
+            );
+        }
+    }
+
+    #[test]
+    fn fs_read_mentions_read_before_edit() {
+        let tools = tool_definitions();
+        let fs_read = tools
+            .iter()
+            .find(|t| t.function.name == "fs_read")
+            .expect("fs_read tool");
+        let desc = &fs_read.function.description;
+        assert!(
+            desc.contains("fs_edit"),
+            "fs_read description should cross-reference fs_edit"
+        );
+        assert!(
+            desc.contains("MUST") && desc.contains("BEFORE"),
+            "fs_read description should emphasize reading before editing"
+        );
+    }
+
+    #[test]
+    fn bash_run_cross_references_dedicated_tools() {
+        let tools = tool_definitions();
+        let bash = tools
+            .iter()
+            .find(|t| t.function.name == "bash_run")
+            .expect("bash_run tool");
+        let desc = &bash.function.description;
+        assert!(
+            desc.contains("fs_read"),
+            "bash_run should cross-reference fs_read"
+        );
+        assert!(
+            desc.contains("fs_grep"),
+            "bash_run should cross-reference fs_grep"
+        );
+        assert!(
+            desc.contains("fs_glob"),
+            "bash_run should cross-reference fs_glob"
+        );
+        assert!(
+            desc.contains("fs_edit"),
+            "bash_run should cross-reference fs_edit"
+        );
+        assert!(
+            desc.contains("DO NOT"),
+            "bash_run should say DO NOT use for dedicated tool operations"
+        );
     }
 }

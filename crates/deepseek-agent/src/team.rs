@@ -2,7 +2,7 @@ use crate::apply::{diff_stats, ensure_repo_relative_path, extract_target_files};
 use crate::verify::{derive_verify_commands, run_verify};
 use crate::{AgentEngine, ChatMode, ChatOptions};
 use anyhow::{Context, Result, anyhow};
-use deepseek_core::{ApplyStrategy, EventKind, StreamChunk, ToolCall, runtime_dir};
+use deepseek_core::{ApplyStrategy, ChatMessage, ChatRequest, EventKind, StreamChunk, ToolCall, ToolChoice, runtime_dir};
 use deepseek_diff::{GitApplyStrategy, PatchStore};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,16 +31,17 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     if !is_git_workspace(&engine.workspace) {
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return crate::run_engine::run(engine, prompt, &fallback);
+        return engine.chat_with_options(prompt, fallback);
     }
 
     let max_lanes = engine.cfg.agent_loop.team.max_lanes.max(1) as usize;
     let max_concurrency = engine.cfg.agent_loop.team.max_concurrency.max(1) as usize;
     let mut lanes = plan_lanes(engine, prompt, max_lanes, options);
     if lanes.len() <= 1 {
+        // Single lane: fall back to standard routing (tool-use loop or pipeline).
         let mut fallback = options.clone();
         fallback.disable_team_orchestration = true;
-        return crate::run_engine::run(engine, prompt, &fallback);
+        return engine.chat_with_options(prompt, fallback);
     }
     lanes.truncate(max_lanes);
     lanes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -66,8 +67,6 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             let prompt = prompt.to_string();
             let mut lane_options = options.clone();
             lane_options.mode = ChatMode::Code;
-            lane_options.force_execute = true;
-            lane_options.force_plan_only = false;
             lane_options.disable_team_orchestration = true;
 
             handles.push(thread::spawn(move || {
@@ -123,12 +122,12 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
             };
             let mut recovery_options = options.clone();
             recovery_options.disable_team_orchestration = true;
-            recovery_options.force_execute = true;
+            recovery_options.mode = ChatMode::Code;
             let recovery_prompt = format!(
                 "Lane merge conflict while applying {} ({})\n\nConflict details:\n{}\n\nOriginal request:\n{}\n\nResolve with a single unified patch and re-verify.",
                 lane.lane.id, lane.lane.name, conflict_text, prompt
             );
-            return crate::run_engine::run(engine, &recovery_prompt, &recovery_options);
+            return engine.chat_with_options(&recovery_prompt, recovery_options);
         }
     }
 
@@ -143,12 +142,12 @@ pub fn run(engine: &AgentEngine, prompt: &str, options: &ChatOptions) -> Result<
     if !verify.success {
         let mut recovery_options = options.clone();
         recovery_options.disable_team_orchestration = true;
-        recovery_options.force_execute = true;
+        recovery_options.mode = ChatMode::Code;
         let recovery_prompt = format!(
             "Global verify failed after deterministic lane merge.\n\nVerify summary:\n{}\n\nOriginal request:\n{}\n\nProduce a corrective unified diff and pass verification.",
             verify.summary, prompt
         );
-        return crate::run_engine::run(engine, &recovery_prompt, &recovery_options);
+        return engine.chat_with_options(&recovery_prompt, recovery_options);
     }
 
     let non_empty = results
@@ -341,19 +340,45 @@ fn validate_lane_patch_artifact(patch: &str) -> Result<()> {
     Ok(())
 }
 
-fn plan_lanes(engine: &AgentEngine, prompt: &str, max_lanes: usize, options: &ChatOptions) -> Vec<LaneSpec> {
+/// Use a lightweight LLM call to identify files relevant to a task.
+/// Returns a list of workspace-relative file paths extracted from the model response.
+fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>> {
+    let system = "You are a planning assistant. Given a user request, list the workspace-relative file paths that need to be modified or created. Return ONLY one file path per line, no other text.";
+    let req = ChatRequest {
+        model: engine.cfg.llm.base_model.clone(),
+        messages: vec![
+            ChatMessage::System { content: system.to_string() },
+            ChatMessage::User { content: prompt.to_string() },
+        ],
+        tools: vec![],
+        tool_choice: ToolChoice::none(),
+        max_tokens: 2048,
+        temperature: Some(0.0),
+        top_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logprobs: None,
+        top_logprobs: None,
+        thinking: None,
+        images: vec![],
+        response_format: None,
+    };
+    let response = engine.llm.complete_chat(&req)?;
+    let files: Vec<String> = response.text
+        .lines()
+        .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    Ok(files)
+}
+
+fn plan_lanes(engine: &AgentEngine, prompt: &str, max_lanes: usize, _options: &ChatOptions) -> Vec<LaneSpec> {
     let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if let Ok(plan) = engine.plan_only(prompt, options) {
-        let mut text = String::new();
-        for step in &plan.steps {
-            text.push_str(&step.intent);
-            text.push('\n');
-        }
-        for step in &plan.steps {
-            for path in &step.files {
-                let lane = classify_lane_for_path(path);
-                grouped.entry(lane).or_default().insert(path.clone());
-            }
+    // Use a lightweight LLM call to plan lanes (files → lane categories)
+    if let Ok(files) = plan_files_via_llm(engine, prompt) {
+        for path in &files {
+            let lane = classify_lane_for_path(path);
+            grouped.entry(lane).or_default().insert(path.clone());
         }
     }
 

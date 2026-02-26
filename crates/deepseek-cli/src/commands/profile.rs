@@ -890,27 +890,29 @@ pub(crate) fn run_profile_benchmark(
 
     for case in selected_cases.drain(..) {
         let started = Instant::now();
-        let options = ChatOptions::default();
-        let result = engine.plan_only(&case.prompt, &options);
+        let plan_prompt = format!(
+            "Create a detailed implementation plan for: {}\n\nReturn a structured plan with steps and verification commands.",
+            case.prompt
+        );
+        let options = ChatOptions {
+            tools: true,
+            ..ChatOptions::default()
+        };
+        let result = engine.chat_with_options(&plan_prompt, options);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         latencies.push(elapsed_ms);
         match result {
-            Ok(plan) => {
-                let plan_text = serde_json::to_string(&plan)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
+            Ok(output) => {
+                let plan_text = output.to_ascii_lowercase();
                 let keyword_total = case.expected_keywords.len();
                 let keyword_matches = case
                     .expected_keywords
                     .iter()
                     .filter(|kw| plan_text.contains(kw.as_str()))
                     .count();
-                let min_steps = case.min_steps.unwrap_or(1);
-                let min_verification_steps = case.min_verification_steps.unwrap_or(1);
-                let min_steps_ok = plan.steps.len() >= min_steps;
-                let min_verification_ok = plan.verification.len() >= min_verification_steps;
                 let keywords_ok = keyword_total == 0 || keyword_matches == keyword_total;
-                let case_ok = min_steps_ok && min_verification_ok && keywords_ok;
+                // In tool-use mode we measure keyword coverage as the quality signal
+                let case_ok = keywords_ok;
                 if case_ok {
                     succeeded += 1;
                 }
@@ -919,10 +921,6 @@ pub(crate) fn run_profile_benchmark(
                     "prompt_sha256": sha256_hex(case.prompt.as_bytes()),
                     "ok": case_ok,
                     "elapsed_ms": elapsed_ms,
-                    "steps": plan.steps.len(),
-                    "verification_steps": plan.verification.len(),
-                    "min_steps_required": min_steps,
-                    "min_verification_required": min_verification_steps,
                     "keyword_matches": keyword_matches,
                     "keyword_total": keyword_total,
                     "keywords_ok": keywords_ok,

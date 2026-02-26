@@ -33,6 +33,24 @@ pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
 /// Target context usage after compaction.
 pub const COMPACTION_TARGET_PCT: f64 = 0.80;
 
+/// If the model's first response (with no tool calls) exceeds this many
+/// characters, it's likely hallucinating a long answer instead of using tools.
+/// We inject a nudge to get it back on track.
+const HALLUCINATION_NUDGE_THRESHOLD: usize = 300;
+
+/// Every N tool calls, inject a brief system reminder to keep the model on track.
+const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
+
+/// Brief reminder injected every `MID_CONVERSATION_REMINDER_INTERVAL` tool calls.
+const MID_CONVERSATION_REMINDER: &str = "Reminder: Verify changes with tests. Be concise. Use tools — do not guess.";
+
+/// Message injected when the model tries to answer a question about the codebase
+/// without using any tools first.
+const HALLUCINATION_NUDGE: &str = "STOP. You are answering without using tools. \
+Your response likely contains fabricated information. You MUST use tools first. \
+Start with fs_list or fs_glob to explore the project, then fs_read for specific files. \
+Do NOT guess or synthesize answers from memory.";
+
 /// Record of a single tool call made during the loop.
 #[derive(Debug, Clone)]
 pub struct ToolCallRecord {
@@ -83,17 +101,23 @@ pub struct ToolLoopConfig {
     pub max_turns: usize,
     /// When true, use read-only tools only (Ask/Context mode).
     pub read_only: bool,
+    /// Thinking configuration — enables chain-of-thought reasoning for the main model.
+    pub thinking: Option<deepseek_core::ThinkingConfig>,
+    /// Model name used by `think_deeply` agent-level tool.
+    pub think_deeply_model: String,
 }
 
 impl Default for ToolLoopConfig {
     fn default() -> Self {
         Self {
-            model: "deepseek-chat".to_string(),
-            max_tokens: 8192,
+            model: deepseek_core::DEEPSEEK_V32_CHAT_MODEL.to_string(),
+            max_tokens: deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS,
             temperature: None,
             context_window_tokens: 128_000,
             max_turns: DEFAULT_MAX_TURNS,
             read_only: false,
+            thinking: None,
+            think_deeply_model: deepseek_core::DEEPSEEK_V32_REASONER_MODEL.to_string(),
         }
     }
 }
@@ -271,9 +295,31 @@ impl<'a> ToolUseLoop<'a> {
                 return Err(anyhow!("Response blocked by content filter"));
             }
 
-            // No tool calls → return the text response
+            // No tool calls → return the text response (or nudge to use tools)
             if response.tool_calls.is_empty() {
                 let text = response.text.clone();
+
+                // Anti-hallucination guard: if this is the first turn and the
+                // response is long (likely a fabricated analysis), nudge the
+                // model to use tools instead of guessing.
+                let should_nudge = turns == 1
+                    && tool_calls_made.is_empty()
+                    && !self.config.read_only
+                    && (text.len() > HALLUCINATION_NUDGE_THRESHOLD
+                        || has_unverified_file_references(&text, &tool_calls_made));
+
+                if should_nudge {
+                    // Don't emit this attempt — inject a nudge and retry
+                    self.messages.push(ChatMessage::Assistant {
+                        content: Some(text),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                    });
+                    self.messages.push(ChatMessage::User {
+                        content: HALLUCINATION_NUDGE.to_string(),
+                    });
+                    continue;
+                }
 
                 // Append assistant message to history
                 self.messages.push(ChatMessage::Assistant {
@@ -317,6 +363,16 @@ impl<'a> ToolUseLoop<'a> {
             for llm_call in &response.tool_calls {
                 let records = self.execute_tool_call(llm_call)?;
                 tool_calls_made.extend(records);
+            }
+
+            // Mid-conversation reminder: every N tool calls, inject a brief
+            // system-like nudge to keep the model focused.
+            if !tool_calls_made.is_empty()
+                && tool_calls_made.len() % MID_CONVERSATION_REMINDER_INTERVAL == 0
+            {
+                self.messages.push(ChatMessage::User {
+                    content: MID_CONVERSATION_REMINDER.to_string(),
+                });
             }
 
             // Strip reasoning from prior turns for DeepSeek API compliance
@@ -570,7 +626,7 @@ impl<'a> ToolUseLoop<'a> {
             "Analyze this problem carefully:\n\nQuestion: {question}\n\nContext:\n{context}\n\nProvide a clear, actionable recommendation."
         );
         let request = ChatRequest {
-            model: "deepseek-reasoner".to_string(),
+            model: self.config.think_deeply_model.clone(),
             messages: vec![
                 ChatMessage::System {
                     content: "You are a deep reasoning engine. Provide thorough analysis and clear recommendations.".to_string(),
@@ -579,14 +635,14 @@ impl<'a> ToolUseLoop<'a> {
             ],
             tools: vec![],
             tool_choice: ToolChoice::none(),
-            max_tokens: 4096,
+            max_tokens: deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS,
             temperature: None,
             top_p: None,
             presence_penalty: None,
             frequency_penalty: None,
             logprobs: None,
             top_logprobs: None,
-            thinking: None,
+            thinking: Some(deepseek_core::ThinkingConfig::enabled(16_384)),
             images: vec![],
             response_format: None,
         };
@@ -606,11 +662,23 @@ impl<'a> ToolUseLoop<'a> {
             self.tools.clone()
         };
 
+        // Force tool use on first turn (no tool results yet) so the model
+        // explores the codebase instead of fabricating an answer.
+        let has_tool_results = self
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Tool { .. }));
+        let tool_choice = if !has_tool_results && !self.config.read_only {
+            ToolChoice::required()
+        } else {
+            ToolChoice::auto()
+        };
+
         ChatRequest {
             model: self.config.model.clone(),
             messages: self.messages.clone(),
             tools,
-            tool_choice: ToolChoice::auto(),
+            tool_choice,
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             top_p: None,
@@ -618,7 +686,7 @@ impl<'a> ToolUseLoop<'a> {
             frequency_penalty: None,
             logprobs: None,
             top_logprobs: None,
-            thinking: None,
+            thinking: self.config.thinking.clone(),
             images: vec![],
             response_format: None,
         }
@@ -708,6 +776,38 @@ fn summarize_args(args: &serde_json::Value) -> String {
         return "()".to_string();
     }
     parts.join(", ")
+}
+
+/// Detect when the model mentions file paths without having called fs_read/fs_glob first.
+/// Returns true if the text references paths that haven't been verified by tool calls.
+fn has_unverified_file_references(text: &str, tool_calls_made: &[ToolCallRecord]) -> bool {
+    // Extract path-like patterns from text (e.g. src/main.rs, ./config.json, crates/foo/bar.rs)
+    let path_pattern = regex::Regex::new(r"\b[\w./\-]+\.\w{1,6}\b").unwrap_or_else(|_| return regex::Regex::new(r"^$").unwrap());
+    let mentioned_paths: Vec<&str> = path_pattern
+        .find_iter(text)
+        .map(|m| m.as_str())
+        .filter(|p| {
+            // Filter to things that look like real file paths
+            p.contains('/') || p.ends_with(".rs") || p.ends_with(".ts") || p.ends_with(".js")
+                || p.ends_with(".py") || p.ends_with(".json") || p.ends_with(".toml")
+                || p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".md")
+        })
+        .collect();
+
+    if mentioned_paths.is_empty() {
+        return false;
+    }
+
+    // Check if any read/glob/grep tool was called (the model at least tried to look)
+    let used_read_tools = tool_calls_made.iter().any(|tc| {
+        tc.tool_name == "fs_read" || tc.tool_name == "fs.read"
+            || tc.tool_name == "fs_glob" || tc.tool_name == "fs.glob"
+            || tc.tool_name == "fs_grep" || tc.tool_name == "fs.grep"
+            || tc.tool_name == "fs_list" || tc.tool_name == "fs.list"
+    });
+
+    // If paths are mentioned but no read/search tools were used, flag it
+    !used_read_tools && mentioned_paths.len() >= 2
 }
 
 #[cfg(test)]
@@ -1167,5 +1267,191 @@ mod tests {
         assert_eq!(r2.response, "Second answer");
         // Messages should contain: system, user1, assistant1, user2, assistant2
         assert_eq!(r2.messages.len(), 5);
+    }
+
+    #[test]
+    fn hallucination_nudge_triggers_on_long_first_response() {
+        // First response: long text with no tools (hallucination)
+        // Second response: shorter text (after nudge, model cooperates)
+        let long_hallucination = "a".repeat(HALLUCINATION_NUDGE_THRESHOLD + 100);
+        let llm = ScriptedLlm::new(vec![
+            make_text_response(&long_hallucination),
+            make_text_response("Let me check with tools."), // after nudge
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("analyze this project").unwrap();
+        // Should get the second (post-nudge) response, not the hallucinated one
+        assert_eq!(result.response, "Let me check with tools.");
+        // Should have used 2 turns
+        assert_eq!(result.turns, 2);
+        // Messages should contain the nudge
+        let has_nudge = result.messages.iter().any(|m| {
+            if let ChatMessage::User { content } = m {
+                content.contains("STOP. You are answering without using tools")
+            } else {
+                false
+            }
+        });
+        assert!(has_nudge, "should contain hallucination nudge message");
+    }
+
+    #[test]
+    fn hallucination_nudge_skips_short_responses() {
+        // Short response should NOT trigger nudge
+        let llm = ScriptedLlm::new(vec![make_text_response("Done.")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("hello").unwrap();
+        assert_eq!(result.response, "Done.");
+        assert_eq!(result.turns, 1); // no nudge, single turn
+    }
+
+    // ── Batch 6: Anti-hallucination hardening tests ──
+
+    #[test]
+    fn first_turn_uses_required_tool_choice() {
+        // Build a loop with no tool results in messages (first turn)
+        let llm = ScriptedLlm::new(vec![
+            // Force tool_choice=required will cause the model to call a tool
+            make_tool_response(vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+            }]),
+            make_text_response("Read the file."),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![ToolResult {
+                invocation_id: uuid::Uuid::nil(),
+                success: true,
+                output: serde_json::json!({"content": "[package]\nname = \"test\""}),
+            }],
+            true,
+        ));
+
+        let config = ToolLoopConfig::default();
+        let loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        // The first build_request should use tool_choice=required
+        let request = loop_.build_request();
+        assert_eq!(
+            request.tool_choice,
+            ToolChoice::required(),
+            "first turn should force tool_choice=required"
+        );
+    }
+
+    #[test]
+    fn subsequent_turns_use_auto_tool_choice() {
+        let llm = ScriptedLlm::new(vec![]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        // Add a tool result message to simulate a later turn
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "file content".to_string(),
+        });
+
+        let request = loop_.build_request();
+        assert_eq!(
+            request.tool_choice,
+            ToolChoice::auto(),
+            "subsequent turns should use tool_choice=auto"
+        );
+    }
+
+    #[test]
+    fn hallucination_nudge_triggers_at_300_chars() {
+        // Response of exactly 301 chars should trigger nudge
+        let text_301 = "x".repeat(301);
+        let llm = ScriptedLlm::new(vec![
+            make_text_response(&text_301),
+            make_text_response("OK"), // after nudge
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("describe the project").unwrap();
+        assert_eq!(result.response, "OK");
+        assert_eq!(result.turns, 2, "nudge should have triggered an extra turn");
+
+        // Response of exactly 300 chars should NOT trigger nudge
+        let text_300 = "y".repeat(300);
+        let llm2 = ScriptedLlm::new(vec![make_text_response(&text_300)]);
+        let tool_host2 = Arc::new(MockToolHost::new(vec![], true));
+
+        let mut loop2 = ToolUseLoop::new(
+            &llm2,
+            tool_host2,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result2 = loop2.run("describe the project").unwrap();
+        assert_eq!(result2.turns, 1, "300 chars should not trigger nudge");
+    }
+
+    #[test]
+    fn unverified_file_references_detected() {
+        // Text mentioning file paths without any tool calls
+        assert!(has_unverified_file_references(
+            "The project has src/main.rs and src/lib.rs with key functions.",
+            &[]
+        ));
+
+        // After reading files, should not flag
+        let read_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: "path=\"src/main.rs\"".to_string(),
+            success: true,
+            duration_ms: 10,
+        }];
+        assert!(!has_unverified_file_references(
+            "The project has src/main.rs and src/lib.rs with key functions.",
+            &read_calls
+        ));
+
+        // Short text with no path-like patterns should not flag
+        assert!(!has_unverified_file_references("Hello, world!", &[]));
     }
 }

@@ -1,15 +1,11 @@
 mod analysis;
 pub mod apply;
-mod architect;
 mod complexity;
-mod editor;
 mod gather_context;
 mod intent;
-pub mod linter;
-mod r#loop;
 pub mod prompts;
-pub mod run_engine;
 mod repo_map_v2;
+mod shared;
 mod team;
 pub mod tool_bridge;
 pub mod tool_loop;
@@ -46,10 +42,7 @@ pub enum ChatMode {
     Ask,          // Read-only, tool-use loop (read_only=true)
     #[default]
     Code,         // Default: tool-use loop (full capability)
-    Architect,    // Plan-only output via run_engine
     Context,      // Read-only, tool-use loop (read_only=true)
-    /// Explicit old pipeline: Architect→Editor→Apply→Verify state machine.
-    Pipeline,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -68,9 +61,6 @@ pub struct ChatOptions {
     /// Log expanded context blocks to stderr before sending to LLM.
     pub debug_context: bool,
     pub mode: ChatMode,
-    /// When true, agents apply file changes directly without asking for confirmation.
-    pub force_execute: bool,
-    pub force_plan_only: bool,
     pub teammate_mode: Option<String>,
     pub disable_team_orchestration: bool,
     /// When true, attempts to parse and fetch web URLs from prompt.
@@ -368,13 +358,10 @@ impl AgentEngine {
             prompt,
             mode: options.mode,
             tools: options.tools,
-            force_execute: options.force_execute,
-            force_plan_only: options.force_plan_only,
         });
         let intent_label = match task_intent {
             intent::TaskIntent::InspectRepo => "InspectRepo",
             intent::TaskIntent::EditCode => "EditCode",
-            intent::TaskIntent::ArchitectOnly => "ArchitectOnly",
         };
         let bootstrap = gather_context::gather_for_prompt(
             &self.workspace,
@@ -385,46 +372,6 @@ impl AgentEngine {
             options.repo_root_override.as_deref(),
         );
         bootstrap.debug_digest(intent_label, options.mode)
-    }
-
-    pub fn plan_only(&self, prompt: &str, options: &ChatOptions) -> Result<deepseek_core::Plan> {
-        let feedback = architect::ArchitectFeedback::default();
-        let input = architect::ArchitectInput {
-            user_prompt: prompt,
-            iteration: 1,
-            feedback: &feedback,
-            max_files: self.cfg.agent_loop.max_files_per_iteration as usize,
-            additional_dirs: &[],
-            debug_context: false,
-            chat_history: &options.chat_history,
-        };
-        let plan = architect::run_architect(
-            self,
-            &self.workspace,
-            &input,
-            self.cfg.agent_loop.architect_parse_retries as usize,
-        )?;
-        Ok(deepseek_core::Plan {
-            plan_id: uuid::Uuid::now_v7(),
-            version: 1,
-            goal: prompt.to_string(),
-            assumptions: vec![],
-            steps: plan
-                .steps
-                .iter()
-                .enumerate()
-                .map(|(idx, step)| deepseek_core::PlanStep {
-                    step_id: uuid::Uuid::now_v7(),
-                    title: format!("Step {}", idx + 1),
-                    intent: step.clone(),
-                    tools: vec![],
-                    files: plan.files.iter().map(|f| f.path.clone()).collect(),
-                    done: false,
-                })
-                .collect(),
-            verification: plan.verify_commands.clone(),
-            risk_notes: plan.acceptance.clone(),
-        })
     }
 
     /// Run the tool-use conversation loop (P3 architecture).
@@ -458,13 +405,35 @@ impl AgentEngine {
         );
 
         let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
+        let use_thinking = options.force_max_think;
         let config = tool_loop::ToolLoopConfig {
-            model: self.cfg.llm.base_model.clone(),
-            max_tokens: deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS,
-            temperature: Some(self.cfg.llm.temperature),
+            model: if use_thinking {
+                self.cfg.llm.max_think_model.clone()
+            } else {
+                self.cfg.llm.base_model.clone()
+            },
+            max_tokens: if use_thinking {
+                deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS
+            } else {
+                deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS
+            },
+            temperature: if use_thinking {
+                None // Thinking mode is incompatible with temperature
+            } else {
+                Some(self.cfg.llm.temperature)
+            },
             context_window_tokens: self.cfg.llm.context_window_tokens,
-            max_turns: self.max_turns.unwrap_or(tool_loop::DEFAULT_MAX_TURNS as u64) as usize,
+            max_turns: self
+                .max_turns
+                .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns)
+                as usize,
             read_only,
+            thinking: if use_thinking {
+                Some(deepseek_core::ThinkingConfig::enabled(16_384))
+            } else {
+                None
+            },
+            think_deeply_model: self.cfg.llm.max_think_model.clone(),
         };
 
         let mut loop_ = tool_loop::ToolUseLoop::new(
@@ -556,27 +525,13 @@ impl AgentEngine {
             },
         });
 
-        let result = match options.mode {
-            ChatMode::Pipeline => {
-                // Explicit old pipeline (Architect→Editor→Apply→Verify)
-                run_engine::run(self, &prompt_enriched, &options)
-            }
-            ChatMode::Architect => {
-                // Plan-only output via old pipeline
-                run_engine::run(self, &prompt_enriched, &options)
-            }
-            _ if !options.tools => {
-                // No tools requested → use the analysis path (read-only Q&A)
-                self.analyze_with_options(&prompt_enriched, options)
-            }
-            _ => {
-                // Code, Ask, Context → tool-use loop
-                if should_run_team_orchestration(self, &prompt_enriched, &options) {
-                    team::run(self, &prompt_enriched, &options)
-                } else {
-                    self.run_tool_use_loop(&prompt_enriched, &options)
-                }
-            }
+        let result = if !options.tools {
+            // No tools requested → use the analysis path (read-only Q&A)
+            self.analyze_with_options(&prompt_enriched, options)
+        } else if should_run_team_orchestration(self, &prompt_enriched, &options) {
+            team::run(self, &prompt_enriched, &options)
+        } else {
+            self.run_tool_use_loop(&prompt_enriched, &options)
         };
 
         if let Ok(text) = &result {
@@ -592,42 +547,6 @@ impl AgentEngine {
 
         // Fire Stop hooks for post-processing (logging, notifications, etc.)
         self.fire_stop();
-
-        result
-    }
-
-    /// Alternative agent loop with integrated lint auto-fix, failure classification,
-    /// and commit proposals. Uses a monolithic loop (architect → editor → lint → verify)
-    /// instead of the state-machine `RunEngine` approach.
-    pub fn chat_loop(&self, prompt: &str, options: ChatOptions) -> Result<String> {
-        let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
-
-        // Load chat history from the store if possible
-        let mut options = options;
-        if let Ok(Some(session)) = self.store.load_latest_session() {
-            if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
-                options.chat_history = projection.chat_messages;
-            }
-        }
-
-        // Record User Turn
-        self.append_event_best_effort(EventKind::ChatTurnV1 {
-            message: ChatMessage::User {
-                content: prompt_enriched.clone(),
-            },
-        });
-
-        let result = r#loop::run(self, &prompt_enriched, &options);
-
-        if let Ok(text) = &result {
-            self.append_event_best_effort(EventKind::ChatTurnV1 {
-                message: ChatMessage::Assistant {
-                    content: Some(text.clone()),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                },
-            });
-        }
 
         result
     }
@@ -648,6 +567,7 @@ impl AgentEngine {
         let _ = self.store.append_event(&event);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn record_usage(&self, model: &str, usage: &deepseek_core::TokenUsage) {
         self.append_event_best_effort(EventKind::UsageUpdatedV1 {
             unit: deepseek_core::LlmUnit::Model(model.to_string()),

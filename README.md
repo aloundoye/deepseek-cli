@@ -19,7 +19,7 @@ DeepSeek CLI is a Rust workspace organized into focused crates:
 | Crate | Role |
 |-------|------|
 | `deepseek-cli` | CLI dispatch, argument parsing, subcommand handlers |
-| `deepseek-agent` | Run Engine state machine, Architect/Editor/Verify orchestration |
+| `deepseek-agent` | Agent engine, tool-use loop (default), pipeline orchestration |
 | `deepseek-core` | Shared types, config loading, event definitions |
 | `deepseek-diff` | Unified diff parsing, patch staging, and git-apply |
 | `deepseek-store` | Session persistence, event log (JSONL), SQLite projections |
@@ -34,7 +34,19 @@ DeepSeek CLI is a Rust workspace organized into focused crates:
 | `deepseek-subagent` | Specialist subagents (debugger, refactor-sheriff, security-sentinel) |
 | `deepseek-observe` | Observability, structured logging |
 
-The core execution pipeline follows a deterministic state machine:
+The default execution mode is the **tool-use loop** (think→act→observe):
+
+```
+User → LLM (with tools) → Tool calls → Results → LLM → ... → Final response
+```
+
+- The LLM freely decides which tools to call (file read/write, shell, search, etc.)
+- Tools execute locally with policy-gated approval for write operations
+- Checkpoints are created before destructive tool calls
+- The loop continues until the LLM responds without tool calls (task complete)
+- Thinking mode (`deepseek-reasoner`) can be enabled for complex reasoning
+
+A legacy **pipeline mode** (`--mode pipeline`) is also available:
 
 ```
 Context → Architect → Editor → Apply → Verify → (loop or done)
@@ -44,7 +56,6 @@ Context → Architect → Editor → Apply → Verify → (loop or done)
 - **Editor** produces strict unified diffs (`deepseek-chat`, thinking disabled)
 - **Apply Gate** validates hashes, enforces approval, creates checkpoints
 - **Verify** runs derived commands, classifies failures for auto-repair
-- On failure, the engine classifies the error and retries Editor-first or Architect-first
 
 ## Install
 
@@ -199,7 +210,7 @@ Notable architecture/runtime defaults:
 - Apply safety gates require approval for oversized patches and create checkpoints around patch apply.
 - Verify-pass emits a commit proposal and next actions; it never auto-commits.
 - Optional team-lane composition (`--teammate-mode`) runs lane pipelines in isolated worktrees and merges lane patches deterministically.
-- Tool/function-calling orchestration is not used as the core execution backbone.
+- Tool/function-calling orchestration is the default execution backbone (tool-use loop).
 - Analysis/review commands use a separate non-edit path and do not mutate files.
 - Ask/context analysis prompts use deterministic `AUTO_CONTEXT_BOOTSTRAP_V1` repo context and return initial analysis before limited follow-up questions.
 - Repo-oriented prompts without a detected repository return: `No repository detected. Run from project root or pass --repo <path>.`
@@ -210,7 +221,7 @@ Notable architecture/runtime defaults:
 - Teleport link base URL is configurable (`ui.handoff_base_url`).
 
 Common execution control flags:
-- `--force-execute` (force full Architect->Editor->Apply->Verify loop)
+- `--force-execute` (force pipeline mode: Architect→Editor→Apply→Verify)
 - `--plan-only` (architect plan output only, no apply/verify)
 - `--repo <path>` (override repository root for bootstrap/context)
 - `--debug-context` (print deterministic pre-model context digest; also available via `DEEPSEEK_DEBUG_CONTEXT=1`)

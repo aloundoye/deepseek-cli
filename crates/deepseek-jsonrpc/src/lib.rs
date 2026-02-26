@@ -374,14 +374,6 @@ impl IdeRpcHandler {
             .or_else(|| params.get("thinking_enabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let force_execute = params
-            .get("force_execute")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let force_plan_only = params
-            .get("plan_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let tools = params
             .get("tools")
             .and_then(|v| v.as_bool())
@@ -435,8 +427,6 @@ impl IdeRpcHandler {
                     repo_root_override: repo_root,
                     debug_context,
                     mode,
-                    force_execute,
-                    force_plan_only,
                     teammate_mode,
                     ..Default::default()
                 };
@@ -1222,14 +1212,6 @@ impl IdeRpcHandler {
             .get("tools")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let force_execute = params
-            .get("force_execute")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let force_plan_only = params
-            .get("plan_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let repo_root_override = params
             .get("repo_root")
             .and_then(|v| v.as_str())
@@ -1241,8 +1223,6 @@ impl IdeRpcHandler {
             &ChatOptions {
                 tools,
                 mode,
-                force_execute,
-                force_plan_only,
                 repo_root_override,
                 debug_context: true,
                 ..Default::default()
@@ -1443,9 +1423,7 @@ fn env_flag_enabled(key: &str) -> bool {
 fn parse_chat_mode(value: &str) -> ChatMode {
     match value.trim().to_ascii_lowercase().as_str() {
         "ask" => ChatMode::Ask,
-        "architect" => ChatMode::Architect,
         "context" => ChatMode::Context,
-        "pipeline" => ChatMode::Pipeline,
         _ => ChatMode::Code,
     }
 }

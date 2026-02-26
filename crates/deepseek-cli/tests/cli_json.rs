@@ -19,12 +19,11 @@ fn plan_command_emits_json_shape() {
         workspace.path(),
         &["--json", "plan", "Refactor planner state"],
     );
-    assert!(out.get("plan_id").is_some());
-    assert!(out["steps"].as_array().is_some_and(|s| !s.is_empty()));
+    // The plan command now routes through chat_with_options and wraps
+    // the LLM response text in a {"plan": "..."} envelope.
     assert!(
-        out["verification"]
-            .as_array()
-            .is_some_and(|v| !v.is_empty())
+        out.get("plan").is_some(),
+        "plan command JSON should contain 'plan' key, got: {out}"
     );
 }
 

@@ -180,14 +180,6 @@ struct Cli {
     #[arg(long = "teammate-mode", global = true)]
     teammate_mode: Option<String>,
 
-    /// Force execution through Architect->Editor->Apply->Verify even for non-edit prompts.
-    #[arg(long = "force-execute", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    force_execute: bool,
-
-    /// Return architect plan only (no apply/verify execution).
-    #[arg(long = "plan-only", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    plan_only: bool,
-
     /// Enable beta features by name.
     #[arg(long = "betas", global = true, value_delimiter = ',')]
     betas: Vec<String>,
@@ -1483,12 +1475,6 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
         )
         .into_error());
     }
-    if cli.force_execute && cli.plan_only {
-        return Err(enhanced_errors::config_error(
-            "--force-execute and --plan-only are mutually exclusive",
-        )
-        .into_error());
-    }
     if cli.dangerously_skip_permissions && !cli.allow_dangerously_skip_permissions {
         return Err(enhanced_errors::config_error(
             "--dangerously-skip-permissions requires --allow-dangerously-skip-permissions to confirm intent"
@@ -1649,13 +1635,16 @@ fn run() -> Result<()> {
         Commands::Plan(args) => {
             ensure_llm_ready(&cwd, cli.json)?;
             let engine = AgentEngine::new(&cwd)?;
-            #[allow(deprecated)]
-            let options = chat_options_from_cli(&cli, false, ChatMode::Architect);
-            let plan = engine.plan_only(&args.prompt, &options)?;
+            let options = chat_options_from_cli(&cli, true, ChatMode::Code);
+            let plan_prompt = format!(
+                "Create a detailed implementation plan for: {}\n\nReturn ONLY a structured plan with steps, files, and verification commands. Do NOT implement any changes.",
+                args.prompt
+            );
+            let result = engine.chat_with_options(&plan_prompt, options)?;
             if cli.json {
-                print_json(&plan)?;
+                print_json(&json!({"plan": result}))?;
             } else {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
+                println!("{result}");
             }
             Ok(())
         }

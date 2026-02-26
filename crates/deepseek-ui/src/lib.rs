@@ -58,62 +58,6 @@ pub enum TuiStreamEvent {
     ContentDelta(String),
     /// Incremental reasoning/thinking text from the LLM.
     ReasoningDelta(String),
-    /// Architect phase started.
-    ArchitectStarted { iteration: u64 },
-    /// Architect phase completed.
-    ArchitectCompleted {
-        iteration: u64,
-        files: u32,
-        no_edit: bool,
-    },
-    /// Editor phase started.
-    EditorStarted { iteration: u64, files: u32 },
-    /// Editor phase completed.
-    EditorCompleted { iteration: u64, status: String },
-    /// Apply phase started.
-    ApplyStarted { iteration: u64 },
-    /// Apply phase completed.
-    ApplyCompleted {
-        iteration: u64,
-        success: bool,
-        summary: String,
-    },
-    /// Verify phase started.
-    VerifyStarted {
-        iteration: u64,
-        commands: Vec<String>,
-    },
-    /// Verify phase completed.
-    VerifyCompleted {
-        iteration: u64,
-        success: bool,
-        summary: String,
-    },
-    /// Lint auto-fix phase started.
-    LintStarted {
-        iteration: u64,
-        commands: Vec<String>,
-    },
-    /// Lint auto-fix phase completed.
-    LintCompleted {
-        iteration: u64,
-        success: bool,
-        fixed: u32,
-        remaining: u32,
-    },
-    /// Commit completed successfully.
-    CommitCompleted { sha: String, message: String },
-    /// Commit skipped by user.
-    CommitSkipped,
-    /// Verify passed and user can explicitly commit.
-    CommitProposal {
-        files: Vec<String>,
-        touched_files: u32,
-        loc_delta: u32,
-        verify_commands: Vec<String>,
-        verify_status: String,
-        suggested_message: String,
-    },
     /// A tool is now actively executing.
     ToolActive(String),
     /// A tool call has started — pushed to transcript.
@@ -468,7 +412,9 @@ pub fn render_statusline(status: &UiStatus) -> String {
         (Some(s), None) => format!(" review={s}"),
         _ => String::new(),
     };
-    let agent_part = if !status.agent_mode.is_empty() && status.agent_mode != "ArchitectEditorLoop"
+    let agent_part = if !status.agent_mode.is_empty()
+        && status.agent_mode != "ToolUseLoop"
+        && status.agent_mode != "ArchitectEditorLoop"
     {
         format!(" agent={}", status.agent_mode)
     } else {
@@ -598,7 +544,10 @@ fn render_statusline_spans(
     }
 
     // Agent mode badge — only shown when not in default loop mode.
-    if !status.agent_mode.is_empty() && status.agent_mode != "ArchitectEditorLoop" {
+    if !status.agent_mode.is_empty()
+        && status.agent_mode != "ToolUseLoop"
+        && status.agent_mode != "ArchitectEditorLoop"
+    {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!(" {} ", status.agent_mode),
@@ -2981,7 +2930,7 @@ where
     let mission_control_max_events = ui_cfg.mission_control_max_events.max(50) as usize;
 
     let mut shell = ChatShell {
-        agent_mode: "ArchitectEditorLoop".to_string(),
+        agent_mode: "ToolUseLoop".to_string(),
         reduced_motion,
         mission_control_max_events,
         thinking_visibility: thinking_visibility.clone(),
@@ -3494,195 +3443,6 @@ where
                             shell.thinking_buffer = format!("{label}: analyzing...");
                         }
                     }
-                }
-                TuiStreamEvent::ArchitectStarted { iteration } => {
-                    shell.push_mission_control(format!("iteration {iteration}: architect started"));
-                    info_line = format!("iter {iteration} architect");
-                    active_phase = Some((iteration, "planning".to_string()));
-                    last_phase_event_at = Instant::now();
-                    last_phase_heartbeat_at = Instant::now();
-                    if shell.thinking_visibility != "raw" {
-                        shell.is_thinking = true;
-                        shell.thinking_buffer =
-                            "planning: building a deterministic plan".to_string();
-                    }
-                }
-                TuiStreamEvent::ArchitectCompleted {
-                    iteration,
-                    files,
-                    no_edit,
-                } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: architect completed files={files} no_edit={no_edit}"
-                    ));
-                    info_line = format!("iter {iteration} architect done");
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
-                }
-                TuiStreamEvent::EditorStarted { iteration, files } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: editor started files={files}"
-                    ));
-                    info_line = format!("iter {iteration} editor");
-                    active_phase = Some((iteration, "editing".to_string()));
-                    last_phase_event_at = Instant::now();
-                    last_phase_heartbeat_at = Instant::now();
-                    if shell.thinking_visibility != "raw" {
-                        shell.is_thinking = true;
-                        shell.thinking_buffer = "editing: generating unified diff".to_string();
-                    }
-                }
-                TuiStreamEvent::EditorCompleted { iteration, status } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: editor completed status={status}"
-                    ));
-                    info_line = format!("iter {iteration} editor {status}");
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
-                }
-                TuiStreamEvent::ApplyStarted { iteration } => {
-                    shell.push_mission_control(format!("iteration {iteration}: apply started"));
-                    info_line = format!("iter {iteration} apply");
-                    active_phase = Some((iteration, "applying".to_string()));
-                    last_phase_event_at = Instant::now();
-                    last_phase_heartbeat_at = Instant::now();
-                    if shell.thinking_visibility != "raw" {
-                        shell.is_thinking = true;
-                        shell.thinking_buffer =
-                            "applying: validating and applying patch".to_string();
-                    }
-                }
-                TuiStreamEvent::ApplyCompleted {
-                    iteration,
-                    success,
-                    summary,
-                } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: apply {} {}",
-                        if success { "ok" } else { "failed" },
-                        truncate_inline(&summary.replace('\n', " "), 120)
-                    ));
-                    info_line = format!(
-                        "iter {iteration} apply {}",
-                        if success { "ok" } else { "failed" }
-                    );
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
-                }
-                TuiStreamEvent::VerifyStarted {
-                    iteration,
-                    commands,
-                } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: verify started commands={}",
-                        commands.join(" | ")
-                    ));
-                    info_line = format!("iter {iteration} verify");
-                    active_phase = Some((iteration, "verifying".to_string()));
-                    last_phase_event_at = Instant::now();
-                    last_phase_heartbeat_at = Instant::now();
-                    if shell.thinking_visibility != "raw" {
-                        shell.is_thinking = true;
-                        shell.thinking_buffer =
-                            "verifying: running deterministic checks".to_string();
-                    }
-                }
-                TuiStreamEvent::VerifyCompleted {
-                    iteration,
-                    success,
-                    summary,
-                } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: verify {} {}",
-                        if success { "ok" } else { "failed" },
-                        truncate_inline(&summary.replace('\n', " "), 120)
-                    ));
-                    if success {
-                        shell.push_system(
-                            "\x1b[2mtip: use /rewind to undo changes\x1b[0m".to_string(),
-                        );
-                    }
-                    info_line = format!(
-                        "iter {iteration} verify {}",
-                        if success { "ok" } else { "failed" }
-                    );
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
-                }
-                TuiStreamEvent::LintStarted {
-                    iteration,
-                    commands,
-                } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: lint started commands={}",
-                        commands.join(" | ")
-                    ));
-                    info_line = format!("iter {iteration} lint");
-                    active_phase = Some((iteration, "linting".to_string()));
-                    last_phase_event_at = Instant::now();
-                    last_phase_heartbeat_at = Instant::now();
-                    if shell.thinking_visibility != "raw" {
-                        shell.is_thinking = true;
-                        shell.thinking_buffer =
-                            "linting: running auto-fix checks".to_string();
-                    }
-                }
-                TuiStreamEvent::LintCompleted {
-                    iteration,
-                    success,
-                    fixed,
-                    remaining,
-                } => {
-                    shell.push_mission_control(format!(
-                        "iteration {iteration}: lint {} fixed={fixed} remaining={remaining}",
-                        if success { "ok" } else { "failed" },
-                    ));
-                    info_line = format!(
-                        "iter {iteration} lint {} fixed={fixed} remaining={remaining}",
-                        if success { "ok" } else { "failed" }
-                    );
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
-                }
-                TuiStreamEvent::CommitProposal {
-                    files,
-                    touched_files,
-                    loc_delta,
-                    verify_commands,
-                    verify_status,
-                    suggested_message,
-                } => {
-                    shell.push_mission_control(format!(
-                        "commit proposal files={} touched={} loc={} verify={} msg={}",
-                        files.join(","),
-                        touched_files,
-                        loc_delta,
-                        truncate_inline(&verify_status.replace('\n', " "), 90),
-                        truncate_inline(&suggested_message, 90)
-                    ));
-                    shell.push_system(
-                        "✅ Verify passed. Run /commit to save changes, /diff to review, /undo to revert."
-                            .to_string(),
-                    );
-                    if !verify_commands.is_empty() {
-                        shell.push_system(format!(
-                            "verify commands: {}",
-                            verify_commands.join(" | ")
-                        ));
-                    }
-                    info_line = "ready to commit".to_string();
-                }
-                TuiStreamEvent::CommitCompleted { sha, message } => {
-                    shell.push_mission_control(format!("commit completed sha={sha} msg={}", truncate_inline(&message, 90)));
-                    info_line = format!("committed {}", &sha[..sha.len().min(8)]);
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
-                }
-                TuiStreamEvent::CommitSkipped => {
-                    shell.push_mission_control("commit skipped by user".to_string());
-                    info_line = "commit skipped".to_string();
-                    active_phase = None;
-                    last_phase_event_at = Instant::now();
                 }
                 TuiStreamEvent::ToolActive(name) => {
                     shell.is_thinking = false;
@@ -6623,20 +6383,20 @@ mod tests {
     #[test]
     fn mode_transition_updates_shell_and_transcript() {
         let mut shell = ChatShell {
-            agent_mode: "ArchitectEditorLoop".to_string(),
+            agent_mode: "ToolUseLoop".to_string(),
             ..Default::default()
         };
         shell.agent_mode = "VerifyRetry".to_string();
-        shell.push_system("mode transition ArchitectEditorLoop -> VerifyRetry (verify failure)");
+        shell.push_system("mode transition ToolUseLoop -> VerifyRetry (verify failure)");
 
         assert_eq!(shell.agent_mode, "VerifyRetry");
         assert_eq!(shell.transcript.len(), 1);
         assert_eq!(shell.transcript[0].kind, MessageKind::System);
         assert!(shell.transcript[0].text.contains("mode transition"));
 
-        shell.agent_mode = "ArchitectEditorLoop".to_string();
-        shell.push_system("mode transition VerifyRetry -> ArchitectEditorLoop (recovered)");
-        assert_eq!(shell.agent_mode, "ArchitectEditorLoop");
+        shell.agent_mode = "ToolUseLoop".to_string();
+        shell.push_system("mode transition VerifyRetry -> ToolUseLoop (recovered)");
+        assert_eq!(shell.agent_mode, "ToolUseLoop");
         assert_eq!(shell.transcript.len(), 2);
         assert!(shell.transcript[1].text.contains("mode transition"));
     }
@@ -6658,16 +6418,30 @@ mod tests {
 
     #[test]
     fn statusline_hides_mode_badge_in_default_mode() {
+        // ToolUseLoop (new default) should be hidden
         let status = UiStatus {
             model: "deepseek-chat".to_string(),
-            agent_mode: "ArchitectEditorLoop".to_string(),
+            agent_mode: "ToolUseLoop".to_string(),
             ..Default::default()
         };
         let spans = render_statusline_spans(&status, None, "", None, None, false, false);
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(
-            !text.contains(" ArchitectEditorLoop "),
-            "status bar should not show mode badge in default mode"
+            !text.contains(" ToolUseLoop "),
+            "status bar should not show mode badge for ToolUseLoop"
+        );
+
+        // ArchitectEditorLoop (old default, for pipeline mode) should also be hidden
+        let status2 = UiStatus {
+            model: "deepseek-chat".to_string(),
+            agent_mode: "ArchitectEditorLoop".to_string(),
+            ..Default::default()
+        };
+        let spans2 = render_statusline_spans(&status2, None, "", None, None, false, false);
+        let text2: String = spans2.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            !text2.contains(" ArchitectEditorLoop "),
+            "status bar should not show mode badge for ArchitectEditorLoop"
         );
     }
 
@@ -6686,7 +6460,7 @@ mod tests {
     fn plain_statusline_hides_agent_mode_when_default() {
         let status = UiStatus {
             model: "deepseek-chat".to_string(),
-            agent_mode: "ArchitectEditorLoop".to_string(),
+            agent_mode: "ToolUseLoop".to_string(),
             ..Default::default()
         };
         let line = render_statusline(&status);
