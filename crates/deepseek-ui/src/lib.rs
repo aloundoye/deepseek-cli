@@ -2418,8 +2418,8 @@ pub fn format_relative_time(timestamp: &str) -> String {
 
 /// Available model choices for the interactive `/model` picker.
 const MODEL_CHOICES: &[(&str, &str)] = &[
-    ("deepseek-chat", "Fast, general-purpose"),
-    ("deepseek-reasoner", "Thinking mode, detailed reasoning"),
+    ("deepseek-chat", "Thinking + tools (default)"),
+    ("deepseek-reasoner", "Deep reasoning, no tools"),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -2505,6 +2505,96 @@ impl AutocompleteState {
             .collect()
     }
 }
+
+// ─── ML Ghost Text ──────────────────────────────────────────────────────────
+
+/// State for ML-powered ghost text (autocomplete) suggestions.
+///
+/// Ghost text rendering priority: ML suggestion > history ghost > none.
+/// Uses DarkGray italic styling to distinguish from user input.
+#[derive(Debug, Clone)]
+pub struct GhostTextState {
+    /// The current ghost text suggestion, if any.
+    pub suggestion: Option<String>,
+    /// When the last keystroke occurred (for debounce).
+    pub last_keystroke: Instant,
+    /// Whether a completion request is pending (debounce not yet elapsed).
+    pub pending: bool,
+    /// Debounce duration (default 200ms).
+    pub debounce_ms: u64,
+    /// Minimum input length before triggering completions.
+    pub min_input_len: usize,
+}
+
+impl Default for GhostTextState {
+    fn default() -> Self {
+        Self {
+            suggestion: None,
+            last_keystroke: Instant::now(),
+            pending: false,
+            debounce_ms: 200,
+            min_input_len: 3,
+        }
+    }
+}
+
+impl GhostTextState {
+    /// Record a keystroke — clears current suggestion and resets debounce.
+    pub fn on_keystroke(&mut self) {
+        self.suggestion = None;
+        self.last_keystroke = Instant::now();
+        self.pending = true;
+    }
+
+    /// Check if the debounce period has elapsed and a completion should be requested.
+    pub fn should_request(&self, input_len: usize) -> bool {
+        self.pending
+            && input_len >= self.min_input_len
+            && self.last_keystroke.elapsed() >= Duration::from_millis(self.debounce_ms)
+    }
+
+    /// Set the suggestion from a completion callback result.
+    pub fn set_suggestion(&mut self, text: Option<String>) {
+        self.suggestion = text;
+        self.pending = false;
+    }
+
+    /// Accept the full ghost text suggestion, returning it.
+    pub fn accept_full(&mut self) -> Option<String> {
+        self.pending = false;
+        self.suggestion.take()
+    }
+
+    /// Accept one word from the ghost text suggestion.
+    pub fn accept_word(&mut self) -> Option<String> {
+        if let Some(ref text) = self.suggestion {
+            let trimmed = text.trim_start();
+            let word_end = trimmed
+                .find(|c: char| c.is_whitespace())
+                .map(|i| i + (text.len() - trimmed.len()))
+                .unwrap_or(text.len());
+            if word_end == 0 {
+                return self.accept_full();
+            }
+            let word = text[..word_end].to_string();
+            let remaining = &text[word_end..];
+            if remaining.is_empty() {
+                self.suggestion = None;
+            } else {
+                self.suggestion = Some(remaining.to_string());
+            }
+            self.pending = false;
+            Some(word)
+        } else {
+            None
+        }
+    }
+}
+
+/// Type alias for the ML completion callback.
+///
+/// Takes the current input text and returns an optional completion suggestion.
+pub type MlCompletionCallback = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Slash commands with short descriptions for the autocomplete dropdown.
 const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
@@ -2911,6 +3001,7 @@ where
             }
         },
         || None,
+        None,
     )
 }
 
@@ -2922,6 +3013,7 @@ pub fn run_tui_shell_with_bindings<F, S>(
     stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
     mut refresh_status: S,
+    ml_completion: Option<MlCompletionCallback>,
 ) -> Result<()>
 where
     F: FnMut(&str),
@@ -3049,8 +3141,19 @@ where
     let mut model_picker: Option<ModelPickerState> = None;
     let mut pending_images: Vec<PathBuf> = Vec::new();
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
+    let mut ml_ghost: GhostTextState = GhostTextState::default();
 
     loop {
+        // ML ghost text: check debounce and invoke completion callback
+        if ml_ghost.should_request(input.len()) {
+            if let Some(ref cb) = ml_completion {
+                let suggestion = cb(&input);
+                ml_ghost.set_suggestion(suggestion);
+            } else {
+                ml_ghost.set_suggestion(None);
+            }
+        }
+
         tick_count = tick_count.wrapping_add(1);
         shell.spinner_tick = tick_count;
         cursor_visible = tick_count % 16 < 8;
@@ -3319,16 +3422,23 @@ where
                     Span::raw(cursor_ch.to_string()),
                     Span::raw(after.to_string()),
                 ];
-                if scroll_y == 0
-                    && cursor_pos >= input.len()
-                    && let Some(ghost) = history_ghost_suffix(&history, &input)
-                {
-                    spans.push(Span::styled(
-                        ghost,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ));
+                // Ghost text priority: ML suggestion > history ghost > none
+                if scroll_y == 0 && cursor_pos >= input.len() {
+                    if let Some(ref ml_text) = ml_ghost.suggestion {
+                        spans.push(Span::styled(
+                            ml_text.clone(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    } else if let Some(ghost) = history_ghost_suffix(&history, &input) {
+                        spans.push(Span::styled(
+                            ghost,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    }
                 }
                 frame.render_widget(
                     Paragraph::new(Line::from(spans))
@@ -4606,7 +4716,29 @@ where
             cursor_pos = input.len();
             continue;
         }
+        // Alt+Right: accept one word of ML ghost text
+        if key.code == KeyCode::Right && key.modifiers == KeyModifiers::ALT {
+            if let Some(word) = ml_ghost.accept_word() {
+                input.push_str(&word);
+                cursor_pos = input.len();
+                info_line = "accepted word".to_string();
+                continue;
+            }
+        }
         if key == bindings.autocomplete {
+            // ML ghost text has highest priority
+            if cursor_pos >= input.len()
+                && !input.starts_with('/')
+                && ml_ghost.suggestion.is_some()
+            {
+                if let Some(text) = ml_ghost.accept_full() {
+                    input.push_str(&text);
+                    cursor_pos = input.len();
+                    info_line = "accepted ML suggestion".to_string();
+                    continue;
+                }
+            }
+            // Then history ghost
             if cursor_pos >= input.len()
                 && !input.starts_with('/')
                 && let Some(ghost) = history_ghost_suffix(&history, &input)
@@ -4778,11 +4910,13 @@ where
                 if cursor_pos > 0 && cursor_pos <= input.len() {
                     input.remove(cursor_pos - 1);
                     cursor_pos -= 1;
+                    ml_ghost.on_keystroke();
                 }
             }
             KeyCode::Delete => {
                 if cursor_pos < input.len() {
                     input.remove(cursor_pos);
+                    ml_ghost.on_keystroke();
                 }
             }
             KeyCode::Left => {
@@ -4802,6 +4936,7 @@ where
             KeyCode::Char(ch) => {
                 input.insert(cursor_pos.min(input.len()), ch);
                 cursor_pos += 1;
+                ml_ghost.on_keystroke();
                 if autocomplete_dropdown.is_none() {
                     if ch == '@' {
                         // Trigger @ file autocomplete dropdown
@@ -7140,6 +7275,93 @@ mod tests {
             .iter()
             .find(|(name, _)| name.starts_with(prefix));
         assert!(found.is_some(), "should find a command starting with 'co'");
+    }
+
+    // ── P8-08: ML Ghost Text tests ─────────────────────────────────────
+
+    #[test]
+    fn ghost_text_debounces() {
+        let mut ghost = GhostTextState::default();
+        // Before any keystroke, should not request
+        assert!(!ghost.should_request(5));
+
+        // After keystroke, should not request immediately (debounce not elapsed)
+        ghost.on_keystroke();
+        assert!(!ghost.should_request(5), "should not request before debounce");
+
+        // Still pending
+        assert!(ghost.pending);
+        assert!(ghost.suggestion.is_none());
+    }
+
+    #[test]
+    fn ghost_text_cancels_on_keystroke() {
+        let mut ghost = GhostTextState::default();
+        ghost.set_suggestion(Some("hello world".to_string()));
+        assert!(ghost.suggestion.is_some());
+
+        // New keystroke should clear the suggestion
+        ghost.on_keystroke();
+        assert!(ghost.suggestion.is_none(), "keystroke should clear suggestion");
+        assert!(ghost.pending, "should mark as pending after keystroke");
+    }
+
+    #[test]
+    fn ghost_text_tab_accepts() {
+        let mut ghost = GhostTextState::default();
+        ghost.set_suggestion(Some(" world".to_string()));
+
+        let accepted = ghost.accept_full();
+        assert_eq!(accepted, Some(" world".to_string()));
+        assert!(ghost.suggestion.is_none(), "suggestion should be consumed");
+    }
+
+    #[test]
+    fn ghost_text_accept_word() {
+        let mut ghost = GhostTextState::default();
+        ghost.set_suggestion(Some("hello world goodbye".to_string()));
+
+        let word = ghost.accept_word();
+        assert_eq!(word, Some("hello".to_string()));
+        assert_eq!(
+            ghost.suggestion,
+            Some(" world goodbye".to_string()),
+            "remaining text should be preserved"
+        );
+
+        let word2 = ghost.accept_word();
+        assert_eq!(word2, Some(" world".to_string()));
+        assert_eq!(ghost.suggestion, Some(" goodbye".to_string()));
+    }
+
+    #[test]
+    fn ghost_text_renders_darkgray() {
+        // Verify the DarkGray italic style is correctly constructed
+        let style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let span = Span::styled("ghost text", style);
+        assert_eq!(span.style.fg, Some(Color::DarkGray));
+        assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn ghost_text_min_input_length() {
+        let mut ghost = GhostTextState::default();
+        ghost.on_keystroke();
+        // Input too short (< 3 chars)
+        assert!(!ghost.should_request(2), "should not request for short input");
+        // Wait past debounce and check with sufficient input
+        ghost.last_keystroke = Instant::now() - Duration::from_millis(300);
+        assert!(ghost.should_request(5), "should request for long input after debounce");
+        assert!(!ghost.should_request(2), "still should not request for short input");
+    }
+
+    #[test]
+    fn ghost_text_accept_full_when_no_suggestion() {
+        let mut ghost = GhostTextState::default();
+        assert!(ghost.accept_full().is_none());
+        assert!(ghost.accept_word().is_none());
     }
 }
 

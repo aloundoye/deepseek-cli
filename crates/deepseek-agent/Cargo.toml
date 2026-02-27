@@ -25,6 +25,7 @@ deepseek-diff = { path = "../deepseek-diff" }
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-context = { path = "../deepseek-context" }
 deepseek-index = { path = "../deepseek-index" }
+deepseek-local-ml = { path = "../deepseek-local-ml" }
 reqwest.workspace = true
 base64.workspace = true
 chrono.workspace = true

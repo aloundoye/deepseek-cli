@@ -41,6 +41,8 @@ deepseek-jsonrpc = { path = "../deepseek-jsonrpc" }
 deepseek-context = { path = "../deepseek-context" }
 deepseek-errors = { path = "../deepseek-errors" }
 deepseek-chrome = { path = "../deepseek-chrome" }
+deepseek-local-ml = { path = "../deepseek-local-ml" }
+ignore.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -146,6 +146,21 @@ pub struct ToolLoopConfig {
     pub skill_runner: Option<SkillRunner>,
     /// Workspace root path (for subagent spawning).
     pub workspace: Option<PathBuf>,
+    /// Optional retriever callback for injecting relevant code context before LLM calls.
+    /// Takes (query, max_results) and returns matching code chunks.
+    pub retriever: Option<Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync>>,
+    /// Optional privacy router for scanning tool outputs before appending to messages.
+    pub privacy_router: Option<Arc<deepseek_local_ml::PrivacyRouter>>,
+}
+
+/// A piece of retrieved code context from the workspace index.
+#[derive(Debug, Clone)]
+pub struct RetrievalContext {
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+    pub score: f32,
 }
 
 impl Default for ToolLoopConfig {
@@ -165,6 +180,8 @@ impl Default for ToolLoopConfig {
             subagent_worker: None,
             skill_runner: None,
             workspace: None,
+            retriever: None,
+            privacy_router: None,
         }
     }
 }
@@ -267,6 +284,9 @@ impl<'a> ToolUseLoop<'a> {
         self.messages.push(ChatMessage::User {
             content: user_message.to_string(),
         });
+
+        // Inject retrieval context on first turn only
+        self.prepare_retrieval_context(user_message);
 
         self.execute_loop()
     }
@@ -625,6 +645,18 @@ impl<'a> ToolUseLoop<'a> {
             &result,
             Some(&self.output_scanner),
         );
+        // Apply privacy router to tool output if configured
+        let msg = if self.config.privacy_router.is_some() {
+            match msg {
+                ChatMessage::Tool { tool_call_id, content } => {
+                    let filtered = self.apply_privacy_to_output(&content);
+                    ChatMessage::Tool { tool_call_id, content: filtered }
+                }
+                other => other,
+            }
+        } else {
+            msg
+        };
         self.messages.push(msg);
 
         // Emit security warnings to user
@@ -1003,6 +1035,83 @@ impl<'a> ToolUseLoop<'a> {
         self.messages = vec![system, summary_msg];
         self.messages.extend(recent);
         true
+    }
+
+    /// Inject retrieval context from the workspace vector index before the first LLM call.
+    /// Budgets the context to at most 20% of the context window.
+    fn prepare_retrieval_context(&mut self, user_message: &str) {
+        let retriever = match &self.config.retriever {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        let max_results = 10;
+        let results = match retriever(user_message, max_results) {
+            Ok(r) if !r.is_empty() => r,
+            _ => return,
+        };
+
+        // Budget: max 20% of context window
+        let budget_tokens = self.config.context_window_tokens / 5;
+        let mut context_parts = Vec::new();
+        let mut token_estimate: u64 = 0;
+
+        for r in &results {
+            let chunk_text = format!(
+                "--- {}:{}-{} (score: {:.3}) ---\n{}\n",
+                r.file_path, r.start_line, r.end_line, r.score, r.content,
+            );
+            let chunk_tokens = (chunk_text.len() as u64) / 4;
+            if token_estimate + chunk_tokens > budget_tokens {
+                break;
+            }
+            token_estimate += chunk_tokens;
+            context_parts.push(chunk_text);
+        }
+
+        if !context_parts.is_empty() {
+            let context_msg = format!(
+                "RETRIEVAL_CONTEXT (relevant code from workspace index):\n{}",
+                context_parts.join("\n")
+            );
+            self.messages.push(ChatMessage::System {
+                content: context_msg,
+            });
+
+            if let Some(ref cb) = self.event_cb {
+                cb(EventKind::Retrieval {
+                    query: user_message.to_string(),
+                    chunks_injected: context_parts.len() as u64,
+                    token_estimate,
+                });
+            }
+        }
+    }
+
+    /// Apply privacy router to tool output, redacting sensitive content if configured.
+    fn apply_privacy_to_output(&self, output: &str) -> String {
+        if let Some(ref router) = self.config.privacy_router {
+            match router.apply_policy(output, None) {
+                deepseek_local_ml::PrivacyResult::Redacted(redacted) => {
+                    self.emit(StreamChunk::SecurityWarning {
+                        message: "Privacy router redacted sensitive content in tool output"
+                            .to_string(),
+                    });
+                    return redacted;
+                }
+                deepseek_local_ml::PrivacyResult::Blocked => {
+                    self.emit(StreamChunk::SecurityWarning {
+                        message: "Privacy router blocked tool output containing sensitive data"
+                            .to_string(),
+                    });
+                    return "[BLOCKED: Privacy router blocked this output due to sensitive content]"
+                        .to_string();
+                }
+                deepseek_local_ml::PrivacyResult::LocalSummary(summary) => return summary,
+                deepseek_local_ml::PrivacyResult::Clean(_) => {}
+            }
+        }
+        output.to_string()
     }
 
     /// Emit a stream chunk to the callback.

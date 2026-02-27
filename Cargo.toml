@@ -21,6 +21,7 @@ members = [
   "crates/deepseek-chrome",
   "crates/deepseek-context",
   "crates/deepseek-errors",
+  "crates/deepseek-local-ml",
 ]
 resolver = "2"
 

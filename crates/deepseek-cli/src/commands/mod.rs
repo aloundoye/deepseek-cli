@@ -25,4 +25,6 @@ pub(crate) mod status;
 pub(crate) mod tasks;
 pub(crate) mod teleport;
 pub(crate) mod update;
+pub(crate) mod autocomplete_cmd;
+pub(crate) mod privacy;
 pub(crate) mod visual;

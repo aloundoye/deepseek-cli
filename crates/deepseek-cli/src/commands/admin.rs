@@ -405,10 +405,19 @@ pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()
     let session = ensure_session_record(cwd, &store)?;
 
     match cmd {
-        IndexCmd::Build => {
+        IndexCmd::Build { hybrid } => {
             let manifest = service.build(&session)?;
+            if hybrid {
+                // Log that hybrid mode was requested (vector index built separately)
+                if !json_mode {
+                    println!("hybrid mode: BM25 index built; vector index via local-ml");
+                }
+            }
             if json_mode {
-                print_json(&manifest)?;
+                print_json(&serde_json::json!({
+                    "manifest": manifest,
+                    "hybrid": hybrid,
+                }))?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
             }
@@ -450,6 +459,39 @@ pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()
                 print_json(&result)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        }
+        IndexCmd::Doctor => {
+            let status = service.status()?;
+            let index_path = cwd.join(".deepseek").join("index");
+            let has_index = index_path.exists();
+            let result = serde_json::json!({
+                "index_exists": has_index,
+                "index_path": index_path.to_string_lossy(),
+                "status": status,
+            });
+            if json_mode {
+                print_json(&result)?;
+            } else {
+                println!("Index diagnostics:");
+                println!("  index exists: {}", has_index);
+                println!("  index path: {}", index_path.display());
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            }
+        }
+        IndexCmd::Clean => {
+            let index_path = cwd.join(".deepseek").join("index");
+            if index_path.exists() {
+                std::fs::remove_dir_all(&index_path)?;
+                if json_mode {
+                    print_json(&serde_json::json!({"cleaned": true, "path": index_path.to_string_lossy()}))?;
+                } else {
+                    println!("Index cleaned: {}", index_path.display());
+                }
+            } else if json_mode {
+                print_json(&serde_json::json!({"cleaned": false, "reason": "no index found"}))?;
+            } else {
+                println!("No index to clean.");
             }
         }
     }

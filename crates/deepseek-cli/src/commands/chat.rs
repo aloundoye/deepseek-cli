@@ -3159,6 +3159,7 @@ pub(crate) fn run_chat_tui(
             });
         },
         move || current_ui_status(cwd, cfg, fmt_refresh.load(Ordering::Relaxed)).ok(),
+        None,
     )
 }
 

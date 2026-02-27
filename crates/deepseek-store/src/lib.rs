@@ -3178,6 +3178,13 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::EnterPlanMode { .. } => "EnterPlanMode@v1",
         EventKind::ExitPlanMode { .. } => "ExitPlanMode@v1",
         EventKind::ProviderSelected { .. } => "ProviderSelected@v1",
+        EventKind::IndexBuild { .. } => "IndexBuild@v1",
+        EventKind::IndexUpdate { .. } => "IndexUpdate@v1",
+        EventKind::IndexQueryEvent { .. } => "IndexQuery@v1",
+        EventKind::Retrieval { .. } => "Retrieval@v1",
+        EventKind::PrivacyRedaction { .. } => "PrivacyRedaction@v1",
+        EventKind::PrivacyBlock { .. } => "PrivacyBlock@v1",
+        EventKind::Autocomplete { .. } => "Autocomplete@v1",
     }
 }
 
