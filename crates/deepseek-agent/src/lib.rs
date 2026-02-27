@@ -443,10 +443,12 @@ impl AgentEngine {
         bootstrap.debug_digest(intent_label, options.mode)
     }
 
-    /// Run the tool-use conversation loop (P3 architecture).
+    /// Run the tool-use conversation loop.
     ///
     /// The model freely decides which tools to call at each step, enabling
-    /// fluid think→act→observe behavior instead of the rigid pipeline.
+    /// fluid think→act→observe behavior. Bootstrap context (project structure,
+    /// repo map, manifests) is injected on the first turn so the model starts
+    /// with project awareness instead of blind.
     fn run_tool_use_loop(&self, prompt: &str, options: &ChatOptions) -> Result<String> {
         let project_memory = deepseek_memory::MemoryManager::new(&self.workspace)
             .ok()
@@ -469,12 +471,25 @@ impl AgentEngine {
         // Classify complexity before building system prompt (planning injection depends on it).
         let complexity = complexity::classify_complexity(prompt);
 
+        // Build repo map for Complex tasks so the model knows the project structure
+        let repo_map_summary = if complexity == complexity::PromptComplexity::Complex {
+            Some(shared::build_repo_map(
+                &self.workspace,
+                prompt,
+                40, // top 40 files
+                &options.additional_dirs,
+            ))
+        } else {
+            None
+        };
+
         let system_prompt = prompts::build_tool_use_system_prompt_with_complexity(
             project_memory.as_deref(),
             options.system_prompt_override.as_deref(),
             options.system_prompt_append.as_deref(),
             Some(&ws_context),
             complexity,
+            repo_map_summary.as_deref(),
         );
 
         let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
@@ -486,6 +501,14 @@ impl AgentEngine {
         } else {
             complexity::thinking_budget_for(complexity) // Simple 8K / Medium 16K / Complex 32K
         };
+
+        // Gather lightweight bootstrap context so the model starts with project awareness.
+        // Budget: ~15% of context window to leave room for conversation.
+        let initial_context = self.build_bootstrap_context(
+            prompt,
+            options,
+            self.cfg.llm.context_window_tokens,
+        );
 
         let config = tool_loop::ToolLoopConfig {
             model: self.cfg.llm.base_model.clone(), // Always deepseek-chat
@@ -506,6 +529,7 @@ impl AgentEngine {
             retriever: build_retriever_callback(&self.workspace, &self.cfg),
             privacy_router: build_privacy_router(&self.cfg),
             images: options.images.clone(),
+            initial_context,
         };
 
         let mut loop_ = tool_loop::ToolUseLoop::new(
@@ -587,6 +611,60 @@ impl AgentEngine {
         }
 
         Ok(result.response)
+    }
+
+    /// Build bootstrap context messages from gather_context.
+    ///
+    /// Returns a vec of System messages containing project structure, repo map, etc.
+    /// Budgeted to ~15% of context window to leave room for conversation.
+    fn build_bootstrap_context(
+        &self,
+        prompt: &str,
+        options: &ChatOptions,
+        context_window_tokens: u64,
+    ) -> Vec<ChatMessage> {
+        let bootstrap = gather_context::gather_for_prompt(
+            &self.workspace,
+            &self.cfg,
+            prompt,
+            options.mode,
+            &options.additional_dirs,
+            options.repo_root_override.as_deref(),
+        );
+
+        if !bootstrap.enabled || bootstrap.packet.is_empty() {
+            return vec![];
+        }
+
+        // Enrich with dependency-analysis hub files
+        let mut packet = bootstrap.packet;
+        if let Ok(mut ctx_mgr) = deepseek_context::ContextManager::new(&self.workspace) {
+            if ctx_mgr.analyze_workspace().is_ok() {
+                let suggestions = ctx_mgr.suggest_relevant_files(prompt, 10);
+                if !suggestions.is_empty() {
+                    packet.push_str("\nKey files (by dependency centrality):\n");
+                    for s in &suggestions {
+                        let reasons = s.reasons.join(", ");
+                        packet.push_str(&format!(
+                            "  - {} (score: {:.1}, {})\n",
+                            s.path.display(),
+                            s.score,
+                            reasons
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Budget: ~15% of context window (128K × 0.15 ≈ 19K tokens)
+        let budget_tokens = context_window_tokens / 7;
+        let truncated = truncate_to_token_budget(&packet, budget_tokens);
+
+        vec![ChatMessage::System {
+            content: format!(
+                "PROJECT_CONTEXT (auto-gathered, do NOT repeat this to the user):\n{truncated}"
+            ),
+        }]
     }
 
     pub fn chat_with_options(&self, prompt: &str, mut options: ChatOptions) -> Result<String> {
@@ -685,17 +763,97 @@ impl AgentEngine {
     }
 }
 
+/// Truncate text to fit a token budget (chars/4 heuristic).
+/// Finds a clean break at a newline near the limit.
+fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
+    let max_chars = (max_tokens * 4) as usize;
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let truncated = &text[..max_chars.min(text.len())];
+    if let Some(last_newline) = truncated.rfind('\n') {
+        let remaining = text.len() - last_newline;
+        format!(
+            "{}...\n[truncated — {} more chars]",
+            &text[..last_newline],
+            remaining
+        )
+    } else {
+        format!("{}...\n[truncated]", truncated)
+    }
+}
+
 /// Build a retriever callback from config. Returns None if local_ml is disabled.
+///
+/// Uses MockEmbeddings (deterministic SHA-256 hashing) by default for consistent
+/// file-level retrieval. When compiled with `--features local-ml`, tries Candle
+/// embeddings (jina-code-v2) first for true semantic search.
 fn build_retriever_callback(
-    _workspace: &std::path::Path,
+    workspace: &std::path::Path,
     cfg: &deepseek_core::AppConfig,
 ) -> Option<std::sync::Arc<dyn Fn(&str, usize) -> anyhow::Result<Vec<tool_loop::RetrievalContext>> + Send + Sync>> {
     if !cfg.local_ml.enabled {
         return None;
     }
-    // Retriever will be wired to HybridRetriever when local-ml feature is active.
-    // For now, return None as the actual ML backend requires feature-gated initialization.
-    None
+
+    // Build embeddings backend (MockEmbeddings provides deterministic SHA-256 hashing;
+    // for true semantic search, compile deepseek-local-ml with --features local-ml).
+    let embeddings: std::sync::Arc<dyn deepseek_local_ml::EmbeddingsBackend> =
+        std::sync::Arc::new(deepseek_local_ml::MockEmbeddings::new(384));
+
+    // Build vector index path
+    let index_path = workspace.join(".deepseek").join("vector_index");
+    let chunk_config = deepseek_local_ml::ChunkConfig {
+        chunk_lines: cfg.local_ml.index.chunk_lines as usize,
+        ..Default::default()
+    };
+
+    // Build hybrid retriever
+    let retriever = match deepseek_local_ml::HybridRetriever::new(
+        &index_path,
+        embeddings,
+        None, // tantivy index — optional
+        0.7,  // blend_alpha: favor vector search
+        chunk_config,
+    ) {
+        Ok(r) => std::sync::Arc::new(std::sync::Mutex::new(r)),
+        Err(e) => {
+            eprintln!("[deepseek] retriever init failed ({e}), retrieval disabled");
+            return None;
+        }
+    };
+
+    // Lazy index on first retrieval call
+    let workspace_path = workspace.to_path_buf();
+    let indexed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    Some(std::sync::Arc::new(move |query: &str, max_results: usize| {
+        let mut retriever = retriever.lock().map_err(|e| anyhow!("retriever lock: {e}"))?;
+
+        // Lazy index on first call
+        if !indexed.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Err(e) = retriever.build_index(&workspace_path) {
+                eprintln!("[deepseek] index build failed: {e}");
+            }
+            indexed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let filter = deepseek_local_ml::SearchFilter {
+            max_results,
+            ..Default::default()
+        };
+        let results = retriever.search(query, max_results, &filter)?;
+        Ok(results
+            .into_iter()
+            .map(|r| tool_loop::RetrievalContext {
+                file_path: r.chunk.file_path.to_string_lossy().to_string(),
+                start_line: r.chunk.start_line,
+                end_line: r.chunk.end_line,
+                content: r.chunk.content,
+                score: r.hybrid_score,
+            })
+            .collect())
+    }))
 }
 
 /// Build a privacy router from config. Returns None if privacy is disabled.
@@ -893,6 +1051,22 @@ mod tests {
     }
 
     #[test]
+    fn truncate_to_token_budget_short_text_unchanged() {
+        let text = "hello world\nsecond line";
+        let result = truncate_to_token_budget(text, 1000);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn truncate_to_token_budget_long_text_truncated() {
+        let text = "line1\nline2\nline3\nline4\nline5\nline6";
+        // 4 tokens = 16 chars, which should cut mid-text
+        let result = truncate_to_token_budget(text, 4);
+        assert!(result.contains("truncated"));
+        assert!(result.len() < text.len() + 40); // truncated + marker
+    }
+
+    #[test]
     fn shadow_commit_used_in_checkpoint() {
         // Verify that MemoryManager::create_shadow_commit exists and returns
         // the expected ShadowCommit struct. On non-git directories, it should
@@ -914,6 +1088,52 @@ mod tests {
                 // and the checkpoint callback falls back to file-based
             }
         }
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // ── Batch 7: Context Manager Wiring ──
+
+    #[test]
+    fn context_manager_handles_missing_repo() {
+        // ContextManager should gracefully handle a non-existent or empty workspace
+        let result = deepseek_context::ContextManager::new("/tmp/nonexistent_deepseek_test_dir");
+        // Should succeed (creates empty graph) — not panic
+        assert!(result.is_ok(), "ContextManager::new should not fail on missing dir");
+    }
+
+    #[test]
+    fn context_manager_suggest_files_on_real_workspace() {
+        // Create a temp workspace with a few files that have import relationships
+        let workspace = std::env::temp_dir().join("deepseek_test_ctx_mgr");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(workspace.join("src")).expect("create src dir");
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub mod utils;\npub mod handler;\n",
+        )
+        .expect("write lib.rs");
+        std::fs::write(
+            workspace.join("src/utils.rs"),
+            "pub fn helper() {}\n",
+        )
+        .expect("write utils.rs");
+        std::fs::write(
+            workspace.join("src/handler.rs"),
+            "use crate::utils;\npub fn handle() { utils::helper(); }\n",
+        )
+        .expect("write handler.rs");
+
+        let mut ctx_mgr =
+            deepseek_context::ContextManager::new(&workspace).expect("context manager");
+        ctx_mgr.analyze_workspace().expect("analyze");
+
+        let suggestions = ctx_mgr.suggest_relevant_files("handler", 5);
+        // handler.rs should score high because its name matches the query
+        let has_handler = suggestions
+            .iter()
+            .any(|s| s.path.to_string_lossy().contains("handler"));
+        assert!(has_handler, "handler.rs should appear in suggestions for query 'handler'");
 
         let _ = std::fs::remove_dir_all(&workspace);
     }

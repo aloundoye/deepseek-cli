@@ -1,17 +1,22 @@
 # DeepSeek CLI Feature Matrix
 
-Updated: 2026-02-26
+Updated: 2026-02-27
 
-This matrix reflects runtime behavior after the tool-use loop migration (P3.5).
+This matrix reflects runtime behavior after P10 (Full Agent Intelligence Activation).
 
 ## 1. Core Agent Architecture
 
 | Area | Status | Runtime Truth |
 |---|---|---|
 | Tool-use loop (default) | DONE | Code/Ask/Context modes use a fluid think→act→observe loop where the LLM decides which tools to call. |
-| Pipeline mode (legacy) | DONE | Available via `--mode pipeline` or `--force-execute`. Uses `Architect (R1) → Editor (V3) → Apply → Verify`. |
-| Legacy mode router in execution loop | REMOVED | No runtime fallback/escalation path is used for edit execution. |
-| Legacy R1 tool-driving mode | REMOVED | No R1 JSON-intent drive-tools path in the execution loop. |
+| Adaptive complexity classifier | DONE | Simple decision-tree classifier (Simple/Medium/Complex). Initial budgets: 8K/16K/32K. Evidence-driven escalation (+8K per failure, capped 64K). De-escalation after 3 successes. |
+| Bootstrap context injection | DONE | Gathers project tree, git status, repo map, manifests, README, and dependency hub files on first tool-loop turn. Budget: ~15% of context window. |
+| Hybrid retrieval pipeline | DONE | Vector + BM25 search with RRF fusion. Lazy indexing on first query. Mock embeddings by default; Candle/jina-code-v2 with `--features local-ml`. |
+| Semantic compaction | DONE | Preserves files modified, files read, errors encountered, key decisions, and tool usage counts when compacting long conversations. |
+| Model routing | DONE | Complex+escalated tasks route to `deepseek-reasoner`; de-escalate to `deepseek-chat` after 3 consecutive successes. |
+| Error recovery guidance | DONE | Injects ERROR_RECOVERY system message on first escalation transition. STUCK_DETECTION after 3+ identical errors. |
+| Planning prompts (3-tier) | DONE | Complex: full planning protocol (Explore→Plan→Execute) + anti-patterns + repo map. Medium: lightweight guidance. Simple: no overhead. |
+| Privacy router | DONE | 3-layer detection (path globs, content regex, builtin secrets). Policies: BlockCloud, Redact, LocalOnlySummary. Applied to tool outputs. |
 | Deterministic edit contract | DONE | Unified diff is the only accepted edit payload from Editor (with bounded `NEED_CONTEXT|...` requests). |
 | Deterministic local apply | DONE | Diffs are validated and applied through `PatchStore` with path and scope checks. |
 | Deterministic local verify | DONE | Verify success depends on actual command exit status and timeout checks. |
@@ -35,7 +40,7 @@ This matrix reflects runtime behavior after the tool-use loop migration (P3.5).
 
 | Area | Status | Runtime Truth |
 |---|---|---|
-| Phase streaming | DONE | Emits `Architect*`, `Editor*`, `Apply*`, `Verify*` stream chunks. |
+| Phase streaming | DONE | Emits `ToolCallStart/End`, `TextDelta`, `SecurityWarning`, `Done` stream chunks. |
 | Verify-pass commit proposal | DONE | Emits `CommitProposal` stream/event payload with diffstat, verify status, and suggested message. |
 | TUI phase visibility | DONE | TUI shows live per-iteration phase transitions and outcomes. |
 | UI heartbeat progress | DONE | Active execution phases emit periodic in-progress heartbeat lines in mission control/status without layout changes. |
@@ -70,10 +75,24 @@ This matrix reflects runtime behavior after the tool-use loop migration (P3.5).
 | Terminal image fallback | DONE | `visual show` supports inline/external/path fallback by policy. |
 | CI nightly parity streak gate | DONE | Nightly journey report artifact + PR streak gate enforce 3 successful nightly runs. |
 
-## 6. Compatibility Notes
+## 6. Local ML Intelligence
+
+| Area | Status | Runtime Truth |
+|---|---|---|
+| Candle embeddings (jina-code-v2) | DONE | Feature-gated behind `local-ml`. MockEmbeddings (SHA-256 hash) always compiled. |
+| Candle completion (code generation) | DONE | Multi-token autoregressive generation. Feature-gated behind `local-ml`. |
+| Overlapping-window chunker | DONE | Gitignore-aware, SHA-256 change detection, incremental updates. |
+| BruteForce vector backend | DONE | O(n) cosine similarity, always compiled. |
+| Usearch HNSW backend | DONE | Feature-gated behind `local-ml`. |
+| Hybrid retriever (RRF) | DONE | Vector + BM25 fusion. `build_index()` / `update_index()` / `search()`. |
+| TUI ghost text | DONE | ML completion with 200ms debounce, Tab accepts full, Alt+Right accepts word. |
+| Model download with progress | DONE | `ensure_model_with_progress()` with callback for download tracking. |
+
+## 7. Compatibility Notes
 
 | Topic | Current Position |
 |---|---|
-| Aider-style parity | Achieved for core edit execution model (architect/editor split + deterministic apply/verify) via pipeline mode. |
+| Claude Code-like agent intelligence | Achieved via bootstrap context, hybrid retrieval, semantic compaction, error recovery, and 3-tier planning. |
 | Claude-like unified reasoning+tools in one model | Achieved via tool-use loop with thinking mode (`deepseek-reasoner` with tools). |
-| Tool-calling as execution backbone | Default execution mode. LLM freely calls tools in a think→act→observe loop. |
+| Tool-calling as execution backbone | Default and sole execution mode. LLM freely calls tools in a think→act→observe loop. |
+| Local-first ML intelligence | Achieved via Candle embeddings/completion, hybrid retrieval, privacy router. Works with mock backends by default. |

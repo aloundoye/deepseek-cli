@@ -35,16 +35,11 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `tool_loop_max_turns` | int | `50` | Maximum LLM calls in the tool-use loop (default mode) |
-| `max_iterations` | int | `6` | Maximum Architect→Editor→Apply→Verify iterations (pipeline mode) |
-| `architect_parse_retries` | int | `2` | Retries for parsing Architect output |
-| `editor_parse_retries` | int | `2` | Retries for parsing Editor output |
+| `tool_loop_max_turns` | int | `50` | Maximum LLM calls in the tool-use loop |
 | `max_files_per_iteration` | int | `12` | Maximum files per edit iteration |
 | `max_file_bytes` | int | `200000` | Maximum file size to include in context |
 | `max_diff_bytes` | int | `400000` | Maximum diff size |
 | `verify_timeout_seconds` | int | `60` | Timeout for verification commands |
-| `max_context_requests_per_iteration` | int | `3` | Max `NEED_CONTEXT` requests per loop |
-| `max_context_range_lines` | int | `400` | Max lines per context range request |
 | `apply_strategy` | string | `"auto"` | Patch apply strategy (`auto` or `three_way`) |
 
 ### `agent_loop.failure_classifier`
@@ -173,6 +168,64 @@ Controls for automatic workspace context injection:
 | `primary` | string | `"Cyan"` | Primary accent color |
 | `secondary` | string | `"Yellow"` | Secondary accent color |
 | `error` | string | `"Red"` | Error highlight color |
+
+## `local_ml` — Local ML Intelligence
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable local ML features (retrieval, privacy, autocomplete) |
+| `cache_dir` | string | `"~/.cache/deepseek"` | Directory for model weights and index cache |
+
+### `local_ml.embeddings`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `model_id` | string | `"jinaai/jina-embeddings-v2-base-code"` | HuggingFace model ID for embeddings |
+| `dimension` | int | `384` | Embedding vector dimension |
+| `batch_size` | int | `32` | Batch size for embedding computation |
+
+### `local_ml.completion`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `model_id` | string | `"deepseek-ai/deepseek-coder-1.3b-base"` | Model for local code completion |
+| `max_tokens` | int | `64` | Max tokens for completion |
+| `temperature` | float | `0.2` | Sampling temperature |
+
+### `local_ml.autocomplete`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable ghost text in TUI (when local_ml is enabled) |
+| `debounce_ms` | int | `200` | Debounce delay before triggering completion |
+| `max_tokens` | int | `64` | Max tokens for autocomplete |
+| `temperature` | float | `0.2` | Sampling temperature |
+
+### `local_ml.privacy`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable 3-layer privacy detection on tool outputs |
+| `path_globs` | string[] | `[".env*","*credentials*",...]` | File path patterns to flag as sensitive |
+| `content_patterns` | string[] | `["(?i)api.?key","(?i)secret",...]` | Content regex patterns for sensitive data |
+| `policy` | string | `"Redact"` | Default privacy policy (`BlockCloud`, `Redact`, `LocalOnlySummary`) |
+
+### `local_ml.retrieval`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable hybrid retrieval (when local_ml is enabled) |
+| `max_results` | int | `10` | Max chunks returned per query |
+| `context_budget_pct` | float | `0.15` | Fraction of context window for retrieval results |
+| `rrf_k` | float | `60.0` | Reciprocal Rank Fusion constant |
+
+### `local_ml.chunker`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `window_size` | int | `512` | Chunk window size in tokens |
+| `overlap` | int | `64` | Overlap between adjacent chunks |
+| `max_file_size` | int | `200000` | Skip files larger than this |
 
 ## `experiments` — Feature Flags
 

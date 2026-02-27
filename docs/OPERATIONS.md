@@ -30,6 +30,18 @@
 - Plugin faults:
   - Disable plugin via `deepseek plugins disable <id>`.
   - Re-run core workflow without plugins.
+- Local ML failures:
+  - **Embeddings backend unavailable**: Falls back to `MockEmbeddings` (deterministic SHA-256 hash, not semantic but provides consistent retrieval). Set `local_ml.enabled=false` to disable entirely.
+  - **Vector index corruption**: Delete `.deepseek/vector_index.sqlite` and restart — lazy indexing rebuilds on next query.
+  - **Candle model load failure**: Check `local_ml.cache_dir` permissions and disk space. Falls back to mock backend automatically.
+  - **Retrieval returns irrelevant results**: Rebuild index with `deepseek index --hybrid doctor`. Check `local_ml.chunker.window_size` settings.
+  - **Privacy false positives**: Adjust `local_ml.privacy.path_globs` and `local_ml.privacy.content_patterns` in project config.
+  - **Ghost text not appearing**: Verify `local_ml.enabled=true` and `local_ml.autocomplete.enabled=true`. Check TUI is active (not `--json` mode).
+- Bootstrap context failures:
+  - **Context too large**: Reduce `agent_loop.context_bootstrap_max_tree_entries` or `context_bootstrap_max_repo_map_lines`.
+  - **Context manager crash**: Set `agent_loop.context_bootstrap_enabled=false` to disable. File an issue with the error log.
+- Compaction data loss:
+  - Semantic compaction preserves key facts automatically. If critical context is lost, lower `context.auto_compact_threshold` to delay compaction.
 
 ## Rollback strategy
 - Releases are immutable and versioned; keep at least one prior stable release.

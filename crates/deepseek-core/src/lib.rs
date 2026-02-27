@@ -3589,6 +3589,15 @@ mod tests {
     }
 
     #[test]
+    fn default_config_has_bootstrap_enabled() {
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.agent_loop.context_bootstrap_enabled,
+            "context bootstrap should be enabled by default"
+        );
+    }
+
+    #[test]
     fn index_build_event_roundtrip() {
         let event = EventKind::IndexBuild {
             chunks_indexed: 1500,

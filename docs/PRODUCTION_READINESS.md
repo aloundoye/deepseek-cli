@@ -1,6 +1,6 @@
 # DeepSeek CLI Production Readiness Checklist
 
-Date: 2026-02-19
+Date: 2026-02-27
 
 This checklist closes M11 launch gates from `PLANS.md` and provides a repeatable release signoff contract.
 

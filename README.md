@@ -18,21 +18,28 @@ DeepSeek CLI is a Rust workspace organized into focused crates:
 
 | Crate | Role |
 |-------|------|
-| `deepseek-cli` | CLI dispatch, argument parsing, subcommand handlers |
-| `deepseek-agent` | Agent engine, tool-use loop (default), pipeline orchestration |
-| `deepseek-core` | Shared types, config loading, event definitions |
-| `deepseek-diff` | Unified diff parsing, patch staging, and git-apply |
-| `deepseek-store` | Session persistence, event log (JSONL), SQLite projections |
-| `deepseek-policy` | Permission engine — denylist/allowlist, approval gates, sandbox |
-| `deepseek-tools` | Tool execution, plugin manager, shell runner |
+| `deepseek-cli` | CLI dispatch, argument parsing, 30+ subcommand handlers |
+| `deepseek-agent` | Agent engine, tool-use loop, complexity classifier, prompt construction, team mode |
+| `deepseek-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `EventEnvelope`), config loading |
+| `deepseek-llm` | LLM client (`LlmClient` trait), streaming, prompt cache |
+| `deepseek-tools` | Tool definitions (enriched descriptions), plugin manager, shell runner, sandbox wrapping |
+| `deepseek-policy` | Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings` |
+| `deepseek-hooks` | 14 lifecycle events, `HookRuntime`, once/disabled fields, `PermissionDecision` |
+| `deepseek-local-ml` | Local ML via Candle: embeddings, completion, chunking, vector index, hybrid retrieval, privacy router |
+| `deepseek-store` | Session persistence (JSONL event log + SQLite projections) |
+| `deepseek-memory` | Long-term memory, shadow commits, checkpoints |
 | `deepseek-index` | Full-text code index (Tantivy), RAG retrieval with citations |
 | `deepseek-mcp` | MCP server management (JSON-RPC stdio/http transports) |
-| `deepseek-memory` | Long-term memory and context management |
-| `deepseek-llm` | LLM client, streaming, prompt cache |
-| `deepseek-ui` | TUI rendering, status line, progress display |
-| `deepseek-skills` | Skill discovery, installation, and prompt rendering |
-| `deepseek-subagent` | Specialist subagents (debugger, refactor-sheriff, security-sentinel) |
-| `deepseek-observe` | Observability, structured logging |
+| `deepseek-ui` | TUI rendering (ratatui/crossterm), autocomplete, vim mode, ML ghost text |
+| `deepseek-diff` | Unified diff parsing, patch staging, and git-apply |
+| `deepseek-context` | Context enrichment, dependency analysis (petgraph), file relevance scoring |
+| `deepseek-skills` | Skill discovery, forked execution, frontmatter parsing |
+| `deepseek-subagent` | Background tasks, worktree isolation, custom agent definitions |
+| `deepseek-observe` | Structured logging |
+| `deepseek-jsonrpc` | JSON-RPC server for IDE integration |
+| `deepseek-chrome` | Chrome native host bridge |
+| `deepseek-errors` | Error types |
+| `deepseek-testkit` | Test utilities |
 
 The default execution mode is the **tool-use loop** (think→act→observe):
 
@@ -45,17 +52,12 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 - Checkpoints are created before destructive tool calls
 - The loop continues until the LLM responds without tool calls (task complete)
 - Thinking mode (`deepseek-reasoner`) can be enabled for complex reasoning
-
-A legacy **pipeline mode** (`--mode pipeline`) is also available:
-
-```
-Context → Architect → Editor → Apply → Verify → (loop or done)
-```
-
-- **Architect** plans which files to edit (`deepseek-reasoner`, thinking enabled)
-- **Editor** produces strict unified diffs (`deepseek-chat`, thinking disabled)
-- **Apply Gate** validates hashes, enforces approval, creates checkpoints
-- **Verify** runs derived commands, classifies failures for auto-repair
+- Adaptive complexity: Simple/Medium/Complex classification with thinking budget escalation (8K→64K)
+- Bootstrap context: automatic project awareness (tree, git status, repo map, manifests) on first turn
+- Hybrid retrieval: vector + BM25 search with Reciprocal Rank Fusion (RRF)
+- Semantic compaction: preserves file/error/decision context when compacting long conversations
+- Error recovery: automatic guidance injection on failures, stuck detection after repeated errors
+- Model routing: Complex+escalated tasks route to `deepseek-reasoner` automatically
 
 ## Install
 
@@ -204,25 +206,19 @@ Reference files:
 - `config.example.toml`
 
 Notable architecture/runtime defaults:
-- Edit execution uses a deterministic loop: Architect (`deepseek-reasoner`) -> Editor (`deepseek-chat`) -> Apply -> Verify.
-- Unified diff is the only edit contract in the execution loop (`NEED_CONTEXT|path[:start-end]` is used when Editor needs more file context).
-- Verify failures are classified deterministically (mechanical/repeated/design-mismatch) to decide Editor-first vs Architect-first retry.
-- Apply safety gates require approval for oversized patches and create checkpoints around patch apply.
-- Verify-pass emits a commit proposal and next actions; it never auto-commits.
-- Optional team-lane composition (`--teammate-mode`) runs lane pipelines in isolated worktrees and merges lane patches deterministically.
-- Tool/function-calling orchestration is the default execution backbone (tool-use loop).
+- Tool-use loop is the sole execution backbone (Code/Ask/Context modes).
+- Adaptive complexity classifier (Simple/Medium/Complex) sets thinking budgets and planning guidance.
+- Bootstrap context gathers project structure, git status, repo map, and dependency hub files on first turn.
+- Hybrid retrieval (vector + BM25 via RRF) injects relevant code chunks before LLM calls.
+- Semantic compaction preserves files modified, errors encountered, and key decisions during context compression.
+- Complex+escalated tasks auto-route to `deepseek-reasoner`; de-escalate back to `deepseek-chat` after 3 successes.
+- Error recovery guidance injected on first failure; stuck detection fires after 3 identical errors.
+- Anti-hallucination: `tool_choice=required` per turn, nudge at 300 chars (3 attempts), structural file-reference validation.
 - Analysis/review commands use a separate non-edit path and do not mutate files.
-- Ask/context analysis prompts use deterministic `AUTO_CONTEXT_BOOTSTRAP` repo context and return initial analysis before limited follow-up questions.
-- Repo-oriented prompts without a detected repository return: `No repository detected. Run from project root or pass --repo <path>.`
 - Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
-- Terminal image fallback policy is configurable (`ui.image_fallback = "open|path|none"`).
-- TUI visibility defaults to concise phase summaries with heartbeat progress (`ui.thinking_visibility = "concise"`, `ui.phase_heartbeat_ms = 5000`).
-- Mission Control retention is bounded (`ui.mission_control_max_events`).
-- Teleport link base URL is configurable (`ui.handoff_base_url`).
+- TUI visibility defaults to concise phase summaries with heartbeat progress.
 
 Common execution control flags:
-- `--force-execute` (force pipeline mode: Architect→Editor→Apply→Verify)
-- `--plan-only` (architect plan output only, no apply/verify)
 - `--repo <path>` (override repository root for bootstrap/context)
 - `--debug-context` (print deterministic pre-model context digest; also available via `DEEPSEEK_DEBUG_CONTEXT=1`)
 - `--watch-files` (inject deterministic TODO/FIXME/AI marker hints when repo comment markers change)
