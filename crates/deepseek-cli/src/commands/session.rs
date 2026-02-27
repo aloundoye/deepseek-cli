@@ -27,7 +27,7 @@ pub enum SessionCmd {
 
 pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Result<()> {
     let store = Store::new(workspace)?;
-    
+
     match command {
         SessionCmd::List => {
             let sessions = store.list_sessions()?;
@@ -35,7 +35,7 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                 println!("No sessions found.");
                 return Ok(());
             }
-            
+
             println!("{:<40} | {:<20} | {}", "SESSION ID", "STATUS", "WORKSPACE");
             println!("{:-<40}-+-{:-<20}-+-{:-<40}", "", "", "");
             for s in sessions {
@@ -52,7 +52,7 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                 Some(sid) => store.load_session(Uuid::parse_str(&sid)?)?,
                 None => store.load_latest_session()?,
             };
-            
+
             match session {
                 Some(s) => {
                     println!("Session ID: {}", s.session_id);
@@ -73,7 +73,7 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                 Some(sid) => store.load_session(Uuid::parse_str(&sid)?)?,
                 None => store.load_latest_session()?,
             };
-            
+
             match session {
                 Some(s) => {
                     let runs = store.list_runs(s.session_id)?;
@@ -81,8 +81,11 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                         println!("No runs found for session {}.", s.session_id);
                         return Ok(());
                     }
-                    
-                    println!("{:<40} | {:<20} | {:<30} | {}", "RUN ID", "STATUS", "CREATED AT", "PROMPT");
+
+                    println!(
+                        "{:<40} | {:<20} | {:<30} | {}",
+                        "RUN ID", "STATUS", "CREATED AT", "PROMPT"
+                    );
                     println!("{:-<40}-+-{:-<20}-+-{:-<30}-+-{:-<40}", "", "", "", "");
                     for r in runs {
                         let short_prompt = if r.prompt.len() > 37 {
@@ -117,6 +120,6 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
             }
         }
     }
-    
+
     Ok(())
 }

@@ -6,12 +6,11 @@
 
 use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::quantized_llama::ModelWeights;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
@@ -23,7 +22,7 @@ use super::{GenOpts, LocalGenBackend};
 /// Respects max_tokens, timeout, stop tokens, and an external cancel flag
 /// for responsive ghost-text completion.
 pub struct CandleCompletion {
-    model: ModelWeights,
+    model: Mutex<ModelWeights>,
     tokenizer: Tokenizer,
     device: Device,
     cancel_flag: Arc<AtomicBool>,
@@ -36,13 +35,13 @@ impl CandleCompletion {
     /// - `model_path`: path to the .gguf weights file
     /// - `tokenizer_path`: path to the tokenizer.json
     /// - `device`: Candle compute device
-    pub fn load(
-        model_path: &Path,
-        tokenizer_path: &Path,
-        device: &Device,
-    ) -> Result<Self> {
+    pub fn load(model_path: &Path, tokenizer_path: &Path, device: &Device) -> Result<Self> {
         let mut file = std::fs::File::open(model_path)?;
-        let model = ModelWeights::from_gguf(candle_core::quantized::gguf_file::Content::read(&mut file)?, &mut file, device)?;
+        let model = ModelWeights::from_gguf(
+            candle_core::quantized::gguf_file::Content::read(&mut file)?,
+            &mut file,
+            device,
+        )?;
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow!("failed to load tokenizer: {}", e))?;
@@ -54,7 +53,7 @@ impl CandleCompletion {
             .to_string();
 
         Ok(Self {
-            model,
+            model: Mutex::new(model),
             tokenizer,
             device: device.clone(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -88,12 +87,17 @@ impl CandleCompletion {
             None, // top_p
         );
 
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| anyhow!("model lock poisoned: {}", e))?;
+
         let mut all_tokens = input_ids.clone();
         let mut generated = String::new();
 
         // Process the full prompt and generate the first token
         let input_tensor = Tensor::new(&input_ids[..], &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input_tensor, 0)?;
+        let logits = model.forward(&input_tensor, 0)?;
         let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
         let seq_len = logits.dim(0)?;
         let last_logits = logits.narrow(0, seq_len - 1, 1)?.squeeze(0)?;
@@ -115,7 +119,11 @@ impl CandleCompletion {
                 .map_err(|e| anyhow!("decode failed: {}", e))?;
 
             // Check stop tokens
-            if opts.stop_tokens.iter().any(|s| token_text.contains(s.as_str())) {
+            if opts
+                .stop_tokens
+                .iter()
+                .any(|s| token_text.contains(s.as_str()))
+            {
                 break;
             }
 
@@ -126,9 +134,7 @@ impl CandleCompletion {
 
             // Generate next token (autoregressive: feed current_token, advance position)
             let input = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
-            let logits = self
-                .model
-                .forward(&input, input_ids.len() + i as usize)?;
+            let logits = model.forward(&input, input_ids.len() + i as usize)?;
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
             let last_logits = logits.narrow(0, logits.dim(0)? - 1, 1)?.squeeze(0)?;
             current_token = logits_processor.sample(&last_logits)?;
@@ -171,11 +177,7 @@ mod tests {
         // Look for a GGUF model in a standard location
         let home = std::env::var("HOME").ok()?;
         let dir = PathBuf::from(home).join(".cache/deepseek/models");
-        if dir.exists() {
-            Some(dir)
-        } else {
-            None
-        }
+        if dir.exists() { Some(dir) } else { None }
     }
 
     #[test]
@@ -188,13 +190,13 @@ mod tests {
             panic!("model files not found in {:?}", dir);
         }
 
-        let gen = CandleCompletion::load(&model_path, &tokenizer_path, &Device::Cpu).unwrap();
+        let completer = CandleCompletion::load(&model_path, &tokenizer_path, &Device::Cpu).unwrap();
         let opts = GenOpts {
             max_tokens: 20,
             temperature: 0.1,
             ..Default::default()
         };
-        let result = gen.generate("fn main() {", &opts).unwrap();
+        let result = completer.generate("fn main() {", &opts).unwrap();
         assert!(!result.is_empty(), "should produce some output");
     }
 
@@ -208,8 +210,8 @@ mod tests {
             panic!("model files not found");
         }
 
-        let gen = CandleCompletion::load(&model_path, &tokenizer_path, &Device::Cpu).unwrap();
-        let flag = gen.cancel_flag();
+        let completer = CandleCompletion::load(&model_path, &tokenizer_path, &Device::Cpu).unwrap();
+        let flag = completer.cancel_flag();
 
         // Cancel before generating
         flag.store(true, Ordering::SeqCst);
@@ -218,7 +220,7 @@ mod tests {
             timeout_ms: 0, // no timeout — rely on cancel flag
             ..Default::default()
         };
-        let result = gen.generate("fn test() {", &opts).unwrap();
+        let result = completer.generate("fn test() {", &opts).unwrap();
         // Should produce minimal output since cancel is set
         assert!(
             result.len() < 200,
@@ -236,7 +238,7 @@ mod tests {
             panic!("model files not found");
         }
 
-        let gen = CandleCompletion::load(&model_path, &tokenizer_path, &Device::Cpu).unwrap();
+        let completer = CandleCompletion::load(&model_path, &tokenizer_path, &Device::Cpu).unwrap();
         let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
         let tokens_clone = tokens.clone();
 
@@ -245,7 +247,7 @@ mod tests {
             temperature: 0.1,
             ..Default::default()
         };
-        let result = gen
+        let result = completer
             .generate_streaming("Hello", &opts, &move |token| {
                 tokens_clone.lock().unwrap().push(token.to_string());
             })

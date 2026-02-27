@@ -52,9 +52,7 @@ impl LlmClient for ScriptedToolLlm {
         self.complete_chat(req)
     }
     fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> Result<LlmResponse> {
-        Err(anyhow!(
-            "complete_fim() not used in tool_use_default tests"
-        ))
+        Err(anyhow!("complete_fim() not used in tool_use_default tests"))
     }
     fn complete_fim_streaming(
         &self,
@@ -141,11 +139,7 @@ fn default_code_mode_uses_tool_loop() -> Result<()> {
         temp.path(),
         vec![
             // Turn 1: LLM calls fs_read
-            tool_call_response(vec![(
-                "call_1",
-                "fs_read",
-                r#"{"path":"hello.txt"}"#,
-            )]),
+            tool_call_response(vec![("call_1", "fs_read", r#"{"path":"hello.txt"}"#)]),
             // Turn 2: LLM responds with text
             text_response("The file contains a greeting."),
         ],
@@ -175,11 +169,7 @@ fn tool_loop_reads_then_edits_file() -> Result<()> {
         temp.path(),
         vec![
             // Turn 1: read file
-            tool_call_response(vec![(
-                "call_1",
-                "fs_read",
-                r#"{"path":"demo.txt"}"#,
-            )]),
+            tool_call_response(vec![("call_1", "fs_read", r#"{"path":"demo.txt"}"#)]),
             // Turn 2: edit file (fs_edit uses search/replace fields)
             tool_call_response(vec![(
                 "call_2",
@@ -254,11 +244,7 @@ fn tool_loop_denied_tool_feeds_back() -> Result<()> {
         temp.path(),
         vec![
             // Turn 1: LLM tries bash_run (requires approval)
-            tool_call_response(vec![(
-                "call_1",
-                "bash_run",
-                r#"{"command":"rm -rf /"}"#,
-            )]),
+            tool_call_response(vec![("call_1", "bash_run", r#"{"command":"rm -rf /"}"#)]),
             // Turn 2: after denial, LLM responds with alternative
             text_response("I cannot execute that command. Can I help another way?"),
         ],
@@ -288,11 +274,7 @@ fn tool_loop_multi_turn_conversation() -> Result<()> {
         temp.path(),
         vec![
             // First prompt, turn 1: read file
-            tool_call_response(vec![(
-                "call_1",
-                "fs_read",
-                r#"{"path":"a.txt"}"#,
-            )]),
+            tool_call_response(vec![("call_1", "fs_read", r#"{"path":"a.txt"}"#)]),
             // First prompt, turn 2: respond
             text_response("File a.txt contains 'aaa'."),
         ],
@@ -320,11 +302,7 @@ fn ask_mode_restricts_to_read_only() -> Result<()> {
         temp.path(),
         vec![
             // Turn 1: LLM reads a file (should work in Ask mode)
-            tool_call_response(vec![(
-                "call_1",
-                "fs_read",
-                r#"{"path":"src/main.rs"}"#,
-            )]),
+            tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
             // Turn 2: respond
             text_response("The file has a main function."),
         ],
@@ -351,9 +329,7 @@ fn context_mode_restricts_to_read_only() -> Result<()> {
 
     let engine = build_engine(
         temp.path(),
-        vec![
-            text_response("Here's the project overview."),
-        ],
+        vec![text_response("Here's the project overview.")],
     )?;
 
     let output = engine.chat_with_options(
@@ -468,11 +444,7 @@ fn tool_descriptions_are_enriched_in_request() -> Result<()> {
     init_workspace(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
-        tool_call_response(vec![(
-            "call_1",
-            "fs_read",
-            r#"{"path":"src/main.rs"}"#,
-        )]),
+        tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
         text_response("Done."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
@@ -487,7 +459,10 @@ fn tool_descriptions_are_enriched_in_request() -> Result<()> {
     )?;
 
     let requests = captured.lock().unwrap();
-    assert!(!requests.is_empty(), "should have captured at least one request");
+    assert!(
+        !requests.is_empty(),
+        "should have captured at least one request"
+    );
     let first_req = &requests[0];
     // Find fs_read tool in the request tools
     let fs_read_tool = first_req
@@ -514,11 +489,7 @@ fn first_turn_tool_choice_required() -> Result<()> {
     init_workspace(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
-        tool_call_response(vec![(
-            "call_1",
-            "fs_read",
-            r#"{"path":"src/main.rs"}"#,
-        )]),
+        tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
         text_response("Read the file."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
@@ -552,11 +523,7 @@ fn subsequent_turns_tool_choice_auto() -> Result<()> {
 
     let (llm, captured) = CapturingLlm::new(vec![
         // Turn 1: tool call
-        tool_call_response(vec![(
-            "call_1",
-            "fs_read",
-            r#"{"path":"test.txt"}"#,
-        )]),
+        tool_call_response(vec![("call_1", "fs_read", r#"{"path":"test.txt"}"#)]),
         // Turn 2: text response (after tool results in messages)
         text_response("File read successfully."),
     ]);
@@ -589,11 +556,7 @@ fn ask_mode_uses_read_only_tools() -> Result<()> {
     init_workspace(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
-        tool_call_response(vec![(
-            "call_1",
-            "fs_read",
-            r#"{"path":"src/main.rs"}"#,
-        )]),
+        tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
         text_response("It's a Rust project."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
@@ -621,8 +584,14 @@ fn ask_mode_uses_read_only_tools() -> Result<()> {
     assert!(tool_names.contains(&"fs_grep"), "should have fs_grep");
     // Write tools should NOT be present
     assert!(!tool_names.contains(&"fs_edit"), "should not have fs_edit");
-    assert!(!tool_names.contains(&"fs_write"), "should not have fs_write");
-    assert!(!tool_names.contains(&"bash_run"), "should not have bash_run");
+    assert!(
+        !tool_names.contains(&"fs_write"),
+        "should not have fs_write"
+    );
+    assert!(
+        !tool_names.contains(&"bash_run"),
+        "should not have bash_run"
+    );
     Ok(())
 }
 
@@ -632,9 +601,7 @@ fn context_mode_uses_read_only_tools() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
 
-    let (llm, captured) = CapturingLlm::new(vec![
-        text_response("Project overview."),
-    ]);
+    let (llm, captured) = CapturingLlm::new(vec![text_response("Project overview.")]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
@@ -654,8 +621,14 @@ fn context_mode_uses_read_only_tools() -> Result<()> {
         .iter()
         .map(|t| t.function.name.as_str())
         .collect();
-    assert!(!tool_names.contains(&"fs_edit"), "Context mode should not have fs_edit");
-    assert!(!tool_names.contains(&"bash_run"), "Context mode should not have bash_run");
+    assert!(
+        !tool_names.contains(&"fs_edit"),
+        "Context mode should not have fs_edit"
+    );
+    assert!(
+        !tool_names.contains(&"bash_run"),
+        "Context mode should not have bash_run"
+    );
     Ok(())
 }
 
@@ -665,9 +638,7 @@ fn tools_false_uses_analysis_path() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
 
-    let (llm, captured) = CapturingLlm::new(vec![
-        text_response("Analysis complete."),
-    ]);
+    let (llm, captured) = CapturingLlm::new(vec![text_response("Analysis complete.")]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
@@ -698,11 +669,7 @@ fn default_tool_loop_has_thinking_enabled() -> Result<()> {
     init_workspace(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
-        tool_call_response(vec![(
-            "call_1",
-            "fs_read",
-            r#"{"path":"src/main.rs"}"#,
-        )]),
+        tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
         text_response("Done."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
@@ -719,8 +686,14 @@ fn default_tool_loop_has_thinking_enabled() -> Result<()> {
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
     // Thinking should always be enabled by default
-    let thinking = requests[0].thinking.as_ref().expect("thinking should be enabled by default");
-    assert!(thinking.budget_tokens.unwrap_or(0) > 0, "thinking budget should be positive");
+    let thinking = requests[0]
+        .thinking
+        .as_ref()
+        .expect("thinking should be enabled by default");
+    assert!(
+        thinking.budget_tokens.unwrap_or(0) > 0,
+        "thinking budget should be positive"
+    );
     Ok(())
 }
 
@@ -731,11 +704,7 @@ fn force_max_think_overrides_budget() -> Result<()> {
     init_workspace(temp.path())?;
 
     let (llm, captured) = CapturingLlm::new(vec![
-        tool_call_response(vec![(
-            "call_1",
-            "fs_read",
-            r#"{"path":"src/main.rs"}"#,
-        )]),
+        tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
         text_response("Done."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
@@ -752,9 +721,16 @@ fn force_max_think_overrides_budget() -> Result<()> {
 
     let requests = captured.lock().unwrap();
     assert!(!requests.is_empty());
-    let thinking = requests[0].thinking.as_ref().expect("thinking should be enabled with force_max_think");
+    let thinking = requests[0]
+        .thinking
+        .as_ref()
+        .expect("thinking should be enabled with force_max_think");
     // force_max_think should use COMPLEX_THINK_BUDGET * 2 = 65536 (max budget)
-    assert_eq!(thinking.budget_tokens, Some(65536), "force_max_think should use maximum budget");
+    assert_eq!(
+        thinking.budget_tokens,
+        Some(65536),
+        "force_max_think should use maximum budget"
+    );
     Ok(())
 }
 
@@ -763,14 +739,13 @@ fn force_max_think_overrides_budget() -> Result<()> {
 fn tool_loop_with_thinking_mode() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
-    fs::write(temp.path().join("src/main.rs"), "fn main() { println!(\"hello\"); }\n")?;
+    fs::write(
+        temp.path().join("src/main.rs"),
+        "fn main() { println!(\"hello\"); }\n",
+    )?;
 
     // Simulate thinking mode response (with reasoning_content)
-    let mut response = tool_call_response(vec![(
-        "call_1",
-        "fs_read",
-        r#"{"path":"src/main.rs"}"#,
-    )]);
+    let mut response = tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]);
     response.reasoning_content = "Let me think about which file to read...".to_string();
 
     let mut final_response = text_response("The main function prints hello.");
@@ -831,7 +806,10 @@ fn spawn_task_calls_worker() -> Result<()> {
         },
     )?;
 
-    assert!(*worker_called.lock().unwrap(), "subagent worker should have been called");
+    assert!(
+        *worker_called.lock().unwrap(),
+        "subagent worker should have been called"
+    );
     assert!(!output.is_empty());
     Ok(())
 }
@@ -906,7 +884,9 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
     )?;
 
     let role = captured_role.lock().unwrap();
-    assert_eq!(*role, "Plan", "subagent_type 'plan' should map to SubagentRole::Plan");
-    Ok(()
-    )
+    assert_eq!(
+        *role, "Plan",
+        "subagent_type 'plan' should map to SubagentRole::Plan"
+    );
+    Ok(())
 }

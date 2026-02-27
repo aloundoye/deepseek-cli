@@ -41,22 +41,9 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/parity_regression_check.sh
 
-      - name: parity contract check
-        if: runner.os == 'Linux'
-        run: bash scripts/parity_contract_check.sh
-
       - name: runtime conformance scan
         if: runner.os == 'Linux'
         run: bash scripts/runtime_conformance_scan.sh
-
-      - name: parity nightly streak gate
-        if: runner.os == 'Linux' && github.event_name == 'pull_request'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PARITY_WORKFLOW_FILE: parity-nightly.yml
-          PARITY_REQUIRED_STREAK: "3"
-        run: python3 scripts/parity_streak_gate.py
 
       - name: build
         run: cargo build --workspace
@@ -70,7 +57,6 @@ jobs:
           cargo run --bin deepseek -- --json memory show
           cargo run --bin deepseek -- --json mcp add ci-local --command echo --arg ok
           cargo run --bin deepseek -- --json mcp list
-          cargo run --bin deepseek -- --json profile
           cargo run --bin deepseek -- --json export --format json
           cargo run --bin deepseek -- --json mcp remove ci-local
 

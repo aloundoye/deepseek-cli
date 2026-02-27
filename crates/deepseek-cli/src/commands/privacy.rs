@@ -144,9 +144,18 @@ fn run_policy_show(cfg: &AppConfig, json_mode: bool) -> Result<()> {
         println!("Privacy policy:");
         println!("  enabled: {}", cfg.local_ml.privacy.enabled);
         println!("  policy: {}", cfg.local_ml.privacy.policy);
-        println!("  sensitive globs: {:?}", cfg.local_ml.privacy.sensitive_globs);
-        println!("  sensitive regex: {:?}", cfg.local_ml.privacy.sensitive_regex);
-        println!("  store raw in logs: {}", cfg.local_ml.privacy.store_raw_in_logs);
+        println!(
+            "  sensitive globs: {:?}",
+            cfg.local_ml.privacy.sensitive_globs
+        );
+        println!(
+            "  sensitive regex: {:?}",
+            cfg.local_ml.privacy.sensitive_regex
+        );
+        println!(
+            "  store raw in logs: {}",
+            cfg.local_ml.privacy.store_raw_in_logs
+        );
     }
     Ok(())
 }

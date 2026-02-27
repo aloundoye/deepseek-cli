@@ -3,8 +3,8 @@
 use anyhow::{Result, anyhow};
 use deepseek_agent::tool_loop::{RetrievalContext, ToolLoopConfig, ToolUseLoop};
 use deepseek_core::{
-    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback,
-    StreamChunk, TokenUsage,
+    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, StreamChunk,
+    TokenUsage,
 };
 use deepseek_llm::LlmClient;
 use std::collections::VecDeque;
@@ -171,13 +171,7 @@ fn retrieval_respects_budget() {
         ..Default::default()
     };
 
-    let mut loop_ = ToolUseLoop::new(
-        &llm,
-        tool_host,
-        config,
-        "system".to_string(),
-        vec![],
-    );
+    let mut loop_ = ToolUseLoop::new(&llm, tool_host, config, "system".to_string(), vec![]);
 
     let result = loop_.run("search").unwrap();
     assert_eq!(result.response, "Done");
@@ -198,9 +192,7 @@ fn retrieval_respects_budget() {
 fn index_query_tool_available() {
     // The index_query tool should be in the tool definitions
     let tools = deepseek_tools::tool_definitions();
-    let has_index_query = tools
-        .iter()
-        .any(|t| t.function.name == "index_query");
+    let has_index_query = tools.iter().any(|t| t.function.name == "index_query");
     assert!(
         has_index_query,
         "tool_definitions() should include index_query"
@@ -236,9 +228,7 @@ fn privacy_router_redacts_in_tool_loop() {
         policy: deepseek_local_ml::PrivacyPolicy::Redact,
         ..Default::default()
     };
-    let privacy_router = Arc::new(
-        deepseek_local_ml::PrivacyRouter::new(privacy_config).unwrap()
-    );
+    let privacy_router = Arc::new(deepseek_local_ml::PrivacyRouter::new(privacy_config).unwrap());
 
     // Tool host that returns content with a custom secret pattern
     struct SensitiveToolHost;

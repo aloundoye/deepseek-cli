@@ -96,30 +96,99 @@ impl TagExtractor {
     fn build_language_map() -> HashMap<String, (Language, String)> {
         let mut map = HashMap::new();
 
-        map.insert("rs".to_string(), (tree_sitter_rust::LANGUAGE.into(), RUST_QUERY.to_string()));
+        map.insert(
+            "rs".to_string(),
+            (tree_sitter_rust::LANGUAGE.into(), RUST_QUERY.to_string()),
+        );
 
-        map.insert("py".to_string(), (tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY.to_string()));
-        map.insert("pyi".to_string(), (tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY.to_string()));
+        map.insert(
+            "py".to_string(),
+            (
+                tree_sitter_python::LANGUAGE.into(),
+                PYTHON_QUERY.to_string(),
+            ),
+        );
+        map.insert(
+            "pyi".to_string(),
+            (
+                tree_sitter_python::LANGUAGE.into(),
+                PYTHON_QUERY.to_string(),
+            ),
+        );
 
-        map.insert("js".to_string(), (tree_sitter_javascript::LANGUAGE.into(), JS_QUERY.to_string()));
-        map.insert("jsx".to_string(), (tree_sitter_javascript::LANGUAGE.into(), JS_QUERY.to_string()));
-        map.insert("mjs".to_string(), (tree_sitter_javascript::LANGUAGE.into(), JS_QUERY.to_string()));
+        map.insert(
+            "js".to_string(),
+            (
+                tree_sitter_javascript::LANGUAGE.into(),
+                JS_QUERY.to_string(),
+            ),
+        );
+        map.insert(
+            "jsx".to_string(),
+            (
+                tree_sitter_javascript::LANGUAGE.into(),
+                JS_QUERY.to_string(),
+            ),
+        );
+        map.insert(
+            "mjs".to_string(),
+            (
+                tree_sitter_javascript::LANGUAGE.into(),
+                JS_QUERY.to_string(),
+            ),
+        );
 
-        map.insert("ts".to_string(), (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), TS_QUERY.to_string()));
+        map.insert(
+            "ts".to_string(),
+            (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                TS_QUERY.to_string(),
+            ),
+        );
 
-        map.insert("tsx".to_string(), (tree_sitter_typescript::LANGUAGE_TSX.into(), TSX_QUERY.to_string()));
+        map.insert(
+            "tsx".to_string(),
+            (
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                TSX_QUERY.to_string(),
+            ),
+        );
 
-        map.insert("go".to_string(), (tree_sitter_go::LANGUAGE.into(), GO_QUERY.to_string()));
+        map.insert(
+            "go".to_string(),
+            (tree_sitter_go::LANGUAGE.into(), GO_QUERY.to_string()),
+        );
 
-        map.insert("java".to_string(), (tree_sitter_java::LANGUAGE.into(), JAVA_QUERY.to_string()));
+        map.insert(
+            "java".to_string(),
+            (tree_sitter_java::LANGUAGE.into(), JAVA_QUERY.to_string()),
+        );
 
-        map.insert("cs".to_string(), (tree_sitter_c_sharp::LANGUAGE.into(), CSHARP_QUERY.to_string()));
+        map.insert(
+            "cs".to_string(),
+            (
+                tree_sitter_c_sharp::LANGUAGE.into(),
+                CSHARP_QUERY.to_string(),
+            ),
+        );
 
-        map.insert("hs".to_string(), (tree_sitter_haskell::LANGUAGE.into(), HASKELL_QUERY.to_string()));
+        map.insert(
+            "hs".to_string(),
+            (
+                tree_sitter_haskell::LANGUAGE.into(),
+                HASKELL_QUERY.to_string(),
+            ),
+        );
 
-        map.insert("swift".to_string(), (tree_sitter_swift::LANGUAGE.into(), SWIFT_QUERY.to_string()));
+        map.insert(
+            "swift".to_string(),
+            (tree_sitter_swift::LANGUAGE.into(), SWIFT_QUERY.to_string()),
+        );
 
-        map.insert("zig".to_string(), (tree_sitter_zig::LANGUAGE.into(), ZIG_QUERY.to_string()));
+        map.insert(
+            "zig".to_string(),
+            (tree_sitter_zig::LANGUAGE.into(), ZIG_QUERY.to_string()),
+        );
 
         map
     }
@@ -145,10 +214,7 @@ impl TagExtractor {
 
     /// Extract tags without cache lookup.
     pub fn extract_tags_uncached(&self, path: &Path) -> Result<Vec<Tag>> {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         let (language, query_src) = self
             .languages
@@ -170,12 +236,11 @@ impl TagExtractor {
     }
 
     fn get_cached(&self, path: &str, mtime: u64) -> Result<Vec<Tag>> {
-        let mut stmt = self.cache_db.prepare(
-            "SELECT tags_json FROM tag_cache WHERE path = ?1 AND mtime_secs = ?2",
-        )?;
-        let json: String = stmt.query_row(rusqlite::params![path, mtime as i64], |row| {
-            row.get(0)
-        })?;
+        let mut stmt = self
+            .cache_db
+            .prepare("SELECT tags_json FROM tag_cache WHERE path = ?1 AND mtime_secs = ?2")?;
+        let json: String =
+            stmt.query_row(rusqlite::params![path, mtime as i64], |row| row.get(0))?;
         let tags: Vec<CachedTag> = serde_json::from_str(&json)?;
         Ok(tags.into_iter().map(|ct| ct.into()).collect())
     }
@@ -198,7 +263,11 @@ impl TagExtractor {
 }
 
 /// Extract tags from source code string using a tree-sitter language and query.
-pub fn extract_tags_from_source(source: &str, language: Language, query_src: &str) -> Result<Vec<Tag>> {
+pub fn extract_tags_from_source(
+    source: &str,
+    language: Language,
+    query_src: &str,
+) -> Result<Vec<Tag>> {
     let mut parser = Parser::new();
     parser.set_language(&language)?;
 
@@ -211,7 +280,11 @@ pub fn extract_tags_from_source(source: &str, language: Language, query_src: &st
     let source_bytes = source.as_bytes();
 
     let mut tags = Vec::new();
-    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let capture_names: Vec<String> = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
     while let Some(m) = matches.next() {
@@ -416,8 +489,16 @@ impl Foo {}
         let lang: Language = tree_sitter_rust::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, RUST_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"hello"), "should find hello; got: {:?}", names);
-        assert!(names.contains(&"world"), "should find world; got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find hello; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"world"),
+            "should find world; got: {:?}",
+            names
+        );
         assert!(names.contains(&"Foo"), "should find Foo; got: {:?}", names);
         assert!(names.contains(&"Bar"), "should find Bar; got: {:?}", names);
         assert!(names.contains(&"Baz"), "should find Baz; got: {:?}", names);
@@ -436,9 +517,21 @@ class MyClass:
         let lang: Language = tree_sitter_python::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, PYTHON_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"hello"), "should find hello; got: {:?}", names);
-        assert!(names.contains(&"MyClass"), "should find MyClass; got: {:?}", names);
-        assert!(names.contains(&"method"), "should find method; got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find hello; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MyClass"),
+            "should find MyClass; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"method"),
+            "should find method; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -450,8 +543,16 @@ class Widget {}
         let lang: Language = tree_sitter_javascript::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, JS_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"greet"), "should find greet; got: {:?}", names);
-        assert!(names.contains(&"Widget"), "should find Widget; got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "should find greet; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Widget"),
+            "should find Widget; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -465,10 +566,26 @@ enum Color { Red, Green }
         let lang: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
         let tags = extract_tags_from_source(source, lang, TS_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"greet"), "should find greet; got: {:?}", names);
-        assert!(names.contains(&"Widget"), "should find Widget; got: {:?}", names);
-        assert!(names.contains(&"Props"), "should find Props; got: {:?}", names);
-        assert!(names.contains(&"Color"), "should find Color; got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "should find greet; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Widget"),
+            "should find Widget; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Props"),
+            "should find Props; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "should find Color; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -485,9 +602,21 @@ func (s *Server) Start() {}
         let lang: Language = tree_sitter_go::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, GO_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"Hello"), "should find Hello; got: {:?}", names);
-        assert!(names.contains(&"Server"), "should find Server; got: {:?}", names);
-        assert!(names.contains(&"Start"), "should find Start; got: {:?}", names);
+        assert!(
+            names.contains(&"Hello"),
+            "should find Hello; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Server"),
+            "should find Server; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Start"),
+            "should find Start; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -505,8 +634,16 @@ enum Status { OK, ERROR }
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"App"), "should find App; got: {:?}", names);
         assert!(names.contains(&"run"), "should find run; got: {:?}", names);
-        assert!(names.contains(&"Service"), "should find Service; got: {:?}", names);
-        assert!(names.contains(&"Status"), "should find Status; got: {:?}", names);
+        assert!(
+            names.contains(&"Service"),
+            "should find Service; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "should find Status; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -525,9 +662,21 @@ struct Point {}
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"App"), "should find App; got: {:?}", names);
         assert!(names.contains(&"Run"), "should find Run; got: {:?}", names);
-        assert!(names.contains(&"IService"), "should find IService; got: {:?}", names);
-        assert!(names.contains(&"Status"), "should find Status; got: {:?}", names);
-        assert!(names.contains(&"Point"), "should find Point; got: {:?}", names);
+        assert!(
+            names.contains(&"IService"),
+            "should find IService; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "should find Status; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "should find Point; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -545,8 +694,16 @@ type Name = String
         let lang: Language = tree_sitter_haskell::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, HASKELL_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"hello"), "should find hello; got: {:?}", names);
-        assert!(names.contains(&"Color"), "should find Color; got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find hello; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "should find Color; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -561,11 +718,31 @@ enum Direction { case north, south }
         let lang: Language = tree_sitter_swift::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, SWIFT_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"greet"), "should find greet; got: {:?}", names);
-        assert!(names.contains(&"Widget"), "should find Widget; got: {:?}", names);
-        assert!(names.contains(&"Drawable"), "should find Drawable; got: {:?}", names);
-        assert!(names.contains(&"Point"), "should find Point; got: {:?}", names);
-        assert!(names.contains(&"Direction"), "should find Direction; got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "should find greet; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Widget"),
+            "should find Widget; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Drawable"),
+            "should find Drawable; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "should find Point; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Direction"),
+            "should find Direction; got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -582,16 +759,32 @@ pub fn main() !void {
         let lang: Language = tree_sitter_zig::LANGUAGE.into();
         let tags = extract_tags_from_source(source, lang, ZIG_QUERY).unwrap();
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"hello"), "should find hello; got: {:?}", names);
-        assert!(names.contains(&"main"), "should find main; got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find hello; got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "should find main; got: {:?}",
+            names
+        );
     }
 
     #[test]
     fn cache_round_trip() {
         let extractor = TagExtractor::new_in_memory().unwrap();
         let tags = vec![
-            Tag { name: "hello".to_string(), kind: TagKind::Function, line: 1 },
-            Tag { name: "Foo".to_string(), kind: TagKind::Struct, line: 5 },
+            Tag {
+                name: "hello".to_string(),
+                kind: TagKind::Function,
+                line: 1,
+            },
+            Tag {
+                name: "Foo".to_string(),
+                kind: TagKind::Struct,
+                line: 5,
+            },
         ];
         extractor.set_cached("/test.rs", 12345, &tags).unwrap();
         let cached = extractor.get_cached("/test.rs", 12345).unwrap();
@@ -603,7 +796,11 @@ pub fn main() !void {
     #[test]
     fn cache_miss_on_mtime_change() {
         let extractor = TagExtractor::new_in_memory().unwrap();
-        let tags = vec![Tag { name: "hello".to_string(), kind: TagKind::Function, line: 1 }];
+        let tags = vec![Tag {
+            name: "hello".to_string(),
+            kind: TagKind::Function,
+            line: 1,
+        }];
         extractor.set_cached("/test.rs", 12345, &tags).unwrap();
         assert!(extractor.get_cached("/test.rs", 99999).is_err());
     }
@@ -611,9 +808,21 @@ pub fn main() !void {
     #[test]
     fn tags_to_hints() {
         let tags = vec![
-            Tag { name: "hello".to_string(), kind: TagKind::Function, line: 1 },
-            Tag { name: "Foo".to_string(), kind: TagKind::Struct, line: 5 },
-            Tag { name: "Bar".to_string(), kind: TagKind::Enum, line: 10 },
+            Tag {
+                name: "hello".to_string(),
+                kind: TagKind::Function,
+                line: 1,
+            },
+            Tag {
+                name: "Foo".to_string(),
+                kind: TagKind::Struct,
+                line: 5,
+            },
+            Tag {
+                name: "Bar".to_string(),
+                kind: TagKind::Enum,
+                line: 10,
+            },
         ];
         let hints = tags_to_symbol_hints(&tags, 2);
         assert_eq!(hints, vec!["fn:hello", "struct:Foo"]);

@@ -34,9 +34,9 @@ use crate::util::*;
 
 // CLI types
 use crate::{
-    Cli, CompactArgs, ConfigCmd, DoctorArgs, DoctorModeArg, ExportArgs, McpCmd, McpGetArgs,
-    McpRemoveArgs, MemoryCmd, MemoryEditArgs, MemoryShowArgs, MemorySyncArgs, RewindArgs, RunArgs,
-    SearchArgs, SkillRunArgs, SkillsCmd, UsageArgs,
+    Cli, CompactArgs, ConfigCmd, DoctorArgs, ExportArgs, McpCmd, McpGetArgs, McpRemoveArgs,
+    MemoryCmd, MemoryEditArgs, MemoryShowArgs, MemorySyncArgs, RewindArgs, RunArgs, SearchArgs,
+    SkillRunArgs, SkillsCmd, UsageArgs,
 };
 
 // Commands that chat dispatches to
@@ -53,12 +53,9 @@ use crate::commands::git::{
 };
 use crate::commands::mcp::run_mcp;
 use crate::commands::memory::{run_export, run_memory};
-use crate::commands::remote_env::{parse_remote_env_cmd, remote_env_now, run_remote_env};
 use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
 use crate::commands::status::{current_ui_status, run_context, run_status, run_usage};
-use crate::commands::teleport::{parse_teleport_args, run_teleport, teleport_now};
-use crate::commands::visual::{parse_visual_cmd, run_visual, visual_payload};
 
 fn is_max_think_selection(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
@@ -551,7 +548,9 @@ fn slash_tokens_output(cwd: &Path, cfg: &AppConfig) -> Result<String> {
 
     let total_used = system_prompt_est + memory_tokens + conversation_tokens + repo_map_tokens;
     let reserved = cfg.context.reserved_overhead_tokens + cfg.context.response_budget_tokens;
-    let available = context_window.saturating_sub(total_used).saturating_sub(reserved);
+    let available = context_window
+        .saturating_sub(total_used)
+        .saturating_sub(reserved);
     let utilization = if context_window > 0 {
         (total_used as f64 / context_window as f64) * 100.0
     } else {
@@ -563,8 +562,7 @@ fn slash_tokens_output(cwd: &Path, cfg: &AppConfig) -> Result<String> {
 
     Ok(format!(
         "token breakdown:\n  system_prompt:  ~{system_prompt_est}\n  memory:         ~{memory_tokens}\n  conversation:   ~{conversation_tokens}\n  repo_map:       ~{repo_map_tokens}\n  ────────────────────\n  total_used:     ~{total_used}\n  reserved:       ~{reserved} (overhead={} response={})\n  available:      ~{available}\n  context_window: {context_window}\n  utilization:    {utilization:.1}%\n  est_input_cost: ${input_cost:.4}",
-        cfg.context.reserved_overhead_tokens,
-        cfg.context.response_budget_tokens,
+        cfg.context.reserved_overhead_tokens, cfg.context.response_budget_tokens,
     ))
 }
 
@@ -1015,8 +1013,7 @@ pub(crate) fn run_chat(
             && last_watch_digest != Some(digest)
         {
             last_watch_digest = Some(digest);
-            prompt_owned
-                .push_str("\n\nAUTO_WATCH_CONTEXT\nDetected comment hints in workspace:\n");
+            prompt_owned.push_str("\n\nAUTO_WATCH_CONTEXT\nDetected comment hints in workspace:\n");
             prompt_owned.push_str(&hints);
             prompt_owned.push_str("\nAUTO_WATCH_CONTEXT_END");
         }
@@ -1042,8 +1039,6 @@ pub(crate) fn run_chat(
                             "/rewind",
                             "/export",
                             "/plan",
-                            "/teleport",
-                            "/remote-env",
                             "/status",
                             "/add",
                             "/drop",
@@ -1063,7 +1058,6 @@ pub(crate) fn run_chat(
                             "/skills",
                             "/permissions",
                             "/background",
-                            "/visual",
                             "/vim",
                             "/copy",
                             "/paste",
@@ -1140,9 +1134,7 @@ pub(crate) fn run_chat(
                             &json!({"error": format!("unsupported chat mode: {raw_mode}")}),
                         )?;
                     } else {
-                        println!(
-                            "unsupported chat mode: {raw_mode} (use ask|code|context)"
-                        );
+                        println!("unsupported chat mode: {raw_mode} (use ask|code|context)");
                     }
                 }
                 SlashCommand::Init => {
@@ -1255,8 +1247,14 @@ pub(crate) fn run_chat(
                                     deepseek_mcp::McpTransport::Http => "http",
                                     deepseek_mcp::McpTransport::Sse => "sse",
                                 };
-                                let status = if server.enabled { "enabled" } else { "disabled" };
-                                let endpoint = server.command.as_deref()
+                                let status = if server.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                };
+                                let endpoint = server
+                                    .command
+                                    .as_deref()
                                     .or(server.url.as_deref())
                                     .unwrap_or("-");
                                 println!(
@@ -1265,7 +1263,9 @@ pub(crate) fn run_chat(
                                     server.id
                                 );
                             }
-                            println!("\nCommands: /mcp list, /mcp get <id>, /mcp add, /mcp remove <id>, /mcp prompt");
+                            println!(
+                                "\nCommands: /mcp list, /mcp get <id>, /mcp add, /mcp remove <id>, /mcp prompt"
+                            );
                         }
                     } else if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
                         run_mcp(cwd, McpCmd::List, json_mode)?;
@@ -1297,7 +1297,9 @@ pub(crate) fn run_chat(
                                 }).collect();
                                 print_json(&json!({"mcp_prompts": prompts}))?;
                             } else {
-                                println!("MCP prompts — usage: /mcp prompt <server> <name> [args...]");
+                                println!(
+                                    "MCP prompts — usage: /mcp prompt <server> <name> [args...]"
+                                );
                                 for s in &servers {
                                     println!("  server: {}", s.id);
                                 }
@@ -1310,7 +1312,10 @@ pub(crate) fn run_chat(
                                 let mut map = serde_json::Map::new();
                                 for kv in &args[3..] {
                                     if let Some((k, v)) = kv.split_once('=') {
-                                        map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                                        map.insert(
+                                            k.to_string(),
+                                            serde_json::Value::String(v.to_string()),
+                                        );
                                     }
                                 }
                                 serde_json::Value::Object(map)
@@ -1318,8 +1323,9 @@ pub(crate) fn run_chat(
                                 json!({})
                             };
                             let result = deepseek_mcp::execute_mcp_stdio_request(
-                                &mcp.get_server(server_id)?
-                                    .ok_or_else(|| anyhow::anyhow!("MCP server not found: {server_id}"))?,
+                                &mcp.get_server(server_id)?.ok_or_else(|| {
+                                    anyhow::anyhow!("MCP server not found: {server_id}")
+                                })?,
                                 "prompts/get",
                                 json!({"name": prompt_name, "arguments": prompt_args}),
                                 3,
@@ -1328,10 +1334,17 @@ pub(crate) fn run_chat(
                             if json_mode {
                                 print_json(&result)?;
                             } else {
-                                if let Some(messages) = result.pointer("/result/messages").and_then(|v| v.as_array()) {
+                                if let Some(messages) = result
+                                    .pointer("/result/messages")
+                                    .and_then(|v| v.as_array())
+                                {
                                     for msg in messages {
-                                        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                                        let text = msg.pointer("/content/text").and_then(|v| v.as_str()).unwrap_or("");
+                                        let role =
+                                            msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                                        let text = msg
+                                            .pointer("/content/text")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
                                         println!("[{role}] {text}");
                                     }
                                 } else {
@@ -1340,7 +1353,9 @@ pub(crate) fn run_chat(
                             }
                         }
                     } else if json_mode {
-                        print_json(&json!({"error":"use /mcp list|get <id>|remove <id>|prompt <server> <name>"}))?;
+                        print_json(
+                            &json!({"error":"use /mcp list|get <id>|remove <id>|prompt <server> <name>"}),
+                        )?;
                     } else {
                         println!("use /mcp list|get <id>|remove <id>|prompt <server> <name>");
                     }
@@ -1376,26 +1391,6 @@ pub(crate) fn run_chat(
                         );
                     }
                 }
-                SlashCommand::Teleport(args) => match parse_teleport_args(args) {
-                    Ok(teleport_args) => run_teleport(cwd, teleport_args, json_mode)?,
-                    Err(err) => {
-                        if json_mode {
-                            print_json(&json!({"error": err.to_string()}))?;
-                        } else {
-                            println!("teleport parse error: {err}");
-                        }
-                    }
-                },
-                SlashCommand::RemoteEnv(args) => match parse_remote_env_cmd(args) {
-                    Ok(command) => run_remote_env(cwd, command, json_mode)?,
-                    Err(err) => {
-                        if json_mode {
-                            print_json(&json!({"error": err.to_string()}))?;
-                        } else {
-                            println!("remote-env parse error: {err}");
-                        }
-                    }
-                },
                 SlashCommand::Add(args) => {
                     let output = slash_add_dirs(cwd, &mut additional_dirs, &args)?;
                     if json_mode {
@@ -1611,16 +1606,6 @@ pub(crate) fn run_chat(
                         }
                     }
                 },
-                SlashCommand::Visual(args) => match parse_visual_cmd(args) {
-                    Ok(command) => run_visual(cwd, command, json_mode)?,
-                    Err(err) => {
-                        if json_mode {
-                            print_json(&json!({"error": err.to_string()}))?;
-                        } else {
-                            println!("visual parse error: {err}");
-                        }
-                    }
-                },
                 SlashCommand::Context => {
                     run_context(cwd, json_mode)?;
                 }
@@ -1762,9 +1747,14 @@ pub(crate) fn run_chat(
                             base64_data: b64,
                         });
                         if json_mode {
-                            print_json(&json!({"pasted_image": true, "size_bytes": img_bytes.len()}))?;
+                            print_json(
+                                &json!({"pasted_image": true, "size_bytes": img_bytes.len()}),
+                            )?;
                         } else {
-                            println!("Image pasted ({} bytes). It will be included in your next prompt.", img_bytes.len());
+                            println!(
+                                "Image pasted ({} bytes). It will be included in your next prompt.",
+                                img_bytes.len()
+                            );
                         }
                     } else {
                         let pasted = read_from_clipboard().unwrap_or_default();
@@ -1913,7 +1903,9 @@ pub(crate) fn run_chat(
                             for s in &sessions {
                                 let total_tokens = s.input_tokens + s.output_tokens;
                                 // Rough cost estimate: $0.27/M input, $1.10/M output (DeepSeek V3)
-                                let cost = (s.input_tokens as f64 * 0.27 + s.output_tokens as f64 * 1.10) / 1_000_000.0;
+                                let cost = (s.input_tokens as f64 * 0.27
+                                    + s.output_tokens as f64 * 1.10)
+                                    / 1_000_000.0;
                                 println!(
                                     "  {} | {}…  | {} turns | {} tokens | ${:.4}",
                                     &s.started_at[..19.min(s.started_at.len())],
@@ -2148,7 +2140,7 @@ pub(crate) fn run_chat(
                 use std::io::Write as _;
                 let out = std::io::stdout();
                 let mut handle = out.lock();
-                
+
                 let val = serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339(),
                     // Event stream payload. Exclude big texts or format appropriately.
@@ -2182,7 +2174,7 @@ pub(crate) fn run_chat(
                         _ => serde_json::json!({}),
                     }
                 });
-                
+
                 let _ = writeln!(handle, "{}", serde_json::to_string(&val).unwrap());
                 let _ = handle.flush();
             }));
@@ -2305,7 +2297,9 @@ pub(crate) fn run_chat(
         let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
         if json_mode {
             let suggestions = generate_prompt_suggestions(&output);
-            print_json(&json!({"output": output, "statusline": render_statusline(&ui_status), "suggestions": suggestions}))?;
+            print_json(
+                &json!({"output": output, "statusline": render_statusline(&ui_status), "suggestions": suggestions}),
+            )?;
         } else {
             println!("[status] {}", render_statusline(&ui_status));
             // Show follow-up prompt suggestions
@@ -2328,10 +2322,13 @@ pub(crate) fn run_chat(
                     auto_watch_turns += 1;
                     let comment_count = hints.lines().count();
                     if !json_mode {
-                        println!("[watch: auto-trigger {auto_watch_turns}/{MAX_WATCH_AUTO_TURNS} — {comment_count} comment(s)]");
+                        println!(
+                            "[watch: auto-trigger {auto_watch_turns}/{MAX_WATCH_AUTO_TURNS} — {comment_count} comment(s)]"
+                        );
                     }
                     let mut auto_prompt =
-                        "Resolve the following TODO/FIXME/AI comments detected in the workspace:".to_string();
+                        "Resolve the following TODO/FIXME/AI comments detected in the workspace:"
+                            .to_string();
                     auto_prompt.push_str("\n\nAUTO_WATCH_CONTEXT\n");
                     auto_prompt.push_str(&hints);
                     auto_prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
@@ -2380,7 +2377,9 @@ pub(crate) fn run_chat_tui(
     let read_only_mode = Arc::new(AtomicBool::new(false));
     let active_chat_mode = Arc::new(std::sync::Mutex::new(ChatMode::Code));
     let last_watch_digest = Arc::new(std::sync::Mutex::new(None::<u64>));
-    let pending_images = Arc::new(std::sync::Mutex::new(Vec::<deepseek_core::ImageContent>::new()));
+    let pending_images = Arc::new(std::sync::Mutex::new(
+        Vec::<deepseek_core::ImageContent>::new(),
+    ));
 
     // Create the channel for TUI stream events.
     let (tx, rx) = mpsc::channel::<TuiStreamEvent>();
@@ -2414,23 +2413,89 @@ pub(crate) fn run_chat_tui(
     let watch_digest_for_closure = Arc::clone(&last_watch_digest);
 
     // Build ML completion callback for ghost text (if local_ml + autocomplete enabled)
-    let ml_completion_cb: Option<deepseek_ui::MlCompletionCallback> =
-        if cfg.local_ml.enabled && cfg.local_ml.autocomplete.enabled {
-            let generator: Arc<dyn deepseek_local_ml::completion::LocalGenBackend> =
-                Arc::new(deepseek_local_ml::completion::MockGenerator::new(String::new()));
-            let max_tokens = cfg.local_ml.autocomplete.max_tokens;
-            let timeout_ms = cfg.local_ml.autocomplete.timeout_ms;
-            Some(Arc::new(move |input: &str| -> Option<String> {
-                let opts = deepseek_local_ml::completion::GenOpts {
-                    max_tokens,
-                    timeout_ms,
-                    ..Default::default()
-                };
-                generator.generate(input, &opts).ok().filter(|s| !s.is_empty())
-            }))
-        } else {
-            None
+    let ml_completion_cb: Option<deepseek_ui::MlCompletionCallback> = if cfg.local_ml.enabled
+        && cfg.local_ml.autocomplete.enabled
+    {
+        let generator: Arc<dyn deepseek_local_ml::completion::LocalGenBackend> = {
+            #[cfg(feature = "local-ml")]
+            {
+                let mut mgr = deepseek_local_ml::ModelManager::new(std::path::PathBuf::from(
+                    &cfg.local_ml.cache_dir,
+                ));
+                match mgr.ensure_model_with_progress(&cfg.local_ml.autocomplete.model_id, |i, t| {
+                    eprintln!("[deepseek] downloading model file {}/{}", i + 1, t);
+                }) {
+                    Ok(model_path) => {
+                        let device = deepseek_local_ml::parse_device(&cfg.local_ml.device);
+                        // Find .gguf file in model dir
+                        let gguf = std::fs::read_dir(&model_path).ok().and_then(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .find(|e| e.path().extension().is_some_and(|ext| ext == "gguf"))
+                                .map(|e| e.path())
+                        });
+                        match gguf {
+                            Some(gguf_path) => {
+                                match deepseek_local_ml::CandleCompletion::load(
+                                    &gguf_path,
+                                    &model_path.join("tokenizer.json"),
+                                    &device,
+                                ) {
+                                    Ok(comp) => Arc::new(comp),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[deepseek] candle completion load failed ({e}), using mock"
+                                        );
+                                        Arc::new(deepseek_local_ml::completion::MockGenerator::new(
+                                            String::new(),
+                                        ))
+                                    }
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "[deepseek] no .gguf file found in model dir, using mock"
+                                );
+                                Arc::new(deepseek_local_ml::completion::MockGenerator::new(
+                                    String::new(),
+                                ))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[deepseek] model '{}' not available ({e}), using mock",
+                            cfg.local_ml.autocomplete.model_id
+                        );
+                        Arc::new(deepseek_local_ml::completion::MockGenerator::new(
+                            String::new(),
+                        ))
+                    }
+                }
+            }
+            #[cfg(not(feature = "local-ml"))]
+            {
+                Arc::new(deepseek_local_ml::completion::MockGenerator::new(
+                    String::new(),
+                ))
+            }
         };
+        let max_tokens = cfg.local_ml.autocomplete.max_tokens;
+        let timeout_ms = cfg.local_ml.autocomplete.timeout_ms;
+        Some(Arc::new(move |input: &str| -> Option<String> {
+            let opts = deepseek_local_ml::completion::GenOpts {
+                max_tokens,
+                timeout_ms,
+                ..Default::default()
+            };
+            generator
+                .generate(input, &opts)
+                .ok()
+                .filter(|s| !s.is_empty())
+        }))
+    } else {
+        None
+    };
 
     run_tui_shell_with_bindings(
         status,
@@ -2443,7 +2508,7 @@ pub(crate) fn run_chat_tui(
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /ask /code /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /teleport /remote-env /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /visual /git /settings /load /save /paste /voice /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Help => "commands: /help /ask /code /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /git /settings /load /save /paste /voice /desktop /todos /chrome /vim".to_string(),
                 SlashCommand::Ask(_) => {
                     if let Ok(mut guard) = active_mode_for_closure.lock() {
                         *guard = ChatMode::Ask;
@@ -2629,42 +2694,6 @@ pub(crate) fn run_chat_tui(
                     force_max_think.store(true, Ordering::Relaxed);
                     "plan mode enabled (thinking enabled)".to_string()
                 }
-                SlashCommand::Teleport(args) => {
-                    match parse_teleport_args(args) {
-                        Ok(teleport_args) => {
-                            let teleport = teleport_now(cwd, teleport_args)?;
-                            match teleport.mode.as_str() {
-                                "import" => format!(
-                                    "imported teleport bundle {}",
-                                    teleport.imported.unwrap_or_default()
-                                ),
-                                "link" => format!(
-                                    "handoff link {}",
-                                    teleport.link_url.unwrap_or_default()
-                                ),
-                                "consume" => format!(
-                                    "consumed handoff {}",
-                                    teleport.handoff_id.unwrap_or_default()
-                                ),
-                                _ => format!(
-                                    "teleport bundle {} -> {}",
-                                    teleport.bundle_id.unwrap_or_default(),
-                                    teleport.path.unwrap_or_default()
-                                ),
-                            }
-                        }
-                        Err(err) => format!("teleport parse error: {err}"),
-                    }
-                }
-                SlashCommand::RemoteEnv(args) => {
-                    match parse_remote_env_cmd(args) {
-                        Ok(cmd) => {
-                            let out = remote_env_now(cwd, cmd)?;
-                            serde_json::to_string(&out)?
-                        }
-                        Err(err) => format!("remote-env parse error: {err}"),
-                    }
-                }
                 SlashCommand::Add(args) => {
                     let mut guard = additional_dirs_for_closure
                         .lock()
@@ -2807,10 +2836,6 @@ pub(crate) fn run_chat_tui(
                 SlashCommand::Background(args) => match parse_background_cmd(args) {
                     Ok(cmd) => serde_json::to_string_pretty(&background_payload(cwd, cmd)?)?,
                     Err(err) => format!("background parse error: {err}"),
-                },
-                SlashCommand::Visual(args) => match parse_visual_cmd(args) {
-                    Ok(cmd) => serde_json::to_string_pretty(&visual_payload(cwd, cmd)?)?,
-                    Err(err) => format!("visual parse error: {err}"),
                 },
                 SlashCommand::Git(args) => slash_git_output(cwd, &args)?,
                 SlashCommand::Settings => format!(
@@ -3049,8 +3074,7 @@ pub(crate) fn run_chat_tui(
                 && *guard != Some(digest)
             {
                 *guard = Some(digest);
-                prompt
-                    .push_str("\n\nAUTO_WATCH_CONTEXT\nDetected comment hints in workspace:\n");
+                prompt.push_str("\n\nAUTO_WATCH_CONTEXT\nDetected comment hints in workspace:\n");
                 prompt.push_str(&hints);
                 prompt.push_str("\nAUTO_WATCH_CONTEXT_END");
             }
@@ -3132,8 +3156,14 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ImageData { data, label } => {
                     let _ = tx_stream.send(TuiStreamEvent::ImageDisplay { data, label });
                 }
-                StreamChunk::WatchTriggered { digest, comment_count } => {
-                    let _ = tx_stream.send(TuiStreamEvent::WatchTriggered { digest, comment_count });
+                StreamChunk::WatchTriggered {
+                    digest,
+                    comment_count,
+                } => {
+                    let _ = tx_stream.send(TuiStreamEvent::WatchTriggered {
+                        digest,
+                        comment_count,
+                    });
                 }
                 StreamChunk::SecurityWarning { message } => {
                     let _ = tx_stream.send(TuiStreamEvent::Error(format!("⚠ Security: {message}")));
@@ -3417,24 +3447,12 @@ fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
     }))
 }
 
-fn desktop_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
-    let teleport_args = if args.is_empty() {
-        parse_teleport_args(vec!["link".to_string()]).unwrap_or_default()
-    } else {
-        parse_teleport_args(args.to_vec()).unwrap_or_default()
-    };
-    let execution = teleport_now(cwd, teleport_args)?;
+fn desktop_payload(cwd: &Path, _args: &[String]) -> Result<serde_json::Value> {
     let session_id = Store::new(cwd)?
         .load_latest_session()?
         .map(|session| session.session_id.to_string());
     Ok(json!({
         "schema": "deepseek.desktop_handoff.v2",
-        "mode": execution.mode,
-        "bundle_id": execution.bundle_id,
-        "handoff_id": execution.handoff_id,
-        "link_url": execution.link_url,
-        "token": execution.token,
-        "path": execution.path.or(execution.imported),
         "session_id": session_id,
         "resume_command": session_id.map(|id| format!("deepseek --resume {id}")),
     }))
@@ -3942,58 +3960,8 @@ fn chrome_error_payload(
     })
 }
 
-fn parse_debug_analysis_args(args: &[String]) -> Result<Option<DoctorArgs>> {
-    if args.is_empty() {
-        return Ok(None);
-    }
-
-    let mut idx = 0usize;
-    if args[0].eq_ignore_ascii_case("analyze") {
-        idx = 1;
-        if idx >= args.len() {
-            return Err(anyhow!(
-                "usage: /debug analyze <auto|runtime|test|performance> <file-or-text>"
-            ));
-        }
-    }
-
-    let Some(mode) = parse_debug_mode_token(&args[idx]) else {
-        if idx == 0 {
-            return Ok(None);
-        }
-        return Err(anyhow!(
-            "usage: /debug analyze <auto|runtime|test|performance> <file-or-text>"
-        ));
-    };
-    idx += 1;
-
-    let remaining = &args[idx..];
-    if remaining.is_empty() {
-        return Err(anyhow!(
-            "missing debug input. provide a file path or inline text after the mode"
-        ));
-    }
-
-    let mut doctor_args = DoctorArgs {
-        mode,
-        ..DoctorArgs::default()
-    };
-    if remaining.len() == 1 && Path::new(&remaining[0]).exists() {
-        doctor_args.analyze_file = Some(remaining[0].clone());
-    } else {
-        doctor_args.analyze_text = Some(remaining.join(" "));
-    }
-    Ok(Some(doctor_args))
-}
-
-fn parse_debug_mode_token(token: &str) -> Option<DoctorModeArg> {
-    match token.to_ascii_lowercase().as_str() {
-        "auto" => Some(DoctorModeArg::Auto),
-        "runtime" => Some(DoctorModeArg::Runtime),
-        "test" | "tests" => Some(DoctorModeArg::Test),
-        "performance" | "perf" => Some(DoctorModeArg::Performance),
-        _ => None,
-    }
+fn parse_debug_analysis_args(_args: &[String]) -> Result<Option<DoctorArgs>> {
+    Ok(None)
 }
 
 pub(crate) fn load_tui_keybindings(cwd: &Path, cfg: &AppConfig) -> KeyBindings {
@@ -4119,7 +4087,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     summary,
                 } => {
                     let status = if success { "ok" } else { "error" };
-                    let _ = writeln!(handle, "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}");
+                    let _ = writeln!(
+                        handle,
+                        "[tool: {tool_name}] {status} ({duration_ms}ms) {summary}"
+                    );
                     let _ = handle.flush();
                 }
                 StreamChunk::ModeTransition { from, to, reason } => {
@@ -4424,12 +4395,19 @@ mod tests {
         // We test the routing logic: when args is empty, it should match the
         // edit branch (first condition), not fall through to show.
         let args: Vec<String> = vec![];
-        let first_condition = args.is_empty() || args.first().is_some_and(|a| a.eq_ignore_ascii_case("edit"));
-        assert!(first_condition, "/memory with no args should match the edit branch");
+        let first_condition =
+            args.is_empty() || args.first().is_some_and(|a| a.eq_ignore_ascii_case("edit"));
+        assert!(
+            first_condition,
+            "/memory with no args should match the edit branch"
+        );
 
         // "show" should NOT match the edit branch
         let show_args = vec![String::from("show")];
-        let edit_branch = show_args.is_empty() || show_args.first().is_some_and(|a| a.eq_ignore_ascii_case("edit"));
+        let edit_branch = show_args.is_empty()
+            || show_args
+                .first()
+                .is_some_and(|a| a.eq_ignore_ascii_case("edit"));
         assert!(!edit_branch, "/memory show should NOT match edit branch");
     }
 
@@ -4443,11 +4421,17 @@ mod tests {
         let args: Vec<String> = vec![];
         let json_mode = false;
         let interactive_menu = args.is_empty() && !json_mode;
-        assert!(interactive_menu, "empty args + non-json should trigger interactive menu");
+        assert!(
+            interactive_menu,
+            "empty args + non-json should trigger interactive menu"
+        );
 
         // JSON mode should fall through to McpCmd::List
         let json_mode = true;
         let interactive_menu = args.is_empty() && !json_mode;
-        assert!(!interactive_menu, "json mode should NOT trigger interactive menu");
+        assert!(
+            !interactive_menu,
+            "json mode should NOT trigger interactive menu"
+        );
     }
 }

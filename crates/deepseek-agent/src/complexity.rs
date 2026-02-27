@@ -153,17 +153,22 @@ impl EscalationSignals {
 
         // Patch rejection
         if tool_name == "fs_edit" || tool_name == "fs.edit" {
-            if lower.contains("no match") || lower.contains("conflict")
-                || lower.contains("not found") || lower.contains("failed to apply")
+            if lower.contains("no match")
+                || lower.contains("conflict")
+                || lower.contains("not found")
+                || lower.contains("failed to apply")
             {
                 self.patch_rejected = true;
             }
         }
 
         // Search miss
-        if (tool_name == "fs_grep" || tool_name == "fs.grep"
-            || tool_name == "fs_glob" || tool_name == "fs.glob")
-            && (lower.contains("no matches") || lower.contains("0 results")
+        if (tool_name == "fs_grep"
+            || tool_name == "fs.grep"
+            || tool_name == "fs_glob"
+            || tool_name == "fs.glob")
+            && (lower.contains("no matches")
+                || lower.contains("0 results")
                 || output.trim().is_empty())
         {
             self.search_miss = true;
@@ -201,12 +206,29 @@ fn is_trivial(lower: &str, words: &[&str], word_count: usize) -> bool {
     }
 
     const TRIVIAL: &[&str] = &[
-        "fix typo", "fix spelling", "fix indent", "fix whitespace",
-        "fix formatting", "format code", "rename", "add import",
-        "remove import", "update version", "bump version",
-        "remove unused", "delete line", "remove line", "add newline",
-        "comment out", "uncomment", "add comma", "remove comma",
-        "add semicolon", "toggle", "swap", "flip",
+        "fix typo",
+        "fix spelling",
+        "fix indent",
+        "fix whitespace",
+        "fix formatting",
+        "format code",
+        "rename",
+        "add import",
+        "remove import",
+        "update version",
+        "bump version",
+        "remove unused",
+        "delete line",
+        "remove line",
+        "add newline",
+        "comment out",
+        "uncomment",
+        "add comma",
+        "remove comma",
+        "add semicolon",
+        "toggle",
+        "swap",
+        "flip",
     ];
 
     if TRIVIAL.iter().any(|t| lower.contains(t)) {
@@ -217,8 +239,16 @@ fn is_trivial(lower: &str, words: &[&str], word_count: usize) -> bool {
         // Check if the rest of the prompt contains complexity keywords.
         // "just refactor everything" is NOT simple, even with a minimizer prefix.
         let has_complex_keyword = [
-            "refactor", "rewrite", "migrate", "redesign", "overhaul",
-            "restructure", "implement", "add", "create", "build",
+            "refactor",
+            "rewrite",
+            "migrate",
+            "redesign",
+            "overhaul",
+            "restructure",
+            "implement",
+            "add",
+            "create",
+            "build",
         ]
         .iter()
         .any(|k| lower.contains(k));
@@ -229,16 +259,27 @@ fn is_trivial(lower: &str, words: &[&str], word_count: usize) -> bool {
 
 fn is_complex(lower: &str, words: &[&str], word_count: usize) -> bool {
     let has_arch = [
-        "refactor", "redesign", "rewrite", "rearchitect",
-        "migrate", "restructure", "overhaul",
+        "refactor",
+        "redesign",
+        "rewrite",
+        "rearchitect",
+        "migrate",
+        "restructure",
+        "overhaul",
     ]
     .iter()
     .any(|k| lower.contains(k));
 
     let has_scope = [
-        "across multiple", "multiple files", "all files",
-        "entire codebase", "whole project", "every file",
-        "each module", "end-to-end", "throughout",
+        "across multiple",
+        "multiple files",
+        "all files",
+        "entire codebase",
+        "whole project",
+        "every file",
+        "each module",
+        "end-to-end",
+        "throughout",
     ]
     .iter()
     .any(|k| lower.contains(k));
@@ -272,11 +313,21 @@ fn is_complex(lower: &str, words: &[&str], word_count: usize) -> bool {
         })
         .count();
 
-    if has_arch && word_count > 5 { return true; }
-    if has_scope && word_count > 15 { return true; }
-    if conjunctions >= 2 { return true; }
-    if list_items >= 3 { return true; }
-    if file_refs >= 3 { return true; }
+    if has_arch && word_count > 5 {
+        return true;
+    }
+    if has_scope && word_count > 15 {
+        return true;
+    }
+    if conjunctions >= 2 {
+        return true;
+    }
+    if list_items >= 3 {
+        return true;
+    }
+    if file_refs >= 3 {
+        return true;
+    }
 
     false
 }
@@ -314,9 +365,9 @@ pub fn classify_with_history(
 /// Further escalation is handled by `EscalationSignals` in the tool loop.
 pub fn thinking_budget_for(complexity: PromptComplexity) -> u32 {
     match complexity {
-        PromptComplexity::Simple => DEFAULT_THINK_BUDGET,     // 8K
-        PromptComplexity::Medium => MEDIUM_THINK_BUDGET,       // 16K
-        PromptComplexity::Complex => HARD_THINK_BUDGET,        // 32K
+        PromptComplexity::Simple => DEFAULT_THINK_BUDGET, // 8K
+        PromptComplexity::Medium => MEDIUM_THINK_BUDGET,  // 16K
+        PromptComplexity::Complex => HARD_THINK_BUDGET,   // 32K
     }
 }
 
@@ -332,8 +383,16 @@ pub fn score_prompt(prompt: &str) -> u64 {
     let mut score = 0_u64;
 
     for keyword in [
-        "frontend", "backend", "api", "database", "migration",
-        "test", "ci", "docs", "security", "performance",
+        "frontend",
+        "backend",
+        "api",
+        "database",
+        "migration",
+        "test",
+        "ci",
+        "docs",
+        "security",
+        "performance",
     ] {
         if lower.contains(keyword) {
             score = score.saturating_add(10);
@@ -341,8 +400,14 @@ pub fn score_prompt(prompt: &str) -> u64 {
     }
 
     for keyword in [
-        "across", "multiple files", "end-to-end", "refactor",
-        "orchestrate", "workflow", "integration", "pipeline",
+        "across",
+        "multiple files",
+        "end-to-end",
+        "refactor",
+        "orchestrate",
+        "workflow",
+        "integration",
+        "pipeline",
     ] {
         if lower.contains(keyword) {
             score = score.saturating_add(8);
@@ -361,8 +426,14 @@ mod tests {
 
     #[test]
     fn default_budget_is_moderate() {
-        assert!(DEFAULT_THINK_BUDGET <= 16_384, "default should be moderate, not huge");
-        assert!(DEFAULT_THINK_BUDGET >= 4_096, "default should not starve reasoning");
+        assert!(
+            DEFAULT_THINK_BUDGET <= 16_384,
+            "default should be moderate, not huge"
+        );
+        assert!(
+            DEFAULT_THINK_BUDGET >= 4_096,
+            "default should not starve reasoning"
+        );
     }
 
     #[test]
@@ -374,9 +445,18 @@ mod tests {
     #[test]
     fn thinking_budget_matches_complexity() {
         // 3-tier: Simple 8K, Medium 16K, Complex 32K
-        assert_eq!(thinking_budget_for(PromptComplexity::Simple), DEFAULT_THINK_BUDGET);
-        assert_eq!(thinking_budget_for(PromptComplexity::Medium), MEDIUM_THINK_BUDGET);
-        assert_eq!(thinking_budget_for(PromptComplexity::Complex), HARD_THINK_BUDGET);
+        assert_eq!(
+            thinking_budget_for(PromptComplexity::Simple),
+            DEFAULT_THINK_BUDGET
+        );
+        assert_eq!(
+            thinking_budget_for(PromptComplexity::Medium),
+            MEDIUM_THINK_BUDGET
+        );
+        assert_eq!(
+            thinking_budget_for(PromptComplexity::Complex),
+            HARD_THINK_BUDGET
+        );
         // Verify actual values
         assert_eq!(DEFAULT_THINK_BUDGET, 8_192);
         assert_eq!(MEDIUM_THINK_BUDGET, 16_384);
@@ -422,7 +502,10 @@ mod tests {
         signals.compile_error = true;
         signals.consecutive_failure_turns = 4;
         let budget = signals.budget();
-        assert!(budget > HARD_THINK_BUDGET, "repeated failures should escalate beyond hard");
+        assert!(
+            budget > HARD_THINK_BUDGET,
+            "repeated failures should escalate beyond hard"
+        );
         assert!(budget <= MAX_THINK_BUDGET, "should be capped at max");
     }
 
@@ -437,7 +520,10 @@ mod tests {
     #[test]
     fn scan_detects_rust_compile_error() {
         let mut signals = EscalationSignals::default();
-        signals.scan_tool_output("bash_run", "error[E0308]: mismatched types\n  expected `u32`");
+        signals.scan_tool_output(
+            "bash_run",
+            "error[E0308]: mismatched types\n  expected `u32`",
+        );
         assert!(signals.compile_error);
     }
 
@@ -467,39 +553,87 @@ mod tests {
 
     #[test]
     fn classify_simple_prompts() {
-        assert_eq!(classify_complexity("fix typo in readme"), PromptComplexity::Simple);
-        assert_eq!(classify_complexity("rename variable foo"), PromptComplexity::Simple);
-        assert_eq!(classify_complexity("add import for serde"), PromptComplexity::Simple);
-        assert_eq!(classify_complexity("update version to 2.0"), PromptComplexity::Simple);
+        assert_eq!(
+            classify_complexity("fix typo in readme"),
+            PromptComplexity::Simple
+        );
+        assert_eq!(
+            classify_complexity("rename variable foo"),
+            PromptComplexity::Simple
+        );
+        assert_eq!(
+            classify_complexity("add import for serde"),
+            PromptComplexity::Simple
+        );
+        assert_eq!(
+            classify_complexity("update version to 2.0"),
+            PromptComplexity::Simple
+        );
     }
 
     #[test]
     fn minimizers_signal_simplicity() {
-        assert_eq!(classify_complexity("just fix the typo"), PromptComplexity::Simple);
-        assert_eq!(classify_complexity("only rename the variable"), PromptComplexity::Simple);
-        assert_eq!(classify_complexity("simply update the comment"), PromptComplexity::Simple);
+        assert_eq!(
+            classify_complexity("just fix the typo"),
+            PromptComplexity::Simple
+        );
+        assert_eq!(
+            classify_complexity("only rename the variable"),
+            PromptComplexity::Simple
+        );
+        assert_eq!(
+            classify_complexity("simply update the comment"),
+            PromptComplexity::Simple
+        );
     }
 
     #[test]
     fn just_refactor_is_not_simple() {
         // "just" with complexity keywords should not be treated as simple
-        assert_ne!(classify_complexity("just refactor everything"), PromptComplexity::Simple);
-        assert_ne!(classify_complexity("just rewrite the auth module"), PromptComplexity::Simple);
-        assert_ne!(classify_complexity("simply migrate the database"), PromptComplexity::Simple);
-        assert_ne!(classify_complexity("only implement the new feature"), PromptComplexity::Simple);
+        assert_ne!(
+            classify_complexity("just refactor everything"),
+            PromptComplexity::Simple
+        );
+        assert_ne!(
+            classify_complexity("just rewrite the auth module"),
+            PromptComplexity::Simple
+        );
+        assert_ne!(
+            classify_complexity("simply migrate the database"),
+            PromptComplexity::Simple
+        );
+        assert_ne!(
+            classify_complexity("only implement the new feature"),
+            PromptComplexity::Simple
+        );
     }
 
     #[test]
     fn just_fix_typo_is_simple() {
-        assert_eq!(classify_complexity("just fix the typo"), PromptComplexity::Simple);
-        assert_eq!(classify_complexity("just remove the comma"), PromptComplexity::Simple);
+        assert_eq!(
+            classify_complexity("just fix the typo"),
+            PromptComplexity::Simple
+        );
+        assert_eq!(
+            classify_complexity("just remove the comma"),
+            PromptComplexity::Simple
+        );
     }
 
     #[test]
     fn classify_medium_prompts() {
-        assert_eq!(classify_complexity("add a login button to the header"), PromptComplexity::Medium);
-        assert_eq!(classify_complexity("implement user authentication"), PromptComplexity::Medium);
-        assert_eq!(classify_complexity("what does this function do?"), PromptComplexity::Medium);
+        assert_eq!(
+            classify_complexity("add a login button to the header"),
+            PromptComplexity::Medium
+        );
+        assert_eq!(
+            classify_complexity("implement user authentication"),
+            PromptComplexity::Medium
+        );
+        assert_eq!(
+            classify_complexity("what does this function do?"),
+            PromptComplexity::Medium
+        );
     }
 
     #[test]
@@ -513,7 +647,9 @@ mod tests {
             PromptComplexity::Complex,
         );
         assert_eq!(
-            classify_complexity("migrate the database schema and update all files that reference it"),
+            classify_complexity(
+                "migrate the database schema and update all files that reference it"
+            ),
             PromptComplexity::Complex,
         );
     }
@@ -521,11 +657,15 @@ mod tests {
     #[test]
     fn multi_step_tasks_are_complex() {
         assert_eq!(
-            classify_complexity("implement authentication and add rate limiting and update the database schema"),
+            classify_complexity(
+                "implement authentication and add rate limiting and update the database schema"
+            ),
             PromptComplexity::Complex,
         );
         assert_eq!(
-            classify_complexity("1. Add the new endpoint\n2. Update the database\n3. Write tests\n4. Update docs"),
+            classify_complexity(
+                "1. Add the new endpoint\n2. Update the database\n3. Write tests\n4. Update docs"
+            ),
             PromptComplexity::Complex,
         );
     }
@@ -533,7 +673,9 @@ mod tests {
     #[test]
     fn many_file_references_are_complex() {
         assert_eq!(
-            classify_complexity("Update src/auth.rs, src/middleware.rs, src/routes.rs, and tests/auth_test.rs to use the new token format"),
+            classify_complexity(
+                "Update src/auth.rs, src/middleware.rs, src/routes.rs, and tests/auth_test.rs to use the new token format"
+            ),
             PromptComplexity::Complex,
         );
     }
@@ -541,7 +683,9 @@ mod tests {
     #[test]
     fn constraint_heavy_tasks_are_complex() {
         assert_eq!(
-            classify_complexity("refactor the module and ensure that thread safety is maintained while keeping backward compatible"),
+            classify_complexity(
+                "refactor the module and ensure that thread safety is maintained while keeping backward compatible"
+            ),
             PromptComplexity::Complex,
         );
     }
@@ -558,9 +702,18 @@ mod tests {
 
     #[test]
     fn pure_questions_stay_medium() {
-        assert_eq!(classify_complexity("what does this function do?"), PromptComplexity::Medium);
-        assert_eq!(classify_complexity("how does the auth flow work?"), PromptComplexity::Medium);
-        assert_eq!(classify_complexity("explain the architecture"), PromptComplexity::Medium);
+        assert_eq!(
+            classify_complexity("what does this function do?"),
+            PromptComplexity::Medium
+        );
+        assert_eq!(
+            classify_complexity("how does the auth flow work?"),
+            PromptComplexity::Medium
+        );
+        assert_eq!(
+            classify_complexity("explain the architecture"),
+            PromptComplexity::Medium
+        );
     }
 
     // ── History-aware ──
@@ -575,13 +728,22 @@ mod tests {
 
     #[test]
     fn history_upgrades_deep_session_with_errors() {
-        assert_eq!(classify_with_history("add a feature", 20, true, 1), PromptComplexity::Complex);
-        assert_eq!(classify_with_history("fix typo", 16, true, 0), PromptComplexity::Medium);
+        assert_eq!(
+            classify_with_history("add a feature", 20, true, 1),
+            PromptComplexity::Complex
+        );
+        assert_eq!(
+            classify_with_history("fix typo", 16, true, 0),
+            PromptComplexity::Medium
+        );
     }
 
     #[test]
     fn history_preserves_without_escalation() {
-        assert_eq!(classify_with_history("fix typo", 0, false, 0), PromptComplexity::Simple);
+        assert_eq!(
+            classify_with_history("fix typo", 0, false, 0),
+            PromptComplexity::Simple
+        );
     }
 
     // ── Legacy escalation API ──
@@ -631,9 +793,15 @@ mod tests {
         // 3 consecutive successes should de-escalate
         signals.record_success();
         signals.record_success();
-        assert!(signals.should_escalate(), "should still be escalated after 2 successes");
+        assert!(
+            signals.should_escalate(),
+            "should still be escalated after 2 successes"
+        );
         signals.record_success();
-        assert!(!signals.should_escalate(), "should de-escalate after 3 successes");
+        assert!(
+            !signals.should_escalate(),
+            "should de-escalate after 3 successes"
+        );
         assert!(!signals.compile_error);
         assert!(!signals.test_failure);
         assert_eq!(signals.budget(), DEFAULT_THINK_BUDGET);
@@ -651,8 +819,14 @@ mod tests {
     fn scan_tool_output_no_false_positive_on_file_not_found() {
         // "no such file" errors from fs_read should NOT trigger compile_error
         let mut signals = EscalationSignals::default();
-        signals.scan_tool_output("fs_read", "error: no such file or directory: /tmp/missing.rs");
-        assert!(!signals.compile_error, "file-not-found should not flag compile error");
+        signals.scan_tool_output(
+            "fs_read",
+            "error: no such file or directory: /tmp/missing.rs",
+        );
+        assert!(
+            !signals.compile_error,
+            "file-not-found should not flag compile error"
+        );
     }
 
     #[test]

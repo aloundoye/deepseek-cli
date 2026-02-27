@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::chunker::{Chunk, ChunkConfig, ChunkManifest};
 use crate::embeddings::EmbeddingsBackend;
-use crate::vector_index::{BruteForceBackend, SearchFilter, VectorIndex};
+use crate::vector_index::{BruteForceBackend, SearchFilter, VectorIndex, VectorIndexBackend};
 
 /// A single retrieval result combining vector and BM25 scores.
 #[derive(Debug, Clone)]
@@ -61,6 +61,27 @@ impl HybridRetriever {
     ) -> Result<Self> {
         let dimension = embeddings.dimension();
         let backend = Box::new(BruteForceBackend::new(dimension));
+        let vector_index = VectorIndex::create(index_path, backend)?;
+
+        Ok(Self {
+            vector_index,
+            embeddings,
+            tantivy_index,
+            blend_alpha,
+            chunk_config,
+            manifest: ChunkManifest::default(),
+        })
+    }
+
+    /// Create a hybrid retriever with a custom vector index backend.
+    pub fn new_with_backend(
+        index_path: &Path,
+        embeddings: Arc<dyn EmbeddingsBackend>,
+        backend: Box<dyn VectorIndexBackend>,
+        tantivy_index: Option<deepseek_index::IndexService>,
+        blend_alpha: f32,
+        chunk_config: ChunkConfig,
+    ) -> Result<Self> {
         let vector_index = VectorIndex::create(index_path, backend)?;
 
         Ok(Self {

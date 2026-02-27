@@ -274,9 +274,15 @@ mod tests {
     fn extended_thinking_tool_exists() {
         let defs = tool_definitions();
         let et = defs.iter().find(|t| t.function.name == "extended_thinking");
-        assert!(et.is_some(), "extended_thinking tool should exist in definitions");
         assert!(
-            et.unwrap().function.description.contains("chain-of-thought"),
+            et.is_some(),
+            "extended_thinking tool should exist in definitions"
+        );
+        assert!(
+            et.unwrap()
+                .function
+                .description
+                .contains("chain-of-thought"),
             "description should mention chain-of-thought reasoning"
         );
     }

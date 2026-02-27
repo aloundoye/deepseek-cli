@@ -44,6 +44,9 @@ deepseek-chrome = { path = "../deepseek-chrome" }
 deepseek-local-ml = { path = "../deepseek-local-ml" }
 ignore.workspace = true
 
+[features]
+local-ml = ["deepseek-agent/local-ml", "deepseek-local-ml/local-ml"]
+
 [dev-dependencies]
 assert_cmd = "2"
 tempfile = "3"

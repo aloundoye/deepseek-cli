@@ -407,7 +407,9 @@ impl IdeRpcHandler {
                     guard.push(stream_chunk_to_event_json(&StreamChunk::ContentDelta(
                         mock_output.to_string(),
                     )));
-                    guard.push(stream_chunk_to_event_json(&StreamChunk::Done { reason: None }));
+                    guard.push(stream_chunk_to_event_json(&StreamChunk::Done {
+                        reason: None,
+                    }));
                 }
                 ("completed".to_string(), mock_output.to_string(), None)
             } else {

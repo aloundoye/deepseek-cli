@@ -549,10 +549,8 @@ mod tests {
 
     #[test]
     fn skill_hooks_parsed_into_custom_command() {
-        let workspace = std::env::temp_dir().join(format!(
-            "deepseek-hook-cmd-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-hook-cmd-test-{}", uuid::Uuid::now_v7()));
         let cmd_dir = workspace.join(".deepseek").join("commands");
         fs::create_dir_all(&cmd_dir).expect("cmd dir");
 
@@ -623,10 +621,8 @@ mod tests {
 
     #[test]
     fn skill_forked_isolates_context() {
-        let workspace = std::env::temp_dir().join(format!(
-            "deepseek-fork-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-fork-test-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         let manager = SkillManager::new(&workspace).expect("manager");
 
@@ -649,9 +645,7 @@ mod tests {
         assert!(output.rendered_prompt.contains("isolated context"));
 
         // Regular run should also detect fork from frontmatter
-        let output2 = manager
-            .run("forked-skill", Some("lint"), &[])
-            .expect("run");
+        let output2 = manager.run("forked-skill", Some("lint"), &[]).expect("run");
         assert!(output2.forked); // context: fork in frontmatter
     }
 
@@ -659,10 +653,8 @@ mod tests {
 
     #[test]
     fn allowed_tools_enforced() {
-        let workspace = std::env::temp_dir().join(format!(
-            "deepseek-allow-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-allow-test-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         let manager = SkillManager::new(&workspace).expect("manager");
 
@@ -675,10 +667,11 @@ mod tests {
         .expect("skill file");
         manager.install(&source).expect("install");
 
-        let output = manager
-            .run("restricted-skill", None, &[])
-            .expect("run");
-        assert_eq!(output.allowed_tools, vec!["fs_read", "fs_glob", "git_status"]);
+        let output = manager.run("restricted-skill", None, &[]).expect("run");
+        assert_eq!(
+            output.allowed_tools,
+            vec!["fs_read", "fs_glob", "git_status"]
+        );
         assert_eq!(output.disallowed_tools, vec!["bash_run"]);
     }
 
@@ -693,10 +686,8 @@ mod tests {
 
     #[test]
     fn skill_invocation_by_model() {
-        let workspace = std::env::temp_dir().join(format!(
-            "deepseek-invoke-test-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-invoke-test-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         let manager = SkillManager::new(&workspace).expect("manager");
 

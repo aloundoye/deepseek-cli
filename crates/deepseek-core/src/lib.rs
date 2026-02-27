@@ -649,38 +649,24 @@ pub fn parse_event_envelope_compat(raw: &str) -> Result<EventEnvelope> {
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
     #[serde(alias = "TurnAddedV1")]
-    TurnAdded {
-        role: String,
-        content: String,
-    },
+    TurnAdded { role: String, content: String },
     /// Structured chat turn with full tool_call data for accurate session resume.
     #[serde(alias = "ChatTurnV1")]
-    ChatTurn {
-        message: ChatMessage,
-    },
+    ChatTurn { message: ChatMessage },
     /// Reverts the session to a prior state by dropping N turns.
     #[serde(alias = "TurnRevertedV1")]
-    TurnReverted {
-        turns_dropped: u32,
-    },
+    TurnReverted { turns_dropped: u32 },
     #[serde(alias = "SessionStateChangedV1")]
     SessionStateChanged {
         from: SessionState,
         to: SessionState,
     },
     #[serde(alias = "PlanCreatedV1")]
-    PlanCreated {
-        plan: Plan,
-    },
+    PlanCreated { plan: Plan },
     #[serde(alias = "PlanRevisedV1")]
-    PlanRevised {
-        plan: Plan,
-    },
+    PlanRevised { plan: Plan },
     #[serde(alias = "RunStartedV1")]
-    RunStarted {
-        run_id: Uuid,
-        prompt: String,
-    },
+    RunStarted { run_id: Uuid, prompt: String },
     #[serde(alias = "RunStateChangedV1")]
     RunStateChanged {
         run_id: Uuid,
@@ -688,10 +674,7 @@ pub enum EventKind {
         to: RunState,
     },
     #[serde(alias = "RunCompletedV1")]
-    RunCompleted {
-        run_id: Uuid,
-        success: bool,
-    },
+    RunCompleted { run_id: Uuid, success: bool },
     #[serde(alias = "StepMarkedV1")]
     StepMarked {
         step_id: Uuid,
@@ -699,22 +682,13 @@ pub enum EventKind {
         note: String,
     },
     #[serde(alias = "ToolProposedV1")]
-    ToolProposed {
-        proposal: ToolProposal,
-    },
+    ToolProposed { proposal: ToolProposal },
     #[serde(alias = "ToolApprovedV1")]
-    ToolApproved {
-        invocation_id: Uuid,
-    },
+    ToolApproved { invocation_id: Uuid },
     #[serde(alias = "ToolResultV1")]
-    ToolResult {
-        result: ToolResult,
-    },
+    ToolResult { result: ToolResult },
     #[serde(alias = "PatchStagedV1")]
-    PatchStaged {
-        patch_id: Uuid,
-        base_sha256: String,
-    },
+    PatchStaged { patch_id: Uuid, base_sha256: String },
     #[serde(alias = "PatchAppliedV1")]
     PatchApplied {
         patch_id: Uuid,
@@ -737,22 +711,13 @@ pub enum EventKind {
         suggested_message: String,
     },
     #[serde(alias = "PluginInstalledV1")]
-    PluginInstalled {
-        plugin_id: String,
-        version: String,
-    },
+    PluginInstalled { plugin_id: String, version: String },
     #[serde(alias = "PluginRemovedV1")]
-    PluginRemoved {
-        plugin_id: String,
-    },
+    PluginRemoved { plugin_id: String },
     #[serde(alias = "PluginEnabledV1")]
-    PluginEnabled {
-        plugin_id: String,
-    },
+    PluginEnabled { plugin_id: String },
     #[serde(alias = "PluginDisabledV1")]
-    PluginDisabled {
-        plugin_id: String,
-    },
+    PluginDisabled { plugin_id: String },
     #[serde(alias = "UsageUpdatedV1")]
     UsageUpdated {
         unit: LlmUnit,
@@ -771,10 +736,7 @@ pub enum EventKind {
         replay_pointer: String,
     },
     #[serde(alias = "AutopilotRunStartedV1")]
-    AutopilotRunStarted {
-        run_id: Uuid,
-        prompt: String,
-    },
+    AutopilotRunStarted { run_id: Uuid, prompt: String },
     #[serde(alias = "AutopilotRunHeartbeatV1")]
     AutopilotRunHeartbeat {
         run_id: Uuid,
@@ -810,10 +772,7 @@ pub enum EventKind {
         snapshot_path: String,
     },
     #[serde(alias = "CheckpointRewoundV1")]
-    CheckpointRewound {
-        checkpoint_id: Uuid,
-        reason: String,
-    },
+    CheckpointRewound { checkpoint_id: Uuid, reason: String },
     #[serde(alias = "TranscriptExportedV1")]
     TranscriptExported {
         export_id: Uuid,
@@ -827,9 +786,7 @@ pub enum EventKind {
         endpoint: String,
     },
     #[serde(alias = "McpServerRemovedV1")]
-    McpServerRemoved {
-        server_id: String,
-    },
+    McpServerRemoved { server_id: String },
     #[serde(alias = "McpToolDiscoveredV1")]
     McpToolDiscovered {
         server_id: String,
@@ -842,15 +799,9 @@ pub enum EventKind {
         goal: String,
     },
     #[serde(alias = "SubagentCompletedV1")]
-    SubagentCompleted {
-        run_id: Uuid,
-        output: String,
-    },
+    SubagentCompleted { run_id: Uuid, output: String },
     #[serde(alias = "SubagentFailedV1")]
-    SubagentFailed {
-        run_id: Uuid,
-        error: String,
-    },
+    SubagentFailed { run_id: Uuid, error: String },
     #[serde(alias = "CostUpdatedV1")]
     CostUpdated {
         input_tokens: u64,
@@ -858,9 +809,7 @@ pub enum EventKind {
         estimated_cost_usd: f64,
     },
     #[serde(alias = "EffortChangedV1")]
-    EffortChanged {
-        level: String,
-    },
+    EffortChanged { level: String },
     #[serde(alias = "ProfileCapturedV1")]
     ProfileCaptured {
         profile_id: Uuid,
@@ -887,10 +836,7 @@ pub enum EventKind {
         to_session_id: Uuid,
     },
     #[serde(alias = "PermissionModeChangedV1")]
-    PermissionModeChanged {
-        from: String,
-        to: String,
-    },
+    PermissionModeChanged { from: String, to: String },
     #[serde(alias = "WebSearchExecutedV1")]
     WebSearchExecuted {
         query: String,
@@ -923,10 +869,7 @@ pub enum EventKind {
         priority: u32,
     },
     #[serde(alias = "TaskCompletedV1")]
-    TaskCompleted {
-        task_id: Uuid,
-        outcome: String,
-    },
+    TaskCompleted { task_id: Uuid, outcome: String },
     #[serde(alias = "ArtifactBundledV1")]
     ArtifactBundled {
         task_id: Uuid,
@@ -945,15 +888,9 @@ pub enum EventKind {
         reference: String,
     },
     #[serde(alias = "BackgroundJobResumedV1")]
-    BackgroundJobResumed {
-        job_id: Uuid,
-        reference: String,
-    },
+    BackgroundJobResumed { job_id: Uuid, reference: String },
     #[serde(alias = "BackgroundJobStoppedV1")]
-    BackgroundJobStopped {
-        job_id: Uuid,
-        reason: String,
-    },
+    BackgroundJobStopped { job_id: Uuid, reason: String },
     #[serde(alias = "SkillLoadedV1")]
     SkillLoaded {
         skill_id: String,
@@ -966,10 +903,7 @@ pub enum EventKind {
         events_replayed: u64,
     },
     #[serde(alias = "PromptCacheHitV1")]
-    PromptCacheHit {
-        cache_key: String,
-        model: String,
-    },
+    PromptCacheHit { cache_key: String, model: String },
     #[serde(alias = "OffPeakScheduledV1")]
     OffPeakScheduled {
         reason: String,
@@ -1006,10 +940,7 @@ pub enum EventKind {
         reference: String,
     },
     #[serde(alias = "TeleportBundleCreatedV1")]
-    TeleportBundleCreated {
-        bundle_id: Uuid,
-        path: String,
-    },
+    TeleportBundleCreated { bundle_id: Uuid, path: String },
     #[serde(alias = "TeleportHandoffLinkCreatedV1")]
     TeleportHandoffLinkCreated {
         handoff_id: Uuid,
@@ -1024,10 +955,7 @@ pub enum EventKind {
         reason: String,
     },
     #[serde(alias = "SessionStartedV1")]
-    SessionStarted {
-        session_id: Uuid,
-        workspace: String,
-    },
+    SessionStarted { session_id: Uuid, workspace: String },
     #[serde(alias = "SessionResumedV1")]
     SessionResumed {
         session_id: Uuid,
@@ -1058,37 +986,19 @@ pub enum EventKind {
         client_info: String,
     },
     #[serde(alias = "TurnLimitExceededV1")]
-    TurnLimitExceeded {
-        limit: u64,
-        actual: u64,
-    },
+    TurnLimitExceeded { limit: u64, actual: u64 },
     #[serde(alias = "BudgetExceededV1")]
-    BudgetExceeded {
-        limit_usd: f64,
-        actual_usd: f64,
-    },
+    BudgetExceeded { limit_usd: f64, actual_usd: f64 },
     #[serde(alias = "TaskUpdatedV1")]
-    TaskUpdated {
-        task_id: String,
-        status: String,
-    },
+    TaskUpdated { task_id: String, status: String },
     #[serde(alias = "TaskDeletedV1")]
-    TaskDeleted {
-        task_id: String,
-    },
+    TaskDeleted { task_id: String },
     #[serde(alias = "EnterPlanModeV1")]
-    EnterPlanMode {
-        session_id: Uuid,
-    },
+    EnterPlanMode { session_id: Uuid },
     #[serde(alias = "ExitPlanModeV1")]
-    ExitPlanMode {
-        session_id: Uuid,
-    },
+    ExitPlanMode { session_id: Uuid },
     #[serde(alias = "ProviderSelectedV1")]
-    ProviderSelected {
-        provider: String,
-        model: String,
-    },
+    ProviderSelected { provider: String, model: String },
     /// Vector/code index was built from scratch.
     #[serde(alias = "IndexBuildV1")]
     IndexBuild {
@@ -1127,10 +1037,7 @@ pub enum EventKind {
     },
     /// Content was blocked from cloud by the privacy router.
     #[serde(alias = "PrivacyBlockV1")]
-    PrivacyBlock {
-        path: String,
-        reason: String,
-    },
+    PrivacyBlock { path: String, reason: String },
     /// Local autocomplete / ghost text was generated.
     #[serde(alias = "AutocompleteV1")]
     Autocomplete {
@@ -1153,9 +1060,9 @@ impl EventKind {
             | Self::SessionForked { .. } => "session",
 
             // Run lifecycle
-            Self::RunStarted { .. }
-            | Self::RunStateChanged { .. }
-            | Self::RunCompleted { .. } => "run",
+            Self::RunStarted { .. } | Self::RunStateChanged { .. } | Self::RunCompleted { .. } => {
+                "run"
+            }
 
             // Chat / transcript
             Self::TurnAdded { .. }
@@ -1201,9 +1108,9 @@ impl EventKind {
             | Self::PluginVerified { .. } => "plugin",
 
             // Usage / cost tracking
-            Self::UsageUpdated { .. }
-            | Self::CostUpdated { .. }
-            | Self::PromptCacheHit { .. } => "usage",
+            Self::UsageUpdated { .. } | Self::CostUpdated { .. } | Self::PromptCacheHit { .. } => {
+                "usage"
+            }
 
             // Autopilot
             Self::AutopilotRunStarted { .. }
@@ -1426,10 +1333,7 @@ pub enum StreamChunk {
     /// An image was read and should be displayed inline in the terminal.
     ImageData { data: Vec<u8>, label: String },
     /// Watch mode auto-triggered because comment digest changed.
-    WatchTriggered {
-        digest: u64,
-        comment_count: usize,
-    },
+    WatchTriggered { digest: u64, comment_count: usize },
     /// A security warning detected in tool output (prompt injection, suspicious patterns).
     SecurityWarning { message: String },
     /// Clear any previously streamed text — the response contains tool calls,
@@ -1664,7 +1568,10 @@ pub fn estimate_message_tokens(messages: &[ChatMessage]) -> u64 {
             } => {
                 content.as_deref().map_or(0, |c| c.len() as u64)
                     + reasoning_content.as_deref().map_or(0, |r| r.len() as u64)
-                    + tool_calls.iter().map(|tc| tc.arguments.len() as u64).sum::<u64>()
+                    + tool_calls
+                        .iter()
+                        .map(|tc| tc.arguments.len() as u64)
+                        .sum::<u64>()
             }
             ChatMessage::Tool { content, .. } => content.len() as u64,
         })
@@ -3464,7 +3371,10 @@ mod tests {
             reasoning_content, ..
         } = &messages[1]
         {
-            assert!(reasoning_content.is_none(), "turn 1 reasoning should be stripped");
+            assert!(
+                reasoning_content.is_none(),
+                "turn 1 reasoning should be stripped"
+            );
         }
         // Turn 2 assistant reasoning kept (current turn)
         if let ChatMessage::Assistant {

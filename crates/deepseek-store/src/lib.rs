@@ -814,7 +814,9 @@ impl Store {
                 baseline_commit: row.get(2)?,
                 status: serde_json::from_str(&row.get::<_, String>(3)?).unwrap(),
                 budgets: serde_json::from_str(&row.get::<_, String>(4)?).unwrap(),
-                active_plan_id: row.get::<_, Option<String>>(5)?.map(|v| Uuid::parse_str(&v).unwrap()),
+                active_plan_id: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|v| Uuid::parse_str(&v).unwrap()),
             })
         })?;
         let mut out = Vec::new();
@@ -1302,9 +1304,8 @@ impl Store {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
         let conn = self.db()?;
-        let mut stmt = conn.prepare(
-            "SELECT snapshot_path FROM checkpoints WHERE created_at < ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT snapshot_path FROM checkpoints WHERE created_at < ?1")?;
         let paths: Vec<String> = stmt
             .query_map([&cutoff_str], |r| r.get(0))?
             .filter_map(|r| r.ok())
@@ -1354,10 +1355,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    pub fn list_persistent_approvals(
-        &self,
-        project_hash: &str,
-    ) -> Result<Vec<PersistentApproval>> {
+    pub fn list_persistent_approvals(&self, project_hash: &str) -> Result<Vec<PersistentApproval>> {
         let conn = self.db()?;
         let mut stmt = conn.prepare(
             "SELECT tool_name, command_pattern, project_hash
@@ -3042,9 +3040,15 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             proj.chat_messages.push(message.clone());
         }
         EventKind::TurnReverted { turns_dropped } => {
-            let keep_chat = proj.chat_messages.len().saturating_sub(*turns_dropped as usize);
+            let keep_chat = proj
+                .chat_messages
+                .len()
+                .saturating_sub(*turns_dropped as usize);
             proj.chat_messages.truncate(keep_chat);
-            let keep_transcript = proj.transcript.len().saturating_sub(*turns_dropped as usize);
+            let keep_transcript = proj
+                .transcript
+                .len()
+                .saturating_sub(*turns_dropped as usize);
             proj.transcript.truncate(keep_transcript);
         }
         EventKind::PlanCreated { plan } | EventKind::PlanRevised { plan } => {
@@ -3063,12 +3067,8 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
                 proj.applied_patches.push(*patch_id)
             }
         }
-        EventKind::ToolProposed { proposal } => {
-            proj.tool_invocations.push(proposal.invocation_id)
-        }
-        EventKind::ToolApproved { invocation_id } => {
-            proj.approved_invocations.push(*invocation_id)
-        }
+        EventKind::ToolProposed { proposal } => proj.tool_invocations.push(proposal.invocation_id),
+        EventKind::ToolApproved { invocation_id } => proj.approved_invocations.push(*invocation_id),
         EventKind::SessionStateChanged { to, .. } => proj.state = Some(to.clone()),
         EventKind::PluginInstalled { plugin_id, .. }
         | EventKind::PluginRemoved { plugin_id }
@@ -3082,8 +3082,12 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
             ..
         } => {
             proj.usage_input_tokens = proj.usage_input_tokens.saturating_add(*input_tokens);
-            proj.usage_cache_hit_tokens = proj.usage_cache_hit_tokens.saturating_add(*cache_hit_tokens);
-            proj.usage_cache_miss_tokens = proj.usage_cache_miss_tokens.saturating_add(*cache_miss_tokens);
+            proj.usage_cache_hit_tokens = proj
+                .usage_cache_hit_tokens
+                .saturating_add(*cache_hit_tokens);
+            proj.usage_cache_miss_tokens = proj
+                .usage_cache_miss_tokens
+                .saturating_add(*cache_miss_tokens);
             proj.usage_output_tokens = proj.usage_output_tokens.saturating_add(*output_tokens);
         }
         EventKind::ContextCompacted { .. } => {
@@ -3601,10 +3605,33 @@ mod tests {
 
         // Insert events of different types in a known order
         let event_specs: Vec<(u64, EventKind)> = vec![
-            (1, EventKind::TurnAdded { role: "user".to_string(), content: "first".to_string() }),
-            (2, EventKind::TurnAdded { role: "assistant".to_string(), content: "second".to_string() }),
-            (3, EventKind::PluginEnabled { plugin_id: "plug-a".to_string() }),
-            (4, EventKind::TurnAdded { role: "user".to_string(), content: "third".to_string() }),
+            (
+                1,
+                EventKind::TurnAdded {
+                    role: "user".to_string(),
+                    content: "first".to_string(),
+                },
+            ),
+            (
+                2,
+                EventKind::TurnAdded {
+                    role: "assistant".to_string(),
+                    content: "second".to_string(),
+                },
+            ),
+            (
+                3,
+                EventKind::PluginEnabled {
+                    plugin_id: "plug-a".to_string(),
+                },
+            ),
+            (
+                4,
+                EventKind::TurnAdded {
+                    role: "user".to_string(),
+                    content: "third".to_string(),
+                },
+            ),
         ];
 
         for (seq, kind) in &event_specs {
@@ -3689,12 +3716,16 @@ mod tests {
         store
             .insert_persistent_approval("bash.run", "npm test", "proj_abc")
             .expect("insert");
-        assert!(store
-            .is_persistently_approved("bash.run", "npm test", "proj_abc")
-            .expect("query"));
-        assert!(!store
-            .is_persistently_approved("bash.run", "npm test", "proj_other")
-            .expect("other project"));
+        assert!(
+            store
+                .is_persistently_approved("bash.run", "npm test", "proj_abc")
+                .expect("query")
+        );
+        assert!(
+            !store
+                .is_persistently_approved("bash.run", "npm test", "proj_other")
+                .expect("other project")
+        );
     }
 
     #[test]
@@ -3707,9 +3738,11 @@ mod tests {
         store
             .insert_persistent_approval("bash.run", "cargo build", "project_a")
             .expect("insert");
-        assert!(!store
-            .is_persistently_approved("bash.run", "cargo build", "project_b")
-            .expect("wrong project"));
+        assert!(
+            !store
+                .is_persistently_approved("bash.run", "cargo build", "project_b")
+                .expect("wrong project")
+        );
     }
 
     #[test]
@@ -3722,13 +3755,21 @@ mod tests {
         store
             .insert_persistent_approval("bash.run", "make", "proj_x")
             .expect("insert");
-        assert!(store.is_persistently_approved("bash.run", "make", "proj_x").unwrap());
+        assert!(
+            store
+                .is_persistently_approved("bash.run", "make", "proj_x")
+                .unwrap()
+        );
 
         let removed = store
             .remove_persistent_approval("bash.run", "make", "proj_x")
             .expect("remove");
         assert!(removed);
-        assert!(!store.is_persistently_approved("bash.run", "make", "proj_x").unwrap());
+        assert!(
+            !store
+                .is_persistently_approved("bash.run", "make", "proj_x")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -3738,9 +3779,15 @@ mod tests {
         fs::create_dir_all(&workspace).expect("temp workspace");
         let store = Store::new(&workspace).expect("store");
 
-        store.insert_persistent_approval("bash.run", "npm test", "proj_1").unwrap();
-        store.insert_persistent_approval("bash.run", "npm build", "proj_1").unwrap();
-        store.insert_persistent_approval("bash.run", "npm lint", "proj_1").unwrap();
+        store
+            .insert_persistent_approval("bash.run", "npm test", "proj_1")
+            .unwrap();
+        store
+            .insert_persistent_approval("bash.run", "npm build", "proj_1")
+            .unwrap();
+        store
+            .insert_persistent_approval("bash.run", "npm lint", "proj_1")
+            .unwrap();
 
         let all = store.list_persistent_approvals("proj_1").expect("list");
         assert_eq!(all.len(), 3);
@@ -3776,7 +3823,11 @@ mod tests {
         ).unwrap();
 
         let history = store.session_history(7).expect("session_history");
-        assert!(history.len() >= 2, "should have at least 2 sessions, got {}", history.len());
+        assert!(
+            history.len() >= 2,
+            "should have at least 2 sessions, got {}",
+            history.len()
+        );
 
         let entry_a = history.iter().find(|e| e.session_id == session_a).unwrap();
         assert_eq!(entry_a.input_tokens, 3000);

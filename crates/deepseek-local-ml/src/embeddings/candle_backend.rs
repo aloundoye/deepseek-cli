@@ -44,9 +44,7 @@ impl CandleEmbeddings {
         let config: BertConfig = serde_json::from_str(&config_data)?;
         let dim = config.hidden_size;
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, device)?
-        };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, device)? };
         let model = BertModel::load(vb, &config)?;
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
@@ -100,8 +98,7 @@ impl EmbeddingsBackend for CandleEmbeddings {
         let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
         let attention_mask =
             Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
-        let token_type_ids =
-            Tensor::new(encoding.get_type_ids(), &self.device)?.unsqueeze(0)?;
+        let token_type_ids = Tensor::new(encoding.get_type_ids(), &self.device)?.unsqueeze(0)?;
 
         let hidden = self
             .model
@@ -127,7 +124,11 @@ impl EmbeddingsBackend for CandleEmbeddings {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
         if max_len == 0 {
             bail!("all inputs produced empty tokenizations");
         }
@@ -135,8 +136,7 @@ impl EmbeddingsBackend for CandleEmbeddings {
         let mut results = Vec::with_capacity(texts.len());
         // Process individually — batched GPU inference would go here
         for encoding in &encodings {
-            let input_ids =
-                Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
+            let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
             let attention_mask =
                 Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
             let token_type_ids =
@@ -168,12 +168,9 @@ mod tests {
     fn model_dir() -> Option<PathBuf> {
         // Look for model files in standard HF cache or a local test directory
         let home = std::env::var("HOME").ok()?;
-        let cache = PathBuf::from(home).join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2");
-        if cache.exists() {
-            Some(cache)
-        } else {
-            None
-        }
+        let cache = PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2");
+        if cache.exists() { Some(cache) } else { None }
     }
 
     #[test]
@@ -200,7 +197,11 @@ mod tests {
         assert_eq!(vec.len(), embeddings.dimension());
         // Normalized vector should have unit length
         let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01, "expected unit vector, got norm={}", norm);
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "expected unit vector, got norm={}",
+            norm
+        );
     }
 
     #[test]
@@ -248,7 +249,9 @@ mod tests {
         )
         .expect("load");
 
-        let v_rust = embeddings.embed("fn main() { println!(\"hello\"); }").unwrap();
+        let v_rust = embeddings
+            .embed("fn main() { println!(\"hello\"); }")
+            .unwrap();
         let v_python = embeddings.embed("def main(): print('hello')").unwrap();
         let v_recipe = embeddings.embed("preheat the oven to 350 degrees").unwrap();
 

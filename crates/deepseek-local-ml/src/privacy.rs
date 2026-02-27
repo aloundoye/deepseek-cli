@@ -215,10 +215,7 @@ fn build_builtin_secret_patterns() -> Vec<(String, Regex)> {
         ("aws_key", r"AKIA[0-9A-Z]{16}"),
         ("github_token", r"ghp_[a-zA-Z0-9]{36}"),
         ("gitlab_token", r"glpat-[a-zA-Z0-9\-]{20,}"),
-        (
-            "private_key",
-            r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----",
-        ),
+        ("private_key", r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----"),
         (
             "postgres_conn",
             r#"postgres(ql)?://[^\s'"]+:[^\s'"]+@[^\s'"]+"#,
@@ -237,10 +234,6 @@ fn build_builtin_secret_patterns() -> Vec<(String, Regex)> {
 
     patterns
         .into_iter()
-        .filter_map(|(name, pattern)| {
-            Regex::new(pattern)
-                .ok()
-                .map(|r| (name.to_string(), r))
-        })
+        .filter_map(|(name, pattern)| Regex::new(pattern).ok().map(|r| (name.to_string(), r)))
         .collect()
 }

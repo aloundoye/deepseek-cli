@@ -56,9 +56,7 @@ pub(crate) fn compact_now(
     // When a focus topic is provided, prioritize lines mentioning the topic
     let summary_lines = build_compact_summary_lines(&selected, focus);
 
-    let focus_header = focus
-        .map(|f| format!("\nfocus: {f}"))
-        .unwrap_or_default();
+    let focus_header = focus.map(|f| format!("\nfocus: {f}")).unwrap_or_default();
     let summary = format!(
         "Compaction summary {}\nfrom_turn: {}\nto_turn: {}{}\n\n{}",
         summary_id,
@@ -387,9 +385,7 @@ mod tests {
 
     #[test]
     fn build_compact_summary_lines_no_focus() {
-        let lines: Vec<String> = (1..=20)
-            .map(|i| format!("turn {i} content"))
-            .collect();
+        let lines: Vec<String> = (1..=20).map(|i| format!("turn {i} content")).collect();
         let result = build_compact_summary_lines(&lines, None);
         assert_eq!(result.len(), 12, "should take up to 12 lines without focus");
         assert!(result[0].contains("turn 1"));

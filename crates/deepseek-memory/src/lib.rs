@@ -364,8 +364,7 @@ impl MemoryManager {
                 continue;
             }
             let rel = if file.is_absolute() {
-                file.strip_prefix(&self.workspace)
-                    .unwrap_or(file.as_path())
+                file.strip_prefix(&self.workspace).unwrap_or(file.as_path())
             } else {
                 file.as_path()
             };
@@ -524,7 +523,9 @@ impl MemoryManager {
 
         let tree_sha = if stash_result.status.success() && !stash_result.stdout.is_empty() {
             // We have changes — use the stash tree
-            let stash_sha = String::from_utf8_lossy(&stash_result.stdout).trim().to_string();
+            let stash_sha = String::from_utf8_lossy(&stash_result.stdout)
+                .trim()
+                .to_string();
             // Get the tree from the stash commit
             let tree_out = std::process::Command::new("git")
                 .args(["rev-parse", &format!("{stash_sha}^{{tree}}")])
@@ -540,7 +541,9 @@ impl MemoryManager {
             if !head_tree.status.success() {
                 return Err(anyhow!("no git HEAD found for shadow commit"));
             }
-            String::from_utf8_lossy(&head_tree.stdout).trim().to_string()
+            String::from_utf8_lossy(&head_tree.stdout)
+                .trim()
+                .to_string()
         };
 
         // Create a commit object from the tree
@@ -557,7 +560,9 @@ impl MemoryManager {
             ));
         }
 
-        let commit_sha = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+        let commit_sha = String::from_utf8_lossy(&commit_out.stdout)
+            .trim()
+            .to_string();
 
         // Create the hidden ref
         let ref_result = std::process::Command::new("git")
@@ -1313,8 +1318,7 @@ mod tests {
 
     #[test]
     fn cleanup_keeps_recent_checkpoints() {
-        let workspace =
-            std::env::temp_dir().join(format!("deepseek-mem-keep-{}", Uuid::now_v7()));
+        let workspace = std::env::temp_dir().join(format!("deepseek-mem-keep-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         fs::write(workspace.join("b.txt"), "data").expect("seed");
 
@@ -1330,8 +1334,7 @@ mod tests {
 
     #[test]
     fn cleanup_returns_count() {
-        let workspace =
-            std::env::temp_dir().join(format!("deepseek-mem-count-{}", Uuid::now_v7()));
+        let workspace = std::env::temp_dir().join(format!("deepseek-mem-count-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         fs::write(workspace.join("c.txt"), "data").expect("seed");
 

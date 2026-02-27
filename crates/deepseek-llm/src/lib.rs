@@ -29,7 +29,8 @@ pub trait LlmClient {
     fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse>;
 
     /// Streaming chat completion with tool definitions.
-    fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback) -> Result<LlmResponse>;
+    fn complete_chat_streaming(&self, req: &ChatRequest, cb: StreamCallback)
+    -> Result<LlmResponse>;
 
     /// Beta FIM completion (Fill-In-The-Middle)
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse>;
@@ -58,7 +59,11 @@ impl DeepSeekClient {
             return self.cfg.endpoint.clone();
         }
         let base = self.cfg.base_url.trim_end_matches('/');
-        let prefix = if self.cfg.openai_compat_prefix { "/v1" } else { "" };
+        let prefix = if self.cfg.openai_compat_prefix {
+            "/v1"
+        } else {
+            ""
+        };
         let path = if is_fim || is_strict_tools {
             format!("{prefix}/beta/completions")
         } else if is_chat {
@@ -298,7 +303,7 @@ impl DeepSeekClient {
                 payload["frequency_penalty"] = json!(fp);
             }
         }
-        
+
         if let Some(fmt) = &req.response_format {
             payload["response_format"] = fmt.clone();
         }
@@ -392,9 +397,18 @@ impl DeepSeekClient {
                     if status.is_success() {
                         return parse_fim_non_streaming_payload(&body);
                     }
-                    last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
+                    last_err = Some(format_api_error(
+                        status,
+                        &body,
+                        attempt,
+                        self.cfg.max_retries,
+                    ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        std::thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        std::thread::sleep(retry_delay_ms(
+                            self.cfg.retry_base_ms,
+                            attempt,
+                            retry_after,
+                        ));
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -478,7 +492,9 @@ impl DeepSeekClient {
                             let Some(choice) = choice else {
                                 continue;
                             };
-                            if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                            if let Some(reason) =
+                                choice.get("finish_reason").and_then(|v| v.as_str())
+                            {
                                 finish_reason = Some(reason.to_string());
                             }
                             if let Some(text) = choice.get("text").and_then(|v| v.as_str()) {
@@ -497,10 +513,19 @@ impl DeepSeekClient {
                         }
                     } else {
                         let body = resp.text().unwrap_or_default();
-                        last_err = Some(format_api_error(status, &body, attempt, self.cfg.max_retries));
+                        last_err = Some(format_api_error(
+                            status,
+                            &body,
+                            attempt,
+                            self.cfg.max_retries,
+                        ));
                     }
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
-                        std::thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
+                        std::thread::sleep(retry_delay_ms(
+                            self.cfg.retry_base_ms,
+                            attempt,
+                            retry_after,
+                        ));
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
@@ -943,7 +968,6 @@ fn model_max_output_tokens(model: &str, thinking_enabled: bool) -> u32 {
     }
 }
 
-
 impl LlmClient for DeepSeekClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let provider = self.cfg.provider.to_ascii_lowercase();
@@ -1030,20 +1054,20 @@ impl LlmClient for DeepSeekClient {
         if provider != "deepseek" {
             return Err(anyhow!("unsupported llm.provider"));
         }
-        let key = self.resolve_api_key().ok_or_else(|| anyhow!("api_key missing"))?;
+        let key = self
+            .resolve_api_key()
+            .ok_or_else(|| anyhow!("api_key missing"))?;
         self.complete_fim_inner(req, &key)
     }
 
-    fn complete_fim_streaming(
-        &self,
-        req: &FimRequest,
-        cb: StreamCallback,
-    ) -> Result<LlmResponse> {
+    fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse> {
         let provider = self.cfg.provider.to_ascii_lowercase();
         if provider != "deepseek" {
             return Err(anyhow!("unsupported llm.provider"));
         }
-        let key = self.resolve_api_key().ok_or_else(|| anyhow!("api_key missing"))?;
+        let key = self
+            .resolve_api_key()
+            .ok_or_else(|| anyhow!("api_key missing"))?;
         self.complete_fim_streaming_inner(req, &key, cb)
     }
 }
@@ -1096,7 +1120,7 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
                 param,
                 detail
             )
-        },
+        }
         StatusCode::TOO_MANY_REQUESTS => anyhow!(
             "Rate limited (HTTP 429). Exhausted {}/{} retries. Try again shortly or reduce request frequency. Detail: {}",
             attempt + 1,
@@ -1110,7 +1134,12 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
             max_retries + 1,
             detail
         ),
-        _ => anyhow!("DeepSeek API error (HTTP {}, type={}): {}", status.as_u16(), error_type, detail),
+        _ => anyhow!(
+            "DeepSeek API error (HTTP {}, type={}): {}",
+            status.as_u16(),
+            error_type,
+            detail
+        ),
     }
 }
 
@@ -1201,7 +1230,9 @@ fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first());
     let Some(choice) = choice else {
-        return Err(anyhow!("unexpected non-streaming payload: missing choices[0]"));
+        return Err(anyhow!(
+            "unexpected non-streaming payload: missing choices[0]"
+        ));
     };
     let finish_reason = choice
         .get("finish_reason")
@@ -1224,7 +1255,6 @@ fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
 }
 
 fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
-
     let value: Value = serde_json::from_str(body)?;
     let choice = value
         .get("choices")
@@ -1279,10 +1309,7 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
 fn parse_usage_object(usage_value: Option<&Value>) -> Option<deepseek_core::TokenUsage> {
     let u = usage_value?;
     Some(deepseek_core::TokenUsage {
-        prompt_tokens: u
-            .get("prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
         completion_tokens: u
             .get("completion_tokens")
             .and_then(|v| v.as_u64())
@@ -1673,7 +1700,10 @@ mod tests {
         let err = client
             .complete_chat(&req)
             .expect_err("logprobs with thinking should fail");
-        assert!(err.to_string().contains("logprobs is incompatible with thinking mode"));
+        assert!(
+            err.to_string()
+                .contains("logprobs is incompatible with thinking mode")
+        );
     }
 
     #[test]
@@ -1704,7 +1734,10 @@ mod tests {
         let err = client
             .complete_chat(&req)
             .expect_err("top_logprobs with thinking should fail");
-        assert!(err.to_string().contains("top_logprobs is incompatible with thinking mode"));
+        assert!(
+            err.to_string()
+                .contains("top_logprobs is incompatible with thinking mode")
+        );
     }
 
     #[test]
@@ -1731,12 +1764,24 @@ mod tests {
         };
         let payload = client.build_chat_payload(&req);
         // With thinking enabled, all sampling params must be omitted
-        assert!(payload.get("temperature").is_none(), "temperature should be stripped");
+        assert!(
+            payload.get("temperature").is_none(),
+            "temperature should be stripped"
+        );
         assert!(payload.get("top_p").is_none(), "top_p should be stripped");
-        assert!(payload.get("presence_penalty").is_none(), "presence_penalty should be stripped");
-        assert!(payload.get("frequency_penalty").is_none(), "frequency_penalty should be stripped");
+        assert!(
+            payload.get("presence_penalty").is_none(),
+            "presence_penalty should be stripped"
+        );
+        assert!(
+            payload.get("frequency_penalty").is_none(),
+            "frequency_penalty should be stripped"
+        );
         // thinking config should be present
-        assert!(payload.get("thinking").is_some(), "thinking should be present");
+        assert!(
+            payload.get("thinking").is_some(),
+            "thinking should be present"
+        );
     }
 
     #[test]
@@ -1762,10 +1807,19 @@ mod tests {
             response_format: None,
         };
         let payload = client.build_chat_payload(&req);
-        assert!(payload.get("temperature").is_some(), "temperature should be present");
+        assert!(
+            payload.get("temperature").is_some(),
+            "temperature should be present"
+        );
         assert!(payload.get("top_p").is_some(), "top_p should be present");
-        assert!(payload.get("presence_penalty").is_some(), "presence_penalty should be present");
-        assert!(payload.get("frequency_penalty").is_some(), "frequency_penalty should be present");
+        assert!(
+            payload.get("presence_penalty").is_some(),
+            "presence_penalty should be present"
+        );
+        assert!(
+            payload.get("frequency_penalty").is_some(),
+            "frequency_penalty should be present"
+        );
         assert_eq!(payload["logprobs"], true);
         assert_eq!(payload["top_logprobs"], 3);
     }
@@ -1800,7 +1854,10 @@ mod tests {
         let body = "something went wrong";
         let err = format_api_error(StatusCode::INTERNAL_SERVER_ERROR, body, 2, 3);
         let msg = err.to_string();
-        assert!(msg.contains("something went wrong"), "should include raw body: {msg}");
+        assert!(
+            msg.contains("something went wrong"),
+            "should include raw body: {msg}"
+        );
     }
 
     #[test]

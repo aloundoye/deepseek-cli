@@ -1,8 +1,8 @@
+use deepseek_local_ml::ChunkConfig;
 use deepseek_local_ml::chunker::Chunk;
 use deepseek_local_ml::embeddings::MockEmbeddings;
-use deepseek_local_ml::retrieval::{reciprocal_rank_fusion, HybridRetriever};
+use deepseek_local_ml::retrieval::{HybridRetriever, reciprocal_rank_fusion};
 use deepseek_local_ml::vector_index::*;
-use deepseek_local_ml::ChunkConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -158,7 +158,9 @@ fn hybrid_search_combines_scores() {
     assert!(report.files_processed > 0);
 
     let filter = SearchFilter::default();
-    let results = retriever.search("function implementation", 5, &filter).unwrap();
+    let results = retriever
+        .search("function implementation", 5, &filter)
+        .unwrap();
     assert!(!results.is_empty(), "hybrid search should return results");
 
     // All results should have valid scores
@@ -203,8 +205,14 @@ fn hybrid_alpha_1_is_vector_only() {
 
     let fused = reciprocal_rank_fusion(&vec_results, &bm25_results, 1.0, 60);
     // With alpha=1, only vector contributes. Vector ranking: a, b, c
-    assert_eq!(fused[0].0, "a", "alpha=1 should use vector ranking: a first");
-    assert_eq!(fused[1].0, "b", "alpha=1 should use vector ranking: b second");
+    assert_eq!(
+        fused[0].0, "a",
+        "alpha=1 should use vector ranking: a first"
+    );
+    assert_eq!(
+        fused[1].0, "b",
+        "alpha=1 should use vector ranking: b second"
+    );
 }
 
 #[test]

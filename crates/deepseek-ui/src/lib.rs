@@ -125,10 +125,7 @@ pub enum TuiStreamEvent {
         cost_usd: f64,
     },
     /// Role/phase header for clear visual boundaries.
-    RoleHeader {
-        role: String,
-        model: String,
-    },
+    RoleHeader { role: String, model: String },
     /// An error occurred during agent execution.
     Error(String),
     /// Agent execution completed with the given output.
@@ -163,14 +160,11 @@ pub enum SlashCommand {
     Rewind(Vec<String>),
     Export(Vec<String>),
     Plan,
-    Teleport(Vec<String>),
-    RemoteEnv(Vec<String>),
     Status,
     Effort(Option<String>),
     Skills(Vec<String>),
     Permissions(Vec<String>),
     Background(Vec<String>),
-    Visual(Vec<String>),
     Commit(Vec<String>),
     Stage(Vec<String>),
     Unstage(Vec<String>),
@@ -250,14 +244,11 @@ impl SlashCommand {
             "rewind" => Self::Rewind(args),
             "export" => Self::Export(args),
             "plan" => Self::Plan,
-            "teleport" => Self::Teleport(args),
-            "remote-env" => Self::RemoteEnv(args),
             "status" => Self::Status,
             "effort" => Self::Effort(args.first().cloned()),
             "skills" => Self::Skills(args),
             "permissions" => Self::Permissions(args),
             "background" => Self::Background(args),
-            "visual" => Self::Visual(args),
             "commit" => Self::Commit(args),
             "stage" => Self::Stage(args),
             "unstage" => Self::Unstage(args),
@@ -2691,15 +2682,13 @@ fn autocomplete_at_suggestions(prefix: &str, workspace: &Path) -> Vec<String> {
             paths
                 .filter_map(Result::ok)
                 .filter_map(|p| {
-                    p.strip_prefix(search_dir)
-                        .ok()
-                        .map(|rel| {
-                            if p.is_dir() {
-                                format!("{}/", rel.display())
-                            } else {
-                                rel.display().to_string()
-                            }
-                        })
+                    p.strip_prefix(search_dir).ok().map(|rel| {
+                        if p.is_dir() {
+                            format!("{}/", rel.display())
+                        } else {
+                            rel.display().to_string()
+                        }
+                    })
                 })
                 .filter(|s| {
                     !s.starts_with('.')
@@ -3688,7 +3677,9 @@ where
                     info_line = format!("subagent failed: {name}");
                 }
                 TuiStreamEvent::WatchTriggered { comment_count, .. } => {
-                    shell.push_system(format!("[watch: {comment_count} comment(s) detected, auto-triggering]"));
+                    shell.push_system(format!(
+                        "[watch: {comment_count} comment(s) detected, auto-triggering]"
+                    ));
                     info_line = format!("watch: {comment_count} hints");
                 }
                 TuiStreamEvent::ImageDisplay { data, label } => {
@@ -3705,12 +3696,23 @@ where
                     streaming_buffer.clear();
                     shell.clear_streaming_text();
                 }
-                TuiStreamEvent::DiffApplied { path, hunks, added, removed } => {
+                TuiStreamEvent::DiffApplied {
+                    path,
+                    hunks,
+                    added,
+                    removed,
+                } => {
                     shell.push_system(format!(
-                        "  \u{2502} {} \u{2014} {} hunk(s), +{} -{}", path, hunks, added, removed
+                        "  \u{2502} {} \u{2014} {} hunk(s), +{} -{}",
+                        path, hunks, added, removed
                     ));
                 }
-                TuiStreamEvent::UsageSummary { input_tokens, output_tokens, cache_hit_tokens, cost_usd } => {
+                TuiStreamEvent::UsageSummary {
+                    input_tokens,
+                    output_tokens,
+                    cache_hit_tokens,
+                    cost_usd,
+                } => {
                     let cache_info = if cache_hit_tokens > 0 {
                         format!(" (cache hit: {})", cache_hit_tokens)
                     } else {
@@ -3722,7 +3724,10 @@ where
                     ));
                 }
                 TuiStreamEvent::RoleHeader { role, model } => {
-                    shell.push_system(format!("\u{2501}\u{2501} {} ({}) \u{2501}\u{2501}", role, model));
+                    shell.push_system(format!(
+                        "\u{2501}\u{2501} {} ({}) \u{2501}\u{2501}",
+                        role, model
+                    ));
                 }
                 TuiStreamEvent::ApprovalNeeded {
                     tool_name,
@@ -3967,10 +3972,8 @@ where
                             autocomplete_dropdown = None;
                             info_line = String::new();
                         } else {
-                            autocomplete_dropdown = Some(AutocompleteState::new(
-                                suggestions,
-                                ac.trigger_pos,
-                            ));
+                            autocomplete_dropdown =
+                                Some(AutocompleteState::new(suggestions, ac.trigger_pos));
                             let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
                             info_line = lines.join("  ");
                         }
@@ -4000,11 +4003,10 @@ where
                                 autocomplete_dropdown = None;
                                 info_line = String::new();
                             } else {
-                                autocomplete_dropdown = Some(AutocompleteState::new(
-                                    suggestions,
-                                    ac.trigger_pos,
-                                ));
-                                let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                                autocomplete_dropdown =
+                                    Some(AutocompleteState::new(suggestions, ac.trigger_pos));
+                                let lines =
+                                    autocomplete_dropdown.as_ref().unwrap().display_lines(6);
                                 info_line = lines.join("  ");
                             }
                         }
@@ -4637,7 +4639,8 @@ where
                     info_line = "Failed to save clipboard image.".to_string();
                 }
             } else {
-                info_line = "No image in clipboard. Use terminal bracketed paste for text.".to_string();
+                info_line =
+                    "No image in clipboard. Use terminal bracketed paste for text.".to_string();
             }
             continue;
         }
@@ -4682,8 +4685,7 @@ where
             let editor = std::env::var("EDITOR")
                 .or_else(|_| std::env::var("VISUAL"))
                 .unwrap_or_else(|_| "vim".into());
-            let tmp = std::env::temp_dir()
-                .join(format!("deepseek-edit-{}.md", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!("deepseek-edit-{}.md", std::process::id()));
             let _ = std::fs::write(&tmp, &input);
             crossterm::terminal::disable_raw_mode().ok();
             let _ = std::process::Command::new(&editor).arg(&tmp).status();
@@ -4727,9 +4729,7 @@ where
         }
         if key == bindings.autocomplete {
             // ML ghost text has highest priority
-            if cursor_pos >= input.len()
-                && !input.starts_with('/')
-                && ml_ghost.suggestion.is_some()
+            if cursor_pos >= input.len() && !input.starts_with('/') && ml_ghost.suggestion.is_some()
             {
                 if let Some(text) = ml_ghost.accept_full() {
                     input.push_str(&text);
@@ -4870,7 +4870,8 @@ where
             // /model (no args) — open interactive model picker
             if prompt == "/model" {
                 model_picker = Some(ModelPickerState::new());
-                info_line = "Select model: Up/Down to move, Enter to confirm, Esc to cancel".to_string();
+                info_line =
+                    "Select model: Up/Down to move, Enter to confirm, Esc to cancel".to_string();
                 input.clear();
                 cursor_pos = 0;
                 continue;
@@ -4945,18 +4946,15 @@ where
                         if !suggestions.is_empty() {
                             autocomplete_dropdown =
                                 Some(AutocompleteState::new(suggestions, trigger));
-                            let lines =
-                                autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                            let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
                             info_line = lines.join("  ");
                         }
                     } else if ch == '/' && cursor_pos == 1 && input == "/" {
                         // Trigger slash command autocomplete at start of input
                         let suggestions = slash_command_suggestions("", 8);
                         if !suggestions.is_empty() {
-                            autocomplete_dropdown =
-                                Some(AutocompleteState::new(suggestions, 0));
-                            let lines =
-                                autocomplete_dropdown.as_ref().unwrap().display_lines(6);
+                            autocomplete_dropdown = Some(AutocompleteState::new(suggestions, 0));
+                            let lines = autocomplete_dropdown.as_ref().unwrap().display_lines(6);
                             info_line = lines.join("  ");
                         }
                     }
@@ -5027,10 +5025,7 @@ fn execute_bang_command(cmd: &str) -> String {
     } else {
         "-c"
     };
-    match std::process::Command::new(shell)
-        .args([flag, cmd])
-        .output()
-    {
+    match std::process::Command::new(shell).args([flag, cmd]).output() {
         Ok(output) => {
             let mut result = String::new();
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5575,7 +5570,10 @@ mod tests {
         // /architect was removed — parses as unknown command
         assert_eq!(
             SlashCommand::parse("/architect"),
-            Some(SlashCommand::Unknown { name: "architect".to_string(), args: vec![] })
+            Some(SlashCommand::Unknown {
+                name: "architect".to_string(),
+                args: vec![]
+            })
         );
         assert_eq!(
             SlashCommand::parse("/chat-mode ask"),
@@ -5593,10 +5591,6 @@ mod tests {
             ]))
         );
         assert_eq!(
-            SlashCommand::parse("/remote-env list"),
-            Some(SlashCommand::RemoteEnv(vec!["list".to_string()]))
-        );
-        assert_eq!(
             SlashCommand::parse("/skills run refactor"),
             Some(SlashCommand::Skills(vec![
                 "run".to_string(),
@@ -5610,13 +5604,6 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/background list"),
             Some(SlashCommand::Background(vec!["list".to_string()]))
-        );
-        assert_eq!(
-            SlashCommand::parse("/visual analyze --strict"),
-            Some(SlashCommand::Visual(vec![
-                "analyze".to_string(),
-                "--strict".to_string()
-            ]))
         );
         assert_eq!(
             SlashCommand::parse("/commit -m \"checkpoint\""),
@@ -6998,7 +6985,10 @@ mod tests {
     #[test]
     fn prompt_suggestions_shown_when_empty() {
         let spans = render_prompt_suggestions(true);
-        assert!(!spans.is_empty(), "should show suggestions when input is empty");
+        assert!(
+            !spans.is_empty(),
+            "should show suggestions when input is empty"
+        );
         let text: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(text.contains("Explain this project"));
     }
@@ -7006,7 +6996,10 @@ mod tests {
     #[test]
     fn prompt_suggestions_hidden_when_typing() {
         let spans = render_prompt_suggestions(false);
-        assert!(spans.is_empty(), "should hide suggestions when input is non-empty");
+        assert!(
+            spans.is_empty(),
+            "should hide suggestions when input is non-empty"
+        );
     }
 
     // ── P4-03: bang prefix direct execution tests ────────────────────────
@@ -7287,7 +7280,10 @@ mod tests {
 
         // After keystroke, should not request immediately (debounce not elapsed)
         ghost.on_keystroke();
-        assert!(!ghost.should_request(5), "should not request before debounce");
+        assert!(
+            !ghost.should_request(5),
+            "should not request before debounce"
+        );
 
         // Still pending
         assert!(ghost.pending);
@@ -7302,7 +7298,10 @@ mod tests {
 
         // New keystroke should clear the suggestion
         ghost.on_keystroke();
-        assert!(ghost.suggestion.is_none(), "keystroke should clear suggestion");
+        assert!(
+            ghost.suggestion.is_none(),
+            "keystroke should clear suggestion"
+        );
         assert!(ghost.pending, "should mark as pending after keystroke");
     }
 
@@ -7350,11 +7349,20 @@ mod tests {
         let mut ghost = GhostTextState::default();
         ghost.on_keystroke();
         // Input too short (< 3 chars)
-        assert!(!ghost.should_request(2), "should not request for short input");
+        assert!(
+            !ghost.should_request(2),
+            "should not request for short input"
+        );
         // Wait past debounce and check with sufficient input
         ghost.last_keystroke = Instant::now() - Duration::from_millis(300);
-        assert!(ghost.should_request(5), "should request for long input after debounce");
-        assert!(!ghost.should_request(2), "still should not request for short input");
+        assert!(
+            ghost.should_request(5),
+            "should request for long input after debounce"
+        );
+        assert!(
+            !ghost.should_request(2),
+            "still should not request for short input"
+        );
     }
 
     #[test]

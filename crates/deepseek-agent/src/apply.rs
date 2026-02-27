@@ -387,9 +387,14 @@ mod tests {
     #[test]
     fn rejects_empty_diff() {
         let allowed = HashSet::new();
-        let err =
-            apply_unified_diff(Path::new("/tmp"), "", &allowed, &HashMap::new(), ApplyStrategy::Auto)
-                .unwrap_err();
+        let err = apply_unified_diff(
+            Path::new("/tmp"),
+            "",
+            &allowed,
+            &HashMap::new(),
+            ApplyStrategy::Auto,
+        )
+        .unwrap_err();
         assert!(err.reason.contains("empty diff"));
     }
 
@@ -514,8 +519,7 @@ mod tests {
         let allowed = HashSet::from(["main.rs".to_string()]);
         let expected = HashMap::from([("main.rs".to_string(), hash)]);
 
-        let diff =
-            "--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { println!(\"hi\"); }\n";
+        let diff = "--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { println!(\"hi\"); }\n";
 
         let result =
             apply_unified_diff(temp.path(), diff, &allowed, &expected, ApplyStrategy::Auto);

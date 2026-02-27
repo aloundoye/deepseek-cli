@@ -16,6 +16,23 @@ pub use vector_index::{
     BruteForceBackend, IndexStats, SearchFilter, SearchResult, VectorIndex, VectorIndexBackend,
 };
 
+#[cfg(feature = "local-ml")]
+pub use completion::candle_backend::CandleCompletion;
+#[cfg(feature = "local-ml")]
+pub use embeddings::candle_backend::CandleEmbeddings;
+#[cfg(feature = "local-ml")]
+pub use vector_index::UsearchBackend;
+
+/// Parse a device string ("cpu", "cuda", "metal") into a candle Device.
+#[cfg(feature = "local-ml")]
+pub fn parse_device(s: &str) -> candle_core::Device {
+    match s {
+        "metal" => candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu),
+        "cuda" => candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu),
+        _ => candle_core::Device::Cpu,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,7 +50,11 @@ mod tests {
         let dim = 384;
         let emb = MockEmbeddings::new(dim);
         let v = emb.embed("test input").unwrap();
-        assert_eq!(v.len(), dim, "vector length must equal configured dimension");
+        assert_eq!(
+            v.len(),
+            dim,
+            "vector length must equal configured dimension"
+        );
     }
 
     #[test]

@@ -141,7 +141,10 @@ fn eval_harness_produces_report() {
     };
 
     // Verify report structure
-    assert!(report.baseline.estimated_tokens > 0, "baseline should have tokens");
+    assert!(
+        report.baseline.estimated_tokens > 0,
+        "baseline should have tokens"
+    );
     assert!(
         report.retrieval_first.estimated_tokens > 0,
         "retrieval should have tokens"

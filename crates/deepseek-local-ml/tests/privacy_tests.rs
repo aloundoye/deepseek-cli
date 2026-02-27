@@ -112,12 +112,10 @@ fn session_log_redacted_when_configured() {
 #[test]
 fn private_key_pattern_detected() {
     let router = make_router(PrivacyPolicy::Redact);
-    let content = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0B\n-----END PRIVATE KEY-----";
+    let content =
+        "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0B\n-----END PRIVATE KEY-----";
     let matches = router.scan_content(content);
-    assert!(
-        !matches.is_empty(),
-        "private key block should be detected"
-    );
+    assert!(!matches.is_empty(), "private key block should be detected");
 }
 
 #[test]
@@ -125,10 +123,7 @@ fn github_token_pattern_detected() {
     let router = make_router(PrivacyPolicy::Redact);
     let content = "GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
     let matches = router.scan_content(content);
-    assert!(
-        !matches.is_empty(),
-        "GitHub token should be detected"
-    );
+    assert!(!matches.is_empty(), "GitHub token should be detected");
 }
 
 #[test]

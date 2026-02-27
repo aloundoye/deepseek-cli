@@ -176,7 +176,9 @@ impl StreamingMdRenderer {
         let stripped = line.trim_start();
         let indent_len = line.len() - stripped.len();
         if indent_len >= 2 {
-            if let Some(item) = stripped.strip_prefix("- ").or_else(|| stripped.strip_prefix("* "))
+            if let Some(item) = stripped
+                .strip_prefix("- ")
+                .or_else(|| stripped.strip_prefix("* "))
             {
                 let indent = " ".repeat(indent_len);
                 let styled = render_inline_markdown(item);

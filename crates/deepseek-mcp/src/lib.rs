@@ -444,35 +444,33 @@ impl McpManager {
         let mut resources = Vec::new();
         for server in self.list_servers()?.into_iter().filter(|s| s.enabled) {
             let discovered = match server.transport {
-                McpTransport::Stdio => {
-                    execute_mcp_stdio_request(
-                        &server,
-                        "resources/list",
-                        json!({}),
-                        3,
-                        Duration::from_secs(6),
-                    )
-                    .ok()
-                    .and_then(|r| r.get("result")?.get("resources")?.as_array().cloned())
-                }
-                McpTransport::Http | McpTransport::Sse => {
-                    server.url.as_deref().and_then(|url| {
-                        Client::builder()
-                            .timeout(Duration::from_secs(10))
-                            .build()
-                            .ok()?
-                            .post(url)
-                            .json(&json!({"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}))
-                            .send()
-                            .ok()?
-                            .json::<serde_json::Value>()
-                            .ok()?
-                            .get("result")?
-                            .get("resources")?
-                            .as_array()
-                            .cloned()
-                    })
-                }
+                McpTransport::Stdio => execute_mcp_stdio_request(
+                    &server,
+                    "resources/list",
+                    json!({}),
+                    3,
+                    Duration::from_secs(6),
+                )
+                .ok()
+                .and_then(|r| r.get("result")?.get("resources")?.as_array().cloned()),
+                McpTransport::Http | McpTransport::Sse => server.url.as_deref().and_then(|url| {
+                    Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .ok()?
+                        .post(url)
+                        .json(
+                            &json!({"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}),
+                        )
+                        .send()
+                        .ok()?
+                        .json::<serde_json::Value>()
+                        .ok()?
+                        .get("result")?
+                        .get("resources")?
+                        .as_array()
+                        .cloned()
+                }),
             };
             if let Some(items) = discovered {
                 for item in items {
@@ -554,24 +552,22 @@ impl McpManager {
                 )
                 .ok()
                 .and_then(|r| r.get("result")?.get("prompts")?.as_array().cloned()),
-                McpTransport::Http | McpTransport::Sse => {
-                    server.url.as_deref().and_then(|url| {
-                        Client::builder()
-                            .timeout(Duration::from_secs(10))
-                            .build()
-                            .ok()?
-                            .post(url)
-                            .json(&json!({"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}))
-                            .send()
-                            .ok()?
-                            .json::<serde_json::Value>()
-                            .ok()?
-                            .get("result")?
-                            .get("prompts")?
-                            .as_array()
-                            .cloned()
-                    })
-                }
+                McpTransport::Http | McpTransport::Sse => server.url.as_deref().and_then(|url| {
+                    Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .ok()?
+                        .post(url)
+                        .json(&json!({"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}))
+                        .send()
+                        .ok()?
+                        .json::<serde_json::Value>()
+                        .ok()?
+                        .get("result")?
+                        .get("prompts")?
+                        .as_array()
+                        .cloned()
+                }),
             };
             if let Some(items) = discovered {
                 for item in items {
@@ -897,9 +893,7 @@ fn discover_sse_tools(server: &McpServer) -> Result<Vec<McpTool>> {
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("SSE transport requires url"))?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
     let mut req = client.get(url);
     for (k, v) in &server.headers {
         req = req.header(k.as_str(), v.as_str());
@@ -1383,9 +1377,7 @@ fn exchange_oauth_code(
     code_verifier: &str,
     server_id: &str,
 ) -> Result<McpOAuthToken> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let mut body = json!({
         "grant_type": "authorization_code",
         "code": code,
@@ -1411,13 +1403,11 @@ fn exchange_oauth_code(
             .get("refresh_token")
             .and_then(|v| v.as_str())
             .map(String::from),
-        token_type: resp["token_type"]
-            .as_str()
-            .unwrap_or("Bearer")
-            .to_string(),
-        expires_at: resp.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
-            (Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-        }),
+        token_type: resp["token_type"].as_str().unwrap_or("Bearer").to_string(),
+        expires_at: resp
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .map(|secs| (Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()),
         server_id: server_id.to_string(),
     })
 }
@@ -1434,9 +1424,7 @@ pub fn refresh_oauth_token(server: &McpServer, token: &McpOAuthToken) -> Result<
         .refresh_token
         .as_deref()
         .ok_or_else(|| anyhow!("no refresh token available"))?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let resp: serde_json::Value = client
         .post(&oauth.token_url)
         .json(&json!({
@@ -1458,13 +1446,11 @@ pub fn refresh_oauth_token(server: &McpServer, token: &McpOAuthToken) -> Result<
             .and_then(|v| v.as_str())
             .map(String::from)
             .or_else(|| token.refresh_token.clone()),
-        token_type: resp["token_type"]
-            .as_str()
-            .unwrap_or("Bearer")
-            .to_string(),
-        expires_at: resp.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
-            (Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-        }),
+        token_type: resp["token_type"].as_str().unwrap_or("Bearer").to_string(),
+        expires_at: resp
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .map(|secs| (Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()),
         server_id: server.id.clone(),
     };
     store_mcp_token(&server.id, &new_token)?;
@@ -2269,7 +2255,9 @@ mod tests {
             .expect("add");
 
         // Below 10% threshold → returns all tools regardless of query
-        let tools = manager.tools_for_context(5.0, Some("t1"), 10).expect("tools");
+        let tools = manager
+            .tools_for_context(5.0, Some("t1"), 10)
+            .expect("tools");
         assert_eq!(tools.len(), 2);
     }
 
@@ -2500,7 +2488,10 @@ data: {"other":"ignored"}
     fn managed_config_missing_returns_none() {
         // The managed config path points to a system location that won't exist in test
         let result = McpManager::load_managed_mcp_config();
-        assert!(result.is_none(), "managed config should return None when file is absent");
+        assert!(
+            result.is_none(),
+            "managed config should return None when file is absent"
+        );
     }
 
     #[test]
@@ -2512,7 +2503,8 @@ data: {"other":"ignored"}
     fn cannot_remove_managed_server_would_fail() {
         // Without a managed config file, is_managed_server returns false,
         // so the guard doesn't trigger. This tests the guard integration exists.
-        let workspace = std::env::temp_dir().join(format!("deepseek-mcp-managed-{}", Uuid::now_v7()));
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-mcp-managed-{}", Uuid::now_v7()));
         fs::create_dir_all(&workspace).expect("workspace");
         let manager = McpManager::new(&workspace).expect("manager");
 

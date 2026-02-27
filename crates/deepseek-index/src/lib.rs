@@ -234,7 +234,12 @@ impl IndexService {
         Ok(())
     }
 
-    fn query_tantivy(&self, q: &str, top_k: usize, scope: Option<&str>) -> Result<Vec<QueryResult>> {
+    fn query_tantivy(
+        &self,
+        q: &str,
+        top_k: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<QueryResult>> {
         let index = Index::open_in_dir(self.tantivy_dir())?;
         let schema = index.schema();
         let path_field = schema.get_field("path")?;
@@ -283,7 +288,12 @@ impl IndexService {
         Ok(out)
     }
 
-    fn query_fallback(&self, q: &str, top_k: usize, scope: Option<&str>) -> Result<Vec<QueryResult>> {
+    fn query_fallback(
+        &self,
+        q: &str,
+        top_k: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
         for path in workspace_file_paths(&self.workspace, true) {
             if !path.is_file() {

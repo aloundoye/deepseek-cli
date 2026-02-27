@@ -397,9 +397,7 @@ impl HookRuntime {
             HookHandler::Command { command, timeout } => {
                 self.run_command_handler(command, input, *timeout)
             }
-            HookHandler::Async { command, timeout } => {
-                self.run_async_handler(command, *timeout)
-            }
+            HookHandler::Async { command, timeout } => self.run_async_handler(command, *timeout),
             HookHandler::Prompt {
                 prompt,
                 model,
@@ -415,8 +413,16 @@ impl HookRuntime {
 
     /// Fire-and-forget a command in the background. Never blocks the main loop.
     fn run_async_handler(&self, command: &str, timeout_secs: u64) -> HookRun {
-        let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
-        let shell_flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+        let shell = if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        };
+        let shell_flag = if cfg!(target_os = "windows") {
+            "/C"
+        } else {
+            "-c"
+        };
 
         let mut cmd = Command::new(shell);
         cmd.arg(shell_flag)
@@ -435,8 +441,16 @@ impl HookRuntime {
             let ws = self.workspace.clone();
             std::thread::spawn(move || {
                 // Re-spawn so we can wait with timeout (the original handle is moved)
-                let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
-                let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+                let shell = if cfg!(target_os = "windows") {
+                    "cmd"
+                } else {
+                    "sh"
+                };
+                let flag = if cfg!(target_os = "windows") {
+                    "/C"
+                } else {
+                    "-c"
+                };
                 if let Ok(mut child) = Command::new(shell)
                     .arg(flag)
                     .arg(&cmd_str)
@@ -447,7 +461,10 @@ impl HookRuntime {
                     .spawn()
                 {
                     match child.wait_timeout(timeout) {
-                        Ok(None) => { let _ = child.kill(); let _ = child.wait(); }
+                        Ok(None) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
                         _ => {}
                     }
                 }
@@ -671,8 +688,8 @@ pub fn merge_skill_hooks(
                     command: cmd.clone(),
                     timeout: 30,
                 }],
-            once: false,
-            disabled: false,
+                once: false,
+                disabled: false,
             })
             .collect();
         merged
@@ -841,8 +858,8 @@ mod tests {
                     command: "exit 2".to_string(),
                     timeout: 5,
                 }],
-            once: false,
-            disabled: false,
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -871,8 +888,8 @@ mod tests {
                     command: "exit 0".to_string(),
                     timeout: 5,
                 }],
-            once: false,
-            disabled: false,
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
@@ -1094,24 +1111,22 @@ mod tests {
                     command: "existing".to_string(),
                     timeout: 5,
                 }],
-            once: false,
-            disabled: false,
+                once: false,
+                disabled: false,
             }],
         );
         let base = HooksConfig { events };
 
         let mut skill_hooks = HashMap::new();
-        skill_hooks.insert(
-            "PreToolUse".to_string(),
-            vec!["echo validate".to_string()],
-        );
-        skill_hooks.insert(
-            "Stop".to_string(),
-            vec!["echo done".to_string()],
-        );
+        skill_hooks.insert("PreToolUse".to_string(), vec!["echo validate".to_string()]);
+        skill_hooks.insert("Stop".to_string(), vec!["echo done".to_string()]);
 
         let merged = merge_skill_hooks(&base, &skill_hooks);
-        assert_eq!(merged.events["PreToolUse"].len(), 2, "should have original + skill hook");
+        assert_eq!(
+            merged.events["PreToolUse"].len(),
+            2,
+            "should have original + skill hook"
+        );
         assert!(merged.events.contains_key("Stop"), "should add new event");
     }
 
@@ -1135,8 +1150,8 @@ mod tests {
                     command: "sleep 10".to_string(),
                     timeout: 1,
                 }],
-            once: false,
-            disabled: false,
+                once: false,
+                disabled: false,
             }],
         );
         let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
