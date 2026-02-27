@@ -2031,16 +2031,16 @@ fn merge_json_value(base: &mut serde_json::Value, overlay: &serde_json::Value) {
     }
 }
 
-/// Prompt caching strategy for API requests.
+/// Prompt caching strategy — deprecated, kept only for config deserialization compat.
+///
+/// DeepSeek uses automatic server-side prefix caching. Client-side `cache_control`
+/// annotations cause 400 errors. All variants are now no-ops.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheStrategy {
-    /// Annotate system prompt + first user message (stable prefix).
     #[default]
     Auto,
-    /// Annotate system prompt + first 3 messages (more aggressive prefix caching).
     Aggressive,
-    /// No cache annotations.
     Off,
 }
 

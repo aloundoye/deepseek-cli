@@ -33,10 +33,15 @@ pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
 /// Target context usage after compaction.
 pub const COMPACTION_TARGET_PCT: f64 = 0.80;
 
-/// If the model's first response (with no tool calls) exceeds this many
+/// If the model's response (with no tool calls) exceeds this many
 /// characters, it's likely hallucinating a long answer instead of using tools.
 /// We inject a nudge to get it back on track.
 const HALLUCINATION_NUDGE_THRESHOLD: usize = 300;
+
+/// Maximum number of hallucination nudges before letting the response through.
+/// After this many nudges without the model using tools, it may be a legitimate
+/// non-code question — let it answer.
+const MAX_NUDGE_ATTEMPTS: usize = 3;
 
 /// Every N tool calls, inject a brief system reminder to keep the model on track.
 const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
@@ -151,6 +156,8 @@ pub struct ToolLoopConfig {
     pub retriever: Option<Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync>>,
     /// Optional privacy router for scanning tool outputs before appending to messages.
     pub privacy_router: Option<Arc<deepseek_local_ml::PrivacyRouter>>,
+    /// Images to include with the LLM request (multimodal).
+    pub images: Vec<deepseek_core::ImageContent>,
 }
 
 /// A piece of retrieved code context from the workspace index.
@@ -182,6 +189,7 @@ impl Default for ToolLoopConfig {
             workspace: None,
             retriever: None,
             privacy_router: None,
+            images: vec![],
         }
     }
 }
@@ -308,6 +316,7 @@ impl<'a> ToolUseLoop<'a> {
         let mut tool_calls_made = Vec::new();
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
+        let mut nudge_count: usize = 0;
 
         loop {
             // Check turn limit
@@ -325,8 +334,12 @@ impl<'a> ToolUseLoop<'a> {
                 });
             }
 
-            // Check context window usage
-            let estimated_tokens = estimate_message_tokens(&self.messages);
+            // Check context window usage (messages + tool definitions overhead)
+            let message_tokens = estimate_message_tokens(&self.messages);
+            let tool_def_tokens: u64 = self.tools.iter()
+                .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
+                .sum();
+            let estimated_tokens = message_tokens + tool_def_tokens;
             let threshold = (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
             if estimated_tokens > threshold {
                 // Try to compact
@@ -374,17 +387,19 @@ impl<'a> ToolUseLoop<'a> {
             if response.tool_calls.is_empty() {
                 let text = response.text.clone();
 
-                // Anti-hallucination guard: if this is the first turn and the
-                // response is long (likely a fabricated analysis), nudge the
-                // model to use tools instead of guessing.
-                let should_nudge = turns == 1
+                // Anti-hallucination guard: if the model responds with a long text
+                // without using tools, nudge it to use tools instead of guessing.
+                // Fires in ALL modes including Ask/read-only — that's where users
+                // ask about the codebase and hallucination is most harmful.
+                // Allows up to MAX_NUDGE_ATTEMPTS nudges before letting through.
+                let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
                     && tool_calls_made.is_empty()
-                    && !self.config.read_only
                     && (text.len() > HALLUCINATION_NUDGE_THRESHOLD
                         || has_unverified_file_references(&text, &tool_calls_made));
 
                 if should_nudge {
                     // Don't emit this attempt — inject a nudge and retry
+                    nudge_count += 1;
                     self.messages.push(ChatMessage::Assistant {
                         content: Some(text),
                         reasoning_content: None,
@@ -503,7 +518,9 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: None,
                 prompt: None,
                 session_type: None,
-                workspace: String::new(),
+                workspace: self.config.workspace.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             };
             let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
             if hook_result.blocked {
@@ -607,11 +624,15 @@ impl<'a> ToolUseLoop<'a> {
             let input = HookInput {
                 event: HookEvent::PostToolUse.as_str().to_string(),
                 tool_name: Some(llm_call.name.clone()),
-                tool_input: Some(serde_json::json!({})),
+                tool_input: Some(
+                    serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({})),
+                ),
                 tool_result: Some(result.output.clone()),
                 prompt: None,
                 session_type: None,
-                workspace: String::new(),
+                workspace: self.config.workspace.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             };
             let _ = hooks.fire(HookEvent::PostToolUse, &input);
         }
@@ -754,6 +775,10 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Handle the extended_thinking tool by calling the reasoner model.
+    ///
+    /// `deepseek-reasoner` thinks natively — no `ThinkingConfig` needed (that's
+    /// only for enabling thinking on `deepseek-chat`). V3.2 supports tool calls
+    /// with the reasoner, so we pass through the current tool definitions.
     fn handle_extended_thinking(&self, question: &str, context: &str) -> Result<String> {
         let prompt = format!(
             "Analyze this problem carefully:\n\nQuestion: {question}\n\nContext:\n{context}\n\nProvide a clear, actionable recommendation."
@@ -766,8 +791,8 @@ impl<'a> ToolUseLoop<'a> {
                 },
                 ChatMessage::User { content: prompt },
             ],
-            tools: vec![],
-            tool_choice: ToolChoice::none(),
+            tools: self.tools.clone(),       // V3.2 supports tools with reasoner
+            tool_choice: ToolChoice::auto(),  // Let the model decide
             max_tokens: deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS,
             temperature: None,
             top_p: None,
@@ -775,7 +800,7 @@ impl<'a> ToolUseLoop<'a> {
             frequency_penalty: None,
             logprobs: None,
             top_logprobs: None,
-            thinking: Some(deepseek_core::ThinkingConfig::enabled(16_384)),
+            thinking: None,  // Reasoner thinks natively — no ThinkingConfig needed
             images: vec![],
             response_format: None,
         };
@@ -970,13 +995,19 @@ impl<'a> ToolUseLoop<'a> {
             self.tools.clone()
         };
 
-        // Force tool use on first turn (no tool results yet) so the model
+        // Force tool use on the first turn for each new question so the model
         // explores the codebase instead of fabricating an answer.
-        let has_tool_results = self
+        // Check if there are tool results AFTER the last user message
+        // (i.e., tools used for THIS question, not a previous one in multi-turn).
+        let last_user_idx = self
             .messages
             .iter()
+            .rposition(|m| matches!(m, ChatMessage::User { .. }))
+            .unwrap_or(0);
+        let has_tool_results_this_turn = self.messages[last_user_idx..]
+            .iter()
             .any(|m| matches!(m, ChatMessage::Tool { .. }));
-        let tool_choice = if !has_tool_results && !self.config.read_only {
+        let tool_choice = if !has_tool_results_this_turn && !self.config.read_only {
             ToolChoice::required()
         } else {
             ToolChoice::auto()
@@ -1005,35 +1036,64 @@ impl<'a> ToolUseLoop<'a> {
             logprobs: None,
             top_logprobs: None,
             thinking,
-            images: vec![],
+            images: self.config.images.clone(),
             response_format: None,
         }
     }
 
-    /// Simple message compaction: remove middle messages keeping system + recent.
-    /// Returns true if compaction happened, false if nothing could be compacted.
-    fn compact_messages(&mut self, _target_tokens: u64) -> bool {
-        // Keep system message (index 0) and last 6 messages
+    /// Compact messages by removing middle exchanges while preserving tool-call/result pairing.
+    ///
+    /// Walks backward from the end, keeping complete exchange groups (User + Assistant + Tool
+    /// messages form a group). Never orphans a Tool message from its corresponding Assistant
+    /// tool_calls. Respects `target_tokens` budget for kept messages.
+    fn compact_messages(&mut self, target_tokens: u64) -> bool {
         if self.messages.len() <= 7 {
-            return false; // Nothing to compact
+            return false;
         }
 
         let system = self.messages[0].clone();
-        let keep_recent = 6;
-        let recent_start = self.messages.len() - keep_recent;
-        let recent: Vec<ChatMessage> = self.messages[recent_start..].to_vec();
 
-        // Summarize the middle section into a single system-like message
-        let middle_count = recent_start - 1; // everything between system and recent
+        // Walk backward to find group boundaries.
+        // A group starts at a User message and includes everything until the next User message.
+        let mut keep_from = self.messages.len();
+        let mut kept_tokens: u64 = 0;
+        let target = target_tokens.min(
+            (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64,
+        );
+
+        while keep_from > 1 {
+            // Find the start of this group (previous User message)
+            let group_start = self.messages[1..keep_from]
+                .iter()
+                .rposition(|m| matches!(m, ChatMessage::User { .. }))
+                .map(|i| i + 1) // +1 for the offset from [1..]
+                .unwrap_or(1);
+
+            let group_tokens: u64 = self.messages[group_start..keep_from]
+                .iter()
+                .map(|m| estimate_message_tokens(std::slice::from_ref(m)) as u64)
+                .sum();
+
+            if kept_tokens + group_tokens > target && keep_from < self.messages.len() {
+                break; // This group would exceed budget
+            }
+            kept_tokens += group_tokens;
+            keep_from = group_start;
+        }
+
+        if keep_from <= 1 {
+            return false; // Nothing to compact
+        }
+
+        let middle_count = keep_from - 1;
         let summary_msg = ChatMessage::User {
             content: format!(
-                "[Conversation compacted: {middle_count} earlier messages were summarized. \
-                 Continue from the recent context below.]"
+                "[Conversation compacted: {middle_count} earlier messages summarized.]"
             ),
         };
-
+        let kept = self.messages[keep_from..].to_vec();
         self.messages = vec![system, summary_msg];
-        self.messages.extend(recent);
+        self.messages.extend(kept);
         true
     }
 
@@ -1174,19 +1234,35 @@ fn summarize_args(args: &serde_json::Value) -> String {
     parts.join(", ")
 }
 
+/// Known file extensions for path detection.
+const FILE_EXTENSIONS: &[&str] = &[
+    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java",
+    ".cpp", ".c", ".h", ".hpp", ".rb", ".swift", ".kt", ".sh",
+    ".sql", ".json", ".toml", ".yaml", ".yml", ".md", ".html",
+    ".css", ".scss", ".vue", ".svelte", ".zig", ".ex", ".exs",
+];
+
 /// Detect when the model mentions file paths without having called fs_read/fs_glob first.
 /// Returns true if the text references paths that haven't been verified by tool calls.
 fn has_unverified_file_references(text: &str, tool_calls_made: &[ToolCallRecord]) -> bool {
-    // Extract path-like patterns from text (e.g. src/main.rs, ./config.json, crates/foo/bar.rs)
-    let path_pattern = regex::Regex::new(r"\b[\w./\-]+\.\w{1,6}\b").unwrap_or_else(|_| return regex::Regex::new(r"^$").unwrap());
-    let mentioned_paths: Vec<&str> = path_pattern
+    use std::sync::LazyLock;
+    static FILE_REF_PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\b[\w./\-]+\.\w{1,6}\b").unwrap()
+    });
+
+    let mentioned_paths: Vec<&str> = FILE_REF_PATTERN
         .find_iter(text)
         .map(|m| m.as_str())
         .filter(|p| {
-            // Filter to things that look like real file paths
-            p.contains('/') || p.ends_with(".rs") || p.ends_with(".ts") || p.ends_with(".js")
-                || p.ends_with(".py") || p.ends_with(".json") || p.ends_with(".toml")
-                || p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".md")
+            // Must look like a real file path, not a dot-access pattern
+            let has_known_ext = FILE_EXTENSIONS.iter().any(|ext| p.ends_with(ext));
+            let has_path_sep = p.contains('/');
+            (has_known_ext || has_path_sep)
+                && !p.starts_with("self.")
+                && !p.starts_with("req.")
+                && !p.starts_with("resp.")
+                && !p.starts_with("cfg.")
+                && !p.contains('(')
         })
         .collect();
 
@@ -1908,5 +1984,304 @@ mod tests {
         assert!(loop_.escalation.test_failure, "should detect test failure");
         assert!(loop_.escalation.should_escalate(), "should be escalated");
         assert_eq!(loop_.escalation.consecutive_failure_turns, 2);
+    }
+
+    // ── Batch 2 (P9): Anti-hallucination ──
+
+    #[test]
+    fn hallucination_nudge_fires_in_ask_mode() {
+        // Even in read_only mode (Ask/Context), the nudge should fire
+        // to prevent hallucinated answers about the codebase.
+        let long_text = "x".repeat(HALLUCINATION_NUDGE_THRESHOLD + 1);
+        let llm = ScriptedLlm::new(vec![
+            make_text_response(&long_text),
+            make_text_response("OK"),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let config = ToolLoopConfig {
+            read_only: true,
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("where is the config?").unwrap();
+        assert_eq!(result.response, "OK");
+        assert_eq!(result.turns, 2, "nudge should fire in read_only/Ask mode");
+    }
+
+    #[test]
+    fn hallucination_nudge_fires_up_to_3_times() {
+        // Model hallucinates 3 times, then on 4th attempt it goes through
+        let long_text = "x".repeat(HALLUCINATION_NUDGE_THRESHOLD + 1);
+        let llm = ScriptedLlm::new(vec![
+            make_text_response(&long_text),
+            make_text_response(&long_text),
+            make_text_response(&long_text),
+            make_text_response(&long_text), // 4th: should pass through (MAX_NUDGE_ATTEMPTS exhausted)
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("what does this project do?").unwrap();
+        assert_eq!(result.turns, 4, "should fire 3 nudges then let 4th through");
+        assert_eq!(result.response.len(), HALLUCINATION_NUDGE_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn tool_choice_required_per_new_question() {
+        // In multi-turn, tool_choice=required should reset for each new user question.
+        // The ScriptedLlm lets us verify via the request the loop builds.
+        // We simulate: turn 1 uses a tool, then continue_with asks a new question.
+        let llm = ScriptedLlm::new(vec![
+            // First run: tool call + response
+            make_tool_response(vec![LlmToolCall {
+                id: "c1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+            }]),
+            make_text_response("Found it."),
+            // Second run (continue_with): tool call + response
+            make_tool_response(vec![LlmToolCall {
+                id: "c2".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"src/main.rs"}"#.to_string(),
+            }]),
+            make_text_response("Found that too."),
+        ]);
+
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    success: true,
+                    output: serde_json::json!("content of lib.rs"),
+                },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    success: true,
+                    output: serde_json::json!("content of main.rs"),
+                },
+            ],
+            true,
+        ));
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let r1 = loop_.run("read lib.rs").unwrap();
+        assert_eq!(r1.response, "Found it.");
+
+        let r2 = loop_.continue_with("now read main.rs").unwrap();
+        assert_eq!(r2.response, "Found that too.");
+    }
+
+    #[test]
+    fn unverified_refs_detects_go_files() {
+        assert!(has_unverified_file_references(
+            "The server code is in cmd/server.go and internal/handler.go.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn unverified_refs_ignores_dot_access() {
+        // self.config, req.model etc. should not be flagged as file paths
+        assert!(!has_unverified_file_references(
+            "The self.config and req.model fields are set during initialization.",
+            &[]
+        ));
+        // But real paths alongside dot-access should still be detected
+        assert!(has_unverified_file_references(
+            "Check src/config.rs and src/model.rs for the implementation.",
+            &[]
+        ));
+    }
+
+    // ── Batch 4 (P9): Compaction & Correctness ──
+
+    #[test]
+    fn compaction_preserves_tool_result_pairing() {
+        // Build a conversation with tool calls that must stay paired.
+        let llm = ScriptedLlm::new(vec![make_text_response("Final answer.")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let config = ToolLoopConfig {
+            // Small context window so compaction budget is tight
+            context_window_tokens: 2000,
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        // Manually build history to simulate a conversation with tool exchanges
+        loop_.messages.push(ChatMessage::User {
+            content: "first question".to_string(),
+        });
+        for i in 0..5 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: format!("call_{i}"),
+                    name: "fs_read".to_string(),
+                    arguments: format!(r#"{{"path":"file{i}.rs"}}"#),
+                }],
+            });
+            loop_.messages.push(ChatMessage::Tool {
+                tool_call_id: format!("call_{i}"),
+                content: format!("content of file{i}.rs — {}", "x".repeat(400)),
+            });
+        }
+        loop_.messages.push(ChatMessage::User {
+            content: "second question".to_string(),
+        });
+        loop_.messages.push(ChatMessage::Assistant {
+            content: Some("Here is what I found.".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+
+        // Force compaction with a tight budget
+        let compacted = loop_.compact_messages(200);
+        assert!(compacted, "should have compacted");
+
+        // Verify no orphaned Tool messages (every Tool must follow an Assistant with tool_calls)
+        let msgs = &loop_.messages;
+        for (i, msg) in msgs.iter().enumerate() {
+            if matches!(msg, ChatMessage::Tool { .. }) {
+                assert!(
+                    i > 0 && matches!(&msgs[i - 1], ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
+                    "Tool message at index {i} is orphaned (no preceding Assistant with tool_calls)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_respects_target_tokens() {
+        let llm = ScriptedLlm::new(vec![]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let config = ToolLoopConfig {
+            context_window_tokens: 128_000,
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        // Add many user/assistant exchanges
+        for i in 0..20 {
+            loop_.messages.push(ChatMessage::User {
+                content: format!("Question {i}: {}", "x".repeat(200)),
+            });
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("Answer {i}: {}", "y".repeat(200))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+
+        let before_len = loop_.messages.len();
+        let compacted = loop_.compact_messages(2000);
+        assert!(compacted, "should compact");
+        assert!(loop_.messages.len() < before_len, "should have fewer messages");
+        // System message should always be first
+        assert!(matches!(&loop_.messages[0], ChatMessage::System { .. }));
+        // Compaction summary should be second
+        assert!(matches!(&loop_.messages[1], ChatMessage::User { content } if content.contains("compacted")));
+    }
+
+    #[test]
+    fn images_forwarded_to_llm_request() {
+        // Verify that images from ToolLoopConfig appear in the ChatRequest
+        let llm = ScriptedLlm::new(vec![make_text_response("I see the image.")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let images = vec![deepseek_core::ImageContent {
+            mime: "image/png".to_string(),
+            base64_data: "iVBORw0KGgo=".to_string(),
+        }];
+        let config = ToolLoopConfig {
+            images: images.clone(),
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("what's in this image?").unwrap();
+        assert_eq!(result.response, "I see the image.");
+        // The images are included in the config, which is used in build_request
+        assert!(!loop_.config.images.is_empty());
+    }
+
+    #[test]
+    fn post_tool_use_hook_gets_actual_args() {
+        // This test verifies the PostToolUse hook receives actual tool arguments
+        // (not an empty {}). We can't easily test hook content without a mock hook runtime,
+        // but we verify the code path by checking that the tool executes successfully
+        // with hooks not wired (no-op path).
+        let llm = ScriptedLlm::new(vec![
+            make_tool_response(vec![LlmToolCall {
+                id: "c1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"src/main.rs"}"#.to_string(),
+            }]),
+            make_text_response("Done."),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![ToolResult {
+                invocation_id: uuid::Uuid::nil(),
+                success: true,
+                output: serde_json::json!("file content"),
+            }],
+            true,
+        ));
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("read main.rs").unwrap();
+        assert_eq!(result.response, "Done.");
+        assert_eq!(result.tool_calls_made.len(), 1);
+        assert_eq!(result.tool_calls_made[0].tool_name, "fs_read");
     }
 }

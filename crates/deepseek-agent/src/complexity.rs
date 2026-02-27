@@ -44,9 +44,11 @@ pub const MAX_THINK_BUDGET: u32 = 65_536;
 /// Per-failure escalation step within the hard budget range.
 pub const ESCALATION_STEP: u32 = 8_192;
 
+/// Medium budget — for non-trivial single-feature work.
+pub const MEDIUM_THINK_BUDGET: u32 = 16_384;
+
 // Keep old names as aliases so callers don't break.
 pub const SIMPLE_THINK_BUDGET: u32 = DEFAULT_THINK_BUDGET;
-pub const MEDIUM_THINK_BUDGET: u32 = DEFAULT_THINK_BUDGET;
 pub const COMPLEX_THINK_BUDGET: u32 = HARD_THINK_BUDGET;
 pub const ESCALATION_BUDGET_DELTA: u32 = ESCALATION_STEP;
 
@@ -69,6 +71,8 @@ pub struct EscalationSignals {
     pub search_miss: bool,
     /// Number of consecutive turns where all tool calls failed
     pub consecutive_failure_turns: usize,
+    /// Number of consecutive turns where tool calls succeeded (for de-escalation)
+    pub consecutive_success_turns: usize,
 }
 
 impl EscalationSignals {
@@ -77,6 +81,7 @@ impl EscalationSignals {
         self.compile_error
             || self.test_failure
             || self.patch_rejected
+            || self.search_miss
             || self.consecutive_failure_turns >= 2
     }
 
@@ -97,26 +102,37 @@ impl EscalationSignals {
     }
 
     /// Record a successful tool turn (resets consecutive failures).
+    /// After 3 consecutive successes, de-escalates sticky flags — the issue was resolved.
     pub fn record_success(&mut self) {
         self.consecutive_failure_turns = 0;
-        // Don't clear compile_error/test_failure — once escalated, stay escalated
-        // for the remainder of this conversation turn.
+        self.consecutive_success_turns += 1;
+        if self.consecutive_success_turns >= 3 {
+            // Issue was resolved — de-escalate
+            self.compile_error = false;
+            self.test_failure = false;
+            self.patch_rejected = false;
+            self.search_miss = false;
+        }
     }
 
     /// Record a failed tool turn.
     pub fn record_failure(&mut self) {
         self.consecutive_failure_turns += 1;
+        self.consecutive_success_turns = 0;
     }
 
     /// Detect escalation signals from tool output text.
     pub fn scan_tool_output(&mut self, tool_name: &str, output: &str) {
         let lower = output.to_ascii_lowercase();
 
-        // Compile errors
+        // Compile errors — require stronger signal to avoid false positives
+        // from tool error messages like "no such file" or "permission denied".
         if lower.contains("error[e")           // Rust: error[E0308]
-            || lower.contains("error:")
+            || (lower.contains("error:")
+                && !lower.contains("no such file")
+                && !lower.contains("permission denied")
                 && (lower.contains("cannot find") || lower.contains("expected")
-                    || lower.contains("mismatched") || lower.contains("undeclared"))
+                    || lower.contains("mismatched") || lower.contains("undeclared")))
             || lower.contains("compilation failed")
             || lower.contains("build failed")
             || lower.contains("syntaxerror")
@@ -197,7 +213,18 @@ fn is_trivial(lower: &str, words: &[&str], word_count: usize) -> bool {
         return true;
     }
 
-    matches!(words.first(), Some(&"just" | &"only" | &"simply"))
+    if matches!(words.first(), Some(&"just" | &"only" | &"simply")) {
+        // Check if the rest of the prompt contains complexity keywords.
+        // "just refactor everything" is NOT simple, even with a minimizer prefix.
+        let has_complex_keyword = [
+            "refactor", "rewrite", "migrate", "redesign", "overhaul",
+            "restructure", "implement", "add", "create", "build",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+        return !has_complex_keyword;
+    }
+    false
 }
 
 fn is_complex(lower: &str, words: &[&str], word_count: usize) -> bool {
@@ -281,12 +308,15 @@ pub fn classify_with_history(
     base
 }
 
-/// Thinking budget for a complexity tier (legacy API — use EscalationSignals instead).
+/// Thinking budget for a complexity tier.
+///
+/// Simple → 8K, Medium → 16K, Complex → 32K.
+/// Further escalation is handled by `EscalationSignals` in the tool loop.
 pub fn thinking_budget_for(complexity: PromptComplexity) -> u32 {
     match complexity {
-        PromptComplexity::Simple => DEFAULT_THINK_BUDGET,
-        PromptComplexity::Medium => DEFAULT_THINK_BUDGET,
-        PromptComplexity::Complex => HARD_THINK_BUDGET,
+        PromptComplexity::Simple => DEFAULT_THINK_BUDGET,     // 8K
+        PromptComplexity::Medium => MEDIUM_THINK_BUDGET,       // 16K
+        PromptComplexity::Complex => HARD_THINK_BUDGET,        // 32K
     }
 }
 
@@ -343,11 +373,14 @@ mod tests {
 
     #[test]
     fn thinking_budget_matches_complexity() {
-        // Simple and Medium both use default (moderate)
+        // 3-tier: Simple 8K, Medium 16K, Complex 32K
         assert_eq!(thinking_budget_for(PromptComplexity::Simple), DEFAULT_THINK_BUDGET);
-        assert_eq!(thinking_budget_for(PromptComplexity::Medium), DEFAULT_THINK_BUDGET);
-        // Complex uses hard
+        assert_eq!(thinking_budget_for(PromptComplexity::Medium), MEDIUM_THINK_BUDGET);
         assert_eq!(thinking_budget_for(PromptComplexity::Complex), HARD_THINK_BUDGET);
+        // Verify actual values
+        assert_eq!(DEFAULT_THINK_BUDGET, 8_192);
+        assert_eq!(MEDIUM_THINK_BUDGET, 16_384);
+        assert_eq!(HARD_THINK_BUDGET, 32_768);
     }
 
     // ── Evidence-driven escalation ──
@@ -444,6 +477,22 @@ mod tests {
     fn minimizers_signal_simplicity() {
         assert_eq!(classify_complexity("just fix the typo"), PromptComplexity::Simple);
         assert_eq!(classify_complexity("only rename the variable"), PromptComplexity::Simple);
+        assert_eq!(classify_complexity("simply update the comment"), PromptComplexity::Simple);
+    }
+
+    #[test]
+    fn just_refactor_is_not_simple() {
+        // "just" with complexity keywords should not be treated as simple
+        assert_ne!(classify_complexity("just refactor everything"), PromptComplexity::Simple);
+        assert_ne!(classify_complexity("just rewrite the auth module"), PromptComplexity::Simple);
+        assert_ne!(classify_complexity("simply migrate the database"), PromptComplexity::Simple);
+        assert_ne!(classify_complexity("only implement the new feature"), PromptComplexity::Simple);
+    }
+
+    #[test]
+    fn just_fix_typo_is_simple() {
+        assert_eq!(classify_complexity("just fix the typo"), PromptComplexity::Simple);
+        assert_eq!(classify_complexity("just remove the comma"), PromptComplexity::Simple);
     }
 
     #[test]
@@ -559,5 +608,60 @@ mod tests {
             "refactor backend api and frontend flows across multiple files with tests",
         );
         assert!(complex > simple);
+    }
+
+    // ── P9: Batch 3 new tests ──
+
+    #[test]
+    fn complex_gets_32k_initial_budget() {
+        assert_eq!(
+            thinking_budget_for(PromptComplexity::Complex),
+            HARD_THINK_BUDGET
+        );
+        assert_eq!(HARD_THINK_BUDGET, 32_768);
+    }
+
+    #[test]
+    fn escalation_de_escalates_after_3_successes() {
+        let mut signals = EscalationSignals::default();
+        signals.compile_error = true;
+        signals.test_failure = true;
+        assert!(signals.should_escalate());
+
+        // 3 consecutive successes should de-escalate
+        signals.record_success();
+        signals.record_success();
+        assert!(signals.should_escalate(), "should still be escalated after 2 successes");
+        signals.record_success();
+        assert!(!signals.should_escalate(), "should de-escalate after 3 successes");
+        assert!(!signals.compile_error);
+        assert!(!signals.test_failure);
+        assert_eq!(signals.budget(), DEFAULT_THINK_BUDGET);
+    }
+
+    #[test]
+    fn search_miss_triggers_escalation() {
+        let mut signals = EscalationSignals::default();
+        signals.search_miss = true;
+        assert!(signals.should_escalate());
+        assert_eq!(signals.budget(), HARD_THINK_BUDGET);
+    }
+
+    #[test]
+    fn scan_tool_output_no_false_positive_on_file_not_found() {
+        // "no such file" errors from fs_read should NOT trigger compile_error
+        let mut signals = EscalationSignals::default();
+        signals.scan_tool_output("fs_read", "error: no such file or directory: /tmp/missing.rs");
+        assert!(!signals.compile_error, "file-not-found should not flag compile error");
+    }
+
+    #[test]
+    fn failure_resets_success_counter() {
+        let mut signals = EscalationSignals::default();
+        signals.record_success();
+        signals.record_success();
+        assert_eq!(signals.consecutive_success_turns, 2);
+        signals.record_failure();
+        assert_eq!(signals.consecutive_success_turns, 0);
     }
 }

@@ -2419,7 +2419,7 @@ pub fn format_relative_time(timestamp: &str) -> String {
 /// Available model choices for the interactive `/model` picker.
 const MODEL_CHOICES: &[(&str, &str)] = &[
     ("deepseek-chat", "Thinking + tools (default)"),
-    ("deepseek-reasoner", "Deep reasoning, no tools"),
+    ("deepseek-reasoner", "Deep reasoning + tools"),
 ];
 
 #[derive(Debug, Clone, Default)]
