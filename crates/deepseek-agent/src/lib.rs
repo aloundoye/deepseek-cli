@@ -479,12 +479,12 @@ impl AgentEngine {
 
         let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
 
-        // Two-budget system: moderate default, evidence-driven escalation in the loop.
+        // Complexity-driven initial budget, with evidence-driven escalation in the loop.
         // force_max_think is an explicit user override to maximum.
         let think_budget = if options.force_max_think {
-            complexity::MAX_THINK_BUDGET
+            complexity::MAX_THINK_BUDGET      // 64K
         } else {
-            complexity::DEFAULT_THINK_BUDGET
+            complexity::thinking_budget_for(complexity) // Simple 8K / Medium 16K / Complex 32K
         };
 
         let config = tool_loop::ToolLoopConfig {
@@ -505,6 +505,7 @@ impl AgentEngine {
             workspace: Some(self.workspace.clone()),
             retriever: build_retriever_callback(&self.workspace, &self.cfg),
             privacy_router: build_privacy_router(&self.cfg),
+            images: options.images.clone(),
         };
 
         let mut loop_ = tool_loop::ToolUseLoop::new(

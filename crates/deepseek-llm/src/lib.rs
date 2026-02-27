@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    CacheStrategy, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
+    ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
     StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
@@ -70,8 +70,7 @@ impl DeepSeekClient {
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: &str) -> Result<LlmResponse> {
-        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
-        let mut payload = self.build_payload(req);
+        let payload = self.build_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -95,15 +94,6 @@ impl DeepSeekClient {
                             parse_non_streaming_payload(&body)?
                         };
                         return Ok(parsed);
-                    }
-
-                    if status == StatusCode::BAD_REQUEST
-                        && server_cache_enabled
-                        && payload_rejects_cache_control(&body)
-                    {
-                        server_cache_enabled = false;
-                        payload = self.build_payload_with_server_cache(req, server_cache_enabled);
-                        continue;
                     }
 
                     last_err = Some(format_api_error(
@@ -135,16 +125,8 @@ impl DeepSeekClient {
     }
 
     fn build_payload(&self, req: &LlmRequest) -> Value {
-        self.build_payload_with_server_cache(req, self.cfg.prompt_cache_enabled)
-    }
-
-    fn build_payload_with_server_cache(
-        &self,
-        req: &LlmRequest,
-        enable_server_cache: bool,
-    ) -> Value {
         let fast_mode = self.cfg.fast_mode;
-        let max_cap = model_max_output_tokens(&req.model);
+        let max_cap = model_max_output_tokens(&req.model, false);
         if req.max_tokens > max_cap {
             eprintln!(
                 "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
@@ -183,12 +165,7 @@ impl DeepSeekClient {
             }
             messages.push(json!({"role": "user", "content": parts}));
         }
-        if enable_server_cache {
-            let strategy = &self.cfg.cache_strategy;
-            if *strategy != CacheStrategy::Off {
-                apply_cache_annotations(&mut messages, strategy);
-            }
-        }
+        // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
         let model = normalize_deepseek_model(&req.model).unwrap_or(req.model.as_str());
 
@@ -227,10 +204,6 @@ impl DeepSeekClient {
     }
 
     fn build_chat_payload(&self, req: &ChatRequest) -> Value {
-        self.build_chat_payload_with_cache(req, self.cfg.prompt_cache_enabled)
-    }
-
-    fn build_chat_payload_with_cache(&self, req: &ChatRequest, enable_cache: bool) -> Value {
         let thinking_enabled = req
             .thinking
             .as_ref()
@@ -294,14 +267,9 @@ impl DeepSeekClient {
             }
         }
 
-        if enable_cache {
-            let strategy = &self.cfg.cache_strategy;
-            if *strategy != CacheStrategy::Off {
-                apply_cache_annotations(&mut messages, strategy);
-            }
-        }
+        // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
-        let max_cap = model_max_output_tokens(&req.model);
+        let max_cap = model_max_output_tokens(&req.model, thinking_enabled);
         let mut payload = json!({
             "model": normalize_deepseek_model(&req.model).unwrap_or(&req.model),
             "messages": messages,
@@ -357,8 +325,7 @@ impl DeepSeekClient {
     }
 
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: &str) -> Result<LlmResponse> {
-        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
-        let mut payload = self.build_chat_payload(req);
+        let payload = self.build_chat_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -377,15 +344,6 @@ impl DeepSeekClient {
                     let body = resp.text()?;
                     if status.is_success() {
                         return parse_non_streaming_payload(&body);
-                    }
-                    // Cache control rejection fallback
-                    if status == StatusCode::BAD_REQUEST
-                        && server_cache_enabled
-                        && payload_rejects_cache_control(&body)
-                    {
-                        server_cache_enabled = false;
-                        payload = self.build_chat_payload_with_cache(req, false);
-                        continue;
                     }
                     last_err = Some(format_api_error(
                         status,
@@ -568,7 +526,6 @@ impl DeepSeekClient {
         api_key: &str,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_chat_payload(req);
         payload["stream"] = json!(true);
         payload["stream_options"] = json!({"include_usage": true});
@@ -711,16 +668,6 @@ impl DeepSeekClient {
                     }
 
                     let body = resp.text().unwrap_or_default();
-                    // Cache control rejection fallback
-                    if status == StatusCode::BAD_REQUEST
-                        && server_cache_enabled
-                        && payload_rejects_cache_control(&body)
-                    {
-                        server_cache_enabled = false;
-                        payload = self.build_chat_payload_with_cache(req, false);
-                        payload["stream"] = json!(true);
-                        continue;
-                    }
                     last_err = Some(format_api_error(
                         status,
                         &body,
@@ -805,7 +752,6 @@ impl DeepSeekClient {
         api_key: &str,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut server_cache_enabled = self.cfg.prompt_cache_enabled;
         let mut payload = self.build_payload(req);
         // Force streaming on for the HTTP request
         payload["stream"] = json!(true);
@@ -950,15 +896,6 @@ impl DeepSeekClient {
                     }
 
                     let body = resp.text().unwrap_or_default();
-                    if status == StatusCode::BAD_REQUEST
-                        && server_cache_enabled
-                        && payload_rejects_cache_control(&body)
-                    {
-                        server_cache_enabled = false;
-                        payload = self.build_payload_with_server_cache(req, server_cache_enabled);
-                        payload["stream"] = json!(true);
-                        continue;
-                    }
                     last_err = Some(format_api_error(
                         status,
                         &body,
@@ -989,56 +926,23 @@ impl DeepSeekClient {
     }
 }
 
-fn annotate_cache_control(message: &mut Value) {
-    if let Some(obj) = message.as_object_mut() {
-        obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-    }
-}
+// DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
+// annotate_cache_control / apply_cache_annotations / payload_rejects_cache_control removed in P9.
 
 /// Returns the maximum output token limit for the given model.
-fn model_max_output_tokens(model: &str) -> u32 {
+///
+/// Thinking-aware: `deepseek-chat` with thinking enabled can output up to 32K tokens,
+/// compared to 8K without thinking. `deepseek-reasoner` always outputs up to 64K.
+fn model_max_output_tokens(model: &str, thinking_enabled: bool) -> u32 {
     if model.to_ascii_lowercase().contains("reasoner") {
-        deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS
+        deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS // 65536
+    } else if thinking_enabled {
+        deepseek_core::DEEPSEEK_CHAT_THINKING_MAX_OUTPUT_TOKENS // 32768
     } else {
-        deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS
+        deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS // 8192
     }
 }
 
-/// Apply cache annotations to a messages array based on the cache strategy.
-/// Annotates the stable prefix (system prompt + early messages) for cache hits.
-fn apply_cache_annotations(messages: &mut [Value], strategy: &CacheStrategy) {
-    match strategy {
-        CacheStrategy::Off => {}
-        CacheStrategy::Auto => {
-            // Annotate system prompt (index 0) + first user message (index 1)
-            if let Some(msg) = messages.first_mut() {
-                annotate_cache_control(msg);
-            }
-            if messages.len() > 1 {
-                annotate_cache_control(&mut messages[1]);
-            }
-        }
-        CacheStrategy::Aggressive => {
-            // Annotate the first 3 messages (system + early conversation prefix)
-            let count = messages.len().min(3);
-            for msg in messages[..count].iter_mut() {
-                annotate_cache_control(msg);
-            }
-        }
-    }
-}
-
-fn payload_rejects_cache_control(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("cache_control")
-        || (lower.contains("unknown")
-            && (lower.contains("field") || lower.contains("property"))
-            && lower.contains("cache"))
-        || (lower.contains("extra")
-            && lower.contains("field")
-            && lower.contains("cache")
-            && lower.contains("permitted"))
-}
 
 impl LlmClient for DeepSeekClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
@@ -1251,6 +1155,7 @@ fn should_retry_status(status: StatusCode) -> bool {
         status,
         StatusCode::TOO_MANY_REQUESTS
             | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
     )
 }
@@ -1968,82 +1873,14 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Respond in es")
         );
-        assert!(messages[0].get("cache_control").is_some());
+        // P9: no cache_control annotations — DeepSeek uses server-side prefix caching
+        assert!(messages[0].get("cache_control").is_none());
     }
 
     #[test]
-    fn prompt_cache_annotations_can_be_disabled_for_server_payload() {
-        let cfg = LlmConfig {
-            prompt_cache_enabled: false,
-            ..LlmConfig::default()
-        };
-        let client = DeepSeekClient::new(cfg).expect("client");
-        let payload = client.build_payload(&LlmRequest {
-            unit: deepseek_core::LlmUnit::Planner,
-            prompt: "hello".to_string(),
-            model: "deepseek-chat".to_string(),
-            max_tokens: 128,
-            non_urgent: false,
-            images: vec![],
-        });
-        let messages = payload["messages"].as_array().expect("messages");
-        assert!(
-            messages
-                .iter()
-                .all(|msg| msg.get("cache_control").is_none())
-        );
-    }
-
-    #[test]
-    fn bad_request_cache_control_fallback_disables_server_cache_annotations() {
-        let server = start_mock_retry_server(vec![
-            MockHttpResponse {
-                status: 400,
-                body: r#"{"error":"unknown field cache_control"}"#.to_string(),
-                retry_after: None,
-            },
-            MockHttpResponse {
-                status: 200,
-                body: r#"{"choices":[{"message":{"content":"ok-after-cache-fallback"}}]}"#
-                    .to_string(),
-                retry_after: None,
-            },
-        ]);
-
-        let cfg = LlmConfig {
-            endpoint: server.endpoint.clone(),
-            stream: false,
-            api_key_env: "DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST".to_string(),
-            max_retries: 0,
-            ..LlmConfig::default()
-        };
-        let client = DeepSeekClient::new(cfg).expect("client");
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST", "test-key");
-        }
-
-        let out = client
-            .complete(&LlmRequest {
-                unit: deepseek_core::LlmUnit::Planner,
-                prompt: "fallback".to_string(),
-                model: "deepseek-chat".to_string(),
-                max_tokens: 64,
-                non_urgent: false,
-                images: vec![],
-            })
-            .expect("response should succeed after fallback");
-        assert_eq!(out.text, "ok-after-cache-fallback");
-        assert_eq!(server.request_count(), 2);
-
-        // SAFETY: test-only process-level env mutation.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_API_KEY_CACHE_FALLBACK_TEST");
-        }
-    }
-
-    #[test]
-    fn chat_payload_includes_cache_annotations_by_default() {
+    fn chat_payload_has_no_cache_annotations() {
+        // P9: DeepSeek uses automatic server-side prefix caching.
+        // No client-side cache_control annotations should be sent.
         let cfg = LlmConfig::default();
         let client = DeepSeekClient::new(cfg).expect("client");
         let req = ChatRequest {
@@ -2072,92 +1909,7 @@ mod tests {
         let payload = client.build_chat_payload(&req);
         let messages = payload["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 2);
-        // Auto strategy: system prompt + first user message annotated
-        assert!(messages[0].get("cache_control").is_some());
-        assert!(messages[1].get("cache_control").is_some());
-    }
-
-    #[test]
-    fn chat_payload_off_strategy_has_no_cache_annotations() {
-        let cfg = LlmConfig {
-            cache_strategy: CacheStrategy::Off,
-            ..LlmConfig::default()
-        };
-        let client = DeepSeekClient::new(cfg).expect("client");
-        let req = ChatRequest {
-            model: "deepseek-chat".to_string(),
-            messages: vec![
-                ChatMessage::System {
-                    content: "system prompt".to_string(),
-                },
-                ChatMessage::User {
-                    content: "hello".to_string(),
-                },
-            ],
-            tools: vec![],
-            tool_choice: deepseek_core::ToolChoice::none(),
-            max_tokens: 64,
-            temperature: Some(0.2),
-            top_p: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logprobs: None,
-            top_logprobs: None,
-            thinking: None,
-            images: vec![],
-            response_format: None,
-        };
-        let payload = client.build_chat_payload(&req);
-        let messages = payload["messages"].as_array().expect("messages");
         assert!(messages.iter().all(|m| m.get("cache_control").is_none()));
-    }
-
-    #[test]
-    fn chat_payload_aggressive_strategy_annotates_first_three() {
-        let cfg = LlmConfig {
-            cache_strategy: CacheStrategy::Aggressive,
-            ..LlmConfig::default()
-        };
-        let client = DeepSeekClient::new(cfg).expect("client");
-        let req = ChatRequest {
-            model: "deepseek-chat".to_string(),
-            messages: vec![
-                ChatMessage::System {
-                    content: "system prompt".to_string(),
-                },
-                ChatMessage::User {
-                    content: "hello".to_string(),
-                },
-                ChatMessage::Assistant {
-                    content: Some("hi there".to_string()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                },
-                ChatMessage::User {
-                    content: "follow up".to_string(),
-                },
-            ],
-            tools: vec![],
-            tool_choice: deepseek_core::ToolChoice::none(),
-            max_tokens: 64,
-            temperature: Some(0.2),
-            top_p: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logprobs: None,
-            top_logprobs: None,
-            thinking: None,
-            images: vec![],
-            response_format: None,
-        };
-        let payload = client.build_chat_payload(&req);
-        let messages = payload["messages"].as_array().expect("messages");
-        assert_eq!(messages.len(), 4);
-        // Aggressive: first 3 messages annotated, 4th is not
-        assert!(messages[0].get("cache_control").is_some());
-        assert!(messages[1].get("cache_control").is_some());
-        assert!(messages[2].get("cache_control").is_some());
-        assert!(messages[3].get("cache_control").is_none());
     }
 
     #[test]
@@ -2180,6 +1932,7 @@ mod tests {
     fn retry_status_classification_matches_deepseek_guidance() {
         assert!(should_retry_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(should_retry_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(should_retry_status(StatusCode::BAD_GATEWAY));
         assert!(should_retry_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(!should_retry_status(StatusCode::UNAUTHORIZED));
         assert!(!should_retry_status(StatusCode::BAD_REQUEST));
@@ -2720,21 +2473,44 @@ mod tests {
     }
 
     #[test]
+    fn retry_includes_502_bad_gateway() {
+        assert!(should_retry_status(StatusCode::BAD_GATEWAY));
+    }
+
+    #[test]
     fn model_max_output_tokens_reasoner() {
         assert_eq!(
-            model_max_output_tokens("deepseek-reasoner"),
+            model_max_output_tokens("deepseek-reasoner", false),
             deepseek_core::DEEPSEEK_REASONER_MAX_OUTPUT_TOKENS
         );
-        assert_eq!(model_max_output_tokens("deepseek-reasoner"), 65536);
+        assert_eq!(model_max_output_tokens("deepseek-reasoner", false), 65536);
+        // Reasoner always returns 64K regardless of thinking flag
+        assert_eq!(model_max_output_tokens("deepseek-reasoner", true), 65536);
     }
 
     #[test]
     fn model_max_output_tokens_chat() {
         assert_eq!(
-            model_max_output_tokens("deepseek-chat"),
+            model_max_output_tokens("deepseek-chat", false),
             deepseek_core::DEEPSEEK_CHAT_MAX_OUTPUT_TOKENS
         );
-        assert_eq!(model_max_output_tokens("deepseek-chat"), 8192);
+        assert_eq!(model_max_output_tokens("deepseek-chat", false), 8192);
+    }
+
+    #[test]
+    fn max_output_tokens_thinking_chat_32k() {
+        assert_eq!(
+            model_max_output_tokens("deepseek-chat", true),
+            deepseek_core::DEEPSEEK_CHAT_THINKING_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(model_max_output_tokens("deepseek-chat", true), 32768);
+    }
+
+    #[test]
+    fn max_output_tokens_reasoner_64k() {
+        // Reasoner is always 64K regardless of thinking param
+        assert_eq!(model_max_output_tokens("deepseek-reasoner", false), 65536);
+        assert_eq!(model_max_output_tokens("deepseek-reasoner", true), 65536);
     }
 
     #[test]
