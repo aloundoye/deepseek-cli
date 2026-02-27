@@ -107,14 +107,15 @@ pub fn build_tool_use_system_prompt(
 /// Build system prompt with complexity-based additions.
 ///
 /// The base prompt always includes the working protocol. For Complex tasks,
-/// we add an explicit "PLAN FIRST" reminder. For Simple, nothing extra.
-/// This is a lightweight nudge, not a different prompt.
+/// we add a full planning protocol. For Medium, lightweight guidance.
+/// For Simple, no extra injection.
 pub fn build_tool_use_system_prompt_with_complexity(
     project_memory: Option<&str>,
     system_prompt_override: Option<&str>,
     system_prompt_append: Option<&str>,
     workspace_context: Option<&WorkspaceContext>,
     complexity: PromptComplexity,
+    repo_map_summary: Option<&str>,
 ) -> String {
     let base = build_tool_use_system_prompt(
         project_memory,
@@ -129,17 +130,52 @@ pub fn build_tool_use_system_prompt_with_complexity(
     }
 
     match complexity {
-        PromptComplexity::Complex => format!("{base}{COMPLEX_REMINDER}"),
-        _ => base,
+        PromptComplexity::Complex => {
+            let mut prompt = format!("{base}{COMPLEX_REMINDER}");
+            if let Some(repo_map) = repo_map_summary {
+                if !repo_map.is_empty() {
+                    prompt.push_str(&format!("\n## Project Files\n{repo_map}\n"));
+                }
+            }
+            prompt
+        }
+        PromptComplexity::Medium => format!("{base}{MEDIUM_GUIDANCE}"),
+        PromptComplexity::Simple => base,
     }
 }
 
-/// Brief reminder for complex tasks. The full protocol is already in the base
-/// prompt — this just reinforces it for tasks where skipping planning is risky.
+/// Full planning protocol for Complex tasks. Provides step-by-step methodology
+/// with explore→plan→execute phases and explicit anti-patterns.
 const COMPLEX_REMINDER: &str = "\n\n\
-## IMPORTANT: This looks like a complex task.\n\
-Follow the WORKING PROTOCOL above strictly. State your plan before making changes.\n\
-Modify files in dependency order and verify after each change.\n";
+## COMPLEX TASK — Mandatory Planning Protocol\n\n\
+This task requires architectural thinking. Before making ANY changes:\n\n\
+### Step 1: Explore\n\
+- Read ALL files you plan to modify\n\
+- `fs_grep` for every type, function, or interface you'll change to find ALL call sites\n\
+- Identify the dependency order: which files depend on which\n\n\
+### Step 2: Plan (state this explicitly)\n\
+- List the files to modify in dependency order (change dependencies BEFORE dependents)\n\
+- For each file: what changes, what could break, what to verify\n\
+- Identify risks: shared state, concurrent access, type mismatches, missing imports\n\n\
+### Step 3: Execute Incrementally\n\
+- Modify ONE file at a time\n\
+- After each file: run `bash_run` with the build/test command to verify\n\
+- If a test fails: fix it BEFORE moving to the next file\n\
+- If your plan was wrong: stop, re-read affected files, adjust plan\n\n\
+### Anti-Patterns (NEVER do these)\n\
+- Editing a file you haven't read in THIS session\n\
+- Changing a function signature without grepping for all callers\n\
+- Making all changes then testing at the end (test after EACH change)\n\
+- Continuing after a test failure without fixing it first\n";
+
+/// Lightweight guidance for Medium-complexity tasks. Not the full protocol,
+/// but reminds the model to read-before-write and verify after changes.
+const MEDIUM_GUIDANCE: &str = "\n\n\
+## Task Guidance\n\
+This is a multi-step task. Before making changes:\n\
+1. Read the files you plan to modify.\n\
+2. If changing an interface (function signature, type, struct field), grep for all usages first.\n\
+3. After changes, run tests to verify.\n";
 
 /// Format the environment section for the system prompt.
 fn format_environment_section(ctx: &WorkspaceContext) -> String {
@@ -254,34 +290,56 @@ mod tests {
     // ── Complexity injection ──
 
     #[test]
-    fn complex_task_injects_reminder() {
+    fn complex_gets_full_planning_protocol() {
         let prompt = build_tool_use_system_prompt_with_complexity(
             None, None, None, None,
             PromptComplexity::Complex,
+            None,
         );
-        assert!(prompt.contains("IMPORTANT"), "complex should get reminder");
+        assert!(prompt.contains("COMPLEX TASK"), "complex should get planning protocol");
+        assert!(prompt.contains("Step 1: Explore"), "should include explore step");
+        assert!(prompt.contains("Step 2: Plan"), "should include plan step");
+        assert!(prompt.contains("Step 3: Execute"), "should include execute step");
+        assert!(prompt.contains("Anti-Patterns"), "should include anti-patterns");
         assert!(prompt.contains("WORKING PROTOCOL"), "should have protocol in base");
-        assert!(prompt.contains("ANTI-PATTERNS"), "should have anti-patterns in base");
     }
 
     #[test]
-    fn medium_task_uses_base_prompt_only() {
+    fn medium_gets_lightweight_guidance() {
         let prompt = build_tool_use_system_prompt_with_complexity(
             None, None, None, None,
             PromptComplexity::Medium,
+            None,
         );
-        assert!(prompt.contains("WORKING PROTOCOL"), "medium gets base protocol");
-        assert!(!prompt.contains("IMPORTANT: This looks like"), "medium should NOT get reminder");
+        assert!(prompt.contains("Task Guidance"), "medium should get guidance");
+        assert!(prompt.contains("Read the files"), "should include read-before-write");
+        assert!(prompt.contains("grep for all usages"), "should include impact tracing");
+        assert!(!prompt.contains("COMPLEX TASK"), "medium should NOT get full protocol");
     }
 
     #[test]
-    fn simple_task_uses_base_prompt_only() {
+    fn simple_gets_no_injection() {
         let prompt = build_tool_use_system_prompt_with_complexity(
             None, None, None, None,
             PromptComplexity::Simple,
+            None,
         );
         assert!(prompt.contains("WORKING PROTOCOL"), "simple gets base protocol");
-        assert!(!prompt.contains("IMPORTANT: This looks like"), "simple should NOT get reminder");
+        assert!(!prompt.contains("COMPLEX TASK"), "simple should NOT get complex protocol");
+        assert!(!prompt.contains("Task Guidance"), "simple should NOT get medium guidance");
+    }
+
+    #[test]
+    fn complex_includes_repo_map() {
+        let repo_map = "- src/lib.rs (2048 bytes) score=100\n- src/main.rs (512 bytes) score=50";
+        let prompt = build_tool_use_system_prompt_with_complexity(
+            None, None, None, None,
+            PromptComplexity::Complex,
+            Some(repo_map),
+        );
+        assert!(prompt.contains("Project Files"), "complex should include project files");
+        assert!(prompt.contains("src/lib.rs"), "should include repo map entries");
+        assert!(prompt.contains("src/main.rs"), "should include all repo map entries");
     }
 
     #[test]
@@ -292,8 +350,10 @@ mod tests {
             None,
             None,
             PromptComplexity::Complex,
+            Some("repo map content"),
         );
-        assert!(!prompt.contains("IMPORTANT: This looks like"));
+        assert!(!prompt.contains("COMPLEX TASK"), "override should skip complexity");
+        assert!(!prompt.contains("Project Files"), "override should skip repo map");
     }
 
     #[test]

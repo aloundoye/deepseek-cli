@@ -291,8 +291,96 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a * norm_b)
 }
 
+/// HNSW-based vector index using the usearch library.
+///
+/// Provides O(log n) approximate nearest neighbor search, significantly faster
+/// than BruteForceBackend for large indices (10K+ chunks). Only available when
+/// compiled with the `local-ml` feature.
 #[cfg(feature = "local-ml")]
 pub struct UsearchBackend {
-    // Placeholder for usearch::Index wrapper
-    _dimension: usize,
+    index: usearch::Index,
+    dimension: usize,
+    /// Maps string chunk_id → numeric key for usearch (which uses u64 keys).
+    id_to_key: std::collections::HashMap<String, u64>,
+    /// Reverse map: numeric key → string chunk_id.
+    key_to_id: std::collections::HashMap<u64, String>,
+    /// Monotonically increasing key counter.
+    next_key: u64,
+}
+
+#[cfg(feature = "local-ml")]
+impl UsearchBackend {
+    pub fn new(dimension: usize) -> Result<Self> {
+        let options = usearch::IndexOptions {
+            dimensions: dimension,
+            metric: usearch::MetricKind::Cos,
+            quantization: usearch::ScalarKind::F32,
+            ..Default::default()
+        };
+        let index = usearch::Index::new(&options)
+            .map_err(|e| anyhow::anyhow!("usearch index creation failed: {e}"))?;
+        // Reserve initial capacity
+        index
+            .reserve(1024)
+            .map_err(|e| anyhow::anyhow!("usearch reserve failed: {e}"))?;
+        Ok(Self {
+            index,
+            dimension,
+            id_to_key: std::collections::HashMap::new(),
+            key_to_id: std::collections::HashMap::new(),
+            next_key: 0,
+        })
+    }
+}
+
+#[cfg(feature = "local-ml")]
+impl VectorIndexBackend for UsearchBackend {
+    fn insert(&mut self, chunk_id: &str, vector: &[f32]) -> Result<()> {
+        // Remove existing entry if re-indexing
+        if self.id_to_key.contains_key(chunk_id) {
+            self.remove(chunk_id)?;
+        }
+        let key = self.next_key;
+        self.next_key += 1;
+        self.index
+            .add(key, vector)
+            .map_err(|e| anyhow::anyhow!("usearch add failed: {e}"))?;
+        self.id_to_key.insert(chunk_id.to_string(), key);
+        self.key_to_id.insert(key, chunk_id.to_string());
+        Ok(())
+    }
+
+    fn remove(&mut self, chunk_id: &str) -> Result<()> {
+        if let Some(key) = self.id_to_key.remove(chunk_id) {
+            let _ = self.index.remove(key);
+            self.key_to_id.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
+        let matches = self
+            .index
+            .search(query, k)
+            .map_err(|e| anyhow::anyhow!("usearch search failed: {e}"))?;
+
+        let mut results = Vec::with_capacity(k);
+        for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
+            if let Some(chunk_id) = self.key_to_id.get(key) {
+                // Convert cosine distance to similarity (usearch returns distance, not similarity)
+                let similarity = 1.0 - distance;
+                results.push((chunk_id.clone(), similarity));
+            }
+        }
+        Ok(results)
+    }
+
+    fn stats(&self) -> IndexStats {
+        IndexStats {
+            chunk_count: self.index.size(),
+            dimension: self.dimension,
+            file_count: 0, // Filled by VectorIndex
+            size_bytes: 0,
+        }
+    }
 }

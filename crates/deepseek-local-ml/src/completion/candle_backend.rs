@@ -90,15 +90,18 @@ impl CandleCompletion {
 
         let mut all_tokens = input_ids.clone();
         let mut generated = String::new();
+
+        // Process the full prompt and generate the first token
         let input_tensor = Tensor::new(&input_ids[..], &self.device)?.unsqueeze(0)?;
         let logits = self.model.forward(&input_tensor, 0)?;
         let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
         let seq_len = logits.dim(0)?;
         let last_logits = logits.narrow(0, seq_len - 1, 1)?.squeeze(0)?;
-        let next_token = logits_processor.sample(&last_logits)?;
-        all_tokens.push(next_token);
+        let mut current_token = logits_processor.sample(&last_logits)?;
+        all_tokens.push(current_token);
 
-        for i in 0..opts.max_tokens.saturating_sub(1) {
+        // Autoregressive generation loop
+        for i in 0..opts.max_tokens {
             if self.cancel_flag.load(Ordering::SeqCst) {
                 break;
             }
@@ -108,7 +111,7 @@ impl CandleCompletion {
 
             let token_text = self
                 .tokenizer
-                .decode(&[next_token], true)
+                .decode(&[current_token], true)
                 .map_err(|e| anyhow!("decode failed: {}", e))?;
 
             // Check stop tokens
@@ -121,18 +124,15 @@ impl CandleCompletion {
                 cb(&token_text);
             }
 
-            let input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
+            // Generate next token (autoregressive: feed current_token, advance position)
+            let input = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
             let logits = self
                 .model
-                .forward(&input, input_ids.len() + i as usize + 1)?;
+                .forward(&input, input_ids.len() + i as usize)?;
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
             let last_logits = logits.narrow(0, logits.dim(0)? - 1, 1)?.squeeze(0)?;
-            let next_token_new = logits_processor.sample(&last_logits)?;
-            all_tokens.push(next_token_new);
-            // Shadow for next iteration — can't reassign next_token since it was moved
-            // into the Tensor. We handle it via all_tokens.
-            let _ = next_token_new;
-            break; // TODO: fix loop to use all_tokens properly for multi-token gen
+            current_token = logits_processor.sample(&last_logits)?;
+            all_tokens.push(current_token);
         }
 
         Ok(generated)

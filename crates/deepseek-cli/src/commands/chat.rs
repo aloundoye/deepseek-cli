@@ -2412,6 +2412,26 @@ pub(crate) fn run_chat_tui(
     let read_only_for_closure = Arc::clone(&read_only_mode);
     let active_mode_for_closure = Arc::clone(&active_chat_mode);
     let watch_digest_for_closure = Arc::clone(&last_watch_digest);
+
+    // Build ML completion callback for ghost text (if local_ml + autocomplete enabled)
+    let ml_completion_cb: Option<deepseek_ui::MlCompletionCallback> =
+        if cfg.local_ml.enabled && cfg.local_ml.autocomplete.enabled {
+            let generator: Arc<dyn deepseek_local_ml::completion::LocalGenBackend> =
+                Arc::new(deepseek_local_ml::completion::MockGenerator::new(String::new()));
+            let max_tokens = cfg.local_ml.autocomplete.max_tokens;
+            let timeout_ms = cfg.local_ml.autocomplete.timeout_ms;
+            Some(Arc::new(move |input: &str| -> Option<String> {
+                let opts = deepseek_local_ml::completion::GenOpts {
+                    max_tokens,
+                    timeout_ms,
+                    ..Default::default()
+                };
+                generator.generate(input, &opts).ok().filter(|s| !s.is_empty())
+            }))
+        } else {
+            None
+        };
+
     run_tui_shell_with_bindings(
         status,
         bindings,
@@ -3159,7 +3179,7 @@ pub(crate) fn run_chat_tui(
             });
         },
         move || current_ui_status(cwd, cfg, fmt_refresh.load(Ordering::Relaxed)).ok(),
-        None,
+        ml_completion_cb,
     )
 }
 

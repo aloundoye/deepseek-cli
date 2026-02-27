@@ -1,6 +1,6 @@
 # SPEC_DRIFT_REPORT.md — DeepSeek CLI
 
-**Date:** 2026-02-19
+**Date:** 2026-02-27
 **Audit Result:** PASS — No remaining spec drift.
 
 ---

@@ -10,7 +10,7 @@ This document records the release checklist and verification results for DeepSee
 |-------|---------|--------|
 | Format | `cargo fmt --all -- --check` | PASS (no output, exit 0) |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` | PASS (Finished dev profile, 0 warnings) |
-| Tests | `cargo test --workspace --all-targets` | PASS (165 tests, 0 failures across 18 crates) |
+| Tests | `cargo test --workspace --all-targets` | PASS (870 tests, 0 failures across 25 crates) |
 
 ---
 
@@ -18,25 +18,30 @@ This document records the release checklist and verification results for DeepSee
 
 | Crate | Passed | Notes |
 |-------|--------|-------|
-| deepseek-cli | 39 | Integration tests: cli_json 35 passed |
-| deepseek-core | 5 | Includes proptest property-based tests, `new_event_types_round_trip_via_serde` |
-| deepseek-agent | 3 | |
-| deepseek-llm | 20 | |
-| deepseek-diff | 4 | |
-| deepseek-index | 2 | |
-| deepseek-hooks | 2 | |
-| deepseek-mcp | 2 | |
-| deepseek-memory | 1 | |
-| deepseek-observe | 1 | |
-| deepseek-policy | 19 | Includes `team_policy_locks_permission_mode`, `team_policy_permission_mode_locked_flag` |
-| deepseek-router | removed | Legacy router crate removed from runtime/workspace |
-| deepseek-skills | 1 | |
-| deepseek-store | 2 | |
-| deepseek-subagent | 4 | |
-| deepseek-testkit | 1 | |
-| deepseek-tools | 15 | |
-| deepseek-ui | 11 | Includes `default_keybindings_include_cycle_permission_mode` |
-| **Total** | **165** | **0 failures** |
+| deepseek-cli | 174 | Integration tests: cli_json, subcommand handlers |
+| deepseek-core | 60 | Includes proptest, event round-trip, config defaults |
+| deepseek-agent | 56 | Tool-use loop, complexity, prompts, bootstrap, error recovery |
+| deepseek-agent (integration) | 37 | tool_use_default, retrieval_wiring, runtime_conformance |
+| deepseek-llm | 20 | LLM client, streaming, request building |
+| deepseek-diff | 4 | Diff parsing, patch staging |
+| deepseek-index | 2 | Tantivy index operations |
+| deepseek-hooks | 14 | Lifecycle events, hook runtime |
+| deepseek-mcp | 9 | MCP server management |
+| deepseek-memory | 6 | Long-term memory, checkpoints |
+| deepseek-observe | 1 | Structured logging |
+| deepseek-policy | 21 | Permissions, team policy, managed settings |
+| deepseek-skills | 8 | Skill discovery, forked execution |
+| deepseek-store | 4 | Session persistence, event log |
+| deepseek-subagent | 13 | Background tasks, worktree isolation |
+| deepseek-testkit | 1 | Test utilities |
+| deepseek-tools | 55 | Tool definitions, enriched descriptions |
+| deepseek-ui | 29 | TUI rendering, keybindings, ghost text |
+| deepseek-context | 41 | Dependency analysis, file suggestions |
+| deepseek-local-ml | 60 | Chunker, retrieval, vector index, privacy, embeddings |
+| deepseek-jsonrpc | 16 | JSON-RPC server |
+| deepseek-chrome | 20 | Chrome native host bridge |
+| deepseek-errors | 2 | Error types |
+| **Total** | **870** | **0 failures across 25 crates** |
 
 ---
 
