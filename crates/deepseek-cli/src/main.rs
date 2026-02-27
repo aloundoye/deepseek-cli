@@ -48,6 +48,8 @@ use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
 use commands::teleport::run_teleport;
 use commands::update::run_update;
+use commands::autocomplete_cmd::run_autocomplete;
+use commands::privacy::run_privacy;
 use commands::visual::run_visual;
 use context::{apply_cli_flags, chat_options_from_cli, ensure_llm_ready, wire_subagent_worker};
 use output::print_json;
@@ -438,6 +440,16 @@ enum Commands {
     Serve(ServeArgs),
     /// Start Chrome native messaging host bridge.
     NativeHost(NativeHostArgs),
+    /// Privacy scanning and policy management.
+    Privacy {
+        #[command(subcommand)]
+        command: commands::privacy::PrivacyCmd,
+    },
+    /// Local ML autocomplete management.
+    Autocomplete {
+        #[command(subcommand)]
+        command: commands::autocomplete_cmd::AutocompleteCmd,
+    },
 }
 
 #[derive(Args)]
@@ -1265,7 +1277,11 @@ struct RemoteEnvLogsArgs {
 
 #[derive(Subcommand)]
 enum IndexCmd {
-    Build,
+    Build {
+        /// Build a hybrid (vector + BM25) index.
+        #[arg(long)]
+        hybrid: bool,
+    },
     Update,
     Status,
     Watch {
@@ -1279,6 +1295,10 @@ enum IndexCmd {
         #[arg(long, default_value_t = 10)]
         top_k: usize,
     },
+    /// Run index health diagnostics.
+    Doctor,
+    /// Remove index data and rebuild from scratch.
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -1717,6 +1737,8 @@ fn run() -> Result<()> {
         Commands::Completions(args) => run_completions(args),
         Commands::Serve(args) => run_serve(args, cli.json),
         Commands::NativeHost(args) => run_native_host(&cwd, args),
+        Commands::Privacy { command } => run_privacy(&cwd, command, cli.json),
+        Commands::Autocomplete { command } => run_autocomplete(&cwd, command, cli.json),
     }
 }
 

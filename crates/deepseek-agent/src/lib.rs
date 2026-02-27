@@ -503,6 +503,8 @@ impl AgentEngine {
             subagent_worker: self.build_subagent_worker(),
             skill_runner: self.build_skill_runner(),
             workspace: Some(self.workspace.clone()),
+            retriever: build_retriever_callback(&self.workspace, &self.cfg),
+            privacy_router: build_privacy_router(&self.cfg),
         };
 
         let mut loop_ = tool_loop::ToolUseLoop::new(
@@ -680,6 +682,42 @@ impl AgentEngine {
             projection.step_status.len()
         ))
     }
+}
+
+/// Build a retriever callback from config. Returns None if local_ml is disabled.
+fn build_retriever_callback(
+    _workspace: &std::path::Path,
+    cfg: &deepseek_core::AppConfig,
+) -> Option<std::sync::Arc<dyn Fn(&str, usize) -> anyhow::Result<Vec<tool_loop::RetrievalContext>> + Send + Sync>> {
+    if !cfg.local_ml.enabled {
+        return None;
+    }
+    // Retriever will be wired to HybridRetriever when local-ml feature is active.
+    // For now, return None as the actual ML backend requires feature-gated initialization.
+    None
+}
+
+/// Build a privacy router from config. Returns None if privacy is disabled.
+fn build_privacy_router(
+    cfg: &deepseek_core::AppConfig,
+) -> Option<std::sync::Arc<deepseek_local_ml::PrivacyRouter>> {
+    if !cfg.local_ml.enabled || !cfg.local_ml.privacy.enabled {
+        return None;
+    }
+    let privacy_config = deepseek_local_ml::PrivacyConfig {
+        enabled: true,
+        sensitive_globs: cfg.local_ml.privacy.sensitive_globs.clone(),
+        sensitive_regex: cfg.local_ml.privacy.sensitive_regex.clone(),
+        policy: match cfg.local_ml.privacy.policy.as_str() {
+            "block_cloud" => deepseek_local_ml::PrivacyPolicy::BlockCloud,
+            "local_only_summary" => deepseek_local_ml::PrivacyPolicy::LocalOnlySummary,
+            _ => deepseek_local_ml::PrivacyPolicy::Redact,
+        },
+        store_raw_in_logs: cfg.local_ml.privacy.store_raw_in_logs,
+    };
+    deepseek_local_ml::PrivacyRouter::new(privacy_config)
+        .ok()
+        .map(std::sync::Arc::new)
 }
 
 fn should_run_team_orchestration(
