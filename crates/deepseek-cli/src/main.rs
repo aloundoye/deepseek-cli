@@ -21,6 +21,8 @@ mod output;
 mod util;
 
 use commands::admin::{run_clean, run_config, run_doctor, run_index, run_permissions, run_plugins};
+use commands::agents::run_agents;
+use commands::autocomplete_cmd::run_autocomplete;
 use commands::autopilot::run_autopilot_cmd;
 use commands::background::run_background;
 use commands::chat::{
@@ -31,26 +33,19 @@ use commands::diff::{run_apply, run_diff};
 use commands::exec::run_exec;
 use commands::fork::run_fork;
 use commands::git::run_git;
-use commands::leadership::run_leadership;
 use commands::mcp::run_mcp;
 use commands::memory::{run_export, run_memory};
-use commands::profile::{run_benchmark, run_profile};
-use commands::remote_env::run_remote_env;
+use commands::privacy::run_privacy;
 use commands::replay::run_replay;
 use commands::revert::run_revert;
 use commands::review::run_review;
 use commands::search::run_search;
 use commands::serve::{run_completions, run_native_host, run_serve};
-use commands::session::{run_session_cmd, SessionCmd};
-use commands::agents::run_agents;
+use commands::session::{SessionCmd, run_session_cmd};
 use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
-use commands::teleport::run_teleport;
 use commands::update::run_update;
-use commands::autocomplete_cmd::run_autocomplete;
-use commands::privacy::run_privacy;
-use commands::visual::run_visual;
 use context::{apply_cli_flags, chat_options_from_cli, ensure_llm_ready, wire_subagent_worker};
 use output::print_json;
 
@@ -216,10 +211,6 @@ struct Cli {
     #[arg(long = "auto-lint", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
     auto_lint: bool,
 
-    /// Flag form for teleport handoff.
-    #[arg(long = "teleport", global = true, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    teleport_flag: bool,
-
     /// Enable Chrome browser integration.
     #[arg(long = "chrome")]
     chrome: bool,
@@ -320,8 +311,6 @@ enum Commands {
     Diff,
     /// Apply a staged patch.
     Apply(ApplyArgs),
-    /// Inspect and benchmark model profiles.
-    Profile(ProfileArgs),
     /// Rewind to a previous checkpoint.
     Rewind(RewindArgs),
     /// Revert the last N conversation turns.
@@ -363,18 +352,6 @@ enum Commands {
         #[command(subcommand)]
         command: BackgroundCmd,
     },
-    /// Visual artifact workflows.
-    Visual {
-        #[command(subcommand)]
-        command: VisualCmd,
-    },
-    /// Cross-environment handoff.
-    Teleport(TeleportArgs),
-    /// Remote SSH environment profiles.
-    RemoteEnv {
-        #[command(subcommand)]
-        command: RemoteEnvCmd,
-    },
     /// Session management (list, show, resume).
     Session {
         #[command(subcommand)]
@@ -388,8 +365,6 @@ enum Commands {
     Compact(CompactArgs),
     /// Diagnose runtime, test, and performance issues.
     Doctor(DoctorArgs),
-    /// Enterprise leadership readiness report.
-    Leadership(LeadershipArgs),
     /// Check for and apply CLI updates.
     Update(UpdateArgs),
     /// Manage the local code index.
@@ -401,11 +376,6 @@ enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCmd,
-    },
-    /// Run benchmark suites and matrices.
-    Benchmark {
-        #[command(subcommand)]
-        command: BenchmarkCmd,
     },
     /// Inspect and configure safety permissions.
     Permissions {
@@ -562,38 +532,6 @@ struct RunArgs {
     session_id: Option<String>,
 }
 
-#[derive(Args, Default)]
-struct ProfileArgs {
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    benchmark: bool,
-    #[arg(long, default_value_t = 5)]
-    benchmark_cases: usize,
-    #[arg(long)]
-    benchmark_seed: Option<u64>,
-    #[arg(long)]
-    benchmark_suite: Option<String>,
-    #[arg(long)]
-    benchmark_pack: Option<String>,
-    #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
-    benchmark_signing_key_env: String,
-    #[arg(long)]
-    benchmark_min_success_rate: Option<f64>,
-    #[arg(long)]
-    benchmark_min_quality_rate: Option<f64>,
-    #[arg(long)]
-    benchmark_max_p95_ms: Option<u64>,
-    #[arg(long)]
-    benchmark_baseline: Option<String>,
-    #[arg(long)]
-    benchmark_max_regression_ms: Option<u64>,
-    #[arg(long = "benchmark-compare")]
-    benchmark_compare: Vec<String>,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    benchmark_compare_strict: bool,
-    #[arg(long)]
-    benchmark_output: Option<String>,
-}
-
 #[derive(Args)]
 struct ApplyArgs {
     #[arg(long)]
@@ -685,49 +623,8 @@ struct CompactArgs {
     focus: Option<String>,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum DoctorModeArg {
-    Auto,
-    Runtime,
-    Test,
-    Performance,
-}
-
-#[derive(Args, Clone)]
-struct DoctorArgs {
-    /// Analyze debug input from a file path.
-    #[arg(long)]
-    analyze_file: Option<String>,
-    /// Analyze debug input provided inline.
-    #[arg(long)]
-    analyze_text: Option<String>,
-    /// Debug analysis mode (auto infers from input content).
-    #[arg(long, value_enum, default_value_t = DoctorModeArg::Auto)]
-    mode: DoctorModeArg,
-}
-
-impl Default for DoctorArgs {
-    fn default() -> Self {
-        Self {
-            analyze_file: None,
-            analyze_text: None,
-            mode: DoctorModeArg::Auto,
-        }
-    }
-}
-
-#[derive(Args, Clone)]
-struct LeadershipArgs {
-    /// Audit lookback window (hours) for enterprise report metrics.
-    #[arg(long, default_value_t = 24)]
-    audit_window_hours: u64,
-    /// Optional file path to write report JSON (pretty-printed).
-    #[arg(long)]
-    export: Option<String>,
-    /// Exit with non-zero status when readiness checks fail.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    strict: bool,
-}
+#[derive(Args, Clone, Default)]
+struct DoctorArgs {}
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum UpdateChannelArg {
@@ -1054,13 +951,6 @@ enum BackgroundCmd {
     RunShell(BackgroundRunShellArgs),
 }
 
-#[derive(Subcommand)]
-enum VisualCmd {
-    List(VisualListArgs),
-    Analyze(VisualAnalyzeArgs),
-    Show(VisualShowArgs),
-}
-
 #[derive(Args, Clone)]
 struct BackgroundAttachArgs {
     job_id: String,
@@ -1085,194 +975,6 @@ struct BackgroundRunAgentArgs {
 struct BackgroundRunShellArgs {
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
-}
-
-#[derive(Args)]
-struct VisualListArgs {
-    #[arg(long, default_value_t = 25)]
-    limit: usize,
-}
-
-#[derive(Args)]
-struct VisualAnalyzeArgs {
-    #[arg(long, default_value_t = 25)]
-    limit: usize,
-    #[arg(long, default_value_t = 128)]
-    min_bytes: u64,
-    #[arg(long, default_value_t = 1)]
-    min_artifacts: usize,
-    #[arg(long, default_value_t = 1)]
-    min_image_artifacts: usize,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    strict: bool,
-    #[arg(long)]
-    baseline: Option<String>,
-    #[arg(long = "write-baseline")]
-    write_baseline: Option<String>,
-    #[arg(long, default_value_t = 0)]
-    max_new_artifacts: usize,
-    #[arg(long, default_value_t = 0)]
-    max_missing_artifacts: usize,
-    #[arg(long, default_value_t = 0)]
-    max_changed_artifacts: usize,
-    #[arg(long = "expect", alias = "expectations")]
-    expectations: Option<String>,
-}
-
-#[derive(Args)]
-struct VisualShowArgs {
-    /// Artifact ID from `visual list` or an absolute/relative file path.
-    target: String,
-    /// Disable opening external viewer even when fallback mode is `open`.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    no_open: bool,
-}
-
-#[derive(Args, Default)]
-struct TeleportArgs {
-    #[command(subcommand)]
-    command: Option<TeleportCmd>,
-    // Legacy export/import flags remain for backward compatibility.
-    #[arg(long)]
-    session_id: Option<String>,
-    #[arg(long)]
-    output: Option<String>,
-    #[arg(long)]
-    import: Option<String>,
-}
-
-#[derive(Subcommand)]
-enum TeleportCmd {
-    /// Export a session bundle (legacy mode).
-    Export(TeleportExportArgs),
-    /// Import a session bundle (legacy mode).
-    Import(TeleportImportArgs),
-    /// Create a secure one-time handoff link for desktop/web clients.
-    Link(TeleportLinkArgs),
-    /// Consume a secure handoff link token and import the bundle.
-    Consume(TeleportConsumeArgs),
-}
-
-#[derive(Args, Default)]
-struct TeleportExportArgs {
-    #[arg(long)]
-    session_id: Option<String>,
-    #[arg(long)]
-    output: Option<String>,
-}
-
-#[derive(Args, Default)]
-struct TeleportImportArgs {
-    input: String,
-}
-
-#[derive(Args, Default)]
-struct TeleportLinkArgs {
-    #[arg(long)]
-    session_id: Option<String>,
-    #[arg(long)]
-    base_url: Option<String>,
-    #[arg(long, default_value_t = 30)]
-    ttl_minutes: u64,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    open: bool,
-}
-
-#[derive(Args, Default)]
-struct TeleportConsumeArgs {
-    #[arg(long)]
-    handoff_id: String,
-    #[arg(long)]
-    token: String,
-}
-
-#[derive(Subcommand)]
-enum RemoteEnvCmd {
-    List,
-    Add(RemoteEnvAddArgs),
-    Remove(RemoteEnvRemoveArgs),
-    Check(RemoteEnvCheckArgs),
-    Exec(RemoteEnvExecArgs),
-    RunAgent(RemoteEnvRunAgentArgs),
-    Logs(RemoteEnvLogsArgs),
-}
-
-#[derive(Args)]
-struct RemoteEnvAddArgs {
-    name: String,
-    endpoint: String,
-    #[arg(long, default_value = "token")]
-    auth_mode: String,
-    /// Optional SSH username override.
-    #[arg(long)]
-    ssh_user: Option<String>,
-    /// Optional SSH port override.
-    #[arg(long)]
-    ssh_port: Option<u16>,
-    /// Optional SSH private key path.
-    #[arg(long)]
-    ssh_key_path: Option<String>,
-    /// Remote workspace root used by `remote-env run-agent`.
-    #[arg(long)]
-    workspace_root: Option<String>,
-    /// Additional environment key-value pairs (`KEY=VALUE`), repeatable.
-    #[arg(long = "env")]
-    env: Vec<String>,
-}
-
-#[derive(Args)]
-struct RemoteEnvRemoveArgs {
-    profile_id: String,
-}
-
-#[derive(Args)]
-struct RemoteEnvCheckArgs {
-    profile_id: String,
-}
-
-#[derive(Args)]
-struct RemoteEnvExecArgs {
-    profile_id: String,
-    #[arg(long = "cmd")]
-    cmd: String,
-    #[arg(long)]
-    timeout_seconds: Option<u64>,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    background: bool,
-}
-
-#[derive(Args)]
-struct RemoteEnvRunAgentArgs {
-    profile_id: String,
-    #[arg(long)]
-    prompt: String,
-    #[arg(
-        long,
-        default_value_t = true,
-        action = clap::ArgAction::Set,
-        num_args = 0..=1,
-        default_missing_value = "true"
-    )]
-    tools: bool,
-    #[arg(
-        long,
-        default_value_t = true,
-        action = clap::ArgAction::Set,
-        num_args = 0..=1,
-        default_missing_value = "true"
-    )]
-    max_think: bool,
-    #[arg(long)]
-    timeout_seconds: Option<u64>,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    background: bool,
-}
-
-#[derive(Args)]
-struct RemoteEnvLogsArgs {
-    job_id: String,
-    #[arg(long, default_value_t = 40)]
-    tail_lines: usize,
 }
 
 #[derive(Subcommand)]
@@ -1305,69 +1007,6 @@ enum IndexCmd {
 enum ConfigCmd {
     Edit,
     Show,
-}
-
-#[derive(Subcommand)]
-enum BenchmarkCmd {
-    ListPacks,
-    ShowPack(BenchmarkShowPackArgs),
-    ImportPack(BenchmarkImportPackArgs),
-    SyncPublic(BenchmarkSyncPublicArgs),
-    PublishParity(BenchmarkPublishParityArgs),
-    RunMatrix(BenchmarkRunMatrixArgs),
-}
-
-#[derive(Args)]
-struct BenchmarkShowPackArgs {
-    name: String,
-}
-
-#[derive(Args)]
-struct BenchmarkImportPackArgs {
-    name: String,
-    source: String,
-}
-
-#[derive(Args)]
-struct BenchmarkSyncPublicArgs {
-    catalog: String,
-    #[arg(long, value_delimiter = ',')]
-    only: Vec<String>,
-    #[arg(long)]
-    prefix: Option<String>,
-}
-
-#[derive(Args)]
-struct BenchmarkPublishParityArgs {
-    #[arg(long)]
-    matrix: Option<String>,
-    #[arg(long = "output-dir")]
-    output_dir: Option<String>,
-    #[arg(long = "compare")]
-    compare: Vec<String>,
-    #[arg(long = "require-agent", value_delimiter = ',')]
-    require_agent: Vec<String>,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    strict: bool,
-    #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
-    signing_key_env: String,
-}
-
-#[derive(Args)]
-struct BenchmarkRunMatrixArgs {
-    matrix: String,
-    #[arg(long)]
-    output: Option<String>,
-    #[arg(long = "compare")]
-    compare: Vec<String>,
-    #[arg(long = "report-output")]
-    report_output: Option<String>,
-    #[arg(long = "require-agent", value_delimiter = ',')]
-    require_agent: Vec<String>,
-    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-    strict: bool,
-    #[arg(long, default_value = "DEEPSEEK_BENCHMARK_SIGNING_KEY")]
-    signing_key_env: String,
 }
 
 #[derive(Subcommand)]
@@ -1648,17 +1287,20 @@ fn run() -> Result<()> {
         return run_resume_specific(&cwd, session_id, cli.json, cli.model.as_deref());
     }
 
-    if cli.teleport_flag && cli.command.is_none() {
-        return run_teleport(&cwd, TeleportArgs::default(), cli.json);
-    }
-
     let command = cli
         .command
         .take()
         .unwrap_or(Commands::Chat(ChatArgs::default()));
 
     match command {
-        Commands::Chat(args) => run_chat(&cwd, cli.json, args.json_events, args.tools, args.tui, Some(&cli)),
+        Commands::Chat(args) => run_chat(
+            &cwd,
+            cli.json,
+            args.json_events,
+            args.tools,
+            args.tui,
+            Some(&cli),
+        ),
         Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),
         Commands::Ask(args) => {
             ensure_llm_ready(&cwd, cli.json)?;
@@ -1701,7 +1343,6 @@ fn run() -> Result<()> {
         }
         Commands::Diff => run_diff(&cwd, cli.json),
         Commands::Apply(args) => run_apply(&cwd, args, cli.json),
-        Commands::Profile(args) => run_profile(&cwd, args, cli.json),
         Commands::Rewind(args) => run_rewind(&cwd, args, cli.json),
         Commands::Revert(args) => run_revert(&cwd, args, cli.json),
         Commands::Export(args) => run_export(&cwd, args, cli.json),
@@ -1712,19 +1353,14 @@ fn run() -> Result<()> {
         Commands::Agents { command } => run_agents(&cwd, command, cli.json),
         Commands::Replay { command } => run_replay(&cwd, command, cli.json),
         Commands::Background { command } => run_background(&cwd, command, cli.json),
-        Commands::Visual { command } => run_visual(&cwd, command, cli.json),
-        Commands::Teleport(args) => run_teleport(&cwd, args, cli.json),
-        Commands::RemoteEnv { command } => run_remote_env(&cwd, command, cli.json),
         Commands::Session { command } => run_session_cmd(&cwd, command, cli.json),
         Commands::Status => run_status(&cwd, cli.json),
         Commands::Usage(args) => run_usage(&cwd, args, cli.json),
         Commands::Compact(args) => run_compact(&cwd, args, cli.json),
         Commands::Doctor(args) => run_doctor(&cwd, args, cli.json),
-        Commands::Leadership(args) => run_leadership(&cwd, args, cli.json),
         Commands::Update(args) => run_update(&cwd, args, cli.json),
         Commands::Index { command } => run_index(&cwd, command, cli.json),
         Commands::Config { command } => run_config(&cwd, command, cli.json),
-        Commands::Benchmark { command } => run_benchmark(cwd.as_path(), command, cli.json),
         Commands::Permissions { command } => run_permissions(&cwd, command, cli.json),
         Commands::Plugins { command } => run_plugins(&cwd, command, cli.json),
         Commands::Clean(args) => run_clean(&cwd, args, cli.json),

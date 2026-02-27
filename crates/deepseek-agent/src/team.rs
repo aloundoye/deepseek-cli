@@ -2,7 +2,10 @@ use crate::apply::{diff_stats, ensure_repo_relative_path, extract_target_files};
 use crate::verify::{derive_verify_commands, run_verify};
 use crate::{AgentEngine, ChatMode, ChatOptions};
 use anyhow::{Context, Result, anyhow};
-use deepseek_core::{ApplyStrategy, ChatMessage, ChatRequest, EventKind, StreamChunk, ToolCall, ToolChoice, runtime_dir};
+use deepseek_core::{
+    ApplyStrategy, ChatMessage, ChatRequest, EventKind, StreamChunk, ToolCall, ToolChoice,
+    runtime_dir,
+};
 use deepseek_diff::{GitApplyStrategy, PatchStore};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -246,15 +249,14 @@ fn require_patch_approval(engine: &AgentEngine, diff: &str, lane: &LaneSpec) -> 
         }),
         requires_approval: files_over || loc_over,
     };
-    
+
     match engine.policy.dry_run(&call) {
-        deepseek_policy::PermissionDryRunResult::Denied(msg) => {
-            Err(anyhow::anyhow!("Policy explicitly denied patch apply: {msg}"))
-        }
-        deepseek_policy::PermissionDryRunResult::AutoApproved | deepseek_policy::PermissionDryRunResult::Allowed => Ok(true),
-        deepseek_policy::PermissionDryRunResult::NeedsApproval => {
-            engine.request_approval(&call)
-        }
+        deepseek_policy::PermissionDryRunResult::Denied(msg) => Err(anyhow::anyhow!(
+            "Policy explicitly denied patch apply: {msg}"
+        )),
+        deepseek_policy::PermissionDryRunResult::AutoApproved
+        | deepseek_policy::PermissionDryRunResult::Allowed => Ok(true),
+        deepseek_policy::PermissionDryRunResult::NeedsApproval => engine.request_approval(&call),
     }
 }
 
@@ -347,8 +349,12 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
     let req = ChatRequest {
         model: engine.cfg.llm.base_model.clone(),
         messages: vec![
-            ChatMessage::System { content: system.to_string() },
-            ChatMessage::User { content: prompt.to_string() },
+            ChatMessage::System {
+                content: system.to_string(),
+            },
+            ChatMessage::User {
+                content: prompt.to_string(),
+            },
         ],
         tools: vec![],
         tool_choice: ToolChoice::none(),
@@ -364,7 +370,8 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
         response_format: None,
     };
     let response = engine.llm.complete_chat(&req)?;
-    let files: Vec<String> = response.text
+    let files: Vec<String> = response
+        .text
         .lines()
         .map(|l| l.trim().trim_start_matches("- ").trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -372,7 +379,12 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
     Ok(files)
 }
 
-fn plan_lanes(engine: &AgentEngine, prompt: &str, max_lanes: usize, _options: &ChatOptions) -> Vec<LaneSpec> {
+fn plan_lanes(
+    engine: &AgentEngine,
+    prompt: &str,
+    max_lanes: usize,
+    _options: &ChatOptions,
+) -> Vec<LaneSpec> {
     let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // Use a lightweight LLM call to plan lanes (files → lane categories)
     if let Ok(files) = plan_files_via_llm(engine, prompt) {

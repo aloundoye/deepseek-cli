@@ -18,8 +18,7 @@ pub fn build_repo_map(
     max_files: usize,
     additional_dirs: &[PathBuf],
 ) -> String {
-    let rows =
-        repo_map::build_repo_map(workspace, user_prompt, max_files, additional_dirs);
+    let rows = repo_map::build_repo_map(workspace, user_prompt, max_files, additional_dirs);
     if !rows.is_empty() {
         return repo_map::render_repo_map(&rows);
     }

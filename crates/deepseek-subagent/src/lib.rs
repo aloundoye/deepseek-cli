@@ -1,4 +1,4 @@
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -461,8 +461,7 @@ pub fn append_transcript(workspace: &Path, agent_id: Uuid, line: &str) -> Result
 /// Load a subagent's transcript lines.
 pub fn load_transcript(workspace: &Path, agent_id: Uuid) -> Result<Vec<String>> {
     let path = transcript_path(workspace, agent_id);
-    let content = std::fs::read_to_string(&path)
-        .context("failed to load subagent transcript")?;
+    let content = std::fs::read_to_string(&path).context("failed to load subagent transcript")?;
     Ok(content.lines().map(String::from).collect())
 }
 
@@ -1053,8 +1052,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let agent_id = Uuid::now_v7();
 
-        append_transcript(temp.path(), agent_id, r#"{"role":"user","content":"hello"}"#).unwrap();
-        append_transcript(temp.path(), agent_id, r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        append_transcript(
+            temp.path(),
+            agent_id,
+            r#"{"role":"user","content":"hello"}"#,
+        )
+        .unwrap();
+        append_transcript(
+            temp.path(),
+            agent_id,
+            r#"{"role":"assistant","content":"hi"}"#,
+        )
+        .unwrap();
 
         let lines = load_transcript(temp.path(), agent_id).unwrap();
         assert_eq!(lines.len(), 2);
@@ -1086,7 +1095,10 @@ mod tests {
     #[test]
     fn subagent_inherits_compaction() {
         let config = SubagentConfig::default();
-        assert!(config.compaction_enabled, "compaction should be enabled by default");
+        assert!(
+            config.compaction_enabled,
+            "compaction should be enabled by default"
+        );
         assert_eq!(config.max_turns, 30);
     }
 

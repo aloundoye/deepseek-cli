@@ -43,12 +43,20 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
             let mut options = deepseek_agent::ChatOptions::default();
             options.tools = false; // Subagents (specialists) do not have direct tool access
             options.mode = deepseek_agent::ChatMode::Ask; // Ensure no patching is done
-            
+
             let system_prompt = match task.name.as_str() {
-                "debugger" => "You are the Debugger subagent. Triage failing tests or build data and return a strict JSON object with `{\"analysis\": \"...\", \"suspect_files\": [\"...\"], \"suggested_fix\": \"...\"}`.",
-                "refactor-sheriff" => "You are the Refactor Sheriff subagent. Analyze the code for refactoring opportunities without changing behavior. Return a strict JSON object with `{\"issues\": [\"...\"], \"recommendation\": \"...\"}`.",
-                "security-sentinel" => "You are the Security Sentinel subagent. Scan the requested changes or goal for security vulnerabilities or risky commands. Return a strict JSON object with `{\"safe\": boolean, \"risks\": [\"...\"], \"mitigation\": \"...\"}`.",
-                _ => "You are a specialized subagent. Execute your goal and return a strict JSON object with `{\"findings\": \"...\", \"recommendation\": \"...\"}`.",
+                "debugger" => {
+                    "You are the Debugger subagent. Triage failing tests or build data and return a strict JSON object with `{\"analysis\": \"...\", \"suspect_files\": [\"...\"], \"suggested_fix\": \"...\"}`."
+                }
+                "refactor-sheriff" => {
+                    "You are the Refactor Sheriff subagent. Analyze the code for refactoring opportunities without changing behavior. Return a strict JSON object with `{\"issues\": [\"...\"], \"recommendation\": \"...\"}`."
+                }
+                "security-sentinel" => {
+                    "You are the Security Sentinel subagent. Scan the requested changes or goal for security vulnerabilities or risky commands. Return a strict JSON object with `{\"safe\": boolean, \"risks\": [\"...\"], \"mitigation\": \"...\"}`."
+                }
+                _ => {
+                    "You are a specialized subagent. Execute your goal and return a strict JSON object with `{\"findings\": \"...\", \"recommendation\": \"...\"}`."
+                }
             };
 
             options.system_prompt_append = Some(format!(

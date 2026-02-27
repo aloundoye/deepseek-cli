@@ -181,7 +181,7 @@ fn symbol_hints_for_file(path: &Path) -> Vec<String> {
             .filter(|tags| !tags.is_empty())
             .map(|tags| tags_to_symbol_hints(&tags, 8))
     })
-        .flatten()
+    .flatten()
     {
         return hints;
     }

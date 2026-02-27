@@ -60,7 +60,9 @@ impl LlmClient for ScriptedLlm {
     }
 
     fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!("complete_fim() not used in team orchestration tests"))
+        Err(anyhow!(
+            "complete_fim() not used in team orchestration tests"
+        ))
     }
 
     fn complete_fim_streaming(

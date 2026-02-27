@@ -13,7 +13,7 @@
 use anyhow::{Result, anyhow};
 use deepseek_core::{
     ApprovedToolCall, ChatMessage, ChatRequest, EventKind, LlmToolCall, StreamCallback,
-    StreamChunk, ToolChoice, ToolDefinition, ToolHost, TokenUsage, UserQuestion,
+    StreamChunk, TokenUsage, ToolChoice, ToolDefinition, ToolHost, UserQuestion,
     estimate_message_tokens, strip_prior_reasoning_content,
 };
 use deepseek_hooks::{HookEvent, HookInput, HookRuntime};
@@ -47,7 +47,8 @@ const MAX_NUDGE_ATTEMPTS: usize = 3;
 const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
 
 /// Brief reminder injected every `MID_CONVERSATION_REMINDER_INTERVAL` tool calls.
-const MID_CONVERSATION_REMINDER: &str = "Reminder: Verify changes with tests. Be concise. Use tools — do not guess.";
+const MID_CONVERSATION_REMINDER: &str =
+    "Reminder: Verify changes with tests. Be concise. Use tools — do not guess.";
 
 /// Maximum recent errors to track for stuck detection.
 const MAX_RECENT_ERRORS: usize = 10;
@@ -134,7 +135,8 @@ pub struct SkillInvocationResult {
 
 /// Callback for looking up and running a skill by name.
 /// Returns `None` if the skill is not found.
-pub type SkillRunner = Arc<dyn Fn(&str, Option<&str>) -> Result<Option<SkillInvocationResult>> + Send + Sync>;
+pub type SkillRunner =
+    Arc<dyn Fn(&str, Option<&str>) -> Result<Option<SkillInvocationResult>> + Send + Sync>;
 
 /// Request to spawn a subagent task.
 #[derive(Debug, Clone)]
@@ -369,14 +371,18 @@ impl<'a> ToolUseLoop<'a> {
 
             // Check context window usage (messages + tool definitions overhead)
             let message_tokens = estimate_message_tokens(&self.messages);
-            let tool_def_tokens: u64 = self.tools.iter()
+            let tool_def_tokens: u64 = self
+                .tools
+                .iter()
                 .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
                 .sum();
             let estimated_tokens = message_tokens + tool_def_tokens;
-            let threshold = (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
+            let threshold =
+                (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
             if estimated_tokens > threshold {
                 // Try to compact
-                let target = (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64;
+                let target =
+                    (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64;
                 let compacted = self.compact_messages(target);
                 if !compacted {
                     self.emit(StreamChunk::Done {
@@ -508,7 +514,10 @@ impl<'a> ToolUseLoop<'a> {
                 self.escalation.record_failure();
 
                 // Error recovery: inject guidance on first escalation transition
-                if self.escalation.should_escalate() && !was_escalated_before_batch && !self.recovery_injected {
+                if self.escalation.should_escalate()
+                    && !was_escalated_before_batch
+                    && !self.recovery_injected
+                {
                     self.messages.push(ChatMessage::System {
                         content: ERROR_RECOVERY_GUIDANCE.to_string(),
                     });
@@ -541,10 +550,7 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Execute a single tool call, handling approval flow, hooks, events, and checkpoints.
-    fn execute_tool_call(
-        &mut self,
-        llm_call: &LlmToolCall,
-    ) -> Result<Vec<ToolCallRecord>> {
+    fn execute_tool_call(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
         let mut records = Vec::new();
         let start = Instant::now();
 
@@ -571,7 +577,10 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: None,
                 prompt: None,
                 session_type: None,
-                workspace: self.config.workspace.as_ref()
+                workspace: self
+                    .config
+                    .workspace
+                    .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
             };
@@ -672,7 +681,8 @@ impl<'a> ToolUseLoop<'a> {
                 self.track_error(output_str);
             }
         } else if let Ok(output_text) = serde_json::to_string(&result.output) {
-            self.escalation.scan_tool_output(&llm_call.name, &output_text);
+            self.escalation
+                .scan_tool_output(&llm_call.name, &output_text);
             if !success {
                 self.track_error(&output_text);
             }
@@ -689,7 +699,10 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(result.output.clone()),
                 prompt: None,
                 session_type: None,
-                workspace: self.config.workspace.as_ref()
+                workspace: self
+                    .config
+                    .workspace
+                    .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
             };
@@ -728,9 +741,15 @@ impl<'a> ToolUseLoop<'a> {
         // Apply privacy router to tool output if configured
         let msg = if self.config.privacy_router.is_some() {
             match msg {
-                ChatMessage::Tool { tool_call_id, content } => {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => {
                     let filtered = self.apply_privacy_to_output(&content);
-                    ChatMessage::Tool { tool_call_id, content: filtered }
+                    ChatMessage::Tool {
+                        tool_call_id,
+                        content: filtered,
+                    }
                 }
                 other => other,
             }
@@ -761,13 +780,10 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Handle agent-level tools (user_question, spawn_task, extended_thinking, etc.)
-    fn handle_agent_level_tool(
-        &mut self,
-        llm_call: &LlmToolCall,
-    ) -> Result<Vec<ToolCallRecord>> {
+    fn handle_agent_level_tool(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
         let start = Instant::now();
-        let args: serde_json::Value = serde_json::from_str(&llm_call.arguments)
-            .unwrap_or(serde_json::json!({}));
+        let args: serde_json::Value =
+            serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({}));
 
         let args_summary = summarize_args(&args);
 
@@ -784,30 +800,44 @@ impl<'a> ToolUseLoop<'a> {
                 self.handle_extended_thinking(question, context)?
             }
             "user_question" => {
-                let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("(no question)");
-                let options: Vec<String> = args.get("options")
+                let question = args
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no question)");
+                let options: Vec<String> = args
+                    .get("options")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if let Some(ref cb) = self.user_question_cb {
-                    let uq = UserQuestion { question: question.to_string(), options };
+                    let uq = UserQuestion {
+                        question: question.to_string(),
+                        options,
+                    };
                     match cb(uq) {
                         Some(answer) => format!("User response: {answer}"),
-                        None => format!("Question for user: {question}\n[User cancelled. Proceed with your best judgment.]"),
+                        None => format!(
+                            "Question for user: {question}\n[User cancelled. Proceed with your best judgment.]"
+                        ),
                     }
                 } else {
-                    format!("Question for user: {question}\n[User response not available in this context. Proceed with your best judgment or state your assumption.]")
+                    format!(
+                        "Question for user: {question}\n[User response not available in this context. Proceed with your best judgment or state your assumption.]"
+                    )
                 }
             }
-            "spawn_task" => {
-                self.handle_spawn_task(&args)?
-            }
-            "skill" => {
-                self.handle_skill(&args)?
-            }
+            "spawn_task" => self.handle_spawn_task(&args)?,
+            "skill" => self.handle_skill(&args)?,
             _ => {
                 // Other agent-level tools (task_*, etc.) — not yet wired
-                format!("Agent-level tool '{}' is not yet available in tool-use mode. Try a different approach.", llm_call.name)
+                format!(
+                    "Agent-level tool '{}' is not yet available in tool-use mode. Try a different approach.",
+                    llm_call.name
+                )
             }
         };
 
@@ -870,19 +900,29 @@ impl<'a> ToolUseLoop<'a> {
     /// Handle the spawn_task tool by delegating to the subagent worker.
     fn handle_spawn_task(&self, args: &serde_json::Value) -> Result<String> {
         let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        let task_name = args.get("description")
+        let task_name = args
+            .get("description")
             .or_else(|| args.get("task_name"))
             .and_then(|v| v.as_str())
             .unwrap_or("subtask");
-        let subagent_type = args.get("subagent_type")
+        let subagent_type = args
+            .get("subagent_type")
             .and_then(|v| v.as_str())
             .unwrap_or("general-purpose");
         let model_override = args.get("model").and_then(|v| v.as_str()).map(String::from);
-        let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as usize);
-        let run_in_background = args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
+        let max_turns = args
+            .get("max_turns")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let run_in_background = args
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if prompt.is_empty() {
-            return Ok("Error: spawn_task requires a 'prompt' argument describing the task.".to_string());
+            return Ok(
+                "Error: spawn_task requires a 'prompt' argument describing the task.".to_string(),
+            );
         }
 
         let request = SubagentRequest {
@@ -904,13 +944,21 @@ impl<'a> ToolUseLoop<'a> {
                     tool_result: None,
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self.config.workspace.as_deref().unwrap_or(std::path::Path::new(".")).display().to_string(),
+                    workspace: self
+                        .config
+                        .workspace
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("."))
+                        .display()
+                        .to_string(),
                 };
                 let _ = hooks.fire(HookEvent::SubagentStart, &input);
             }
             let result = match worker(request) {
                 Ok(result) => Ok(result),
-                Err(e) => Ok(format!("Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly.")),
+                Err(e) => Ok(format!(
+                    "Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly."
+                )),
             };
             // P5-14: Fire SubagentStop hook
             if let Some(ref hooks) = self.hooks {
@@ -918,10 +966,19 @@ impl<'a> ToolUseLoop<'a> {
                     event: HookEvent::SubagentStop.as_str().to_string(),
                     tool_name: Some("spawn_task".to_string()),
                     tool_input: Some(args.clone()),
-                    tool_result: result.as_ref().ok().map(|r| serde_json::Value::String(r.clone())),
+                    tool_result: result
+                        .as_ref()
+                        .ok()
+                        .map(|r| serde_json::Value::String(r.clone())),
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self.config.workspace.as_deref().unwrap_or(std::path::Path::new(".")).display().to_string(),
+                    workspace: self
+                        .config
+                        .workspace
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("."))
+                        .display()
+                        .to_string(),
                 };
                 let _ = hooks.fire(HookEvent::SubagentStop, &input);
             }
@@ -943,10 +1000,7 @@ impl<'a> ToolUseLoop<'a> {
     /// - For `context: fork`: delegates to subagent_worker for isolated execution
     /// - For `context: normal`: returns the rendered prompt for inline injection
     fn handle_skill(&self, args: &serde_json::Value) -> Result<String> {
-        let skill_name = args
-            .get("skill")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let skill_name = args.get("skill").and_then(|v| v.as_str()).unwrap_or("");
         let skill_args = args.get("args").and_then(|v| v.as_str());
 
         if skill_name.is_empty() {
@@ -1097,7 +1151,11 @@ impl<'a> ToolUseLoop<'a> {
 
         // Strip sampling parameters for reasoner model (incompatible)
         let is_reasoner = model.contains("reasoner");
-        let temperature = if is_reasoner { None } else { self.config.temperature };
+        let temperature = if is_reasoner {
+            None
+        } else {
+            self.config.temperature
+        };
 
         ChatRequest {
             model,
@@ -1166,9 +1224,8 @@ impl<'a> ToolUseLoop<'a> {
         // A group starts at a User message and includes everything until the next User message.
         let mut keep_from = self.messages.len();
         let mut kept_tokens: u64 = 0;
-        let target = target_tokens.min(
-            (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64,
-        );
+        let target = target_tokens
+            .min((self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64);
 
         while keep_from > 1 {
             // Find the start of this group (previous User message)
@@ -1207,7 +1264,10 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(serde_json::Value::String(summary.clone())),
                 prompt: None,
                 session_type: None,
-                workspace: self.config.workspace.as_ref()
+                workspace: self
+                    .config
+                    .workspace
+                    .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
             };
@@ -1324,15 +1384,23 @@ fn build_compaction_summary(messages: &[ChatMessage]) -> String {
 
     for msg in messages {
         match msg {
-            ChatMessage::Assistant { tool_calls, content, .. } => {
+            ChatMessage::Assistant {
+                tool_calls,
+                content,
+                ..
+            } => {
                 for tc in tool_calls {
                     tools_used.push(tc.name.clone());
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        if let Some(path) = args.get("file_path")
+                        if let Some(path) = args
+                            .get("file_path")
                             .or(args.get("path"))
                             .and_then(|v| v.as_str())
                         {
-                            if tc.name.contains("read") || tc.name.contains("glob") || tc.name.contains("grep") {
+                            if tc.name.contains("read")
+                                || tc.name.contains("glob")
+                                || tc.name.contains("grep")
+                            {
                                 files_read.push(path.to_string());
                             } else {
                                 files_modified.push(path.to_string());
@@ -1348,7 +1416,10 @@ fn build_compaction_summary(messages: &[ChatMessage]) -> String {
             }
             ChatMessage::Tool { content, .. } => {
                 let lower = content.to_ascii_lowercase();
-                if lower.contains("error") || lower.contains("failed") || lower.contains("not found") {
+                if lower.contains("error")
+                    || lower.contains("failed")
+                    || lower.contains("not found")
+                {
                     errors_hit.push(truncate_line(content, 100));
                 }
             }
@@ -1462,19 +1533,17 @@ fn summarize_args(args: &serde_json::Value) -> String {
 
 /// Known file extensions for path detection.
 const FILE_EXTENSIONS: &[&str] = &[
-    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java",
-    ".cpp", ".c", ".h", ".hpp", ".rb", ".swift", ".kt", ".sh",
-    ".sql", ".json", ".toml", ".yaml", ".yml", ".md", ".html",
-    ".css", ".scss", ".vue", ".svelte", ".zig", ".ex", ".exs",
+    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".cpp", ".c", ".h", ".hpp", ".rb",
+    ".swift", ".kt", ".sh", ".sql", ".json", ".toml", ".yaml", ".yml", ".md", ".html", ".css",
+    ".scss", ".vue", ".svelte", ".zig", ".ex", ".exs",
 ];
 
 /// Detect when the model mentions file paths without having called fs_read/fs_glob first.
 /// Returns true if the text references paths that haven't been verified by tool calls.
 fn has_unverified_file_references(text: &str, tool_calls_made: &[ToolCallRecord]) -> bool {
     use std::sync::LazyLock;
-    static FILE_REF_PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\b[\w./\-]+\.\w{1,6}\b").unwrap()
-    });
+    static FILE_REF_PATTERN: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\b[\w./\-]+\.\w{1,6}\b").unwrap());
 
     let mentioned_paths: Vec<&str> = FILE_REF_PATTERN
         .find_iter(text)
@@ -1498,10 +1567,14 @@ fn has_unverified_file_references(text: &str, tool_calls_made: &[ToolCallRecord]
 
     // Check if any read/glob/grep tool was called (the model at least tried to look)
     let used_read_tools = tool_calls_made.iter().any(|tc| {
-        tc.tool_name == "fs_read" || tc.tool_name == "fs.read"
-            || tc.tool_name == "fs_glob" || tc.tool_name == "fs.glob"
-            || tc.tool_name == "fs_grep" || tc.tool_name == "fs.grep"
-            || tc.tool_name == "fs_list" || tc.tool_name == "fs.list"
+        tc.tool_name == "fs_read"
+            || tc.tool_name == "fs.read"
+            || tc.tool_name == "fs_glob"
+            || tc.tool_name == "fs.glob"
+            || tc.tool_name == "fs_grep"
+            || tc.tool_name == "fs.grep"
+            || tc.tool_name == "fs_list"
+            || tc.tool_name == "fs.list"
     });
 
     // If paths are mentioned but no read/search tools were used, flag it
@@ -2206,7 +2279,10 @@ mod tests {
         assert_eq!(result.response, "Got it.");
         assert_eq!(result.turns, 3);
         // Evidence-driven: escalation detected from tool output content
-        assert!(loop_.escalation.compile_error, "should detect compile error");
+        assert!(
+            loop_.escalation.compile_error,
+            "should detect compile error"
+        );
         assert!(loop_.escalation.test_failure, "should detect test failure");
         assert!(loop_.escalation.should_escalate(), "should be escalated");
         assert_eq!(loop_.escalation.consecutive_failure_turns, 2);
@@ -2400,7 +2476,8 @@ mod tests {
         for (i, msg) in msgs.iter().enumerate() {
             if matches!(msg, ChatMessage::Tool { .. }) {
                 assert!(
-                    i > 0 && matches!(&msgs[i - 1], ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
+                    i > 0
+                        && matches!(&msgs[i - 1], ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
                     "Tool message at index {i} is orphaned (no preceding Assistant with tool_calls)"
                 );
             }
@@ -2439,11 +2516,16 @@ mod tests {
         let before_len = loop_.messages.len();
         let compacted = loop_.compact_messages(2000);
         assert!(compacted, "should compact");
-        assert!(loop_.messages.len() < before_len, "should have fewer messages");
+        assert!(
+            loop_.messages.len() < before_len,
+            "should have fewer messages"
+        );
         // System message should always be first
         assert!(matches!(&loop_.messages[0], ChatMessage::System { .. }));
         // Compaction summary should be second
-        assert!(matches!(&loop_.messages[1], ChatMessage::User { content } if content.contains("compacted")));
+        assert!(
+            matches!(&loop_.messages[1], ChatMessage::User { content } if content.contains("compacted"))
+        );
     }
 
     #[test]
@@ -2537,9 +2619,15 @@ mod tests {
         assert_eq!(result.response, "ok");
 
         // Verify the message order: System (prompt), System (bootstrap), User
-        assert!(matches!(&result.messages[0], ChatMessage::System { content } if content.contains("You are helpful")));
-        assert!(matches!(&result.messages[1], ChatMessage::System { content } if content.contains("PROJECT_CONTEXT")));
-        assert!(matches!(&result.messages[2], ChatMessage::User { content } if content.contains("What is this project")));
+        assert!(
+            matches!(&result.messages[0], ChatMessage::System { content } if content.contains("You are helpful"))
+        );
+        assert!(
+            matches!(&result.messages[1], ChatMessage::System { content } if content.contains("PROJECT_CONTEXT"))
+        );
+        assert!(
+            matches!(&result.messages[2], ChatMessage::User { content } if content.contains("What is this project"))
+        );
     }
 
     #[test]
@@ -2569,7 +2657,9 @@ mod tests {
         // The large context is in messages[1] — it should be present (truncation
         // happens in lib.rs via truncate_to_token_budget before it reaches here)
         assert!(result.messages.len() >= 3);
-        assert!(matches!(&result.messages[1], ChatMessage::System { content } if content.contains("PROJECT_CONTEXT")));
+        assert!(
+            matches!(&result.messages[1], ChatMessage::System { content } if content.contains("PROJECT_CONTEXT"))
+        );
     }
 
     #[test]
@@ -2592,7 +2682,9 @@ mod tests {
 
         let result = loop_.run("hi").unwrap();
         // Messages: System, User, Assistant — no bootstrap System message
-        assert!(matches!(&result.messages[0], ChatMessage::System { content } if content == "system"));
+        assert!(
+            matches!(&result.messages[0], ChatMessage::System { content } if content == "system")
+        );
         assert!(matches!(&result.messages[1], ChatMessage::User { .. }));
     }
 
@@ -2626,8 +2718,10 @@ mod tests {
 
         let result = loop_.run("what does main do?").unwrap();
         // Should have retrieval context injected as a System message
-        let has_retrieval = result.messages.iter().any(|m| matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT")));
+        let has_retrieval = result.messages.iter().any(|m| {
+            matches!(m,
+            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
+        });
         assert!(has_retrieval, "retrieval context should be injected");
     }
 
@@ -2667,12 +2761,20 @@ mod tests {
         );
 
         let result = loop_.run("explain auth").unwrap();
-        let retrieval_msg = result.messages.iter().find(|m| matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT")));
+        let retrieval_msg = result.messages.iter().find(|m| {
+            matches!(m,
+            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
+        });
         assert!(retrieval_msg.is_some());
         if let Some(ChatMessage::System { content }) = retrieval_msg {
-            assert!(content.contains("auth.rs"), "should include first result file");
-            assert!(content.contains("middleware.rs"), "should include second result file");
+            assert!(
+                content.contains("auth.rs"),
+                "should include first result file"
+            );
+            assert!(
+                content.contains("middleware.rs"),
+                "should include second result file"
+            );
             assert!(content.contains("verify_token"), "should include content");
         }
     }
@@ -2704,8 +2806,7 @@ mod tests {
             policy: deepseek_local_ml::PrivacyPolicy::Redact,
             store_raw_in_logs: false,
         };
-        let router = deepseek_local_ml::PrivacyRouter::new(privacy_config)
-            .expect("privacy router");
+        let router = deepseek_local_ml::PrivacyRouter::new(privacy_config).expect("privacy router");
 
         let config = ToolLoopConfig {
             privacy_router: Some(Arc::new(router)),
@@ -2722,7 +2823,10 @@ mod tests {
 
         let result = loop_.run("read .env").unwrap();
         // The tool output should have been filtered
-        let tool_msg = result.messages.iter().find(|m| matches!(m, ChatMessage::Tool { .. }));
+        let tool_msg = result
+            .messages
+            .iter()
+            .find(|m| matches!(m, ChatMessage::Tool { .. }));
         assert!(tool_msg.is_some(), "should have a tool message");
         if let Some(ChatMessage::Tool { content, .. }) = tool_msg {
             // Either the secret is redacted or the output is blocked
@@ -2755,9 +2859,14 @@ mod tests {
         );
 
         let result = loop_.run("hello").unwrap();
-        let has_retrieval = result.messages.iter().any(|m| matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT")));
-        assert!(!has_retrieval, "no retrieval context when results are empty");
+        let has_retrieval = result.messages.iter().any(|m| {
+            matches!(m,
+            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
+        });
+        assert!(
+            !has_retrieval,
+            "no retrieval context when results are empty"
+        );
     }
 
     // ── P10 Batch 3: Semantic compaction tests ──
@@ -2793,9 +2902,18 @@ mod tests {
             },
         ];
         let summary = build_compaction_summary(&messages);
-        assert!(summary.contains("src/lib.rs"), "should list modified files: {summary}");
-        assert!(summary.contains("README.md"), "should list read files: {summary}");
-        assert!(summary.contains("fs_edit"), "should list tools used: {summary}");
+        assert!(
+            summary.contains("src/lib.rs"),
+            "should list modified files: {summary}"
+        );
+        assert!(
+            summary.contains("README.md"),
+            "should list read files: {summary}"
+        );
+        assert!(
+            summary.contains("fs_edit"),
+            "should list tools used: {summary}"
+        );
     }
 
     #[test]
@@ -2811,25 +2929,44 @@ mod tests {
             },
         ];
         let summary = build_compaction_summary(&messages);
-        assert!(summary.contains("Errors encountered"), "should capture errors: {summary}");
+        assert!(
+            summary.contains("Errors encountered"),
+            "should capture errors: {summary}"
+        );
     }
 
     #[test]
     fn compaction_summary_tool_counts() {
-        let messages = vec![
-            ChatMessage::Assistant {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![
-                    LlmToolCall { id: "1".to_string(), name: "fs_read".to_string(), arguments: "{}".to_string() },
-                    LlmToolCall { id: "2".to_string(), name: "fs_read".to_string(), arguments: "{}".to_string() },
-                    LlmToolCall { id: "3".to_string(), name: "fs_edit".to_string(), arguments: "{}".to_string() },
-                ],
-            },
-        ];
+        let messages = vec![ChatMessage::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                LlmToolCall {
+                    id: "1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                LlmToolCall {
+                    id: "2".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                LlmToolCall {
+                    id: "3".to_string(),
+                    name: "fs_edit".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+        }];
         let summary = build_compaction_summary(&messages);
-        assert!(summary.contains("fs_read×2"), "should count tools: {summary}");
-        assert!(summary.contains("fs_edit×1"), "should count edit: {summary}");
+        assert!(
+            summary.contains("fs_read×2"),
+            "should count tools: {summary}"
+        );
+        assert!(
+            summary.contains("fs_edit×1"),
+            "should count edit: {summary}"
+        );
     }
 
     // ── P10 Batch 5: Model routing tests ──
@@ -2872,7 +3009,10 @@ mod tests {
 
         let result = loop_.run("refactor auth").unwrap();
         // After the compile error, escalation should be active
-        assert!(loop_.escalation.compile_error, "compile error should be flagged");
+        assert!(
+            loop_.escalation.compile_error,
+            "compile error should be flagged"
+        );
         assert!(loop_.escalation.should_escalate(), "should be escalated");
         // Result should complete (the scripted LLM returns "done")
         assert_eq!(result.response, "done");
@@ -2922,17 +3062,20 @@ mod tests {
     #[test]
     fn compaction_preserves_key_decisions() {
         let decision_text = "I'll modify the authentication module to use JWT tokens instead of session cookies because the API is stateless.";
-        let messages = vec![
-            ChatMessage::Assistant {
-                content: Some(decision_text.to_string()),
-                reasoning_content: None,
-                tool_calls: vec![],
-            },
-        ];
+        let messages = vec![ChatMessage::Assistant {
+            content: Some(decision_text.to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        }];
         let summary = build_compaction_summary(&messages);
-        assert!(summary.contains("Key decisions"), "should have decisions section: {summary}");
-        assert!(summary.contains("JWT tokens") || summary.contains("authentication"),
-            "should preserve decision content: {summary}");
+        assert!(
+            summary.contains("Key decisions"),
+            "should have decisions section: {summary}"
+        );
+        assert!(
+            summary.contains("JWT tokens") || summary.contains("authentication"),
+            "should preserve decision content: {summary}"
+        );
     }
 
     #[test]
@@ -2954,8 +3097,10 @@ mod tests {
         );
 
         let result = loop_.run("hello").unwrap();
-        let has_retrieval = result.messages.iter().any(|m| matches!(m,
-            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT")));
+        let has_retrieval = result.messages.iter().any(|m| {
+            matches!(m,
+            ChatMessage::System { content } if content.contains("RETRIEVAL_CONTEXT"))
+        });
         assert!(!has_retrieval);
     }
 
@@ -2980,8 +3125,10 @@ mod tests {
         );
 
         let result = loop_.run("analyze project").unwrap();
-        assert!(matches!(&result.messages[1], ChatMessage::System { content }
-            if content.contains("REPO_MAP_SUMMARY") && content.contains("src/lib.rs")));
+        assert!(
+            matches!(&result.messages[1], ChatMessage::System { content }
+            if content.contains("REPO_MAP_SUMMARY") && content.contains("src/lib.rs"))
+        );
     }
 
     // ── Batch 8: Error Recovery & Self-Correction ──
@@ -3011,25 +3158,33 @@ mod tests {
         };
 
         let mut loop_ = ToolUseLoop::new(
-            &llm, tool_host, config,
-            "system".to_string(), default_tools(),
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
         );
 
         let result = loop_.run("fix the build").unwrap();
 
-        let has_recovery = result.messages.iter().any(|m| {
-            matches!(m, ChatMessage::System { content } if content.contains("ERROR RECOVERY"))
-        });
-        assert!(has_recovery, "error recovery guidance should be injected on first escalation");
+        let has_recovery = result.messages.iter().any(
+            |m| matches!(m, ChatMessage::System { content } if content.contains("ERROR RECOVERY")),
+        );
+        assert!(
+            has_recovery,
+            "error recovery guidance should be injected on first escalation"
+        );
     }
 
     #[test]
     fn stuck_detection_fires_after_3_same_errors() {
-        let fail_response = |id: &str| make_tool_response(vec![LlmToolCall {
-            id: id.to_string(),
-            name: "bash_run".to_string(),
-            arguments: r#"{"command":"cargo build"}"#.to_string(),
-        }]);
+        let fail_response = |id: &str| {
+            make_tool_response(vec![LlmToolCall {
+                id: id.to_string(),
+                name: "bash_run".to_string(),
+                arguments: r#"{"command":"cargo build"}"#.to_string(),
+            }])
+        };
 
         let llm = ScriptedLlm::new(vec![
             fail_response("tc1"),
@@ -3041,9 +3196,21 @@ mod tests {
         let error_msg = "error[E0308]: mismatched types expected `u32` found `String`";
         let tool_host = Arc::new(MockToolHost::new(
             vec![
-                ToolResult { invocation_id: uuid::Uuid::nil(), output: serde_json::json!(error_msg), success: false },
-                ToolResult { invocation_id: uuid::Uuid::nil(), output: serde_json::json!(error_msg), success: false },
-                ToolResult { invocation_id: uuid::Uuid::nil(), output: serde_json::json!(error_msg), success: false },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    output: serde_json::json!(error_msg),
+                    success: false,
+                },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    output: serde_json::json!(error_msg),
+                    success: false,
+                },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    output: serde_json::json!(error_msg),
+                    success: false,
+                },
             ],
             true,
         ));
@@ -3054,38 +3221,58 @@ mod tests {
         };
 
         let mut loop_ = ToolUseLoop::new(
-            &llm, tool_host, config,
-            "system".to_string(), default_tools(),
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
         );
 
         let result = loop_.run("fix the build").unwrap();
 
-        let has_stuck = result.messages.iter().any(|m| {
-            matches!(m, ChatMessage::System { content } if content.contains("STUCK DETECTION"))
-        });
-        assert!(has_stuck, "stuck detection should fire after 3 identical errors");
+        let has_stuck = result.messages.iter().any(
+            |m| matches!(m, ChatMessage::System { content } if content.contains("STUCK DETECTION")),
+        );
+        assert!(
+            has_stuck,
+            "stuck detection should fire after 3 identical errors"
+        );
     }
 
     #[test]
     fn recovery_guidance_not_repeated_after_success() {
-        let tool_response = |id: &str| make_tool_response(vec![LlmToolCall {
-            id: id.to_string(),
-            name: "bash_run".to_string(),
-            arguments: r#"{"command":"cargo build"}"#.to_string(),
-        }]);
+        let tool_response = |id: &str| {
+            make_tool_response(vec![LlmToolCall {
+                id: id.to_string(),
+                name: "bash_run".to_string(),
+                arguments: r#"{"command":"cargo build"}"#.to_string(),
+            }])
+        };
 
         let llm = ScriptedLlm::new(vec![
-            tool_response("tc1"),  // fails → recovery injected
-            tool_response("tc2"),  // succeeds → recovery reset
-            tool_response("tc3"),  // fails → recovery can inject again
+            tool_response("tc1"), // fails → recovery injected
+            tool_response("tc2"), // succeeds → recovery reset
+            tool_response("tc3"), // fails → recovery can inject again
             make_text_response("Done."),
         ]);
 
         let tool_host = Arc::new(MockToolHost::new(
             vec![
-                ToolResult { invocation_id: uuid::Uuid::nil(), output: serde_json::json!("error: compilation failed"), success: false },
-                ToolResult { invocation_id: uuid::Uuid::nil(), output: serde_json::json!("Build succeeded"), success: true },
-                ToolResult { invocation_id: uuid::Uuid::nil(), output: serde_json::json!("error: different problem"), success: false },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    output: serde_json::json!("error: compilation failed"),
+                    success: false,
+                },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    output: serde_json::json!("Build succeeded"),
+                    success: true,
+                },
+                ToolResult {
+                    invocation_id: uuid::Uuid::nil(),
+                    output: serde_json::json!("error: different problem"),
+                    success: false,
+                },
             ],
             true,
         ));
@@ -3096,8 +3283,11 @@ mod tests {
         };
 
         let mut loop_ = ToolUseLoop::new(
-            &llm, tool_host, config,
-            "system".to_string(), default_tools(),
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
         );
 
         let result = loop_.run("fix the build").unwrap();
@@ -3108,6 +3298,9 @@ mod tests {
 
         // Recovery state resets on success, so it CAN inject again after the second failure.
         // The key invariant: recovery is NOT injected on the same escalation cycle twice.
-        assert!(recovery_count <= 2, "recovery should not spam — got {recovery_count}");
+        assert!(
+            recovery_count <= 2,
+            "recovery should not spam — got {recovery_count}"
+        );
     }
 }

@@ -44,6 +44,11 @@ fn is_review_blocked(tool_name: &str) -> bool {
     deepseek_core::ToolName::from_internal_name(tool_name).is_some_and(|t| t.is_review_blocked())
 }
 
+/// Callback type for executing MCP tool calls.
+/// Takes (server_id, tool_name, arguments) and returns the tool result.
+pub type McpExecutor =
+    Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<serde_json::Value> + Send + Sync>;
+
 pub struct LocalToolHost {
     workspace: PathBuf,
     policy: PolicyEngine,
@@ -59,6 +64,7 @@ pub struct LocalToolHost {
     chrome_allow_stub_fallback: bool,
     lint_after_edit: Option<String>,
     review_mode: bool,
+    mcp_executor: Option<McpExecutor>,
 }
 
 impl LocalToolHost {
@@ -100,7 +106,13 @@ impl LocalToolHost {
             chrome_allow_stub_fallback: cfg.tools.chrome.allow_stub_fallback,
             lint_after_edit,
             review_mode: false,
+            mcp_executor: None,
         })
+    }
+
+    /// Set the MCP executor callback for handling `mcp__*` tool calls.
+    pub fn set_mcp_executor(&mut self, executor: McpExecutor) {
+        self.mcp_executor = Some(executor);
     }
 
     pub fn index(&self) -> &deepseek_index::IndexService {
@@ -520,10 +532,7 @@ impl LocalToolHost {
                     .get("top_k")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
-                let scope = call
-                    .args
-                    .get("scope")
-                    .and_then(|v| v.as_str());
+                let scope = call.args.get("scope").and_then(|v| v.as_str());
                 Ok(serde_json::to_value(self.index.query(q, top_k, scope)?)?)
             }
             "patch.stage" => {
@@ -1093,6 +1102,19 @@ impl LocalToolHost {
                     "source": source,
                 }))
             }
+            name if name.starts_with("mcp__") => {
+                let rest = &name[5..]; // skip "mcp__"
+                let (server_id, tool_name) = rest
+                    .split_once("__")
+                    .ok_or_else(|| anyhow!("invalid MCP tool name: {name}"))?;
+                let args = call.args.get("arguments").cloned().unwrap_or(json!({}));
+                match &self.mcp_executor {
+                    Some(executor) => executor(server_id, tool_name, &args),
+                    None => Err(anyhow!(
+                        "MCP tool '{name}' called but no MCP executor configured"
+                    )),
+                }
+            }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
     }
@@ -1110,8 +1132,7 @@ impl LocalToolHost {
     }
 
     fn run_bash_cmd(&self, cmd: &str, timeout_secs: u64) -> Result<serde_json::Value> {
-        if is_isolated_sandbox_mode(&self.sandbox_mode)
-            && detect_container_environment().is_none()
+        if is_isolated_sandbox_mode(&self.sandbox_mode) && detect_container_environment().is_none()
         {
             return self.run_cmd_in_isolated_sandbox(cmd, timeout_secs);
         }
@@ -2500,7 +2521,7 @@ pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
                 function: FunctionDefinition {
                     name: api_name,
                     description: format!("[Plugin: {}] {} command", plugin.manifest.name, cmd_name),
-            strict: None,
+                    strict: None,
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -4747,7 +4768,13 @@ mod tests {
     fn tool_descriptions_are_sufficiently_detailed() {
         let tools = tool_definitions();
         let core_tools = [
-            "fs_read", "fs_write", "fs_edit", "fs_list", "fs_glob", "fs_grep", "bash_run",
+            "fs_read",
+            "fs_write",
+            "fs_edit",
+            "fs_list",
+            "fs_glob",
+            "fs_grep",
+            "bash_run",
             "multi_edit",
         ];
         for name in &core_tools {
@@ -4829,7 +4856,10 @@ mod tests {
             ..Default::default()
         };
         let wrapped = sandbox_wrap_command(Path::new("/workspace"), "ls -la", &config);
-        assert_eq!(wrapped, "ls -la", "should return raw command when in container");
+        assert_eq!(
+            wrapped, "ls -la",
+            "should return raw command when in container"
+        );
 
         unsafe { std::env::remove_var("DEEPSEEK_CONTAINER_MODE") };
     }

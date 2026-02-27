@@ -32,6 +32,9 @@ chrono.workspace = true
 regex.workspace = true
 notify.workspace = true
 
+[features]
+local-ml = ["deepseek-local-ml/local-ml"]
+
 [dev-dependencies]
 tempfile.workspace = true
 deepseek-testkit = { path = "../deepseek-testkit" }

@@ -75,7 +75,9 @@ impl LlmClient for CapturingLlm {
     }
 
     fn complete_fim(&self, _req: &deepseek_core::FimRequest) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!("complete_fim() not used in analysis bootstrap tests"))
+        Err(anyhow!(
+            "complete_fim() not used in analysis bootstrap tests"
+        ))
     }
 
     fn complete_fim_streaming(
@@ -83,7 +85,9 @@ impl LlmClient for CapturingLlm {
         _req: &deepseek_core::FimRequest,
         _cb: StreamCallback,
     ) -> anyhow::Result<LlmResponse> {
-        Err(anyhow!("complete_fim_streaming() not used in analysis bootstrap tests"))
+        Err(anyhow!(
+            "complete_fim_streaming() not used in analysis bootstrap tests"
+        ))
     }
 }
 

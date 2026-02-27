@@ -297,7 +297,11 @@ pub(crate) fn run_usage(cwd: &Path, args: UsageArgs, json_mode: bool) -> Result<
         println!(
             "input_tokens={} (cache={:.1}%) output_tokens={} estimated_cost_usd={:.6} compactions={} rate_limits={}",
             usage.input_tokens,
-            if usage.input_tokens > 0 { (usage.cache_hit_tokens as f64 / usage.input_tokens as f64) * 100.0 } else { 0.0 },
+            if usage.input_tokens > 0 {
+                (usage.cache_hit_tokens as f64 / usage.input_tokens as f64) * 100.0
+            } else {
+                0.0
+            },
             usage.output_tokens,
             input_cost + output_cost,
             compactions.len(),
@@ -541,5 +545,4 @@ mod tests {
             compact_threshold: 0.50,
         });
     }
-
 }

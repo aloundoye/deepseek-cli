@@ -92,7 +92,9 @@ pub fn build_tool_use_system_prompt(
     if let Some(memory) = project_memory
         && !memory.is_empty()
     {
-        parts.push(format!("\n# Project Instructions (DEEPSEEK.md)\n\n{memory}"));
+        parts.push(format!(
+            "\n# Project Instructions (DEEPSEEK.md)\n\n{memory}"
+        ));
     }
 
     if let Some(append) = system_prompt_append
@@ -209,10 +211,22 @@ mod tests {
     #[test]
     fn system_prompt_always_includes_working_protocol() {
         let prompt = build_tool_use_system_prompt(None, None, None, None);
-        assert!(prompt.contains("WORKING PROTOCOL"), "should always include protocol");
-        assert!(prompt.contains("Read before write"), "should include read-first rule");
-        assert!(prompt.contains("ANTI-PATTERNS"), "should include anti-patterns");
-        assert!(prompt.contains("grep for all call sites"), "should include impact tracing");
+        assert!(
+            prompt.contains("WORKING PROTOCOL"),
+            "should always include protocol"
+        );
+        assert!(
+            prompt.contains("Read before write"),
+            "should include read-first rule"
+        );
+        assert!(
+            prompt.contains("ANTI-PATTERNS"),
+            "should include anti-patterns"
+        );
+        assert!(
+            prompt.contains("grep for all call sites"),
+            "should include impact tracing"
+        );
     }
 
     #[test]
@@ -242,12 +256,8 @@ mod tests {
 
     #[test]
     fn system_prompt_respects_append() {
-        let prompt = build_tool_use_system_prompt(
-            None,
-            None,
-            Some("Extra rule: always add tests."),
-            None,
-        );
+        let prompt =
+            build_tool_use_system_prompt(None, None, Some("Extra rule: always add tests."), None);
         assert!(prompt.contains("You are DeepSeek, an expert software"));
         assert!(prompt.contains("Extra rule: always add tests."));
         assert!(prompt.contains("Additional Instructions"));
@@ -292,54 +302,111 @@ mod tests {
     #[test]
     fn complex_gets_full_planning_protocol() {
         let prompt = build_tool_use_system_prompt_with_complexity(
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
             PromptComplexity::Complex,
             None,
         );
-        assert!(prompt.contains("COMPLEX TASK"), "complex should get planning protocol");
-        assert!(prompt.contains("Step 1: Explore"), "should include explore step");
+        assert!(
+            prompt.contains("COMPLEX TASK"),
+            "complex should get planning protocol"
+        );
+        assert!(
+            prompt.contains("Step 1: Explore"),
+            "should include explore step"
+        );
         assert!(prompt.contains("Step 2: Plan"), "should include plan step");
-        assert!(prompt.contains("Step 3: Execute"), "should include execute step");
-        assert!(prompt.contains("Anti-Patterns"), "should include anti-patterns");
-        assert!(prompt.contains("WORKING PROTOCOL"), "should have protocol in base");
+        assert!(
+            prompt.contains("Step 3: Execute"),
+            "should include execute step"
+        );
+        assert!(
+            prompt.contains("Anti-Patterns"),
+            "should include anti-patterns"
+        );
+        assert!(
+            prompt.contains("WORKING PROTOCOL"),
+            "should have protocol in base"
+        );
     }
 
     #[test]
     fn medium_gets_lightweight_guidance() {
         let prompt = build_tool_use_system_prompt_with_complexity(
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
             PromptComplexity::Medium,
             None,
         );
-        assert!(prompt.contains("Task Guidance"), "medium should get guidance");
-        assert!(prompt.contains("Read the files"), "should include read-before-write");
-        assert!(prompt.contains("grep for all usages"), "should include impact tracing");
-        assert!(!prompt.contains("COMPLEX TASK"), "medium should NOT get full protocol");
+        assert!(
+            prompt.contains("Task Guidance"),
+            "medium should get guidance"
+        );
+        assert!(
+            prompt.contains("Read the files"),
+            "should include read-before-write"
+        );
+        assert!(
+            prompt.contains("grep for all usages"),
+            "should include impact tracing"
+        );
+        assert!(
+            !prompt.contains("COMPLEX TASK"),
+            "medium should NOT get full protocol"
+        );
     }
 
     #[test]
     fn simple_gets_no_injection() {
         let prompt = build_tool_use_system_prompt_with_complexity(
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
             PromptComplexity::Simple,
             None,
         );
-        assert!(prompt.contains("WORKING PROTOCOL"), "simple gets base protocol");
-        assert!(!prompt.contains("COMPLEX TASK"), "simple should NOT get complex protocol");
-        assert!(!prompt.contains("Task Guidance"), "simple should NOT get medium guidance");
+        assert!(
+            prompt.contains("WORKING PROTOCOL"),
+            "simple gets base protocol"
+        );
+        assert!(
+            !prompt.contains("COMPLEX TASK"),
+            "simple should NOT get complex protocol"
+        );
+        assert!(
+            !prompt.contains("Task Guidance"),
+            "simple should NOT get medium guidance"
+        );
     }
 
     #[test]
     fn complex_includes_repo_map() {
         let repo_map = "- src/lib.rs (2048 bytes) score=100\n- src/main.rs (512 bytes) score=50";
         let prompt = build_tool_use_system_prompt_with_complexity(
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
             PromptComplexity::Complex,
             Some(repo_map),
         );
-        assert!(prompt.contains("Project Files"), "complex should include project files");
-        assert!(prompt.contains("src/lib.rs"), "should include repo map entries");
-        assert!(prompt.contains("src/main.rs"), "should include all repo map entries");
+        assert!(
+            prompt.contains("Project Files"),
+            "complex should include project files"
+        );
+        assert!(
+            prompt.contains("src/lib.rs"),
+            "should include repo map entries"
+        );
+        assert!(
+            prompt.contains("src/main.rs"),
+            "should include all repo map entries"
+        );
     }
 
     #[test]
@@ -352,8 +419,14 @@ mod tests {
             PromptComplexity::Complex,
             Some("repo map content"),
         );
-        assert!(!prompt.contains("COMPLEX TASK"), "override should skip complexity");
-        assert!(!prompt.contains("Project Files"), "override should skip repo map");
+        assert!(
+            !prompt.contains("COMPLEX TASK"),
+            "override should skip complexity"
+        );
+        assert!(
+            !prompt.contains("Project Files"),
+            "override should skip repo map"
+        );
     }
 
     #[test]

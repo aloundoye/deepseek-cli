@@ -2122,7 +2122,10 @@ mod tests {
         cfg.agent_loop.max_iterations = 50;
 
         managed.apply_to_config(&mut cfg);
-        assert_eq!(cfg.agent_loop.max_iterations, 10, "managed max_turns should cap config");
+        assert_eq!(
+            cfg.agent_loop.max_iterations, 10,
+            "managed max_turns should cap config"
+        );
     }
 
     #[test]
@@ -2134,13 +2137,19 @@ mod tests {
         let mut cfg = deepseek_core::AppConfig::default();
         // Default permission mode is Ask, not Bypass, so this should be no-op
         managed.apply_to_config(&mut cfg);
-        assert_eq!(cfg.policy.permission_mode, deepseek_core::PermissionMode::Ask);
+        assert_eq!(
+            cfg.policy.permission_mode,
+            deepseek_core::PermissionMode::Ask
+        );
 
         // Verify that max_turns without managed override stays unchanged
         let managed_no_turns = ManagedSettings::default();
         let mut cfg2 = deepseek_core::AppConfig::default();
         let original = cfg2.agent_loop.max_iterations;
         managed_no_turns.apply_to_config(&mut cfg2);
-        assert_eq!(cfg2.agent_loop.max_iterations, original, "no override = unchanged");
+        assert_eq!(
+            cfg2.agent_loop.max_iterations, original,
+            "no override = unchanged"
+        );
     }
 }

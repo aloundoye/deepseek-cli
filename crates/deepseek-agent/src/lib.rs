@@ -39,10 +39,10 @@ type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatMode {
-    Ask,          // Read-only, tool-use loop (read_only=true)
+    Ask, // Read-only, tool-use loop (read_only=true)
     #[default]
-    Code,         // Default: tool-use loop (full capability)
-    Context,      // Read-only, tool-use loop (read_only=true)
+    Code, // Default: tool-use loop (full capability)
+    Context, // Read-only, tool-use loop (read_only=true)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -88,7 +88,6 @@ pub struct AgentEngine {
     user_question_handler: Mutex<Option<UserQuestionHandler>>,
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     pub(crate) hooks: HookRuntime,
-    #[allow(dead_code)]
     mcp: Option<McpManager>,
 }
 
@@ -136,7 +135,37 @@ impl AgentEngine {
             }
         }
 
-        let tool_host = Arc::new(LocalToolHost::new(workspace, policy.clone())?);
+        let mut tool_host = LocalToolHost::new(workspace, policy.clone())?;
+
+        // Wire MCP executor so tool_host can dispatch mcp__* tool calls.
+        let mcp = McpManager::new(workspace).ok();
+        if let Some(mcp_mgr) = &mcp {
+            let servers = mcp_mgr.list_servers().unwrap_or_default();
+            if !servers.is_empty() {
+                let servers = std::sync::Arc::new(servers);
+                tool_host.set_mcp_executor(std::sync::Arc::new(
+                    move |server_id, tool_name, args| {
+                        let server = servers
+                            .iter()
+                            .find(|s| s.id == server_id)
+                            .ok_or_else(|| anyhow!("MCP server '{server_id}' not found"))?;
+                        let params = serde_json::json!({
+                            "name": tool_name,
+                            "arguments": args,
+                        });
+                        deepseek_mcp::execute_mcp_stdio_request(
+                            server,
+                            "tools/call",
+                            params,
+                            1,
+                            std::time::Duration::from_secs(30),
+                        )
+                    },
+                ));
+            }
+        }
+
+        let tool_host = Arc::new(tool_host);
 
         // Best-effort checkpoint cleanup on session start.
         if cfg.cleanup_period_days > 0 {
@@ -164,7 +193,7 @@ impl AgentEngine {
             user_question_handler: Mutex::new(None),
             subagent_worker: Mutex::new(None),
             hooks,
-            mcp: McpManager::new(workspace).ok(),
+            mcp,
         })
     }
 
@@ -312,13 +341,7 @@ impl AgentEngine {
     /// Build a skill runner callback that wraps SkillManager.
     fn build_skill_runner(&self) -> Option<tool_loop::SkillRunner> {
         let workspace = self.workspace.clone();
-        let skill_paths: Vec<String> = self
-            .cfg
-            .skills
-            .paths
-            .iter()
-            .cloned()
-            .collect();
+        let skill_paths: Vec<String> = self.cfg.skills.paths.iter().cloned().collect();
 
         Some(Arc::new(move |skill_name: &str, args: Option<&str>| {
             let manager = deepseek_skills::SkillManager::new(&workspace)?;
@@ -350,7 +373,11 @@ impl AgentEngine {
 
     /// Fire PreToolUse hooks. Returns the aggregate result.
     /// Callers should check `result.blocked` to decide whether to skip tool execution.
-    pub fn fire_pre_tool_use(&self, tool_name: &str, tool_input: &serde_json::Value) -> deepseek_hooks::HookResult {
+    pub fn fire_pre_tool_use(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+    ) -> deepseek_hooks::HookResult {
         let input = deepseek_hooks::HookInput {
             event: deepseek_hooks::HookEvent::PreToolUse.as_str().to_string(),
             tool_name: Some(tool_name.to_string()),
@@ -360,7 +387,8 @@ impl AgentEngine {
             session_type: None,
             workspace: self.workspace.display().to_string(),
         };
-        self.hooks.fire(deepseek_hooks::HookEvent::PreToolUse, &input)
+        self.hooks
+            .fire(deepseek_hooks::HookEvent::PreToolUse, &input)
     }
 
     /// Fire Stop hooks at end of agent execution.
@@ -497,18 +525,15 @@ impl AgentEngine {
         // Complexity-driven initial budget, with evidence-driven escalation in the loop.
         // force_max_think is an explicit user override to maximum.
         let think_budget = if options.force_max_think {
-            complexity::MAX_THINK_BUDGET      // 64K
+            complexity::MAX_THINK_BUDGET // 64K
         } else {
             complexity::thinking_budget_for(complexity) // Simple 8K / Medium 16K / Complex 32K
         };
 
         // Gather lightweight bootstrap context so the model starts with project awareness.
         // Budget: ~15% of context window to leave room for conversation.
-        let initial_context = self.build_bootstrap_context(
-            prompt,
-            options,
-            self.cfg.llm.context_window_tokens,
-        );
+        let initial_context =
+            self.build_bootstrap_context(prompt, options, self.cfg.llm.context_window_tokens);
 
         let config = tool_loop::ToolLoopConfig {
             model: self.cfg.llm.base_model.clone(), // Always deepseek-chat
@@ -517,8 +542,7 @@ impl AgentEngine {
             context_window_tokens: self.cfg.llm.context_window_tokens,
             max_turns: self
                 .max_turns
-                .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns)
-                as usize,
+                .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns) as usize,
             read_only,
             thinking: Some(deepseek_core::ThinkingConfig::enabled(think_budget)),
             extended_thinking_model: self.cfg.llm.max_think_model.clone(),
@@ -532,12 +556,38 @@ impl AgentEngine {
             initial_context,
         };
 
+        // Build tool list: built-in tools + MCP-discovered tools.
+        let mut tools = tool_definitions();
+        if let Some(ref mcp) = self.mcp {
+            if let Ok(mcp_tools) = mcp.discover_tools() {
+                for mt in mcp_tools {
+                    tools.push(deepseek_core::ToolDefinition {
+                        tool_type: "function".to_string(),
+                        function: deepseek_core::FunctionDefinition {
+                            name: format!("mcp__{}__{}", mt.server_id, mt.name),
+                            description: mt.description.clone(),
+                            parameters: serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "arguments": {
+                                        "type": "object",
+                                        "description": "Arguments to pass to the MCP tool"
+                                    }
+                                }
+                            }),
+                            strict: None,
+                        },
+                    });
+                }
+            }
+        }
+
         let mut loop_ = tool_loop::ToolUseLoop::new(
             self.llm.as_ref(),
             self.tool_host.clone(),
             config,
             system_prompt,
-            tool_definitions(),
+            tools,
         );
 
         // Wire stream callback
@@ -553,7 +603,9 @@ impl AgentEngine {
         {
             let handler = Arc::new(Mutex::new(handler));
             loop_.set_approval_callback(Arc::new(move |call| {
-                let mut h = handler.lock().map_err(|_| anyhow!("approval handler mutex poisoned"))?;
+                let mut h = handler
+                    .lock()
+                    .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
                 h(call)
             }));
         }
@@ -791,13 +843,49 @@ fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
 fn build_retriever_callback(
     workspace: &std::path::Path,
     cfg: &deepseek_core::AppConfig,
-) -> Option<std::sync::Arc<dyn Fn(&str, usize) -> anyhow::Result<Vec<tool_loop::RetrievalContext>> + Send + Sync>> {
+) -> Option<
+    std::sync::Arc<
+        dyn Fn(&str, usize) -> anyhow::Result<Vec<tool_loop::RetrievalContext>> + Send + Sync,
+    >,
+> {
     if !cfg.local_ml.enabled {
         return None;
     }
 
-    // Build embeddings backend (MockEmbeddings provides deterministic SHA-256 hashing;
-    // for true semantic search, compile deepseek-local-ml with --features local-ml).
+    // Build embeddings backend: real Candle model with local-ml, deterministic mock without.
+    #[cfg(feature = "local-ml")]
+    let embeddings: std::sync::Arc<dyn deepseek_local_ml::EmbeddingsBackend> = {
+        let mut mgr =
+            deepseek_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir));
+        match mgr.ensure_model(&cfg.local_ml.embeddings.model_id) {
+            Ok(model_path) => {
+                let device = deepseek_local_ml::parse_device(&cfg.local_ml.device);
+                match deepseek_local_ml::CandleEmbeddings::load(
+                    &model_path.join("model.safetensors"),
+                    &model_path.join("config.json"),
+                    &model_path.join("tokenizer.json"),
+                    &device,
+                    cfg.local_ml.embeddings.normalize,
+                ) {
+                    Ok(emb) => std::sync::Arc::new(emb),
+                    Err(e) => {
+                        eprintln!(
+                            "[deepseek] candle embeddings load failed ({e}), falling back to mock"
+                        );
+                        std::sync::Arc::new(deepseek_local_ml::MockEmbeddings::new(384))
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[deepseek] model '{}' not available ({e}), using mock embeddings",
+                    cfg.local_ml.embeddings.model_id
+                );
+                std::sync::Arc::new(deepseek_local_ml::MockEmbeddings::new(384))
+            }
+        }
+    };
+    #[cfg(not(feature = "local-ml"))]
     let embeddings: std::sync::Arc<dyn deepseek_local_ml::EmbeddingsBackend> =
         std::sync::Arc::new(deepseek_local_ml::MockEmbeddings::new(384));
 
@@ -808,14 +896,29 @@ fn build_retriever_callback(
         ..Default::default()
     };
 
-    // Build hybrid retriever
-    let retriever = match deepseek_local_ml::HybridRetriever::new(
-        &index_path,
-        embeddings,
-        None, // tantivy index — optional
-        0.7,  // blend_alpha: favor vector search
-        chunk_config,
-    ) {
+    // Build hybrid retriever: use UsearchBackend (HNSW) with local-ml, BruteForce without.
+    #[cfg(feature = "local-ml")]
+    let retriever = match deepseek_local_ml::UsearchBackend::new(embeddings.dimension()) {
+        Ok(backend) => deepseek_local_ml::HybridRetriever::new_with_backend(
+            &index_path,
+            embeddings,
+            Box::new(backend),
+            None,
+            0.7,
+            chunk_config,
+        ),
+        Err(_) => deepseek_local_ml::HybridRetriever::new(
+            &index_path,
+            embeddings,
+            None,
+            0.7,
+            chunk_config,
+        ),
+    };
+    #[cfg(not(feature = "local-ml"))]
+    let retriever =
+        deepseek_local_ml::HybridRetriever::new(&index_path, embeddings, None, 0.7, chunk_config);
+    let retriever = match retriever {
         Ok(r) => std::sync::Arc::new(std::sync::Mutex::new(r)),
         Err(e) => {
             eprintln!("[deepseek] retriever init failed ({e}), retrieval disabled");
@@ -827,33 +930,37 @@ fn build_retriever_callback(
     let workspace_path = workspace.to_path_buf();
     let indexed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    Some(std::sync::Arc::new(move |query: &str, max_results: usize| {
-        let mut retriever = retriever.lock().map_err(|e| anyhow!("retriever lock: {e}"))?;
+    Some(std::sync::Arc::new(
+        move |query: &str, max_results: usize| {
+            let mut retriever = retriever
+                .lock()
+                .map_err(|e| anyhow!("retriever lock: {e}"))?;
 
-        // Lazy index on first call
-        if !indexed.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Err(e) = retriever.build_index(&workspace_path) {
-                eprintln!("[deepseek] index build failed: {e}");
+            // Lazy index on first call
+            if !indexed.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Err(e) = retriever.build_index(&workspace_path) {
+                    eprintln!("[deepseek] index build failed: {e}");
+                }
+                indexed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            indexed.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
 
-        let filter = deepseek_local_ml::SearchFilter {
-            max_results,
-            ..Default::default()
-        };
-        let results = retriever.search(query, max_results, &filter)?;
-        Ok(results
-            .into_iter()
-            .map(|r| tool_loop::RetrievalContext {
-                file_path: r.chunk.file_path.to_string_lossy().to_string(),
-                start_line: r.chunk.start_line,
-                end_line: r.chunk.end_line,
-                content: r.chunk.content,
-                score: r.hybrid_score,
-            })
-            .collect())
-    }))
+            let filter = deepseek_local_ml::SearchFilter {
+                max_results,
+                ..Default::default()
+            };
+            let results = retriever.search(query, max_results, &filter)?;
+            Ok(results
+                .into_iter()
+                .map(|r| tool_loop::RetrievalContext {
+                    file_path: r.chunk.file_path.to_string_lossy().to_string(),
+                    start_line: r.chunk.start_line,
+                    end_line: r.chunk.end_line,
+                    content: r.chunk.content,
+                    score: r.hybrid_score,
+                })
+                .collect())
+        },
+    ))
 }
 
 /// Build a privacy router from config. Returns None if privacy is disabled.
@@ -1081,7 +1188,10 @@ mod tests {
         // (it falls back to file-based internally, or returns an error)
         match result {
             Ok(sc) => {
-                assert!(!sc.git_backed, "non-git dir should not produce git-backed shadow commit");
+                assert!(
+                    !sc.git_backed,
+                    "non-git dir should not produce git-backed shadow commit"
+                );
             }
             Err(_) => {
                 // Also acceptable: shadow commit fails in non-git dir
@@ -1099,7 +1209,10 @@ mod tests {
         // ContextManager should gracefully handle a non-existent or empty workspace
         let result = deepseek_context::ContextManager::new("/tmp/nonexistent_deepseek_test_dir");
         // Should succeed (creates empty graph) — not panic
-        assert!(result.is_ok(), "ContextManager::new should not fail on missing dir");
+        assert!(
+            result.is_ok(),
+            "ContextManager::new should not fail on missing dir"
+        );
     }
 
     #[test]
@@ -1113,11 +1226,8 @@ mod tests {
             "pub mod utils;\npub mod handler;\n",
         )
         .expect("write lib.rs");
-        std::fs::write(
-            workspace.join("src/utils.rs"),
-            "pub fn helper() {}\n",
-        )
-        .expect("write utils.rs");
+        std::fs::write(workspace.join("src/utils.rs"), "pub fn helper() {}\n")
+            .expect("write utils.rs");
         std::fs::write(
             workspace.join("src/handler.rs"),
             "use crate::utils;\npub fn handle() { utils::helper(); }\n",
@@ -1133,7 +1243,10 @@ mod tests {
         let has_handler = suggestions
             .iter()
             .any(|s| s.path.to_string_lossy().contains("handler"));
-        assert!(has_handler, "handler.rs should appear in suggestions for query 'handler'");
+        assert!(
+            has_handler,
+            "handler.rs should appear in suggestions for query 'handler'"
+        );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }

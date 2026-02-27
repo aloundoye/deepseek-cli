@@ -122,10 +122,7 @@ fn chunk_skips_binary_files() {
         .iter()
         .filter(|c| c.file_path.to_string_lossy().contains("image.png"))
         .collect();
-    assert!(
-        png_chunks.is_empty(),
-        "binary files should be skipped"
-    );
+    assert!(png_chunks.is_empty(), "binary files should be skipped");
 }
 
 #[test]
@@ -177,7 +174,10 @@ fn incremental_only_changed_files() {
 fn detect_language_from_extensions() {
     assert_eq!(detect_language(std::path::Path::new("foo.rs")), "rust");
     assert_eq!(detect_language(std::path::Path::new("bar.py")), "python");
-    assert_eq!(detect_language(std::path::Path::new("baz.ts")), "typescript");
+    assert_eq!(
+        detect_language(std::path::Path::new("baz.ts")),
+        "typescript"
+    );
     assert_eq!(detect_language(std::path::Path::new("qux.go")), "go");
     assert_eq!(detect_language(std::path::Path::new("nope.xyz")), "unknown");
 }

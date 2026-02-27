@@ -11,15 +11,11 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::commands::intelligence::{
-    DebugAnalysisMode, FrameworkReport, analyze_debug_text, detect_frameworks,
-};
-use crate::commands::leadership::{LeadershipReport, build_leadership_report};
 use crate::context::*;
 use crate::output::*;
 use crate::util::*;
 use crate::{
-    CleanArgs, ConfigCmd, DoctorArgs, DoctorModeArg, IndexCmd, PermissionModeArg, PermissionsCmd,
+    CleanArgs, ConfigCmd, DoctorArgs, IndexCmd, PermissionModeArg, PermissionsCmd,
     PermissionsSetArgs, PluginCmd,
 };
 
@@ -192,53 +188,6 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             payload["plugins"]["enabled"].as_u64().unwrap_or(0),
             payload["plugins"]["installed"].as_u64().unwrap_or(0)
         );
-        let framework_names = payload["frameworks"]["detected"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row["name"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        if framework_names.is_empty() {
-            println!("frameworks: none detected");
-        } else {
-            println!(
-                "frameworks: {} (primary={})",
-                framework_names,
-                payload["frameworks"]["primary_ecosystem"]
-                    .as_str()
-                    .unwrap_or("unknown")
-            );
-        }
-        if let Some(leadership) = payload.get("leadership") {
-            println!(
-                "leadership: score={} ok={} integrations={} deployment_risks={}",
-                leadership["readiness"]["score"].as_u64().unwrap_or(0),
-                leadership["readiness"]["ok"].as_bool().unwrap_or(false),
-                leadership["ecosystem"]["integrations"]
-                    .as_array()
-                    .map(|rows| rows.len())
-                    .unwrap_or(0),
-                leadership["deployment"]["risks"]
-                    .as_array()
-                    .map(|rows| rows.len())
-                    .unwrap_or(0)
-            );
-        }
-        if let Some(debug) = payload.get("debug_analysis")
-            && !debug.is_null()
-        {
-            println!(
-                "debug analysis: mode={} issues={}",
-                debug["mode"].as_str().unwrap_or("unknown"),
-                debug["issues"]
-                    .as_array()
-                    .map(|rows| rows.len())
-                    .unwrap_or(0)
-            );
-        }
         if let Some(warnings) = payload["warnings"].as_array()
             && !warnings.is_empty()
         {
@@ -254,7 +203,7 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
     Ok(())
 }
 
-pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json::Value> {
+pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_json::Value> {
     let cfg = AppConfig::ensure(cwd)?;
     let plugin_manager = PluginManager::new(cwd)?;
     let plugins = plugin_manager.list().unwrap_or_default();
@@ -299,54 +248,6 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         warnings.push("cargo not found in PATH".to_string());
     }
 
-    let frameworks = match detect_frameworks(cwd) {
-        Ok(report) => report,
-        Err(err) => {
-            warnings.push(format!("framework detection failed: {err}"));
-            FrameworkReport {
-                detected: Vec::new(),
-                primary_ecosystem: "unknown".to_string(),
-                recommendations: Vec::new(),
-            }
-        }
-    };
-    let leadership = match build_leadership_report(cwd, 24) {
-        Ok(report) => report,
-        Err(err) => {
-            warnings.push(format!("leadership analysis failed: {err}"));
-            LeadershipReport::default()
-        }
-    };
-
-    let debug_source = if let Some(file) = args.analyze_file.as_deref() {
-        Some(json!({
-            "kind": "file",
-            "path": file,
-        }))
-    } else if args.analyze_text.is_some() {
-        Some(json!({
-            "kind": "inline",
-            "path": serde_json::Value::Null,
-        }))
-    } else {
-        None
-    };
-
-    let debug_analysis = if let Some(text) = args.analyze_text.as_deref() {
-        Some(analyze_debug_text(text, debug_mode_from_arg(args.mode)))
-    } else if let Some(path) = args.analyze_file.as_deref() {
-        let content = fs::read_to_string(path).map_err(|err| {
-            anyhow!(
-                "failed to read --analyze-file {}: {}",
-                Path::new(path).display(),
-                err
-            )
-        })?;
-        Some(analyze_debug_text(&content, debug_mode_from_arg(args.mode)))
-    } else {
-        None
-    };
-
     let payload = json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -380,23 +281,10 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "enabled": plugins.iter().filter(|p| p.enabled).count(),
         },
         "checks": checks,
-        "frameworks": frameworks,
-        "leadership": leadership,
-        "debug_source": debug_source,
-        "debug_analysis": debug_analysis,
         "warnings": warnings,
     });
 
     Ok(payload)
-}
-
-fn debug_mode_from_arg(mode: DoctorModeArg) -> DebugAnalysisMode {
-    match mode {
-        DoctorModeArg::Auto => DebugAnalysisMode::Auto,
-        DoctorModeArg::Runtime => DebugAnalysisMode::Runtime,
-        DoctorModeArg::Test => DebugAnalysisMode::Test,
-        DoctorModeArg::Performance => DebugAnalysisMode::Performance,
-    }
 }
 
 pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()> {
@@ -484,7 +372,9 @@ pub(crate) fn run_index(cwd: &Path, cmd: IndexCmd, json_mode: bool) -> Result<()
             if index_path.exists() {
                 std::fs::remove_dir_all(&index_path)?;
                 if json_mode {
-                    print_json(&serde_json::json!({"cleaned": true, "path": index_path.to_string_lossy()}))?;
+                    print_json(
+                        &serde_json::json!({"cleaned": true, "path": index_path.to_string_lossy()}),
+                    )?;
                 } else {
                     println!("Index cleaned: {}", index_path.display());
                 }

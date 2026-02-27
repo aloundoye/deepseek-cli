@@ -66,12 +66,8 @@ pub fn run_verify(
         if command_passed(&result.output, result.success) {
             continue;
         } else {
-            let mut failure_message = format!(
-                "`{}` failed:\n{}",
-                command,
-                truncate(&output, 2500)
-            );
-            
+            let mut failure_message = format!("`{}` failed:\n{}", command, truncate(&output, 2500));
+
             // FailureContextPack: Append auto-extracted files matching paths from the trace
             let context_pack = build_failure_context_pack(workspace, &output);
             if !context_pack.is_empty() {
@@ -164,12 +160,14 @@ fn build_failure_context_pack(workspace: &Path, output: &str) -> String {
     let mut pack = String::new();
 
     // Tokenize roughly to try finding workspace-relative files
-    for token in output.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '=' || c == '[' || c == ']') {
+    for token in output.split(|c: char| {
+        c.is_whitespace() || c == '"' || c == '\'' || c == '=' || c == '[' || c == ']'
+    }) {
         // Strip common trailing punctuation (e.g., from Python stack trace: file.py:20)
         let clean_token = token
             .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.')
             .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
-            
+
         // Look for typical file names and line numbers
         let path_str = if let Some(idx) = clean_token.rfind(':') {
             &clean_token[..idx]
@@ -195,7 +193,10 @@ fn build_failure_context_pack(workspace: &Path, output: &str) -> String {
                 } else {
                     content
                 };
-                pack.push_str(&format!("\n--- Context Auto-Attached: {} ---\n{}\n", path_str, content_str));
+                pack.push_str(&format!(
+                    "\n--- Context Auto-Attached: {} ---\n{}\n",
+                    path_str, content_str
+                ));
             }
         }
     }

@@ -168,7 +168,10 @@ impl OutputScanner {
         for pat in &self.secret_patterns {
             if pat.regex.is_match(&redacted) {
                 had_secrets = true;
-                redacted = pat.regex.replace_all(&redacted, pat.placeholder).to_string();
+                redacted = pat
+                    .regex
+                    .replace_all(&redacted, pat.placeholder)
+                    .to_string();
             }
         }
 
@@ -218,8 +221,7 @@ impl Default for OutputScanner {
 /// Minimal base64 decoder (standard alphabet, with padding).
 /// We avoid pulling in the `base64` crate for this single use.
 fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut buf = Vec::with_capacity(input.len() * 3 / 4);
     let mut accum: u32 = 0;
     let mut bits: u32 = 0;
@@ -350,7 +352,9 @@ fn main() {
         let result = scanner().scan(text);
         assert!(result.had_secrets);
         assert!(
-            result.redacted_output.contains("[REDACTED:connection_string]"),
+            result
+                .redacted_output
+                .contains("[REDACTED:connection_string]"),
             "got: {}",
             result.redacted_output
         );
@@ -384,7 +388,10 @@ mod tests {
 }
 "#;
         let result = scanner().scan(rust_src);
-        assert!(!result.had_secrets, "normal Rust code should not trigger secret detection");
+        assert!(
+            !result.had_secrets,
+            "normal Rust code should not trigger secret detection"
+        );
         assert_eq!(result.redacted_output, rust_src);
     }
 

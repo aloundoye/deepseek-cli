@@ -24,14 +24,8 @@ fn index_build_creates_vector_index() {
     std::fs::write(ws.join("lib.rs"), &content).unwrap();
 
     let idx_path = dir.path().join("vector-index");
-    let mut retriever = HybridRetriever::new(
-        &idx_path,
-        embeddings,
-        None,
-        0.7,
-        ChunkConfig::default(),
-    )
-    .unwrap();
+    let mut retriever =
+        HybridRetriever::new(&idx_path, embeddings, None, 0.7, ChunkConfig::default()).unwrap();
 
     let report = retriever.build_index(&ws).unwrap();
     assert!(report.chunks_indexed > 0, "should index chunks");
@@ -68,7 +62,10 @@ fn privacy_scan_finds_env_files() {
 
     // .env should be detected as sensitive path
     assert!(router.is_sensitive_path(".env"), ".env should be sensitive");
-    assert!(!router.is_sensitive_path("main.rs"), "main.rs should not be sensitive");
+    assert!(
+        !router.is_sensitive_path("main.rs"),
+        "main.rs should not be sensitive"
+    );
 
     // Content scanning should find secrets
     let env_content = std::fs::read_to_string(ws.join(".env")).unwrap();
@@ -80,7 +77,10 @@ fn privacy_scan_finds_env_files() {
 fn autocomplete_enable_disable_toggles() {
     // Test the config toggle logic used by the autocomplete command
     let mut cfg = deepseek_core::AppConfig::default();
-    assert!(!cfg.local_ml.autocomplete.enabled, "default should be disabled");
+    assert!(
+        !cfg.local_ml.autocomplete.enabled,
+        "default should be disabled"
+    );
 
     cfg.local_ml.autocomplete.enabled = true;
     assert!(cfg.local_ml.autocomplete.enabled);
@@ -103,7 +103,10 @@ fn index_query_returns_results() {
 
     let mut content = String::new();
     for i in 1..=60 {
-        content.push_str(&format!("pub fn search_handler_{}() {{ /* search logic */ }}\n", i));
+        content.push_str(&format!(
+            "pub fn search_handler_{}() {{ /* search logic */ }}\n",
+            i
+        ));
     }
     std::fs::write(ws.join("search.rs"), &content).unwrap();
 

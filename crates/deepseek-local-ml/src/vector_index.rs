@@ -118,7 +118,12 @@ impl VectorIndex {
     }
 
     /// Search for similar chunks, with optional filtering.
-    pub fn search(&self, query: &[f32], k: usize, filter: &SearchFilter) -> Result<Vec<SearchResult>> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &SearchFilter,
+    ) -> Result<Vec<SearchResult>> {
         let max_k = if filter.max_results > 0 {
             filter.max_results
         } else {
@@ -141,9 +146,7 @@ impl VectorIndex {
             let chunk = self.get_chunk(&chunk_id)?;
             if let Some(chunk) = chunk {
                 // Apply filters
-                if !filter.languages.is_empty()
-                    && !filter.languages.contains(&chunk.language)
-                {
+                if !filter.languages.is_empty() && !filter.languages.contains(&chunk.language) {
                     continue;
                 }
                 if !filter.file_globs.is_empty() {
@@ -170,17 +173,15 @@ impl VectorIndex {
     pub fn stats(&self) -> Result<IndexStats> {
         let mut backend_stats = self.backend.stats();
 
-        let chunk_count: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM chunks",
-            [],
-            |row| row.get(0),
-        )?;
+        let chunk_count: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
 
-        let file_count: i64 = self.db.query_row(
-            "SELECT COUNT(DISTINCT file_path) FROM chunks",
-            [],
-            |row| row.get(0),
-        )?;
+        let file_count: i64 =
+            self.db
+                .query_row("SELECT COUNT(DISTINCT file_path) FROM chunks", [], |row| {
+                    row.get(0)
+                })?;
 
         let size_bytes = if self.db_path.exists() {
             std::fs::metadata(&self.db_path)

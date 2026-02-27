@@ -95,7 +95,8 @@ pub fn gather_for_prompt(
                 vague_codebase_prompt,
                 packet: String::new(),
                 unavailable_reason: Some(
-                    "No repository detected. Run from project root or pass --repo <path>.".to_string(),
+                    "No repository detected. Run from project root or pass --repo <path>."
+                        .to_string(),
                 ),
                 ..Default::default()
             };

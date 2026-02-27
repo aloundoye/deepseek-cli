@@ -26,8 +26,8 @@ pub fn llm_tool_call_to_internal(call: &LlmToolCall) -> ToolCall {
         .unwrap_or_else(|| call.name.clone());
 
     // Parse arguments from JSON string. If parsing fails, pass empty object.
-    let args: serde_json::Value = serde_json::from_str(&call.arguments)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let args: serde_json::Value =
+        serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
 
     // Determine approval requirement: read-only tools don't need it.
     let requires_approval = ToolName::from_api_name(&call.name)
@@ -235,7 +235,10 @@ mod tests {
         let (msg, warnings) = tool_result_to_message("call_1", "fs_read", &result, None);
         assert!(warnings.is_empty());
         match msg {
-            ChatMessage::Tool { tool_call_id, content } => {
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
                 assert_eq!(tool_call_id, "call_1");
                 assert_eq!(content, "file contents here");
             }
@@ -288,7 +291,10 @@ mod tests {
         let (msg, _) = tool_result_to_message("call_mcp", "mcp__github__search", &result, None);
         match msg {
             ChatMessage::Tool { content, .. } => {
-                assert!(content.len() < 101_000, "MCP output should truncate around 100K");
+                assert!(
+                    content.len() < 101_000,
+                    "MCP output should truncate around 100K"
+                );
                 assert!(content.contains("[Output truncated"));
             }
             _ => panic!("expected Tool message"),
