@@ -3,14 +3,19 @@
 DeepSeek CLI is a terminal-native coding agent written in Rust. It combines chat, planning, tool execution, patch workflows, indexing, and long-running autopilot loops in one cross-platform CLI.
 
 ## Highlights
-- DeepSeek model aliases: `deepseek-chat` and `deepseek-reasoner`
-- Default profile: `v3_2`
-- Interactive chat UI (TUI enabled by default in interactive terminals)
-- Structured automation output via `--json`
-- Session persistence and deterministic replay
-- Plugin, skill, hook, and MCP integrations
-- Permission and sandbox policy controls
-- Built-in benchmark and parity tooling
+- **Agent intelligence**: Adaptive complexity (Simple/Medium/Complex), planning protocols, error recovery, stuck detection
+- **Bootstrap context**: Automatic project awareness (file tree, git status, repo map, dependency analysis) on first turn
+- **Hybrid retrieval**: Vector + BM25 code search with RRF fusion — surfaces relevant code before the LLM responds
+- **Privacy scanning**: 3-layer secret detection (path/content/builtin patterns) with redaction on tool outputs
+- **Ghost text**: Local ML-powered inline completions in the TUI (Tab to accept, Alt+Right for one word)
+- **Model routing**: Automatically routes complex tasks to `deepseek-reasoner`, simple tasks to `deepseek-chat`
+- **14 lifecycle hooks**: SessionStart through TaskCompleted — extend behavior at every stage
+- **Interactive TUI**: Vim mode, @file autocomplete, !bash prefix, syntax highlighting, keyboard shortcuts
+- **Skills & subagents**: Forked execution, worktree isolation, custom agent definitions
+- **MCP integration**: JSON-RPC stdio/http transports, prompts as slash commands
+- **Permission engine**: 7 modes, glob allowlist/denylist, team-managed policy overlays
+- **Session persistence**: JSONL event log + SQLite projections, deterministic replay
+- **Local ML (opt-in)**: Candle-powered embeddings and code completion, HNSW vector index — runs fully offline
 
 ## Architecture
 
@@ -186,127 +191,85 @@ deepseek completions --shell zsh > ~/.zsh/completions/_deepseek
 
 ## Configuration
 
-DeepSeek CLI merges configuration in this order (later entries win):
+Settings merge in order (later wins):
 
-1. Legacy fallback: `.deepseek/config.toml`
-2. User config: `~/.deepseek/settings.json`
-3. Project config: `.deepseek/settings.json`
-4. Project-local overrides: `.deepseek/settings.local.json`
-
-Useful commands:
+1. `~/.deepseek/settings.json` (user — all projects)
+2. `.deepseek/settings.json` (project — shared with team)
+3. `.deepseek/settings.local.json` (local overrides — gitignore this)
 
 ```bash
-deepseek config show
-deepseek config edit
-deepseek --setting-sources
+deepseek config show               # View merged config (keys redacted)
+deepseek config edit               # Open in editor
 ```
 
-Reference files:
-- `config.example.json`
-- `config.example.toml`
+Key settings:
 
-Notable architecture/runtime defaults:
-- Tool-use loop is the sole execution backbone (Code/Ask/Context modes).
-- Adaptive complexity classifier (Simple/Medium/Complex) sets thinking budgets and planning guidance.
-- Bootstrap context gathers project structure, git status, repo map, and dependency hub files on first turn.
-- Hybrid retrieval (vector + BM25 via RRF) injects relevant code chunks before LLM calls.
-- Semantic compaction preserves files modified, errors encountered, and key decisions during context compression.
-- Complex+escalated tasks auto-route to `deepseek-reasoner`; de-escalate back to `deepseek-chat` after 3 successes.
-- Error recovery guidance injected on first failure; stuck detection fires after 3 identical errors.
-- Anti-hallucination: `tool_choice=required` per turn, nudge at 300 chars (3 attempts), structural file-reference validation.
-- Analysis/review commands use a separate non-edit path and do not mutate files.
-- Chrome tooling is strict-live by default (`tools.chrome.allow_stub_fallback = false`).
-- TUI visibility defaults to concise phase summaries with heartbeat progress.
+```json
+{
+  "llm": {
+    "base_model": "deepseek-chat",
+    "max_think_model": "deepseek-reasoner",
+    "context_window_tokens": 128000,
+    "api_key_env": "DEEPSEEK_API_KEY"
+  },
+  "agent_loop": {
+    "tool_loop_max_turns": 50,
+    "context_bootstrap_enabled": true
+  },
+  "policy": {
+    "approve_edits": "ask",
+    "approve_bash": "ask",
+    "allowlist": ["cargo *", "npm test", "git status"]
+  },
+  "local_ml": {
+    "enabled": false
+  }
+}
+```
 
-Common execution control flags:
-- `--repo <path>` (override repository root for bootstrap/context)
-- `--debug-context` (print deterministic pre-model context digest; also available via `DEEPSEEK_DEBUG_CONTEXT=1`)
-- `--watch-files` (inject deterministic TODO/FIXME/AI marker hints when repo comment markers change)
-- `--detect-urls` (augment prompts with bounded URL extracts before model call)
+See `docs/CONFIG_REFERENCE.md` for all options.
 
-Explicit commit workflow:
-- `/stage`, `/unstage`, `/diff`, `/commit`, `/undo` are available in chat/TUI.
-- `/commit` commits staged changes only (no implicit staging).
-- `deepseek git commit --message "..."` also commits staged-only by default.
+## Local ML (Optional)
 
-Workflow parity slash commands:
-- Mode/profile controls: `/ask`, `/code`, `/architect`, `/chat-mode`
-- Session/profile helpers: `/load`, `/save`, `/paste`, `/settings`
-- Context/workspace controls: `/add`, `/drop`, `/read-only`, `/map`, `/map-refresh`
-- Deterministic command helpers: `/run`, `/test`, `/lint`
-- Web + shell helpers: `/web`, `/git`, `/voice`
-
-Default model/profile behavior:
-- `llm.provider = "deepseek"`
-- `llm.profile = "v3_2"`
-- `llm.base_model = "deepseek-chat"`
-- `llm.max_think_model = "deepseek-reasoner"`
-- `llm.context_window_tokens` defaults to `128000` (you can raise this in config, for example to 1M)
-
-## Safety and Policy Controls
-
-- Approval controls: `policy.approve_bash`, `policy.approve_edits`
-- Command allowlist and blocked path patterns
-- Redaction regex patterns for sensitive data
-- Sandbox mode and optional OS sandbox wrapper
-- Team-managed policy overlays (when configured) can lock settings
-
-Inspect and update policy:
+An optional local intelligence layer — hybrid code retrieval, privacy scanning, and ghost text completions. No models bundled; downloads from HuggingFace on first use.
 
 ```bash
-deepseek permissions show
-deepseek permissions set --approve-bash ask --approve-edits ask
-deepseek permissions dry-run bash.run
+# Enable (mock backends, no download needed)
+echo '{"local_ml": {"enabled": true}}' > .deepseek/settings.json
+
+# Enable with real ML models (requires --features local-ml build)
+cargo build --release --bin deepseek --features local-ml
 ```
 
-## Runtime Data
+| Feature | Mock Mode | Full ML Mode |
+|---------|-----------|-------------|
+| Code retrieval | Hash-based matching | Semantic (jina-code-v2, ~270MB) |
+| Ghost text | Empty | Candle completion (~700MB–1.5GB) |
+| Privacy scanning | Fully functional | Fully functional |
+| Vector index | BruteForce O(n) | HNSW via Usearch |
 
-Project runtime state lives in `.deepseek/`, including:
-- `events.jsonl` (append-only event log)
-- `store.sqlite`
-- `plans/`
-- `patches/`
-- `index/`
-- `observe.log`
+```bash
+deepseek privacy scan              # Find secrets in your project
+deepseek privacy redact-preview    # Preview what gets redacted
+deepseek index build               # Build hybrid index
+deepseek index --hybrid doctor     # Diagnose index issues
+```
 
-## Integrations
-
-- IDE/Editor extensions: `extensions/`
-  - VS Code starter extension: `extensions/vscode`
-  - JetBrains starter plugin: `extensions/jetbrains`
-  - Chrome native host bridge: `extensions/chrome`
-- MCP management: `deepseek mcp ...`
-- JSON-RPC server for IDE integration: `deepseek serve`
-
-See `extensions/README.md` for setup.
+See `docs/LOCAL_ML_GUIDE.md` for the full guide.
 
 ## Development
-
-Build and verify:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo build --workspace
-cargo build --release --workspace
-```
-
-Additional production/CI gates used by this repo:
-
-```bash
-cargo run --bin deepseek -- --json replay list --limit 20
-cargo run --bin deepseek -- --json profile --benchmark --benchmark-suite .github/benchmark/slo-suite.json --benchmark-cases 3 --benchmark-min-success-rate 1.0 --benchmark-min-quality-rate 1.0 --benchmark-max-p95-ms 2000
-cargo run --bin deepseek -- --json benchmark run-matrix .github/benchmark/slo-matrix.json --strict
-bash scripts/runtime_conformance_scan.sh
-bash scripts/parity_regression_check.sh
+cargo test --workspace --all-targets    # 870 tests
+cargo build --release --bin deepseek
 ```
 
 ## Docs
 
-- Release process: `docs/RELEASE.md`
-- Release checklist: `docs/RELEASE_CHECKLIST.md`
-- Operations playbook: `docs/OPERATIONS.md`
-- Production readiness: `docs/PRODUCTION_READINESS.md`
-- Feature audit matrix: `docs/FEATURE_MATRIX.md`
-- Configuration reference: `docs/CONFIG_REFERENCE.md`
+- **[User Guide](docs/USER_GUIDE.md)** — complete guide: chat modes, keyboard shortcuts, slash commands, tools, intelligence layers, permissions, hooks, skills, subagents, MCP, local ML, sessions, autopilot, code review, configuration, troubleshooting
+- **[Local ML Guide](docs/LOCAL_ML_GUIDE.md)** — setup, models, retrieval, privacy, ghost text
+- **[Configuration Reference](docs/CONFIG_REFERENCE.md)** — all settings with types and defaults
+- **[Operations Playbook](docs/OPERATIONS.md)** — incident response, failure modes, rollback
+- **[Release Guide](docs/RELEASE.md)** — release process, artifacts, installers
