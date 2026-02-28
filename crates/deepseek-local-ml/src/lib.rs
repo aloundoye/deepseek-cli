@@ -2,15 +2,19 @@ pub mod chunker;
 pub mod completion;
 pub mod embeddings;
 mod model_manager;
+pub mod model_registry;
 pub mod privacy;
+pub mod reranker;
 pub mod retrieval;
+pub mod speculative;
 pub mod vector_index;
 
-pub use chunker::{Chunk, ChunkConfig, ChunkManifest};
+pub use chunker::{Chunk, ChunkConfig, ChunkManifest, ChunkStrategy};
 pub use completion::{GenOpts, LocalGenBackend, MockGenerator};
 pub use embeddings::{EmbeddingsBackend, MockEmbeddings};
 pub use model_manager::{ModelInfo, ModelManager, ModelStatus};
 pub use privacy::{PrivacyConfig, PrivacyPolicy, PrivacyResult, PrivacyRouter, SensitiveMatch};
+pub use reranker::{MockReranker, RerankerBackend};
 pub use retrieval::{HybridRetriever, IndexBuildReport, IndexUpdateReport, RetrievalResult};
 pub use vector_index::{
     BruteForceBackend, IndexStats, SearchFilter, SearchResult, VectorIndex, VectorIndexBackend,
@@ -20,6 +24,8 @@ pub use vector_index::{
 pub use completion::candle_backend::CandleCompletion;
 #[cfg(feature = "local-ml")]
 pub use embeddings::candle_backend::CandleEmbeddings;
+#[cfg(feature = "local-ml")]
+pub use reranker::candle_backend::CandleReranker;
 #[cfg(feature = "local-ml")]
 pub use vector_index::UsearchBackend;
 

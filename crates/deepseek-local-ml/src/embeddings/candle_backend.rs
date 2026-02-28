@@ -108,13 +108,16 @@ impl EmbeddingsBackend for CandleEmbeddings {
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        // For small batches, per-item is simpler and avoids padding complexity.
-        // A production implementation would pad and batch for GPU throughput.
-        if texts.len() <= 4 {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // For very small batches, per-item avoids padding overhead
+        if texts.len() <= 2 {
             return texts.iter().map(|t| self.embed(t)).collect();
         }
 
-        // Batch encoding with padding for larger batches
+        // Batch encoding
         let encodings: Vec<_> = texts
             .iter()
             .map(|t| {
@@ -133,22 +136,63 @@ impl EmbeddingsBackend for CandleEmbeddings {
             bail!("all inputs produced empty tokenizations");
         }
 
-        let mut results = Vec::with_capacity(texts.len());
-        // Process individually — batched GPU inference would go here
-        for encoding in &encodings {
-            let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
-            let attention_mask =
-                Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
-            let token_type_ids =
-                Tensor::new(encoding.get_type_ids(), &self.device)?.unsqueeze(0)?;
+        // Process in mini-batches of BATCH_CHUNK_SIZE for memory control
+        const BATCH_CHUNK_SIZE: usize = 32;
+        let mut all_results = Vec::with_capacity(texts.len());
 
+        for batch_start in (0..encodings.len()).step_by(BATCH_CHUNK_SIZE) {
+            let batch_end = (batch_start + BATCH_CHUNK_SIZE).min(encodings.len());
+            let batch = &encodings[batch_start..batch_end];
+            let batch_size = batch.len();
+
+            // Pad all sequences in this mini-batch to the same length and create
+            // a single batched tensor for GPU parallelism
+            let batch_max_len = batch.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+
+            let mut padded_ids = vec![0u32; batch_size * batch_max_len];
+            let mut padded_masks = vec![0u32; batch_size * batch_max_len];
+            let mut padded_types = vec![0u32; batch_size * batch_max_len];
+
+            for (i, enc) in batch.iter().enumerate() {
+                let ids = enc.get_ids();
+                let mask = enc.get_attention_mask();
+                let types = enc.get_type_ids();
+                let offset = i * batch_max_len;
+                padded_ids[offset..offset + ids.len()].copy_from_slice(ids);
+                padded_masks[offset..offset + mask.len()].copy_from_slice(mask);
+                padded_types[offset..offset + types.len()].copy_from_slice(types);
+            }
+
+            let input_ids = Tensor::from_vec(
+                padded_ids,
+                (batch_size, batch_max_len),
+                &self.device,
+            )?;
+            let attention_mask = Tensor::from_vec(
+                padded_masks,
+                (batch_size, batch_max_len),
+                &self.device,
+            )?;
+            let token_type_ids = Tensor::from_vec(
+                padded_types,
+                (batch_size, batch_max_len),
+                &self.device,
+            )?;
+
+            // Single forward pass for the entire mini-batch
             let hidden = self
                 .model
                 .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
-            results.push(self.mean_pool(&hidden, &attention_mask)?);
+
+            // Mean-pool each sequence using its attention mask
+            for i in 0..batch_size {
+                let seq_hidden = hidden.narrow(0, i, 1)?;
+                let seq_mask = attention_mask.narrow(0, i, 1)?;
+                all_results.push(self.mean_pool(&seq_hidden, &seq_mask)?);
+            }
         }
 
-        Ok(results)
+        Ok(all_results)
     }
 
     fn dimension(&self) -> usize {

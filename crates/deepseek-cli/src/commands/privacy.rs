@@ -89,19 +89,18 @@ fn run_scan(cwd: &Path, cfg: &AppConfig, json_mode: bool) -> Result<()> {
         // Check content for smaller text files
         if let Ok(meta) = path.metadata()
             && meta.len() < 1_048_576
+            && let Ok(content) = std::fs::read_to_string(path)
         {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let matches = router.scan_content(&content);
-                if !matches.is_empty() {
-                    for m in &matches {
-                        findings.push(json!({
-                            "file": rel_str,
-                            "reason": "sensitive_content",
-                            "pattern": m.pattern,
-                            "line": m.line_number,
-                            "preview": m.redacted_preview,
-                        }));
-                    }
+            let matches = router.scan_content(&content);
+            if !matches.is_empty() {
+                for m in &matches {
+                    findings.push(json!({
+                        "file": rel_str,
+                        "reason": "sensitive_content",
+                        "pattern": m.pattern,
+                        "line": m.line_number,
+                        "preview": m.redacted_preview,
+                    }));
                 }
             }
         }

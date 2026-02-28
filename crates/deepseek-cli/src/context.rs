@@ -40,9 +40,11 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
     let worker = std::sync::Arc::new(
         move |task: &deepseek_subagent::SubagentTask| -> anyhow::Result<String> {
             let engine = deepseek_agent::AgentEngine::new(&workspace)?;
-            let mut options = deepseek_agent::ChatOptions::default();
-            options.tools = false; // Subagents (specialists) do not have direct tool access
-            options.mode = deepseek_agent::ChatMode::Ask; // Ensure no patching is done
+            let mut options = deepseek_agent::ChatOptions {
+                tools: false, // Subagents (specialists) do not have direct tool access
+                mode: deepseek_agent::ChatMode::Ask, // Ensure no patching is done
+                ..Default::default()
+            };
 
             let system_prompt = match task.name.as_str() {
                 "debugger" => {

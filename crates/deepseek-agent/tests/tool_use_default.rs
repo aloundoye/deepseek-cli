@@ -791,8 +791,7 @@ fn spawn_task_calls_worker() -> Result<()> {
     )?;
 
     // Wire a subagent worker
-    let worker: Arc<dyn Fn(&deepseek_subagent::SubagentTask) -> Result<String> + Send + Sync> =
-        Arc::new(move |task| {
+    let worker: deepseek_agent::SubagentWorkerFn = Arc::new(move |task| {
             *worker_called_clone.lock().unwrap() = true;
             Ok(format!("Subagent completed: {}", task.goal))
         });
@@ -868,8 +867,7 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
         ],
     )?;
 
-    let worker: Arc<dyn Fn(&deepseek_subagent::SubagentTask) -> Result<String> + Send + Sync> =
-        Arc::new(move |task| {
+    let worker: deepseek_agent::SubagentWorkerFn = Arc::new(move |task| {
             *captured_role_clone.lock().unwrap() = format!("{:?}", task.role);
             Ok("Done".to_string())
         });

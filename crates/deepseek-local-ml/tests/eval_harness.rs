@@ -100,10 +100,10 @@ fn eval_harness_produces_report() {
     // Baseline: full codebase content (no retrieval)
     let mut baseline_chars = 0;
     for entry in std::fs::read_dir(&ws).unwrap().flatten() {
-        if entry.path().is_file() {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                baseline_chars += content.len();
-            }
+        if entry.path().is_file()
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            baseline_chars += content.len();
         }
     }
     let baseline = RunMetrics {
@@ -181,10 +181,10 @@ fn retrieval_reduces_prompt_tokens() {
     // Baseline: count all characters in the workspace
     let mut total_workspace_chars = 0;
     for entry in std::fs::read_dir(&ws).unwrap().flatten() {
-        if entry.path().is_file() {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                total_workspace_chars += content.len();
-            }
+        if entry.path().is_file()
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            total_workspace_chars += content.len();
         }
     }
     let baseline_tokens = estimate_tokens(total_workspace_chars);

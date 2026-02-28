@@ -341,6 +341,9 @@ pub struct PolicyEngine {
     permission_mode: PermissionMode,
     /// When sandbox is enabled with auto_allow_bash_if_sandboxed, auto-approve bash.
     sandbox_auto_allow_bash: bool,
+    /// Workspace root for path canonicalization. Absolute paths under this root
+    /// are permitted; symlinks resolving outside it are blocked.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl PolicyEngine {
@@ -363,6 +366,7 @@ impl PolicyEngine {
             secret_regexes,
             permission_mode,
             sandbox_auto_allow_bash: false,
+            workspace_root: None,
         }
     }
 
@@ -373,6 +377,11 @@ impl PolicyEngine {
             ..PolicyConfig::default()
         };
         Self::new(cfg)
+    }
+
+    /// Set the workspace root for path canonicalization and symlink checks.
+    pub fn set_workspace_root(&mut self, root: std::path::PathBuf) {
+        self.workspace_root = Some(root);
     }
 
     pub fn from_app_config(cfg: &deepseek_core::PolicyConfig) -> Self {
@@ -418,15 +427,41 @@ impl PolicyEngine {
 
     pub fn check_path(&self, path: &str) -> Result<(), PolicyError> {
         let candidate = Path::new(path);
+
+        // Block absolute paths unless workspace root is set and path is under it.
         if candidate.is_absolute() {
-            return Err(PolicyError::PathTraversal);
+            if let Some(ref root) = self.workspace_root {
+                if !candidate.starts_with(root) {
+                    return Err(PolicyError::PathTraversal);
+                }
+            } else {
+                return Err(PolicyError::PathTraversal);
+            }
         }
+
+        // Block parent directory traversal.
         if candidate
             .components()
             .any(|component| matches!(component, Component::ParentDir))
         {
             return Err(PolicyError::PathTraversal);
         }
+
+        // Canonicalize if path exists — resolves symlinks and verifies it stays
+        // under the workspace root (prevents symlink-based escapes).
+        if let Some(ref root) = self.workspace_root {
+            let resolved = if candidate.is_absolute() {
+                std::fs::canonicalize(candidate).ok()
+            } else {
+                std::fs::canonicalize(root.join(candidate)).ok()
+            };
+            if let Some(canonical) = resolved
+                && !canonical.starts_with(root)
+            {
+                return Err(PolicyError::PathTraversal);
+            }
+        }
+
         let lowered = path.to_ascii_lowercase();
         if self.path_is_blocked(&lowered) {
             return Err(PolicyError::SecretPath);
@@ -475,12 +510,11 @@ impl PolicyEngine {
 
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
         // Check persistent bash approvals (project-scoped, "don't ask again").
-        if call.name == "bash.run" {
-            if let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str()) {
-                if self.cfg.persistent_bash_approvals.iter().any(|p| p == cmd) {
-                    return false;
-                }
-            }
+        if call.name == "bash.run"
+            && let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
+            && self.cfg.persistent_bash_approvals.iter().any(|p| p == cmd)
+        {
+            return false;
         }
 
         // Check granular permission rules first (they take priority).
@@ -788,8 +822,47 @@ fn allow_pattern_matches(pattern: &str, cmd_tokens: &[&str]) -> bool {
 
 fn contains_forbidden_shell_tokens(cmd: &str) -> bool {
     // Single-pipe pipelines are allowed; each segment is validated separately.
-    let forbidden = ["\n", "\r", ";", "&&", "||", "`", "$("];
-    forbidden.iter().any(|needle| cmd.contains(needle))
+    let forbidden = [
+        "\n", "\r", ";", "&&", "||", // Command chaining
+        "`", "$(",   // Subshell / command substitution
+        "<(", ">(",  // Process substitution
+        "<<<",        // Here-string
+    ];
+    if forbidden.iter().any(|needle| cmd.contains(needle)) {
+        return true;
+    }
+
+    // Background execution: trailing `&` (but not `&&` which is already checked)
+    let trimmed = cmd.trim();
+    if trimmed.ends_with('&') && !trimmed.ends_with("&&") {
+        return true;
+    }
+
+    // Output redirection: `>`, `>>`, `<` (but allow `|` which is a pipe)
+    // Use shell-words-style tokenization to detect redirection operators
+    has_redirection_operator(trimmed)
+}
+
+/// Detect shell redirection operators (`>`, `>>`, `<`) outside of quoted strings.
+/// Allows comparison operators inside quotes (e.g., `awk '{if ($1 > 5) print}'`).
+fn has_redirection_operator(cmd: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_char = '\0';
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        match ch {
+            '\'' if !in_double && prev_char != '\\' => in_single = !in_single,
+            '"' if !in_single && prev_char != '\\' => in_double = !in_double,
+            '>' | '<' if !in_single && !in_double => return true,
+            _ => {}
+        }
+        prev_char = ch;
+        i += 1;
+    }
+    false
 }
 
 fn split_pipeline_segments(cmd: &str) -> Result<Vec<&str>, PolicyError> {
@@ -1057,10 +1130,10 @@ impl ManagedSettings {
     /// Called after loading config so enterprise constraints are immutable.
     pub fn apply_to_config(&self, cfg: &mut deepseek_core::AppConfig) {
         // Force permission mode at the config level
-        if let Some(ref mode) = self.permission_mode {
-            if let Ok(parsed) = mode.parse::<deepseek_core::PermissionMode>() {
-                cfg.policy.permission_mode = parsed;
-            }
+        if let Some(ref mode) = self.permission_mode
+            && let Ok(parsed) = mode.parse::<deepseek_core::PermissionMode>()
+        {
+            cfg.policy.permission_mode = parsed;
         }
 
         // Cap max_turns if managed setting is lower
@@ -2151,5 +2224,98 @@ mod tests {
             cfg2.agent_loop.max_iterations, original,
             "no override = unchanged"
         );
+    }
+
+    // ── T4.1: Path canonicalization tests ──────────────────────────────
+
+    #[test]
+    fn absolute_path_allowed_under_workspace_root() {
+        let dir = std::env::temp_dir();
+        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        engine.set_workspace_root(dir.clone());
+        // A path under temp_dir should be allowed
+        let test_path = dir.join("test_file.rs");
+        let result = engine.check_path(test_path.to_str().unwrap());
+        assert!(result.is_ok(), "absolute path under workspace root should be allowed");
+    }
+
+    #[test]
+    fn absolute_path_blocked_outside_workspace_root() {
+        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        engine.set_workspace_root(std::path::PathBuf::from("/workspace/project"));
+        let result = engine.check_path("/etc/passwd");
+        assert!(result.is_err(), "absolute path outside workspace root should be blocked");
+    }
+
+    #[test]
+    fn symlink_escape_blocked() {
+        // Create a temp dir and a symlink pointing outside it
+        let temp = std::env::temp_dir().join("deepseek_policy_test_symlink");
+        let _ = std::fs::create_dir_all(&temp);
+        let link_path = temp.join("escape_link");
+        let _ = std::fs::remove_file(&link_path); // clean up any previous test
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let _ = symlink("/etc", &link_path);
+        }
+
+        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        engine.set_workspace_root(temp.clone());
+
+        #[cfg(unix)]
+        {
+            let result = engine.check_path(link_path.to_str().unwrap());
+            assert!(
+                result.is_err(),
+                "symlink pointing outside workspace should be blocked"
+            );
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&link_path);
+        let _ = std::fs::remove_dir(&temp);
+    }
+
+    // ── T4.2: Command injection hardening tests ────────────────────────
+
+    #[test]
+    fn blocks_output_redirection() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        assert!(engine.check_command("echo hello > /tmp/out").is_err());
+        assert!(engine.check_command("echo hello >> /tmp/out").is_err());
+        assert!(engine.check_command("cat < /etc/passwd").is_err());
+    }
+
+    #[test]
+    fn blocks_background_execution() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        assert!(engine.check_command("sleep 100 &").is_err());
+    }
+
+    #[test]
+    fn blocks_process_substitution() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        assert!(engine.check_command("diff <(ls /a) <(ls /b)").is_err());
+        assert!(engine.check_command("tee >(grep foo)").is_err());
+    }
+
+    #[test]
+    fn blocks_here_string() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        assert!(engine.check_command("cat <<< 'hello'").is_err());
+    }
+
+    #[test]
+    fn quoted_angle_brackets_not_blocked() {
+        // Inside quotes, > and < are not redirections
+        assert!(!has_redirection_operator("awk '{if ($1 > 5) print}'"));
+        assert!(!has_redirection_operator(r#"echo "a > b""#));
+    }
+
+    #[test]
+    fn unquoted_angle_brackets_blocked() {
+        assert!(has_redirection_operator("echo hello > out.txt"));
+        assert!(has_redirection_operator("cat < input.txt"));
     }
 }

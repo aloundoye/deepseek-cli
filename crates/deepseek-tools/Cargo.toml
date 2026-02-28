@@ -24,6 +24,7 @@ deepseek-index = { path = "../deepseek-index" }
 deepseek-policy = { path = "../deepseek-policy" }
 deepseek-store = { path = "../deepseek-store" }
 deepseek-hooks = { path = "../deepseek-hooks" }
+jsonschema.workspace = true
 deepseek-memory = { path = "../deepseek-memory" }
 deepseek-chrome = { path = "../deepseek-chrome" }
 base64.workspace = true

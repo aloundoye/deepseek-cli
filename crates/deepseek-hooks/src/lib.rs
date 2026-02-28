@@ -10,7 +10,7 @@ use wait_timeout::ChildExt;
 
 // ── Hook Events ──────────────────────────────────────────────────────────────
 
-/// All hook events matching Claude Code's 14 events.
+/// All 14 lifecycle hook events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum HookEvent {
@@ -459,14 +459,10 @@ impl HookRuntime {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
+                    && let Ok(None) = child.wait_timeout(timeout)
                 {
-                    match child.wait_timeout(timeout) {
-                        Ok(None) => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                        _ => {}
-                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
             });
         }

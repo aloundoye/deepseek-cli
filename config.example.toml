@@ -75,7 +75,7 @@ sandbox_mode = "allowlist"
 # Optional OS-level sandbox wrapper for `sandbox_mode = "isolated"`:
 # sandbox_wrapper = "bwrap --die-with-parent --new-session --unshare-all --bind {workspace} {workspace} --chdir {workspace} /bin/sh -lc {cmd}"
 sandbox_wrapper = ""
-# Optional: auto-lint after fs.edit (from Aider). Lint output included in tool result.
+# Optional: auto-lint after fs.edit. Lint output included in tool result.
 # lint_after_edit = "cargo fmt --check"
 
 [tools.chrome]

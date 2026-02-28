@@ -1339,6 +1339,13 @@ pub enum StreamChunk {
     /// Clear any previously streamed text — the response contains tool calls,
     /// so the interleaved text fragments should be discarded from the display.
     ClearStreamingText,
+    /// Streaming token usage update — emitted after each LLM call for cost/progress tracking.
+    UsageUpdate {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_hit_tokens: u64,
+        estimated_cost_usd: f64,
+    },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1427,6 +1434,18 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
         StreamChunk::ClearStreamingText => serde_json::json!({
             "type": "clear_streaming_text",
         }),
+        StreamChunk::UsageUpdate {
+            input_tokens,
+            output_tokens,
+            cache_hit_tokens,
+            estimated_cost_usd,
+        } => serde_json::json!({
+            "type": "usage_update",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_hit_tokens": cache_hit_tokens,
+            "estimated_cost_usd": estimated_cost_usd,
+        }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });
             if let Some(r) = reason {
@@ -1440,6 +1459,46 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
 /// Callback type for receiving streaming chunks.
 /// Uses `Arc<dyn Fn>` so it can be cloned across multiple turns in a chat loop.
 pub type StreamCallback = std::sync::Arc<dyn Fn(StreamChunk) + Send + Sync>;
+
+/// A thread-safe cancellation token for aborting in-progress streaming requests.
+/// Set by the UI layer (e.g. on Ctrl+C), checked by the LLM streaming loop.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Create a new token in the "not cancelled" state.
+    pub fn new() -> Self {
+        Self {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Signal cancellation.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Check whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Reset the token to "not cancelled" for reuse across turns.
+    pub fn reset(&self) {
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// A question posed by the agent to the user via the `user_question` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3553,5 +3612,45 @@ mod tests {
         let deserialized: EventKind = serde_json::from_str(&serialized).expect("deserialize");
         let re_serialized = serde_json::to_string(&deserialized).expect("re-serialize");
         assert_eq!(serialized, re_serialized);
+    }
+
+    #[test]
+    fn cancellation_token_default_not_cancelled() {
+        let token = CancellationToken::default();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_token_cancel_and_reset() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(token.is_cancelled());
+        token.reset();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_token_clone_shares_state() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+        token.cancel();
+        assert!(clone.is_cancelled(), "clone should see cancellation from original");
+    }
+
+    #[test]
+    fn usage_update_json_serialization() {
+        let chunk = StreamChunk::UsageUpdate {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_hit_tokens: 200,
+            estimated_cost_usd: 0.0042,
+        };
+        let json = stream_chunk_to_event_json(&chunk);
+        assert_eq!(json["type"], "usage_update");
+        assert_eq!(json["input_tokens"], 1000);
+        assert_eq!(json["output_tokens"], 500);
+        assert_eq!(json["cache_hit_tokens"], 200);
+        assert!((json["estimated_cost_usd"].as_f64().unwrap() - 0.0042).abs() < 0.0001);
     }
 }

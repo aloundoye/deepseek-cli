@@ -468,16 +468,16 @@ fn slash_lint_output(cwd: &Path, args: &[String], cfg: Option<&AppConfig>) -> Re
                     "java" => "java",
                     _ => ext,
                 };
-                if let Some(cmd) = lint_cfg.commands.get(lang) {
-                    if !commands.contains(cmd) {
-                        commands.push(cmd.clone());
-                    }
+                if let Some(cmd) = lint_cfg.commands.get(lang)
+                    && !commands.contains(cmd)
+                {
+                    commands.push(cmd.clone());
                 }
             }
             if !commands.is_empty() {
                 let mut results = Vec::new();
                 for cmd in &commands {
-                    let output = slash_run_output(cwd, &[cmd.clone()])?;
+                    let output = slash_run_output(cwd, std::slice::from_ref(cmd))?;
                     results.push(format!("$ {cmd}\n{output}"));
                 }
                 return Ok(results.join("\n\n"));
@@ -1333,23 +1333,21 @@ pub(crate) fn run_chat(
                             )?;
                             if json_mode {
                                 print_json(&result)?;
-                            } else {
-                                if let Some(messages) = result
-                                    .pointer("/result/messages")
-                                    .and_then(|v| v.as_array())
-                                {
-                                    for msg in messages {
-                                        let role =
-                                            msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                                        let text = msg
-                                            .pointer("/content/text")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        println!("[{role}] {text}");
-                                    }
-                                } else {
-                                    println!("{}", serde_json::to_string_pretty(&result)?);
+                            } else if let Some(messages) = result
+                                .pointer("/result/messages")
+                                .and_then(|v| v.as_array())
+                            {
+                                for msg in messages {
+                                    let role =
+                                        msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let text = msg
+                                        .pointer("/content/text")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    println!("[{role}] {text}");
                                 }
+                            } else {
+                                println!("{}", serde_json::to_string_pretty(&result)?);
                             }
                         }
                     } else if json_mode {
@@ -2156,6 +2154,7 @@ pub(crate) fn run_chat(
                         deepseek_core::StreamChunk::ImageData { .. } => "ImageData",
                         deepseek_core::StreamChunk::WatchTriggered { .. } => "WatchTriggered",
                         deepseek_core::StreamChunk::SecurityWarning { .. } => "SecurityWarning",
+                        deepseek_core::StreamChunk::UsageUpdate { .. } => "UsageUpdate",
                         deepseek_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
                         deepseek_core::StreamChunk::Done { .. } => "Done",
                     },
@@ -2259,6 +2258,7 @@ pub(crate) fn run_chat(
                         let _ = writeln!(handle, "  \x1b[33m⚠ Security:\x1b[0m {message}");
                         let _ = handle.flush();
                     }
+                    deepseek_core::StreamChunk::UsageUpdate { .. } => {}
                     deepseek_core::StreamChunk::ClearStreamingText => {}
                     deepseek_core::StreamChunk::Done { .. } => {
                         // Flush any remaining partial line from the renderer
@@ -3168,6 +3168,7 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::SecurityWarning { message } => {
                     let _ = tx_stream.send(TuiStreamEvent::Error(format!("⚠ Security: {message}")));
                 }
+                StreamChunk::UsageUpdate { .. } => {}
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
                 }
@@ -4137,6 +4138,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     let _ = writeln!(handle, "[security warning: {message}]");
                     let _ = handle.flush();
                 }
+                StreamChunk::UsageUpdate { .. } => {}
                 StreamChunk::ClearStreamingText => {
                     // In non-TUI mode, nothing to clear — text already
                     // written to stdout.
@@ -4403,7 +4405,7 @@ mod tests {
         );
 
         // "show" should NOT match the edit branch
-        let show_args = vec![String::from("show")];
+        let show_args = [String::from("show")];
         let edit_branch = show_args.is_empty()
             || show_args
                 .first()
