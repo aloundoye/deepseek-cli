@@ -4,7 +4,7 @@
 //! `ToolCall` (internal, dotted names like `fs.read`) and formats `ToolResult`
 //! back into `ChatMessage::Tool` for feeding to the next LLM turn.
 
-use deepseek_core::{ChatMessage, LlmToolCall, ToolCall, ToolName, ToolResult};
+use deepseek_core::{ChatMessage, LlmToolCall, ToolCall, ToolDefinition, ToolName, ToolResult};
 use deepseek_policy::output_scanner::{InjectionWarning, OutputScanner};
 
 /// Maximum characters for tool output before truncation.
@@ -39,6 +39,63 @@ pub fn llm_tool_call_to_internal(call: &LlmToolCall) -> ToolCall {
         args,
         requires_approval,
     }
+}
+
+/// Attempt to repair a misnamed tool call by fuzzy-matching against available tools.
+///
+/// DeepSeek models sometimes get tool names wrong (wrong casing, hyphens vs
+/// underscores, slight misspellings). This function tries:
+/// 1. Exact match (pass-through)
+/// 2. Lowercase + underscore normalization
+/// 3. Levenshtein distance ≤ 2
+///
+/// Returns `Some(corrected_name)` if a match is found, `None` if no repair possible.
+pub fn repair_tool_name(
+    api_name: &str,
+    available_tools: &[ToolDefinition],
+) -> Option<String> {
+    let tool_names: Vec<&str> = available_tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+
+    // 1. Exact match — no repair needed
+    if tool_names.contains(&api_name) {
+        return Some(api_name.to_string());
+    }
+
+    // 2. Normalize: lowercase, replace hyphens with underscores
+    let normalized = api_name.to_lowercase().replace('-', "_");
+    if let Some(name) = tool_names.iter().find(|n| n.to_lowercase().replace('-', "_") == normalized)
+    {
+        return Some(name.to_string());
+    }
+
+    // 3. Fuzzy match: Levenshtein distance ≤ 2
+    let mut best_match: Option<(&str, usize)> = None;
+    for name in &tool_names {
+        let dist = strsim::levenshtein(api_name, name);
+        if dist <= 2
+            && best_match.as_ref().is_none_or(|(_, d)| dist < *d)
+        {
+            best_match = Some((name, dist));
+        }
+    }
+
+    best_match.map(|(name, _)| name.to_string())
+}
+
+/// Build an error message listing available tools when no repair is possible.
+pub fn invalid_tool_error(api_name: &str, available_tools: &[ToolDefinition]) -> String {
+    let names: Vec<&str> = available_tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    format!(
+        "Unknown tool '{}'. Available tools: {}",
+        api_name,
+        names.join(", ")
+    )
 }
 
 /// Convert a `ToolResult` into a `ChatMessage::Tool` for inclusion in the
@@ -376,5 +433,105 @@ mod tests {
     fn extract_paths_invalid_json() {
         let paths = extract_modified_paths("fs_edit", "not json");
         assert!(paths.is_empty());
+    }
+
+    // ── T2.2: Tool name repair tests ────────────────────────────────────
+
+    fn sample_tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: deepseek_core::FunctionDefinition {
+                    name: "fs_read".to_string(),
+                    description: "Read a file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({}),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: deepseek_core::FunctionDefinition {
+                    name: "fs_write".to_string(),
+                    description: "Write a file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({}),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: deepseek_core::FunctionDefinition {
+                    name: "bash_run".to_string(),
+                    description: "Run a command".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({}),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn repair_exact_match() {
+        let tools = sample_tools();
+        assert_eq!(
+            repair_tool_name("fs_read", &tools),
+            Some("fs_read".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_case_normalization() {
+        let tools = sample_tools();
+        assert_eq!(
+            repair_tool_name("FS_READ", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_name("Fs_Read", &tools),
+            Some("fs_read".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_hyphen_to_underscore() {
+        let tools = sample_tools();
+        assert_eq!(
+            repair_tool_name("fs-read", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_name("bash-run", &tools),
+            Some("bash_run".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_fuzzy_levenshtein() {
+        let tools = sample_tools();
+        // Levenshtein distance 1
+        assert_eq!(
+            repair_tool_name("fs_reaf", &tools),
+            Some("fs_read".to_string())
+        );
+        // Distance 2
+        assert_eq!(
+            repair_tool_name("fs_writ", &tools),
+            Some("fs_write".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_no_match() {
+        let tools = sample_tools();
+        assert_eq!(repair_tool_name("completely_unknown_tool", &tools), None);
+    }
+
+    #[test]
+    fn invalid_tool_error_lists_tools() {
+        let tools = sample_tools();
+        let err = invalid_tool_error("bad_tool", &tools);
+        assert!(err.contains("bad_tool"));
+        assert!(err.contains("fs_read"));
+        assert!(err.contains("fs_write"));
+        assert!(err.contains("bash_run"));
     }
 }

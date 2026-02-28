@@ -136,12 +136,12 @@ fn debounce_loop(
 
         last_scan = Instant::now();
 
-        if let Some(digest) = watch_scan(workspace) {
-            if last_digest != Some(digest.digest) {
-                last_digest = Some(digest.digest);
-                if scan_tx.send(digest).is_err() {
-                    break; // receiver dropped
-                }
+        if let Some(digest) = watch_scan(workspace)
+            && last_digest != Some(digest.digest)
+        {
+            last_digest = Some(digest.digest);
+            if scan_tx.send(digest).is_err() {
+                break; // receiver dropped
             }
         }
     }

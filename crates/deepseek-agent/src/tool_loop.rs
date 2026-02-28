@@ -18,6 +18,7 @@ use deepseek_core::{
 };
 use deepseek_hooks::{HookEvent, HookInput, HookRuntime};
 use deepseek_llm::LlmClient;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,11 +28,19 @@ use crate::tool_bridge;
 /// Default maximum turns (LLM calls) before stopping the loop.
 pub const DEFAULT_MAX_TURNS: usize = 50;
 
-/// Context window usage percentage that triggers compaction.
+/// Context window usage percentage that triggers lightweight pruning (Phase 1).
+/// Prunes old tool outputs (>3 turns old) while keeping recent context intact.
+pub const PRUNE_THRESHOLD_PCT: f64 = 0.80;
+
+/// Context window usage percentage that triggers full compaction (Phase 2).
 pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
 
 /// Target context usage after compaction.
 pub const COMPACTION_TARGET_PCT: f64 = 0.80;
+
+/// Tool outputs older than this many "turn groups" (User→Assistant→Tool cycles)
+/// from the end are eligible for pruning. Only the last write per file is kept.
+const PRUNE_AGE_TURNS: usize = 3;
 
 /// If the model's response (with no tool calls) exceeds this many
 /// characters, it's likely hallucinating a long answer instead of using tools.
@@ -52,6 +61,21 @@ const MID_CONVERSATION_REMINDER: &str =
 
 /// Maximum recent errors to track for stuck detection.
 const MAX_RECENT_ERRORS: usize = 10;
+
+/// Number of consecutive failures on the same tool before circuit-breaking it.
+const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
+
+/// Number of turns a circuit-broken tool remains disabled.
+const CIRCUIT_BREAKER_COOLDOWN_TURNS: usize = 2;
+
+/// Default budget threshold (USD) at which a warning is emitted.
+const DEFAULT_COST_WARNING_USD: f64 = 0.50;
+
+/// TTL for cached read-only tool results (in seconds).
+const TOOL_CACHE_TTL_SECS: u64 = 60;
+
+/// Tools whose results can be cached (all read-only).
+const CACHEABLE_TOOLS: &[&str] = &["fs_read", "fs_glob", "fs_grep", "fs_list", "index_query"];
 
 /// Guidance injected on first escalation (compile error, test failure).
 const ERROR_RECOVERY_GUIDANCE: &str = "ERROR RECOVERY: The previous attempt failed. Before retrying:\n\
@@ -138,6 +162,11 @@ pub struct SkillInvocationResult {
 pub type SkillRunner =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<SkillInvocationResult>> + Send + Sync>;
 
+/// Callback for injecting relevant code context before LLM calls.
+/// Takes `(query, max_results)` and returns matching code chunks.
+pub type RetrieverCallback =
+    Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync>;
+
 /// Request to spawn a subagent task.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
@@ -172,7 +201,7 @@ pub struct ToolLoopConfig {
     pub workspace: Option<PathBuf>,
     /// Optional retriever callback for injecting relevant code context before LLM calls.
     /// Takes (query, max_results) and returns matching code chunks.
-    pub retriever: Option<Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync>>,
+    pub retriever: Option<RetrieverCallback>,
     /// Optional privacy router for scanning tool outputs before appending to messages.
     pub privacy_router: Option<Arc<deepseek_local_ml::PrivacyRouter>>,
     /// Images to include with the LLM request (multimodal).
@@ -244,6 +273,105 @@ pub struct ToolUseLoop<'a> {
     recovery_injected: bool,
     /// Pre-compiled output scanner for injection/secret detection.
     output_scanner: deepseek_policy::output_scanner::OutputScanner,
+    /// Cache for read-only tool results. Keyed by (tool_name, args_hash).
+    /// Entries expire after `TOOL_CACHE_TTL_SECS`. Invalidated when write tools
+    /// modify the cached path.
+    tool_cache: HashMap<String, (serde_json::Value, Instant)>,
+    /// Circuit breaker: tracks consecutive failures per tool name.
+    /// When a tool fails `CIRCUIT_BREAKER_THRESHOLD` times in a row, it is
+    /// disabled for `CIRCUIT_BREAKER_COOLDOWN_TURNS`.
+    circuit_breaker: HashMap<String, CircuitBreakerState>,
+    /// Cumulative cost tracking across the session.
+    cost_tracker: CostTracker,
+    /// Actual tokens-per-char ratio derived from API responses. Starts at 0.25
+    /// (the estimate_message_tokens default) and converges to the real ratio.
+    actual_tokens_per_char: f64,
+}
+
+/// Tracks consecutive failures for a single tool.
+#[derive(Debug, Clone, Default)]
+struct CircuitBreakerState {
+    consecutive_failures: usize,
+    /// Turns remaining in cooldown (0 = active).
+    cooldown_remaining: usize,
+}
+
+/// Tracks cumulative cost across the tool-use loop.
+#[derive(Debug, Clone)]
+pub struct CostTracker {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_hit_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    /// Per-million-token pricing for input.
+    pub cost_per_million_input: f64,
+    /// Per-million-token pricing for output.
+    pub cost_per_million_output: f64,
+    /// Discount factor for cache-hit tokens (e.g. 0.1 means 90% discount).
+    pub cache_discount: f64,
+    /// Optional hard budget cap. If set, loop stops when exceeded.
+    pub max_budget_usd: Option<f64>,
+    /// Whether the user has already been warned about cost threshold.
+    warned: bool,
+}
+
+impl Default for CostTracker {
+    fn default() -> Self {
+        Self {
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_hit_tokens: 0,
+            total_reasoning_tokens: 0,
+            cost_per_million_input: 0.27,
+            cost_per_million_output: 1.10,
+            cache_discount: 0.1,
+            max_budget_usd: None,
+            warned: false,
+        }
+    }
+}
+
+impl CostTracker {
+    /// Record token usage from an API response.
+    pub fn record(&mut self, usage: &TokenUsage) {
+        self.total_input_tokens += usage.prompt_tokens;
+        self.total_output_tokens += usage.completion_tokens;
+        self.total_cache_hit_tokens += usage.prompt_cache_hit_tokens;
+        self.total_reasoning_tokens += usage.reasoning_tokens;
+    }
+
+    /// Compute estimated cumulative cost in USD.
+    pub fn estimated_cost_usd(&self) -> f64 {
+        let input_tokens = self.total_input_tokens as f64;
+        let cache_tokens = self.total_cache_hit_tokens as f64;
+        let output_tokens = self.total_output_tokens as f64;
+
+        // Cache-hit tokens are charged at a discount
+        let effective_input = (input_tokens - cache_tokens)
+            + (cache_tokens * self.cache_discount);
+        let input_cost = effective_input / 1_000_000.0 * self.cost_per_million_input;
+        let output_cost = output_tokens / 1_000_000.0 * self.cost_per_million_output;
+
+        input_cost + output_cost
+    }
+
+    /// Whether the cost has exceeded the hard budget cap.
+    pub fn over_budget(&self) -> bool {
+        self.max_budget_usd
+            .is_some_and(|cap| self.estimated_cost_usd() > cap)
+    }
+
+    /// Whether the cost has passed the warning threshold but not yet warned.
+    pub fn should_warn(&mut self) -> bool {
+        if self.warned {
+            return false;
+        }
+        if self.estimated_cost_usd() > DEFAULT_COST_WARNING_USD {
+            self.warned = true;
+            return true;
+        }
+        false
+    }
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -280,7 +408,45 @@ impl<'a> ToolUseLoop<'a> {
             recent_errors: Vec::new(),
             recovery_injected: false,
             output_scanner: deepseek_policy::output_scanner::OutputScanner::new(),
+            tool_cache: HashMap::new(),
+            circuit_breaker: HashMap::new(),
+            cost_tracker: CostTracker::default(),
+            actual_tokens_per_char: 0.25, // Default estimate, converges from API responses
         }
+    }
+
+    /// Check the tool result cache for a matching entry.
+    fn cache_lookup(&mut self, tool_name: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
+        if !CACHEABLE_TOOLS.contains(&tool_name) {
+            return None;
+        }
+
+        let key = format!("{}:{}", tool_name, args);
+        if let Some((result, timestamp)) = self.tool_cache.get(&key)
+            && timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS
+        {
+            return Some(result.clone());
+        }
+        // Expired or not found — remove it
+        self.tool_cache.remove(&key);
+        None
+    }
+
+    /// Store a tool result in the cache.
+    fn cache_store(&mut self, tool_name: &str, args: &serde_json::Value, result: &serde_json::Value) {
+        if !CACHEABLE_TOOLS.contains(&tool_name) {
+            return;
+        }
+        let key = format!("{}:{}", tool_name, args);
+        self.tool_cache.insert(key, (result.clone(), Instant::now()));
+    }
+
+    /// Invalidate cache entries for a given path (after a write tool modifies it).
+    fn cache_invalidate_path(&mut self, path: &str) {
+        self.tool_cache.retain(|key, _| {
+            // Invalidate any cached entry whose args contain this path
+            !key.contains(path)
+        });
     }
 
     /// Set the stream callback for real-time UI updates.
@@ -369,7 +535,9 @@ impl<'a> ToolUseLoop<'a> {
                 });
             }
 
-            // Check context window usage (messages + tool definitions overhead)
+            // Two-phase context management:
+            // Phase 1 (80%): Prune old tool outputs to free space without losing structure
+            // Phase 2 (95%): Full compaction with structured summary
             let message_tokens = estimate_message_tokens(&self.messages);
             let tool_def_tokens: u64 = self
                 .tools
@@ -377,25 +545,38 @@ impl<'a> ToolUseLoop<'a> {
                 .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
                 .sum();
             let estimated_tokens = message_tokens + tool_def_tokens;
-            let threshold =
+
+            let prune_threshold =
+                (self.config.context_window_tokens as f64 * PRUNE_THRESHOLD_PCT) as u64;
+            let compact_threshold =
                 (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
-            if estimated_tokens > threshold {
-                // Try to compact
-                let target =
-                    (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64;
-                let compacted = self.compact_messages(target);
-                if !compacted {
-                    self.emit(StreamChunk::Done {
-                        reason: Some("context window full".to_string()),
-                    });
-                    return Ok(ToolLoopResult {
-                        response: "Context window is full. Please start a new conversation or use /compact.".to_string(),
-                        tool_calls_made,
-                        finish_reason: "context_overflow".to_string(),
-                        usage: total_usage,
-                        turns,
-                        messages: self.messages.clone(),
-                    });
+
+            if estimated_tokens > prune_threshold {
+                // Phase 1: Lightweight pruning — trim old tool outputs
+                self.prune_old_tool_outputs();
+
+                // Re-check after pruning
+                let post_prune_tokens =
+                    estimate_message_tokens(&self.messages) + tool_def_tokens;
+
+                if post_prune_tokens > compact_threshold {
+                    // Phase 2: Full compaction with structured summary
+                    let target =
+                        (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64;
+                    let compacted = self.compact_messages(target);
+                    if !compacted {
+                        self.emit(StreamChunk::Done {
+                            reason: Some("context window full".to_string()),
+                        });
+                        return Ok(ToolLoopResult {
+                            response: "Context window is full. Please start a new conversation or use /compact.".to_string(),
+                            tool_calls_made,
+                            finish_reason: "context_overflow".to_string(),
+                            usage: total_usage,
+                            turns,
+                            messages: self.messages.clone(),
+                        });
+                    }
                 }
             }
 
@@ -415,6 +596,50 @@ impl<'a> ToolUseLoop<'a> {
                 total_usage.prompt_cache_hit_tokens += usage.prompt_cache_hit_tokens;
                 total_usage.prompt_cache_miss_tokens += usage.prompt_cache_miss_tokens;
                 total_usage.reasoning_tokens += usage.reasoning_tokens;
+
+                // T3.4: Track cost
+                self.cost_tracker.record(usage);
+                if self.cost_tracker.should_warn() {
+                    self.emit(StreamChunk::SecurityWarning {
+                        message: format!(
+                            "Cost warning: estimated ${:.4} spent so far",
+                            self.cost_tracker.estimated_cost_usd()
+                        ),
+                    });
+                }
+                if self.cost_tracker.over_budget() {
+                    return Err(anyhow!(
+                        "Session budget exceeded: ${:.4} > ${:.4} limit",
+                        self.cost_tracker.estimated_cost_usd(),
+                        self.cost_tracker.max_budget_usd.unwrap_or(0.0)
+                    ));
+                }
+
+                // T3.5: Update actual tokens-per-char ratio from API response
+                let total_chars: usize = self.messages.iter().map(|m| {
+                    match m {
+                        ChatMessage::System { content } | ChatMessage::User { content } => content.len(),
+                        ChatMessage::Assistant { content, reasoning_content, tool_calls } => {
+                            content.as_deref().map_or(0, str::len)
+                                + reasoning_content.as_deref().map_or(0, str::len)
+                                + tool_calls.iter().map(|tc| tc.arguments.len()).sum::<usize>()
+                        }
+                        ChatMessage::Tool { content, .. } => content.len(),
+                    }
+                }).sum();
+                if total_chars > 0 && usage.prompt_tokens > 0 {
+                    let new_ratio = usage.prompt_tokens as f64 / total_chars as f64;
+                    // Exponential moving average to smooth the ratio
+                    self.actual_tokens_per_char =
+                        0.7 * self.actual_tokens_per_char + 0.3 * new_ratio;
+                }
+            }
+
+            // T3.3: Decrement circuit breaker cooldowns at start of each turn
+            for state in self.circuit_breaker.values_mut() {
+                if state.cooldown_remaining > 0 {
+                    state.cooldown_remaining -= 1;
+                }
             }
 
             // Handle content filter before anything else
@@ -488,12 +713,164 @@ impl<'a> ToolUseLoop<'a> {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            // Execute each tool call and collect results.
-            // Scan tool outputs for evidence-driven budget escalation.
+            // Execute tool calls, parallelizing independent read-only tools.
             let was_escalated_before_batch = self.escalation.should_escalate();
             let mut batch_had_failure = false;
             let mut batch_had_success = false;
-            for llm_call in &response.tool_calls {
+
+            // Partition: read-only tools with auto-approval can run in parallel;
+            // write tools, unknown tools, and agent-level tools run sequentially.
+            let (parallel_calls, sequential_calls): (Vec<_>, Vec<_>) =
+                response.tool_calls.iter().partition(|c| {
+                    !tool_bridge::is_agent_level_tool(&c.name)
+                        && !tool_bridge::is_write_tool(&c.name)
+                        && deepseek_core::ReviewMode::is_read_only_tool(&c.name)
+                });
+
+            // Execute independent read-only tools in parallel using thread scope.
+            // This avoids blocking on I/O-bound tools (file reads, greps) sequentially.
+            if parallel_calls.len() > 1 {
+                // Execute the raw tool calls in parallel, collecting results
+                let tool_host = &self.tool_host;
+                let tools = &self.tools;
+                let parallel_results: Vec<_> = std::thread::scope(|s| {
+                    let handles: Vec<_> = parallel_calls
+                        .iter()
+                        .map(|llm_call| {
+                            s.spawn(move || {
+                                // Repair tool name
+                                let repaired = tool_bridge::repair_tool_name(&llm_call.name, tools);
+                                let effective_name =
+                                    repaired.unwrap_or_else(|| llm_call.name.clone());
+                                let effective_call = if effective_name != llm_call.name {
+                                    LlmToolCall {
+                                        id: llm_call.id.clone(),
+                                        name: effective_name,
+                                        arguments: llm_call.arguments.clone(),
+                                    }
+                                } else {
+                                    (*llm_call).clone()
+                                };
+                                let internal = tool_bridge::llm_tool_call_to_internal(&effective_call);
+                                let proposal = tool_host.propose(internal);
+                                // Read-only tools are auto-approved
+                                let approved = ApprovedToolCall {
+                                    invocation_id: proposal.invocation_id,
+                                    call: proposal.call,
+                                };
+                                let result = tool_host.execute(approved);
+                                (effective_call, result)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("parallel tool thread panicked"))
+                        .collect()
+                });
+
+                // Process results sequentially (updates messages, cache, events)
+                for (effective_call, result) in &parallel_results {
+                    let args: serde_json::Value =
+                        serde_json::from_str(&effective_call.arguments)
+                            .unwrap_or(serde_json::json!({}));
+                    let args_summary = summarize_args(&args);
+
+                    self.emit(StreamChunk::ToolCallStart {
+                        tool_name: effective_call.name.clone(),
+                        args_summary: args_summary.clone(),
+                    });
+
+                    // Cache store for successful read-only results
+                    if result.success {
+                        self.cache_store(&effective_call.name, &args, &result.output);
+                    }
+
+                    // Scan for escalation signals
+                    if let Some(output_str) = result.output.as_str() {
+                        self.escalation
+                            .scan_tool_output(&effective_call.name, output_str);
+                        if !result.success {
+                            self.track_error(output_str);
+                        }
+                    }
+
+                    let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+                        &effective_call.id,
+                        &effective_call.name,
+                        result,
+                        Some(&self.output_scanner),
+                    );
+                    let msg = if self.config.privacy_router.is_some() {
+                        match msg {
+                            ChatMessage::Tool {
+                                tool_call_id,
+                                content,
+                            } => {
+                                let filtered = self.apply_privacy_to_output(&content);
+                                ChatMessage::Tool {
+                                    tool_call_id,
+                                    content: filtered,
+                                }
+                            }
+                            other => other,
+                        }
+                    } else {
+                        msg
+                    };
+                    self.messages.push(msg);
+
+                    for warning in &injection_warnings {
+                        self.emit(deepseek_core::StreamChunk::SecurityWarning {
+                            message: format!(
+                                "{:?} — {} (matched: {})",
+                                warning.severity, warning.pattern_name, warning.matched_text
+                            ),
+                        });
+                    }
+
+                    self.emit(StreamChunk::ToolCallEnd {
+                        tool_name: effective_call.name.clone(),
+                        duration_ms: 0,
+                        success: result.success,
+                        summary: if result.success {
+                            "ok".to_string()
+                        } else {
+                            "error".to_string()
+                        },
+                    });
+
+                    let record = ToolCallRecord {
+                        tool_name: effective_call.name.clone(),
+                        tool_call_id: effective_call.id.clone(),
+                        args_summary,
+                        success: result.success,
+                        duration_ms: 0,
+                    };
+                    if record.success {
+                        batch_had_success = true;
+                    } else {
+                        batch_had_failure = true;
+                    }
+                    tool_calls_made.push(record);
+                }
+            } else {
+                // ≤1 parallel call — just run them sequentially via execute_tool_call
+                for llm_call in &parallel_calls {
+                    let records = self.execute_tool_call(llm_call)?;
+                    for r in &records {
+                        if r.success {
+                            batch_had_success = true;
+                        } else {
+                            batch_had_failure = true;
+                        }
+                    }
+                    tool_calls_made.extend(records);
+                }
+            }
+
+            // Execute sequential (write/agent-level) tools one at a time
+            for llm_call in &sequential_calls {
                 let records = self.execute_tool_call(llm_call)?;
                 for r in &records {
                     if r.success {
@@ -559,8 +936,80 @@ impl<'a> ToolUseLoop<'a> {
             return self.handle_agent_level_tool(llm_call);
         }
 
+        // ── Circuit breaker ──
+        // If this tool has failed too many times consecutively, reject it
+        // with guidance to try a different approach.
+        if let Some(state) = self.circuit_breaker.get(&llm_call.name)
+            && state.cooldown_remaining > 0
+        {
+            let duration = start.elapsed().as_millis() as u64;
+            self.emit(StreamChunk::ToolCallEnd {
+                tool_name: llm_call.name.clone(),
+                duration_ms: duration,
+                success: false,
+                summary: "circuit-broken".to_string(),
+            });
+            self.messages.push(tool_bridge::tool_error_to_message(
+                &llm_call.id,
+                &format!(
+                    "Tool '{}' is temporarily disabled after {} consecutive failures. \
+                     It will be re-enabled in {} turn(s). Try a different approach or tool.",
+                    llm_call.name, CIRCUIT_BREAKER_THRESHOLD, state.cooldown_remaining
+                ),
+            ));
+            records.push(ToolCallRecord {
+                tool_name: llm_call.name.clone(),
+                tool_call_id: llm_call.id.clone(),
+                args_summary: String::new(),
+                success: false,
+                duration_ms: duration,
+            });
+            return Ok(records);
+        }
+
+        // ── Tool name repair ──
+        // DeepSeek sometimes gets tool names wrong (casing, hyphens, misspellings).
+        // Try to fix before failing hard. If no match is found, pass the original
+        // name through — it may be an MCP/plugin tool not in the definitions list,
+        // or the tool host may handle it.
+        let llm_call = match tool_bridge::repair_tool_name(&llm_call.name, &self.tools) {
+            Some(repaired_name) if repaired_name != llm_call.name => LlmToolCall {
+                id: llm_call.id.clone(),
+                name: repaired_name,
+                arguments: llm_call.arguments.clone(),
+            },
+            _ => llm_call.clone(),
+        };
+
         // Convert LLM call to internal format
-        let tool_call = tool_bridge::llm_tool_call_to_internal(llm_call);
+        let tool_call = tool_bridge::llm_tool_call_to_internal(&llm_call);
+
+        // ── JSON schema validation ──
+        // Validate arguments against the tool's schema before executing.
+        // Returns structured error so the model can self-correct.
+        if let Err(validation_error) =
+            deepseek_tools::validate_tool_args_schema(&llm_call.name, &tool_call.args, &self.tools)
+        {
+            let duration = start.elapsed().as_millis() as u64;
+            self.emit(StreamChunk::ToolCallEnd {
+                tool_name: llm_call.name.clone(),
+                duration_ms: duration,
+                success: false,
+                summary: "invalid args".to_string(),
+            });
+            self.messages.push(tool_bridge::tool_error_to_message(
+                &llm_call.id,
+                &validation_error,
+            ));
+            records.push(ToolCallRecord {
+                tool_name: llm_call.name.clone(),
+                tool_call_id: llm_call.id.clone(),
+                args_summary: summarize_args(&tool_call.args),
+                success: false,
+                duration_ms: duration,
+            });
+            return Ok(records);
+        }
 
         let args_summary = summarize_args(&tool_call.args);
         self.emit(StreamChunk::ToolCallStart {
@@ -655,6 +1104,48 @@ impl<'a> ToolUseLoop<'a> {
             }
         }
 
+        // ── Cache lookup ──
+        // For read-only tools, check if we have a recent cached result.
+        let cached_args = serde_json::from_str::<serde_json::Value>(&llm_call.arguments)
+            .unwrap_or(serde_json::json!({}));
+        if let Some(cached_result) = self.cache_lookup(&llm_call.name, &cached_args) {
+            let duration = start.elapsed().as_millis() as u64;
+            let result = deepseek_core::ToolResult {
+                invocation_id: proposal.invocation_id,
+                success: true,
+                output: cached_result,
+            };
+            let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
+                &llm_call.id,
+                &llm_call.name,
+                &result,
+                Some(&self.output_scanner),
+            );
+            self.messages.push(msg);
+            for warning in &injection_warnings {
+                self.emit(deepseek_core::StreamChunk::SecurityWarning {
+                    message: format!(
+                        "{:?} — {} (matched: {})",
+                        warning.severity, warning.pattern_name, warning.matched_text
+                    ),
+                });
+            }
+            self.emit(StreamChunk::ToolCallEnd {
+                tool_name: llm_call.name.clone(),
+                duration_ms: duration,
+                success: true,
+                summary: "cached".to_string(),
+            });
+            records.push(ToolCallRecord {
+                tool_name: llm_call.name.clone(),
+                tool_call_id: llm_call.id.clone(),
+                args_summary,
+                success: true,
+                duration_ms: duration,
+            });
+            return Ok(records);
+        }
+
         // Create checkpoint before destructive tool calls
         if tool_bridge::is_write_tool(&llm_call.name)
             && let Some(ref cp) = self.checkpoint_cb
@@ -672,6 +1163,35 @@ impl<'a> ToolUseLoop<'a> {
 
         let duration = start.elapsed().as_millis() as u64;
         let success = result.success;
+
+        // ── Circuit breaker update ──
+        // Track consecutive failures per tool for circuit-breaking.
+        let cb_state = self.circuit_breaker.entry(llm_call.name.clone()).or_default();
+        if success {
+            cb_state.consecutive_failures = 0;
+            cb_state.cooldown_remaining = 0;
+        } else {
+            cb_state.consecutive_failures += 1;
+            if cb_state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                cb_state.cooldown_remaining = CIRCUIT_BREAKER_COOLDOWN_TURNS;
+                cb_state.consecutive_failures = 0; // Reset count for next cycle
+            }
+        }
+
+        // ── Cache store / invalidate ──
+        // Cache successful read-only results; invalidate on write tools.
+        if success {
+            self.cache_store(&llm_call.name, &cached_args, &result.output);
+        }
+        if tool_bridge::is_write_tool(&llm_call.name) {
+            // Invalidate cache entries for any paths this write tool modifies
+            let modified = tool_bridge::extract_modified_paths(&llm_call.name, &llm_call.arguments);
+            for path in &modified {
+                if let Some(path_str) = path.to_str() {
+                    self.cache_invalidate_path(path_str);
+                }
+            }
+        }
 
         // Scan tool output for evidence-driven budget escalation signals
         // (compile errors, test failures, patch rejections, search misses).
@@ -1208,6 +1728,69 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
+    /// Phase 1: Lightweight pruning of old tool outputs.
+    ///
+    /// Truncates verbose tool results that are older than `PRUNE_AGE_TURNS` turn groups
+    /// from the end. Keeps the last write result per file path and all recent results.
+    /// This preserves conversation structure while reducing token usage.
+    fn prune_old_tool_outputs(&mut self) {
+        // Count turn groups from the end (a turn group starts at each User message)
+        let mut turn_count = 0;
+        let mut recent_boundary = self.messages.len();
+        for (i, msg) in self.messages.iter().enumerate().rev() {
+            if matches!(msg, ChatMessage::User { .. }) {
+                turn_count += 1;
+                if turn_count >= PRUNE_AGE_TURNS {
+                    recent_boundary = i;
+                    break;
+                }
+            }
+        }
+
+        if recent_boundary <= 1 {
+            return; // Not enough history to prune
+        }
+
+        // Track file paths from recent tool results — keep those untouched
+        let mut recent_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for msg in self.messages[recent_boundary..].iter().rev() {
+            if let ChatMessage::Tool { content, .. } = msg
+                && let Some(path) = extract_tool_path(content)
+            {
+                recent_paths.insert(path);
+            }
+        }
+
+        // Truncate old tool results in the "old" zone (messages[1..recent_boundary])
+        const TRUNCATED_MARKER: &str = "[output pruned — re-read file if needed]";
+        let max_kept_chars = 200;
+
+        for msg in &mut self.messages[1..recent_boundary] {
+            if let ChatMessage::Tool { content, .. } = msg {
+                // Skip if already truncated or short
+                if content.len() <= max_kept_chars
+                    || content.contains(TRUNCATED_MARKER)
+                {
+                    continue;
+                }
+                // Keep results referencing files still active in recent turns
+                if let Some(path) = extract_tool_path(content)
+                    && recent_paths.contains(&path)
+                {
+                    continue;
+                }
+                // Truncate: keep first 200 chars + marker
+                let truncated = format!(
+                    "{}\n{}",
+                    &content[..max_kept_chars.min(content.len())],
+                    TRUNCATED_MARKER,
+                );
+                *content = truncated;
+            }
+        }
+    }
+
     /// Compact messages by removing middle exchanges while preserving tool-call/result pairing.
     ///
     /// Walks backward from the end, keeping complete exchange groups (User + Assistant + Tool
@@ -1370,6 +1953,33 @@ impl<'a> ToolUseLoop<'a> {
     }
 }
 
+/// Extract a file path from a tool result string, if present.
+/// Handles both JSON-formatted results (with "path"/"file_path" keys) and plain text.
+fn extract_tool_path(content: &str) -> Option<String> {
+    // Try parsing as JSON object with "path" or "file_path" key
+    if content.starts_with('{')
+        && let Ok(obj) = serde_json::from_str::<serde_json::Value>(content)
+        && let Some(map) = obj.as_object()
+    {
+        if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
+            return Some(path.to_string());
+        }
+        if let Some(path) = map.get("file_path").and_then(|v| v.as_str()) {
+            return Some(path.to_string());
+        }
+    }
+    // Try as string containing a path-like pattern at the start
+    if (content.starts_with('/') || content.starts_with("./"))
+        && let Some(line) = content.lines().next()
+    {
+        let trimmed = line.trim();
+        if trimmed.len() < 256 && !trimmed.contains(' ') {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
 /// Build a structured summary from messages being compacted.
 ///
 /// Extracts key facts: files modified/read, errors encountered, key decisions,
@@ -1391,27 +2001,27 @@ fn build_compaction_summary(messages: &[ChatMessage]) -> String {
             } => {
                 for tc in tool_calls {
                     tools_used.push(tc.name.clone());
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        if let Some(path) = args
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        && let Some(path) = args
                             .get("file_path")
                             .or(args.get("path"))
                             .and_then(|v| v.as_str())
+                    {
+                        if tc.name.contains("read")
+                            || tc.name.contains("glob")
+                            || tc.name.contains("grep")
                         {
-                            if tc.name.contains("read")
-                                || tc.name.contains("glob")
-                                || tc.name.contains("grep")
-                            {
-                                files_read.push(path.to_string());
-                            } else {
-                                files_modified.push(path.to_string());
-                            }
+                            files_read.push(path.to_string());
+                        } else {
+                            files_modified.push(path.to_string());
                         }
                     }
                 }
-                if let Some(text) = content {
-                    if text.len() > 50 && text.len() < 500 {
-                        key_decisions.push(truncate_line(text, 150));
-                    }
+                if let Some(text) = content
+                    && text.len() > 50
+                    && text.len() < 500
+                {
+                    key_decisions.push(truncate_line(text, 150));
                 }
             }
             ChatMessage::Tool { content, .. } => {
@@ -3020,8 +3630,10 @@ mod tests {
 
     #[test]
     fn de_escalated_routes_back_to_chat() {
-        let mut signals = crate::complexity::EscalationSignals::default();
-        signals.compile_error = true;
+        let mut signals = crate::complexity::EscalationSignals {
+            compile_error: true,
+            ..Default::default()
+        };
         assert!(signals.should_escalate());
 
         // 3 consecutive successes → de-escalate
@@ -3302,5 +3914,363 @@ mod tests {
             recovery_count <= 2,
             "recovery should not spam — got {recovery_count}"
         );
+    }
+
+    // ── CostTracker tests ──────────────────────────────────────────────
+
+    #[test]
+    fn cost_tracker_records_and_estimates() {
+        let mut tracker = CostTracker::default();
+        tracker.record(&TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 100_000,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        // Input: 1M tokens × $0.27/M = $0.27
+        // Output: 100K tokens × $1.10/M = $0.11
+        let cost = tracker.estimated_cost_usd();
+        assert!(
+            (cost - 0.38).abs() < 0.001,
+            "expected ~$0.38, got ${cost:.4}"
+        );
+    }
+
+    #[test]
+    fn cost_tracker_cache_discount() {
+        let mut tracker = CostTracker::default();
+        tracker.record(&TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            prompt_cache_hit_tokens: 800_000, // 80% cached
+            prompt_cache_miss_tokens: 200_000,
+            reasoning_tokens: 0,
+        });
+        // Effective input = (1M - 800K) + (800K × 0.1) = 200K + 80K = 280K
+        // Cost = 280K / 1M × $0.27 = $0.0756
+        let cost = tracker.estimated_cost_usd();
+        assert!(
+            (cost - 0.0756).abs() < 0.001,
+            "expected ~$0.0756 with cache discount, got ${cost:.4}"
+        );
+    }
+
+    #[test]
+    fn cost_tracker_over_budget() {
+        let mut tracker = CostTracker {
+            max_budget_usd: Some(0.10),
+            ..CostTracker::default()
+        };
+        tracker.record(&TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 100_000,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        assert!(tracker.over_budget(), "should be over $0.10 budget");
+    }
+
+    #[test]
+    fn cost_tracker_not_over_budget_without_cap() {
+        let mut tracker = CostTracker::default();
+        // No max_budget_usd set
+        tracker.record(&TokenUsage {
+            prompt_tokens: 10_000_000,
+            completion_tokens: 1_000_000,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        assert!(
+            !tracker.over_budget(),
+            "should never be over budget when no cap is set"
+        );
+    }
+
+    #[test]
+    fn cost_tracker_warns_once() {
+        let mut tracker = CostTracker::default();
+        tracker.record(&TokenUsage {
+            prompt_tokens: 2_000_000,
+            completion_tokens: 500_000,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        // Cost: $0.54 + $0.55 = $1.09 — well above $0.50 threshold
+        assert!(tracker.should_warn(), "should warn first time");
+        assert!(
+            !tracker.should_warn(),
+            "should NOT warn second time"
+        );
+    }
+
+    #[test]
+    fn cost_tracker_no_warn_below_threshold() {
+        let mut tracker = CostTracker::default();
+        tracker.record(&TokenUsage {
+            prompt_tokens: 100_000,
+            completion_tokens: 10_000,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        // Cost: $0.027 + $0.011 = $0.038 — well below $0.50
+        assert!(!tracker.should_warn(), "should not warn below threshold");
+    }
+
+    // ── CircuitBreaker tests ───────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_triggers_after_threshold() {
+        let mut cb = CircuitBreakerState::default();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            cb.consecutive_failures += 1;
+        }
+        assert_eq!(cb.consecutive_failures, CIRCUIT_BREAKER_THRESHOLD);
+        // Simulate triggering cooldown
+        cb.cooldown_remaining = CIRCUIT_BREAKER_COOLDOWN_TURNS;
+        assert_eq!(cb.cooldown_remaining, 2);
+    }
+
+    #[test]
+    fn circuit_breaker_cooldown_decrements() {
+        let mut cb = CircuitBreakerState {
+            consecutive_failures: CIRCUIT_BREAKER_THRESHOLD,
+            cooldown_remaining: CIRCUIT_BREAKER_COOLDOWN_TURNS,
+        };
+        // Simulate one turn of cooldown decrement
+        if cb.cooldown_remaining > 0 {
+            cb.cooldown_remaining -= 1;
+        }
+        assert_eq!(cb.cooldown_remaining, 1);
+        // One more
+        if cb.cooldown_remaining > 0 {
+            cb.cooldown_remaining -= 1;
+        }
+        assert_eq!(cb.cooldown_remaining, 0);
+        // After cooldown, reset failures
+        cb.consecutive_failures = 0;
+        assert_eq!(cb.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn circuit_breaker_resets_on_success() {
+        let mut cb = CircuitBreakerState {
+            consecutive_failures: 2,
+            cooldown_remaining: 0,
+        };
+        // Success resets the counter
+        cb.consecutive_failures = 0;
+        assert_eq!(cb.consecutive_failures, 0);
+        assert_eq!(cb.cooldown_remaining, 0);
+    }
+
+    // ── Tool cache tests ───────────────────────────────────────────────
+
+    #[test]
+    fn tool_cache_stores_and_retrieves() {
+        let llm = ScriptedLlm::new(vec![make_text_response("done")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let args = serde_json::json!({"path": "/foo/bar.rs"});
+        let result = serde_json::json!({"content": "fn main() {}"});
+
+        // Store and retrieve
+        loop_.cache_store("fs_read", &args, &result);
+        let cached = loop_.cache_lookup("fs_read", &args);
+        assert_eq!(cached, Some(result));
+    }
+
+    #[test]
+    fn tool_cache_skips_non_cacheable() {
+        let llm = ScriptedLlm::new(vec![make_text_response("done")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let args = serde_json::json!({"command": "ls"});
+        let result = serde_json::json!({"output": "file1\nfile2"});
+
+        loop_.cache_store("bash_run", &args, &result);
+        let cached = loop_.cache_lookup("bash_run", &args);
+        assert_eq!(cached, None, "bash_run should not be cached");
+    }
+
+    #[test]
+    fn tool_cache_invalidation_by_path() {
+        let llm = ScriptedLlm::new(vec![make_text_response("done")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let args = serde_json::json!({"path": "/foo/bar.rs"});
+        let result = serde_json::json!({"content": "fn main() {}"});
+
+        loop_.cache_store("fs_read", &args, &result);
+        assert!(loop_.cache_lookup("fs_read", &args).is_some());
+
+        // Invalidate by path
+        loop_.cache_invalidate_path("/foo/bar.rs");
+        assert!(
+            loop_.cache_lookup("fs_read", &args).is_none(),
+            "cache should be invalidated after path write"
+        );
+    }
+
+    // ── Pruning tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn prune_truncates_old_tool_outputs() {
+        let llm = ScriptedLlm::new(vec![make_text_response("done")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        // Build messages with 4+ turn groups, with long tool output in old turns
+        let long_output = "x".repeat(500);
+        // Old turn group 1
+        loop_.messages.push(ChatMessage::User {
+            content: "task 1".to_string(),
+        });
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: "tc1".to_string(),
+            content: long_output.clone(),
+        });
+        // Old turn group 2
+        loop_.messages.push(ChatMessage::User {
+            content: "task 2".to_string(),
+        });
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: "tc2".to_string(),
+            content: long_output.clone(),
+        });
+        // Old turn group 3
+        loop_.messages.push(ChatMessage::User {
+            content: "task 3".to_string(),
+        });
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: "tc3".to_string(),
+            content: long_output.clone(),
+        });
+        // Recent turns
+        loop_.messages.push(ChatMessage::User {
+            content: "recent task".to_string(),
+        });
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: "tc4".to_string(),
+            content: long_output.clone(),
+        });
+
+        loop_.prune_old_tool_outputs();
+
+        // Old tool outputs should be truncated
+        let old_tool = &loop_.messages[2]; // tc1
+        if let ChatMessage::Tool { content, .. } = old_tool {
+            assert!(
+                content.contains("[output pruned"),
+                "old tool output should be pruned, got: {}",
+                &content[..50.min(content.len())]
+            );
+            assert!(
+                content.len() < 500,
+                "pruned output should be shorter than original"
+            );
+        }
+
+        // Recent tool output should be unchanged
+        let recent_tool = &loop_.messages[loop_.messages.len() - 1];
+        if let ChatMessage::Tool { content, .. } = recent_tool {
+            assert_eq!(
+                content.len(),
+                500,
+                "recent tool output should not be pruned"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_skips_short_outputs() {
+        let llm = ScriptedLlm::new(vec![make_text_response("done")]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig::default();
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let short_output = "OK".to_string();
+        // Build 4 turn groups
+        for i in 0..4 {
+            loop_.messages.push(ChatMessage::User {
+                content: format!("task {i}"),
+            });
+            loop_.messages.push(ChatMessage::Tool {
+                tool_call_id: format!("tc{i}"),
+                content: short_output.clone(),
+            });
+        }
+
+        loop_.prune_old_tool_outputs();
+
+        // All outputs should remain unchanged (too short to prune)
+        for msg in &loop_.messages {
+            if let ChatMessage::Tool { content, .. } = msg {
+                assert_eq!(content, "OK", "short outputs should not be pruned");
+            }
+        }
+    }
+
+    #[test]
+    fn extract_tool_path_from_json() {
+        let json_content = r#"{"path": "/src/main.rs", "content": "fn main() {}"}"#;
+        assert_eq!(
+            extract_tool_path(json_content),
+            Some("/src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tool_path_from_plain_path() {
+        assert_eq!(
+            extract_tool_path("/src/main.rs\nfn main() {}"),
+            Some("/src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tool_path_none_for_regular_text() {
+        assert_eq!(extract_tool_path("Build succeeded"), None);
     }
 }

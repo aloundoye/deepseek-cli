@@ -239,13 +239,13 @@ impl BackgroundTaskRegistry {
                 Err(e) => (BackgroundTaskStatus::Failed, None, Some(e.to_string())),
             };
             let finished_at = chrono::Utc::now();
-            if let Ok(mut tasks) = tasks_ref.lock() {
-                if let Some(entry) = tasks.get_mut(&id) {
-                    entry.status = status;
-                    entry.result = result;
-                    entry.error = error;
-                    entry.finished_at = Some(finished_at);
-                }
+            if let Ok(mut tasks) = tasks_ref.lock()
+                && let Some(entry) = tasks.get_mut(&id)
+            {
+                entry.status = status;
+                entry.result = result;
+                entry.error = error;
+                entry.finished_at = Some(finished_at);
             }
         });
 

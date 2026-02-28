@@ -430,7 +430,7 @@ impl LocalToolHost {
                 let before_sha = format!("{:x}", sha2::Sha256::digest(before.as_bytes()));
                 let after_sha = format!("{:x}", sha2::Sha256::digest(after.as_bytes()));
 
-                // Auto-lint after edit (from Aider: lint-fix loop)
+                // Auto-lint after edit (lint-fix loop)
                 let lint_output = if let Some(ref lint_cmd) = self.lint_after_edit {
                     match self
                         .runner
@@ -2487,6 +2487,60 @@ pub fn tool_error_hint(tool_name: &str, error_msg: &str) -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+/// Validate tool call arguments against the tool's JSON schema.
+///
+/// Returns `Ok(())` if the arguments are valid, or `Err(message)` with a
+/// structured description of which fields are wrong, so the model can
+/// self-correct instead of getting cryptic runtime errors.
+///
+/// This complements `validation::validate_tool_args` which does deeper
+/// semantic checks (required fields, range checks). This function validates
+/// against the formal JSON schema from tool definitions.
+pub fn validate_tool_args_schema(
+    tool_name: &str,
+    args: &serde_json::Value,
+    tools: &[ToolDefinition],
+) -> Result<(), String> {
+    // Find the tool definition by API name
+    let tool_def = tools.iter().find(|t| t.function.name == tool_name);
+    let Some(tool_def) = tool_def else {
+        return Ok(()); // Unknown tool — skip validation (MCP, plugin)
+    };
+
+    let schema = &tool_def.function.parameters;
+    if schema.is_null() || (schema.is_object() && schema.as_object().unwrap().is_empty()) {
+        return Ok(()); // No schema defined
+    }
+
+    // Compile and validate
+    let validator = match jsonschema::validator_for(schema) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // Invalid schema — skip validation
+    };
+
+    let errors: Vec<String> = validator
+        .iter_errors(args)
+        .map(|e| {
+            let path = e.instance_path.to_string();
+            if path.is_empty() {
+                e.to_string()
+            } else {
+                format!("{}: {}", path, e)
+            }
+        })
+        .collect();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid arguments for tool '{}': {}",
+            tool_name,
+            errors.join("; ")
+        ))
     }
 }
 
@@ -4877,5 +4931,80 @@ mod tests {
             );
         }
         // If None, that's also valid (running on bare metal)
+    }
+
+    // ── T2.1: JSON schema validation tests ──────────────────────────────
+
+    #[test]
+    fn schema_validation_passes_valid_args() {
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: deepseek_core::FunctionDefinition {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }),
+            },
+        }];
+        let args = json!({"path": "src/main.rs"});
+        assert!(validate_tool_args_schema("test_tool", &args, &tools).is_ok());
+    }
+
+    #[test]
+    fn schema_validation_rejects_missing_required() {
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: deepseek_core::FunctionDefinition {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }),
+            },
+        }];
+        let args = json!({});
+        let result = validate_tool_args_schema("test_tool", &args, &tools);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path"));
+    }
+
+    #[test]
+    fn schema_validation_rejects_wrong_type() {
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: deepseek_core::FunctionDefinition {
+                name: "test_tool".to_string(),
+                description: "A test tool".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "integer" }
+                    }
+                }),
+            },
+        }];
+        let args = json!({"count": "not a number"});
+        let result = validate_tool_args_schema("test_tool", &args, &tools);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn schema_validation_skips_unknown_tools() {
+        let tools = vec![];
+        // Unknown tool should not fail validation
+        let args = json!({"anything": "goes"});
+        assert!(validate_tool_args_schema("mcp__unknown__tool", &args, &tools).is_ok());
     }
 }

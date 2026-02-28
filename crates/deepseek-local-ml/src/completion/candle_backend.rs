@@ -95,7 +95,8 @@ impl CandleCompletion {
         let mut all_tokens = input_ids.clone();
         let mut generated = String::new();
 
-        // Process the full prompt and generate the first token
+        // Process the full prompt and generate the first token.
+        // Position starts at 0 for the prompt tokens.
         let input_tensor = Tensor::new(&input_ids[..], &self.device)?.unsqueeze(0)?;
         let logits = model.forward(&input_tensor, 0)?;
         let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
@@ -104,8 +105,13 @@ impl CandleCompletion {
         let mut current_token = logits_processor.sample(&last_logits)?;
         all_tokens.push(current_token);
 
+        // Track position explicitly: after processing the prompt, the next position
+        // is input_ids.len() (the first generated token occupies that position).
+        // Each subsequent token advances position by 1.
+        let mut pos = input_ids.len();
+
         // Autoregressive generation loop
-        for i in 0..opts.max_tokens {
+        for _i in 0..opts.max_tokens {
             if self.cancel_flag.load(Ordering::SeqCst) {
                 break;
             }
@@ -132,9 +138,10 @@ impl CandleCompletion {
                 cb(&token_text);
             }
 
-            // Generate next token (autoregressive: feed current_token, advance position)
+            // Advance position and generate next token
+            pos += 1;
             let input = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, input_ids.len() + i as usize)?;
+            let logits = model.forward(&input, pos)?;
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
             let last_logits = logits.narrow(0, logits.dim(0)? - 1, 1)?.squeeze(0)?;
             current_token = logits_processor.sample(&last_logits)?;

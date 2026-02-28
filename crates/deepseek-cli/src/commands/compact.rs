@@ -325,7 +325,7 @@ pub(crate) fn summarize_conversation(transcript: &[String]) -> String {
     }
 
     let original_tokens = transcript.iter().map(|t| estimate_tokens(t)).sum::<u64>();
-    let target_lines = (original_tokens / 40).max(5).min(50) as usize; // ~10 tokens per summary line
+    let target_lines = (original_tokens / 40).clamp(5, 50) as usize; // ~10 tokens per summary line
 
     let mut summary_parts = Vec::new();
     summary_parts.push(format!(

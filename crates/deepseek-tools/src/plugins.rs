@@ -462,13 +462,13 @@ fn load_plugin_info(path: &Path, enabled: bool) -> Result<PluginInfo> {
     // Collect LSP configs from manifest + .lsp.json files
     let mut lsp_configs = manifest.lsp.clone();
     let lsp_json_path = path.join(".lsp.json");
-    if lsp_json_path.exists() {
-        if let Ok(raw) = fs::read_to_string(&lsp_json_path) {
-            if let Ok(mut file_configs) = serde_json::from_str::<Vec<PluginLspConfig>>(&raw) {
-                lsp_configs.append(&mut file_configs);
-            } else if let Ok(single) = serde_json::from_str::<PluginLspConfig>(&raw) {
-                lsp_configs.push(single);
-            }
+    if lsp_json_path.exists()
+        && let Ok(raw) = fs::read_to_string(&lsp_json_path)
+    {
+        if let Ok(mut file_configs) = serde_json::from_str::<Vec<PluginLspConfig>>(&raw) {
+            lsp_configs.append(&mut file_configs);
+        } else if let Ok(single) = serde_json::from_str::<PluginLspConfig>(&raw) {
+            lsp_configs.push(single);
         }
     }
 

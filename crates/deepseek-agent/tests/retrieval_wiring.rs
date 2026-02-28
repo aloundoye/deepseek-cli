@@ -1,7 +1,7 @@
 //! Tests for retrieval pipeline wiring (P8 Batch 4).
 
 use anyhow::{Result, anyhow};
-use deepseek_agent::tool_loop::{RetrievalContext, ToolLoopConfig, ToolUseLoop};
+use deepseek_agent::tool_loop::{RetrievalContext, RetrieverCallback, ToolLoopConfig, ToolUseLoop};
 use deepseek_core::{
     ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, StreamCallback, StreamChunk,
     TokenUsage,
@@ -99,16 +99,15 @@ fn retrieval_context_added_before_llm() {
     let llm = ScriptedLlm::new(vec![text_response("Done")]);
     let tool_host: Arc<dyn deepseek_core::ToolHost + Send + Sync> = Arc::new(NoopToolHost);
 
-    let retriever: Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync> =
-        Arc::new(|_query, _k| {
-            Ok(vec![RetrievalContext {
-                file_path: "src/main.rs".to_string(),
-                start_line: 1,
-                end_line: 10,
-                content: "fn main() { println!(\"hello\"); }".to_string(),
-                score: 0.95,
-            }])
-        });
+    let retriever: RetrieverCallback = Arc::new(|_query, _k| {
+        Ok(vec![RetrievalContext {
+            file_path: "src/main.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            content: "fn main() { println!(\"hello\"); }".to_string(),
+            score: 0.95,
+        }])
+    });
 
     let config = ToolLoopConfig {
         retriever: Some(retriever),
@@ -150,8 +149,7 @@ fn retrieval_respects_budget() {
     let tool_host: Arc<dyn deepseek_core::ToolHost + Send + Sync> = Arc::new(NoopToolHost);
 
     // Create a retriever that returns lots of chunks
-    let retriever: Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync> =
-        Arc::new(|_query, _k| {
+    let retriever: RetrieverCallback = Arc::new(|_query, _k| {
             let mut results = Vec::new();
             for i in 0..100 {
                 results.push(RetrievalContext {

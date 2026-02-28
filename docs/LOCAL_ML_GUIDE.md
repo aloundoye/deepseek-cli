@@ -4,7 +4,7 @@ DeepSeek CLI includes an optional local ML layer that runs entirely on your mach
 
 - **Hybrid code retrieval** — automatically surfaces relevant code chunks before the LLM responds
 - **Privacy scanning** — detects and redacts secrets in tool outputs before they reach the API
-- **Ghost text** — inline code completions in the TUI (like Copilot, but local)
+- **Ghost text** — inline code completions in the TUI, powered by local models
 
 All of this is **off by default**. No models are bundled — they're downloaded from HuggingFace on first use.
 

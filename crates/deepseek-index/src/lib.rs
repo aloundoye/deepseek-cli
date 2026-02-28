@@ -15,7 +15,7 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{STORED, STRING, Schema, TEXT, Value};
+use tantivy::schema::{NumericOptions, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, doc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,10 +268,11 @@ impl IndexService {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            if let Some(s) = scope {
-                if !path.starts_with(s) && !path.contains(s) {
-                    continue;
-                }
+            if let Some(s) = scope
+                && !path.starts_with(s)
+                && !path.contains(s)
+            {
+                continue;
             }
 
             let full = self.workspace.join(&path);
@@ -304,10 +305,11 @@ impl IndexService {
                 continue;
             }
             let rel = rel_path.to_string_lossy().to_string();
-            if let Some(s) = scope {
-                if !rel.starts_with(s) && !rel.contains(s) {
-                    continue;
-                }
+            if let Some(s) = scope
+                && !rel.starts_with(s)
+                && !rel.contains(s)
+            {
+                continue;
             }
             if let Ok(content) = fs::read_to_string(path) {
                 for (idx, line) in content.lines().enumerate() {
@@ -330,6 +332,144 @@ impl IndexService {
     fn tantivy_dir(&self) -> PathBuf {
         runtime_dir(&self.workspace).join("index/tantivy")
     }
+
+    /// Build a chunk-level Tantivy index from pre-computed chunks.
+    ///
+    /// This is used by `HybridRetriever` to index chunks at the same granularity
+    /// as the vector index, enabling proper BM25↔vector fusion via shared chunk IDs.
+    pub fn build_chunk_index(&self, chunks: &[ChunkEntry]) -> Result<()> {
+        let chunk_dir = self.chunk_tantivy_dir();
+        if chunk_dir.exists() {
+            fs::remove_dir_all(&chunk_dir)?;
+        }
+        fs::create_dir_all(&chunk_dir)?;
+
+        let mut schema_builder = Schema::builder();
+        let chunk_id_field = schema_builder.add_text_field("chunk_id", STRING | STORED);
+        let path_field = schema_builder.add_text_field("path", STRING | STORED);
+        let content_field = schema_builder.add_text_field("content", TEXT | STORED);
+        let start_line_field = schema_builder.add_u64_field(
+            "start_line",
+            NumericOptions::default().set_stored().set_indexed(),
+        );
+        let end_line_field = schema_builder.add_u64_field(
+            "end_line",
+            NumericOptions::default().set_stored().set_indexed(),
+        );
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_dir(&chunk_dir, schema)?;
+        let mut writer = index.writer(50_000_000)?;
+
+        for chunk in chunks {
+            writer.add_document(doc!(
+                chunk_id_field => chunk.chunk_id.as_str(),
+                path_field => chunk.path.as_str(),
+                content_field => chunk.content.as_str(),
+                start_line_field => chunk.start_line as u64,
+                end_line_field => chunk.end_line as u64
+            ))?;
+        }
+
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Query the chunk-level Tantivy index, returning chunk IDs with BM25 scores.
+    pub fn query_chunks(
+        &self,
+        q: &str,
+        top_k: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<ChunkQueryResult>> {
+        let chunk_dir = self.chunk_tantivy_dir();
+        if !chunk_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let index = Index::open_in_dir(chunk_dir)?;
+        let schema = index.schema();
+        let chunk_id_field = schema.get_field("chunk_id")?;
+        let path_field = schema.get_field("path")?;
+        let content_field = schema.get_field("content")?;
+        let start_line_field = schema.get_field("start_line")?;
+        let end_line_field = schema.get_field("end_line")?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let parser = QueryParser::for_index(&index, vec![content_field]);
+        let query = parser.parse_query(q)?;
+        let docs = searcher.search(&query, &TopDocs::with_limit(top_k * 2))?;
+
+        let mut results = Vec::new();
+        for (score, doc_addr) in docs {
+            let retrieved = searcher.doc::<tantivy::schema::TantivyDocument>(doc_addr)?;
+
+            let chunk_id = retrieved
+                .get_first(chunk_id_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let path = retrieved
+                .get_first(path_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let start_line = retrieved
+                .get_first(start_line_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let end_line = retrieved
+                .get_first(end_line_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            if let Some(s) = scope
+                && !path.starts_with(s)
+                && !path.contains(s)
+            {
+                continue;
+            }
+
+            results.push(ChunkQueryResult {
+                chunk_id,
+                path,
+                start_line,
+                end_line,
+                score,
+            });
+
+            if results.len() >= top_k {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn chunk_tantivy_dir(&self) -> PathBuf {
+        runtime_dir(&self.workspace).join("index/tantivy_chunks")
+    }
+}
+
+/// Entry for chunk-level Tantivy indexing.
+#[derive(Debug, Clone)]
+pub struct ChunkEntry {
+    pub chunk_id: String,
+    pub path: String,
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// Result from chunk-level BM25 query.
+#[derive(Debug, Clone)]
+pub struct ChunkQueryResult {
+    pub chunk_id: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub score: f32,
 }
 
 fn workspace_file_paths(workspace: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
@@ -520,5 +660,48 @@ mod tests {
                 "result must include a non-empty excerpt"
             );
         }
+    }
+
+    #[test]
+    fn chunk_level_index_returns_chunk_ids() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-index-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            workspace.join("lib.rs"),
+            "fn compute() { 42 }\nfn helper() { 7 }\n",
+        )
+        .expect("seed");
+
+        let svc = IndexService::new(&workspace).expect("svc");
+
+        let chunks = vec![
+            ChunkEntry {
+                chunk_id: "chunk-001".to_string(),
+                path: "lib.rs".to_string(),
+                content: "fn compute() { 42 }".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+            ChunkEntry {
+                chunk_id: "chunk-002".to_string(),
+                path: "lib.rs".to_string(),
+                content: "fn helper() { 7 }".to_string(),
+                start_line: 2,
+                end_line: 2,
+            },
+        ];
+
+        svc.build_chunk_index(&chunks).expect("build chunk index");
+
+        let results = svc
+            .query_chunks("compute", 5, None)
+            .expect("query chunks");
+        assert!(!results.is_empty(), "should find chunk-level results");
+        assert_eq!(
+            results[0].chunk_id, "chunk-001",
+            "should return the correct chunk_id"
+        );
+        assert_eq!(results[0].path, "lib.rs");
     }
 }

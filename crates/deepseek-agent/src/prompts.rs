@@ -134,10 +134,10 @@ pub fn build_tool_use_system_prompt_with_complexity(
     match complexity {
         PromptComplexity::Complex => {
             let mut prompt = format!("{base}{COMPLEX_REMINDER}");
-            if let Some(repo_map) = repo_map_summary {
-                if !repo_map.is_empty() {
-                    prompt.push_str(&format!("\n## Project Files\n{repo_map}\n"));
-                }
+            if let Some(repo_map) = repo_map_summary
+                && !repo_map.is_empty()
+            {
+                prompt.push_str(&format!("\n## Project Files\n{repo_map}\n"));
             }
             prompt
         }
@@ -178,6 +178,66 @@ This is a multi-step task. Before making changes:\n\
 1. Read the files you plan to modify.\n\
 2. If changing an interface (function signature, type, struct field), grep for all usages first.\n\
 3. After changes, run tests to verify.\n";
+
+/// Additional system prompt section for deepseek-reasoner model.
+/// The reasoner has native chain-of-thought, so we guide it to use thinking
+/// for planning and verification rather than just acting.
+pub const REASONER_GUIDANCE: &str = "\n\n\
+## Model: DeepSeek-Reasoner\n\
+You have extended thinking capabilities. Use them strategically:\n\
+- **Before complex edits**: Think through the change, its impacts, and verify your understanding.\n\
+- **After errors**: Use thinking to analyze why the error occurred before retrying.\n\
+- **For multi-file changes**: Think through the dependency order and plan before acting.\n\
+Do NOT use thinking for trivial operations (reading files, running commands).\n";
+
+/// Additional prescriptive guidance for deepseek-chat when handling Complex tasks
+/// without thinking mode. Since chat lacks native reasoning, we compensate with
+/// explicit step-by-step instructions.
+pub const CHAT_PRESCRIPTIVE_GUIDANCE: &str = "\n\n\
+## Explicit Verification Protocol\n\
+After EVERY file modification, you MUST:\n\
+1. State what you changed and why (one sentence)\n\
+2. Run the build/test command to verify\n\
+3. If the test fails, re-read the error FULLY before making another edit\n\
+\n\
+Every 5 tool calls, ask yourself: have I verified all file paths exist? \
+Am I working on the right files? Have I read the files I'm about to edit?\n";
+
+/// Build system prompt with model-specific additions.
+///
+/// Layers the base prompt with complexity and model-specific guidance.
+pub fn build_model_aware_system_prompt(
+    project_memory: Option<&str>,
+    system_prompt_override: Option<&str>,
+    system_prompt_append: Option<&str>,
+    workspace_context: Option<&WorkspaceContext>,
+    complexity: PromptComplexity,
+    repo_map_summary: Option<&str>,
+    model: &str,
+) -> String {
+    let base = build_tool_use_system_prompt_with_complexity(
+        project_memory,
+        system_prompt_override,
+        system_prompt_append,
+        workspace_context,
+        complexity,
+        repo_map_summary,
+    );
+
+    // Don't inject model guidance if user provided a full override
+    if system_prompt_override.is_some() {
+        return base;
+    }
+
+    if model.contains("reasoner") {
+        format!("{base}{REASONER_GUIDANCE}")
+    } else if complexity == PromptComplexity::Complex {
+        // For chat model on Complex tasks, add prescriptive verification
+        format!("{base}{CHAT_PRESCRIPTIVE_GUIDANCE}")
+    } else {
+        base
+    }
+}
 
 /// Format the environment section for the system prompt.
 fn format_environment_section(ctx: &WorkspaceContext) -> String {
@@ -440,5 +500,87 @@ mod tests {
         assert!(prompt.contains("/tmp/test"));
         assert!(!prompt.contains("Git branch"));
         assert!(prompt.contains("OS: macos"));
+    }
+
+    // ── T3.2: Model-aware prompt tests ──
+
+    #[test]
+    fn reasoner_gets_thinking_guidance() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "deepseek-reasoner",
+        );
+        assert!(
+            prompt.contains("Reasoner"),
+            "reasoner should get thinking guidance"
+        );
+        assert!(
+            prompt.contains("extended thinking"),
+            "should mention thinking capability"
+        );
+    }
+
+    #[test]
+    fn chat_complex_gets_prescriptive_guidance() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "deepseek-chat",
+        );
+        assert!(
+            prompt.contains("Verification Protocol"),
+            "chat on complex should get prescriptive guidance"
+        );
+        assert!(
+            prompt.contains("EVERY file modification"),
+            "should emphasize verification"
+        );
+    }
+
+    #[test]
+    fn chat_simple_gets_no_model_guidance() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "deepseek-chat",
+        );
+        assert!(
+            !prompt.contains("Verification Protocol"),
+            "simple should not get prescriptive guidance"
+        );
+        assert!(
+            !prompt.contains("Reasoner"),
+            "chat should not get reasoner guidance"
+        );
+    }
+
+    #[test]
+    fn override_skips_model_guidance() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            Some("Custom override"),
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "deepseek-reasoner",
+        );
+        assert!(
+            !prompt.contains("Reasoner"),
+            "override should skip model guidance"
+        );
     }
 }

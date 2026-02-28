@@ -9,7 +9,6 @@
 ///
 /// The tool loop escalates dynamically based on *observed* failure states,
 /// not heuristic prompt classification.
-
 /// Prompt complexity — used for planning injection, not budget selection.
 ///
 /// Budget is controlled by `DEFAULT_THINK_BUDGET` vs `HARD_THINK_BUDGET`,
@@ -152,14 +151,13 @@ impl EscalationSignals {
         }
 
         // Patch rejection
-        if tool_name == "fs_edit" || tool_name == "fs.edit" {
-            if lower.contains("no match")
+        if (tool_name == "fs_edit" || tool_name == "fs.edit")
+            && (lower.contains("no match")
                 || lower.contains("conflict")
                 || lower.contains("not found")
-                || lower.contains("failed to apply")
-            {
-                self.patch_rejected = true;
-            }
+                || lower.contains("failed to apply"))
+        {
+            self.patch_rejected = true;
         }
 
         // Search miss
@@ -426,20 +424,24 @@ mod tests {
 
     #[test]
     fn default_budget_is_moderate() {
-        assert!(
-            DEFAULT_THINK_BUDGET <= 16_384,
-            "default should be moderate, not huge"
-        );
-        assert!(
-            DEFAULT_THINK_BUDGET >= 4_096,
-            "default should not starve reasoning"
-        );
+        const {
+            assert!(
+                DEFAULT_THINK_BUDGET <= 16_384,
+                "default should be moderate, not huge"
+            );
+        }
+        const {
+            assert!(
+                DEFAULT_THINK_BUDGET >= 4_096,
+                "default should not starve reasoning"
+            );
+        }
     }
 
     #[test]
     fn hard_budget_is_generous() {
-        assert!(HARD_THINK_BUDGET >= 4 * DEFAULT_THINK_BUDGET);
-        assert!(MAX_THINK_BUDGET >= HARD_THINK_BUDGET);
+        const { assert!(HARD_THINK_BUDGET >= 4 * DEFAULT_THINK_BUDGET) }
+        const { assert!(MAX_THINK_BUDGET >= HARD_THINK_BUDGET) }
     }
 
     #[test]
@@ -474,33 +476,41 @@ mod tests {
 
     #[test]
     fn compile_error_triggers_hard_budget() {
-        let mut signals = EscalationSignals::default();
-        signals.compile_error = true;
+        let signals = EscalationSignals {
+            compile_error: true,
+            ..Default::default()
+        };
         assert!(signals.should_escalate());
         assert_eq!(signals.budget(), HARD_THINK_BUDGET);
     }
 
     #[test]
     fn test_failure_triggers_hard_budget() {
-        let mut signals = EscalationSignals::default();
-        signals.test_failure = true;
+        let signals = EscalationSignals {
+            test_failure: true,
+            ..Default::default()
+        };
         assert!(signals.should_escalate());
         assert_eq!(signals.budget(), HARD_THINK_BUDGET);
     }
 
     #[test]
     fn patch_rejected_triggers_hard_budget() {
-        let mut signals = EscalationSignals::default();
-        signals.patch_rejected = true;
+        let signals = EscalationSignals {
+            patch_rejected: true,
+            ..Default::default()
+        };
         assert!(signals.should_escalate());
         assert_eq!(signals.budget(), HARD_THINK_BUDGET);
     }
 
     #[test]
     fn repeated_failures_escalate_further() {
-        let mut signals = EscalationSignals::default();
-        signals.compile_error = true;
-        signals.consecutive_failure_turns = 4;
+        let signals = EscalationSignals {
+            compile_error: true,
+            consecutive_failure_turns: 4,
+            ..Default::default()
+        };
         let budget = signals.budget();
         assert!(
             budget > HARD_THINK_BUDGET,
@@ -511,9 +521,11 @@ mod tests {
 
     #[test]
     fn escalation_capped_at_max() {
-        let mut signals = EscalationSignals::default();
-        signals.compile_error = true;
-        signals.consecutive_failure_turns = 100;
+        let signals = EscalationSignals {
+            compile_error: true,
+            consecutive_failure_turns: 100,
+            ..Default::default()
+        };
         assert_eq!(signals.budget(), MAX_THINK_BUDGET);
     }
 
@@ -543,8 +555,10 @@ mod tests {
 
     #[test]
     fn success_resets_consecutive_failures() {
-        let mut signals = EscalationSignals::default();
-        signals.consecutive_failure_turns = 3;
+        let mut signals = EscalationSignals {
+            consecutive_failure_turns: 3,
+            ..Default::default()
+        };
         signals.record_success();
         assert_eq!(signals.consecutive_failure_turns, 0);
     }
@@ -785,9 +799,11 @@ mod tests {
 
     #[test]
     fn escalation_de_escalates_after_3_successes() {
-        let mut signals = EscalationSignals::default();
-        signals.compile_error = true;
-        signals.test_failure = true;
+        let mut signals = EscalationSignals {
+            compile_error: true,
+            test_failure: true,
+            ..Default::default()
+        };
         assert!(signals.should_escalate());
 
         // 3 consecutive successes should de-escalate
@@ -809,8 +825,10 @@ mod tests {
 
     #[test]
     fn search_miss_triggers_escalation() {
-        let mut signals = EscalationSignals::default();
-        signals.search_miss = true;
+        let signals = EscalationSignals {
+            search_miss: true,
+            ..Default::default()
+        };
         assert!(signals.should_escalate());
         assert_eq!(signals.budget(), HARD_THINK_BUDGET);
     }

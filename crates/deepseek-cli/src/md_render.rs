@@ -175,27 +175,27 @@ impl StreamingMdRenderer {
         // ── Indented sub-list (2-4 spaces + bullet) ─────────────────
         let stripped = line.trim_start();
         let indent_len = line.len() - stripped.len();
-        if indent_len >= 2 {
-            if let Some(item) = stripped
+        if indent_len >= 2
+            && let Some(item) = stripped
                 .strip_prefix("- ")
                 .or_else(|| stripped.strip_prefix("* "))
-            {
-                let indent = " ".repeat(indent_len);
-                let styled = render_inline_markdown(item);
-                let _ = writeln!(w, "  {indent}{CYAN}◦{RESET} {styled}");
-                return;
-            }
+        {
+            let indent = " ".repeat(indent_len);
+            let styled = render_inline_markdown(item);
+            let _ = writeln!(w, "  {indent}{CYAN}◦{RESET} {styled}");
+            return;
         }
 
         // ── Numbered list ───────────────────────────────────────────
-        if let Some(dot_pos) = line.find(". ") {
-            if dot_pos <= 4 && line[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
-                let num = &line[..dot_pos + 2];
-                let item = &line[dot_pos + 2..];
-                let styled = render_inline_markdown(item);
-                let _ = writeln!(w, "  {CYAN}{num}{RESET}{styled}");
-                return;
-            }
+        if let Some(dot_pos) = line.find(". ")
+            && dot_pos <= 4
+            && line[..dot_pos].chars().all(|c| c.is_ascii_digit())
+        {
+            let num = &line[..dot_pos + 2];
+            let item = &line[dot_pos + 2..];
+            let styled = render_inline_markdown(item);
+            let _ = writeln!(w, "  {CYAN}{num}{RESET}{styled}");
+            return;
         }
 
         // ── Table rows ──────────────────────────────────────────────
@@ -243,82 +243,82 @@ fn render_inline_markdown(text: &str) -> String {
 
     while i < len {
         // Bold+italic: ***text***
-        if i + 2 < len && chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*' {
-            if let Some(end) = find_closing(&chars, i + 3, &['*', '*', '*']) {
-                let inner: String = chars[i + 3..end].iter().collect();
-                out.push_str(&format!("{BOLD}{ITALIC}{inner}{RESET}"));
-                i = end + 3;
-                continue;
-            }
+        if i + 2 < len && chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*'
+            && let Some(end) = find_closing(&chars, i + 3, &['*', '*', '*'])
+        {
+            let inner: String = chars[i + 3..end].iter().collect();
+            out.push_str(&format!("{BOLD}{ITALIC}{inner}{RESET}"));
+            i = end + 3;
+            continue;
         }
 
         // Bold: **text**
-        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_closing(&chars, i + 2, &['*', '*']) {
-                let inner: String = chars[i + 2..end].iter().collect();
-                out.push_str(&format!("{BOLD}{inner}{RESET}"));
-                i = end + 2;
-                continue;
-            }
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*'
+            && let Some(end) = find_closing(&chars, i + 2, &['*', '*'])
+        {
+            let inner: String = chars[i + 2..end].iter().collect();
+            out.push_str(&format!("{BOLD}{inner}{RESET}"));
+            i = end + 2;
+            continue;
         }
 
         // Bold (underscores): __text__
-        if i + 1 < len && chars[i] == '_' && chars[i + 1] == '_' {
-            if let Some(end) = find_closing(&chars, i + 2, &['_', '_']) {
-                let inner: String = chars[i + 2..end].iter().collect();
-                out.push_str(&format!("{BOLD}{inner}{RESET}"));
-                i = end + 2;
-                continue;
-            }
+        if i + 1 < len && chars[i] == '_' && chars[i + 1] == '_'
+            && let Some(end) = find_closing(&chars, i + 2, &['_', '_'])
+        {
+            let inner: String = chars[i + 2..end].iter().collect();
+            out.push_str(&format!("{BOLD}{inner}{RESET}"));
+            i = end + 2;
+            continue;
         }
 
         // Italic: *text* (single asterisk, not followed by another)
-        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
-            if let Some(end) = find_closing(&chars, i + 1, &['*']) {
+        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*')
+            && let Some(end) = find_closing(&chars, i + 1, &['*'])
+        {
+            let inner: String = chars[i + 1..end].iter().collect();
+            out.push_str(&format!("{ITALIC}{inner}{RESET}"));
+            i = end + 1;
+            continue;
+        }
+
+        // Italic (underscore): _text_
+        if chars[i] == '_' && (i + 1 >= len || chars[i + 1] != '_')
+            && let Some(end) = find_closing(&chars, i + 1, &['_'])
+        {
+            // Avoid matching snake_case identifiers
+            if end > i + 1 {
                 let inner: String = chars[i + 1..end].iter().collect();
+                if !inner.contains(' ') && inner.chars().any(|c| c == '_') {
+                    // Likely snake_case — don't treat as italic
+                    out.push(chars[i]);
+                    i += 1;
+                    continue;
+                }
                 out.push_str(&format!("{ITALIC}{inner}{RESET}"));
                 i = end + 1;
                 continue;
             }
         }
 
-        // Italic (underscore): _text_
-        if chars[i] == '_' && (i + 1 >= len || chars[i + 1] != '_') {
-            if let Some(end) = find_closing(&chars, i + 1, &['_']) {
-                // Avoid matching snake_case identifiers
-                if end > i + 1 {
-                    let inner: String = chars[i + 1..end].iter().collect();
-                    if !inner.contains(' ') && inner.chars().any(|c| c == '_') {
-                        // Likely snake_case — don't treat as italic
-                        out.push(chars[i]);
-                        i += 1;
-                        continue;
-                    }
-                    out.push_str(&format!("{ITALIC}{inner}{RESET}"));
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-
         // Strikethrough: ~~text~~
-        if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
-            if let Some(end) = find_closing(&chars, i + 2, &['~', '~']) {
-                let inner: String = chars[i + 2..end].iter().collect();
-                out.push_str(&format!("\x1b[9m{inner}{RESET}"));
-                i = end + 2;
-                continue;
-            }
+        if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~'
+            && let Some(end) = find_closing(&chars, i + 2, &['~', '~'])
+        {
+            let inner: String = chars[i + 2..end].iter().collect();
+            out.push_str(&format!("\x1b[9m{inner}{RESET}"));
+            i = end + 2;
+            continue;
         }
 
         // Inline code: `text`
-        if chars[i] == '`' {
-            if let Some(end) = find_single_closing(&chars, i + 1, '`') {
-                let inner: String = chars[i + 1..end].iter().collect();
-                out.push_str(&format!("{BG_GRAY}{YELLOW} {inner} {RESET}"));
-                i = end + 1;
-                continue;
-            }
+        if chars[i] == '`'
+            && let Some(end) = find_single_closing(&chars, i + 1, '`')
+        {
+            let inner: String = chars[i + 1..end].iter().collect();
+            out.push_str(&format!("{BG_GRAY}{YELLOW} {inner} {RESET}"));
+            i = end + 1;
+            continue;
         }
 
         out.push(chars[i]);
@@ -344,12 +344,7 @@ fn find_closing(chars: &[char], start: usize, delim: &[char]) -> Option<usize> {
 
 /// Find single closing character.
 fn find_single_closing(chars: &[char], start: usize, ch: char) -> Option<usize> {
-    for i in start..chars.len() {
-        if chars[i] == ch {
-            return Some(i);
-        }
-    }
-    None
+    (start..chars.len()).find(|&i| chars[i] == ch)
 }
 
 // ── Role headers ────────────────────────────────────────────────────────

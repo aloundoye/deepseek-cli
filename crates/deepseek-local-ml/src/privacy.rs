@@ -3,20 +3,15 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Policy action when sensitive content is detected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrivacyPolicy {
     /// Block content from being sent to cloud APIs entirely.
     BlockCloud,
     /// Redact sensitive parts before sending to cloud.
+    #[default]
     Redact,
     /// Generate a local-only summary instead of sending raw content.
     LocalOnlySummary,
-}
-
-impl Default for PrivacyPolicy {
-    fn default() -> Self {
-        Self::Redact
-    }
 }
 
 /// Configuration for privacy routing.

@@ -3000,6 +3000,68 @@ impl Store {
         }
         Ok(())
     }
+
+    // ── Session garbage collection ────────────────────────────────────────
+
+    /// Archive (soft-delete) sessions older than `archive_days`.
+    /// Returns the number of sessions archived.
+    pub fn archive_old_sessions(&self, archive_days: u32) -> Result<u64> {
+        let conn = self.db()?;
+        let cutoff = (Utc::now() - chrono::Duration::days(i64::from(archive_days))).to_rfc3339();
+        let count = conn.execute(
+            "UPDATE sessions SET status = '\"Archived\"'
+             WHERE updated_at < ?1 AND status != '\"Archived\"'",
+            params![cutoff],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Permanently delete sessions (and their events) older than `delete_days`.
+    /// Returns the number of sessions deleted.
+    pub fn delete_old_sessions(&self, delete_days: u32) -> Result<u64> {
+        let conn = self.db()?;
+        let cutoff = (Utc::now() - chrono::Duration::days(i64::from(delete_days))).to_rfc3339();
+
+        // Collect session IDs to delete
+        let mut stmt = conn.prepare(
+            "SELECT session_id FROM sessions WHERE updated_at < ?1",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Delete related rows
+        for id in &ids {
+            conn.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM plans WHERE session_id = ?1", params![id])?;
+            conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![id])?;
+        }
+        Ok(ids.len() as u64)
+    }
+
+    /// Return total database file size in bytes.
+    pub fn storage_bytes(&self) -> Result<u64> {
+        let meta = fs::metadata(&self.db_path)?;
+        let mut total = meta.len();
+        if self.events_path.exists() {
+            total += fs::metadata(&self.events_path)?.len();
+        }
+        Ok(total)
+    }
+
+    /// Run full garbage collection: archive >30 days, delete >90 days.
+    /// Returns `(archived, deleted, storage_bytes)`.
+    pub fn gc(&self, archive_days: u32, delete_days: u32) -> Result<(u64, u64, u64)> {
+        let archived = self.archive_old_sessions(archive_days)?;
+        let deleted = self.delete_old_sessions(delete_days)?;
+        let size = self.storage_bytes()?;
+        Ok((archived, deleted, size))
+    }
 }
 
 fn append_lock() -> &'static Mutex<()> {
@@ -3838,5 +3900,98 @@ mod tests {
         assert_eq!(entry_b.input_tokens, 500);
         assert_eq!(entry_b.output_tokens, 200);
         assert_eq!(entry_b.turn_count, 1);
+    }
+
+    fn make_session(workspace: &Path) -> Session {
+        Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        }
+    }
+
+    #[test]
+    fn archive_old_sessions_marks_stale() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-gc-archive-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        // Create a session and manually backdate it
+        let session = make_session(&workspace);
+        store.save_session(&session).expect("save");
+        let conn = store.db().expect("db");
+        let old_date = (Utc::now() - chrono::Duration::days(45)).to_rfc3339();
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
+            params![old_date, session.session_id.to_string()],
+        )
+        .unwrap();
+
+        // Archive sessions older than 30 days
+        let archived = store.archive_old_sessions(30).expect("archive");
+        assert_eq!(archived, 1);
+
+        // Running again should archive 0 (already archived)
+        let archived2 = store.archive_old_sessions(30).expect("archive2");
+        assert_eq!(archived2, 0);
+    }
+
+    #[test]
+    fn delete_old_sessions_removes_data() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-gc-delete-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        let session = make_session(&workspace);
+        store.save_session(&session).expect("save");
+
+        // Add an event for this session
+        let ev = EventEnvelope {
+            seq_no: 1,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::TurnAdded {
+                role: "user".to_string(),
+                content: "test".to_string(),
+            },
+        };
+        store.append_event(&ev).expect("append");
+
+        // Backdate the session to 100 days ago
+        let conn = store.db().expect("db");
+        let old_date = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
+            params![old_date, session.session_id.to_string()],
+        )
+        .unwrap();
+
+        let deleted = store.delete_old_sessions(90).expect("delete");
+        assert_eq!(deleted, 1);
+
+        // Session should be gone
+        let loaded = store.load_session(session.session_id).expect("load");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn gc_returns_storage_size() {
+        let workspace =
+            std::env::temp_dir().join(format!("deepseek-store-gc-size-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        let (archived, deleted, size) = store.gc(30, 90).expect("gc");
+        assert_eq!(archived, 0);
+        assert_eq!(deleted, 0);
+        assert!(size > 0, "db file should have non-zero size");
     }
 }

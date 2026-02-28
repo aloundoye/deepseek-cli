@@ -190,21 +190,21 @@ impl OutputScanner {
         for m in b64_re.find_iter(text) {
             let b64_str = m.as_str();
             // Attempt decoding
-            if let Ok(decoded_bytes) = base64_decode(b64_str) {
-                if let Ok(decoded) = String::from_utf8(decoded_bytes) {
-                    // Check decoded text against injection patterns
-                    for pat in &self.injection_patterns {
-                        if pat.regex.is_match(&decoded) {
-                            warnings.push(InjectionWarning {
-                                pattern_name: "base64_injection",
-                                severity: Severity::Medium,
-                                matched_text: format!(
-                                    "[base64 decoded to injection: {}]",
-                                    pat.name
-                                ),
-                            });
-                            return; // one warning is enough
-                        }
+            if let Ok(decoded_bytes) = base64_decode(b64_str)
+                && let Ok(decoded) = String::from_utf8(decoded_bytes)
+            {
+                // Check decoded text against injection patterns
+                for pat in &self.injection_patterns {
+                    if pat.regex.is_match(&decoded) {
+                        warnings.push(InjectionWarning {
+                            pattern_name: "base64_injection",
+                            severity: Severity::Medium,
+                            matched_text: format!(
+                                "[base64 decoded to injection: {}]",
+                                pat.name
+                            ),
+                        });
+                        return; // one warning is enough
                     }
                 }
             }
@@ -401,7 +401,7 @@ mod tests {
         const TABLE: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let bytes = input.as_bytes();
-        let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0] as u32;
             let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };

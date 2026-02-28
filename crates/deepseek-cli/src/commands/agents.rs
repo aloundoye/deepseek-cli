@@ -18,7 +18,7 @@ pub(crate) fn run_agents(cwd: &Path, cmd: AgentsCmd, json_mode: bool) -> Result<
                     "Create .md files in .deepseek/agents/ or ~/.deepseek/agents/ with YAML frontmatter."
                 );
             } else {
-                println!("{:<20} {:<40} {}", "NAME", "DESCRIPTION", "MODEL");
+                println!("{:<20} {:<40} MODEL", "NAME", "DESCRIPTION");
                 println!("{}", "-".repeat(70));
                 for def in &defs {
                     println!(

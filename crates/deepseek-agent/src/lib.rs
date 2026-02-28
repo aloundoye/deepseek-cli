@@ -3,6 +3,7 @@ pub mod apply;
 pub mod complexity;
 mod gather_context;
 mod intent;
+pub mod local_routing;
 pub mod prompts;
 mod repo_map;
 mod shared;
@@ -34,7 +35,7 @@ use std::time::Duration;
 
 /// Handler for spawn_task subagent workers. Retained for API compatibility,
 /// but the core loop does not dispatch subagents in this architecture.
-type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
+pub type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -168,10 +169,10 @@ impl AgentEngine {
         let tool_host = Arc::new(tool_host);
 
         // Best-effort checkpoint cleanup on session start.
-        if cfg.cleanup_period_days > 0 {
-            if let Ok(mem) = deepseek_memory::MemoryManager::new(workspace) {
-                let _ = mem.cleanup_old_checkpoints(cfg.cleanup_period_days);
-            }
+        if cfg.cleanup_period_days > 0
+            && let Ok(mem) = deepseek_memory::MemoryManager::new(workspace)
+        {
+            let _ = mem.cleanup_old_checkpoints(cfg.cleanup_period_days);
         }
 
         let hooks_config: HooksConfig =
@@ -341,7 +342,7 @@ impl AgentEngine {
     /// Build a skill runner callback that wraps SkillManager.
     fn build_skill_runner(&self) -> Option<tool_loop::SkillRunner> {
         let workspace = self.workspace.clone();
-        let skill_paths: Vec<String> = self.cfg.skills.paths.iter().cloned().collect();
+        let skill_paths: Vec<String> = self.cfg.skills.paths.to_vec();
 
         Some(Arc::new(move |skill_name: &str, args: Option<&str>| {
             let manager = deepseek_skills::SkillManager::new(&workspace)?;
@@ -558,27 +559,27 @@ impl AgentEngine {
 
         // Build tool list: built-in tools + MCP-discovered tools.
         let mut tools = tool_definitions();
-        if let Some(ref mcp) = self.mcp {
-            if let Ok(mcp_tools) = mcp.discover_tools() {
-                for mt in mcp_tools {
-                    tools.push(deepseek_core::ToolDefinition {
-                        tool_type: "function".to_string(),
-                        function: deepseek_core::FunctionDefinition {
-                            name: format!("mcp__{}__{}", mt.server_id, mt.name),
-                            description: mt.description.clone(),
-                            parameters: serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "arguments": {
-                                        "type": "object",
-                                        "description": "Arguments to pass to the MCP tool"
-                                    }
+        if let Some(ref mcp) = self.mcp
+            && let Ok(mcp_tools) = mcp.discover_tools()
+        {
+            for mt in mcp_tools {
+                tools.push(deepseek_core::ToolDefinition {
+                    tool_type: "function".to_string(),
+                    function: deepseek_core::FunctionDefinition {
+                        name: format!("mcp__{}__{}", mt.server_id, mt.name),
+                        description: mt.description.clone(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "arguments": {
+                                    "type": "object",
+                                    "description": "Arguments to pass to the MCP tool"
                                 }
-                            }),
-                            strict: None,
-                        },
-                    });
-                }
+                            }
+                        }),
+                        strict: None,
+                    },
+                });
             }
         }
 
@@ -690,20 +691,20 @@ impl AgentEngine {
 
         // Enrich with dependency-analysis hub files
         let mut packet = bootstrap.packet;
-        if let Ok(mut ctx_mgr) = deepseek_context::ContextManager::new(&self.workspace) {
-            if ctx_mgr.analyze_workspace().is_ok() {
-                let suggestions = ctx_mgr.suggest_relevant_files(prompt, 10);
-                if !suggestions.is_empty() {
-                    packet.push_str("\nKey files (by dependency centrality):\n");
-                    for s in &suggestions {
-                        let reasons = s.reasons.join(", ");
-                        packet.push_str(&format!(
-                            "  - {} (score: {:.1}, {})\n",
-                            s.path.display(),
-                            s.score,
-                            reasons
-                        ));
-                    }
+        if let Ok(mut ctx_mgr) = deepseek_context::ContextManager::new(&self.workspace)
+            && ctx_mgr.analyze_workspace().is_ok()
+        {
+            let suggestions = ctx_mgr.suggest_relevant_files(prompt, 10);
+            if !suggestions.is_empty() {
+                packet.push_str("\nKey files (by dependency centrality):\n");
+                for s in &suggestions {
+                    let reasons = s.reasons.join(", ");
+                    packet.push_str(&format!(
+                        "  - {} (score: {:.1}, {})\n",
+                        s.path.display(),
+                        s.score,
+                        reasons
+                    ));
                 }
             }
         }
@@ -723,10 +724,10 @@ impl AgentEngine {
         let prompt_enriched = enrich_prompt_with_urls(prompt, options.detect_urls);
 
         // Load chat history from the store if possible
-        if let Ok(Some(session)) = self.store.load_latest_session() {
-            if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
-                options.chat_history = projection.chat_messages;
-            }
+        if let Ok(Some(session)) = self.store.load_latest_session()
+            && let Ok(projection) = self.store.rebuild_from_events(session.session_id)
+        {
+            options.chat_history = projection.chat_messages;
         }
 
         // Record User Turn
@@ -843,11 +844,7 @@ fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
 fn build_retriever_callback(
     workspace: &std::path::Path,
     cfg: &deepseek_core::AppConfig,
-) -> Option<
-    std::sync::Arc<
-        dyn Fn(&str, usize) -> anyhow::Result<Vec<tool_loop::RetrievalContext>> + Send + Sync,
-    >,
-> {
+) -> Option<tool_loop::RetrieverCallback> {
     if !cfg.local_ml.enabled {
         return None;
     }
@@ -892,7 +889,7 @@ fn build_retriever_callback(
     // Build vector index path
     let index_path = workspace.join(".deepseek").join("vector_index");
     let chunk_config = deepseek_local_ml::ChunkConfig {
-        chunk_lines: cfg.local_ml.index.chunk_lines as usize,
+        chunk_lines: cfg.local_ml.index.chunk_lines,
         ..Default::default()
     };
 

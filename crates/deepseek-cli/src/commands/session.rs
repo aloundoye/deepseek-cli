@@ -36,7 +36,7 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                 return Ok(());
             }
 
-            println!("{:<40} | {:<20} | {}", "SESSION ID", "STATUS", "WORKSPACE");
+            println!("{:<40} | {:<20} | WORKSPACE", "SESSION ID", "STATUS");
             println!("{:-<40}-+-{:-<20}-+-{:-<40}", "", "", "");
             for s in sessions {
                 println!(
@@ -83,8 +83,8 @@ pub fn run_session_cmd(workspace: &Path, command: SessionCmd, _json: bool) -> Re
                     }
 
                     println!(
-                        "{:<40} | {:<20} | {:<30} | {}",
-                        "RUN ID", "STATUS", "CREATED AT", "PROMPT"
+                        "{:<40} | {:<20} | {:<30} | PROMPT",
+                        "RUN ID", "STATUS", "CREATED AT"
                     );
                     println!("{:-<40}-+-{:-<20}-+-{:-<30}-+-{:-<40}", "", "", "", "");
                     for r in runs {

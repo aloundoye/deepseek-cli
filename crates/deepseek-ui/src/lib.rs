@@ -2668,8 +2668,6 @@ fn autocomplete_at_suggestions(prefix: &str, workspace: &Path) -> Vec<String> {
     let pattern = if prefix.is_empty() {
         // Show top-level files
         "*".to_string()
-    } else if prefix.ends_with('/') {
-        format!("{prefix}*")
     } else {
         format!("{prefix}*")
     };
@@ -2994,6 +2992,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
@@ -3033,7 +3032,7 @@ where
         // that causes issues in VS Code's integrated terminal and other emulators.
         out.write_all(b"\x1b[2J\x1b[H")?;
 
-        // ASCII art logo + info, styled like Claude Code
+        // ASCII art logo + info
         let version = env!("CARGO_PKG_VERSION");
         let model = &status.model;
         let cwd = &status.working_directory;
@@ -3927,23 +3926,23 @@ where
                 }
                 KeyCode::Enter | KeyCode::Right => {
                     // Accept selected suggestion
-                    if let Some(ref ac) = autocomplete_dropdown {
-                        if let Some(value) = ac.selected_value() {
-                            let slash_mode = ac.trigger_pos == 0 && input.starts_with('/');
-                            if slash_mode {
-                                // Replace entire input with the slash command
-                                let cmd = slash_suggestion_to_command(value);
-                                input = format!("{cmd} ");
-                                cursor_pos = input.len();
-                            } else {
-                                let trigger = ac.trigger_pos;
-                                // Replace @prefix with @fullpath
-                                input.truncate(trigger);
-                                input.push('@');
-                                input.push_str(value);
-                                input.push(' ');
-                                cursor_pos = input.len();
-                            }
+                    if let Some(ref ac) = autocomplete_dropdown
+                        && let Some(value) = ac.selected_value()
+                    {
+                        let slash_mode = ac.trigger_pos == 0 && input.starts_with('/');
+                        if slash_mode {
+                            // Replace entire input with the slash command
+                            let cmd = slash_suggestion_to_command(value);
+                            input = format!("{cmd} ");
+                            cursor_pos = input.len();
+                        } else {
+                            let trigger = ac.trigger_pos;
+                            // Replace @prefix with @fullpath
+                            input.truncate(trigger);
+                            input.push('@');
+                            input.push_str(value);
+                            input.push(' ');
+                            cursor_pos = input.len();
                         }
                     }
                     autocomplete_dropdown = None;
@@ -4719,24 +4718,23 @@ where
             continue;
         }
         // Alt+Right: accept one word of ML ghost text
-        if key.code == KeyCode::Right && key.modifiers == KeyModifiers::ALT {
-            if let Some(word) = ml_ghost.accept_word() {
-                input.push_str(&word);
-                cursor_pos = input.len();
-                info_line = "accepted word".to_string();
-                continue;
-            }
+        if key.code == KeyCode::Right && key.modifiers == KeyModifiers::ALT
+            && let Some(word) = ml_ghost.accept_word()
+        {
+            input.push_str(&word);
+            cursor_pos = input.len();
+            info_line = "accepted word".to_string();
+            continue;
         }
         if key == bindings.autocomplete {
             // ML ghost text has highest priority
             if cursor_pos >= input.len() && !input.starts_with('/') && ml_ghost.suggestion.is_some()
+                && let Some(text) = ml_ghost.accept_full()
             {
-                if let Some(text) = ml_ghost.accept_full() {
-                    input.push_str(&text);
-                    cursor_pos = input.len();
-                    info_line = "accepted ML suggestion".to_string();
-                    continue;
-                }
+                input.push_str(&text);
+                cursor_pos = input.len();
+                info_line = "accepted ML suggestion".to_string();
+                continue;
             }
             // Then history ghost
             if cursor_pos >= input.len()

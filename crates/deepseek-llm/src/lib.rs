@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
-    ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse, LlmToolCall,
-    StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
+    CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse,
+    LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model,
+    normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -43,6 +44,9 @@ pub trait LlmClient {
 pub struct DeepSeekClient {
     cfg: LlmConfig,
     client: Client,
+    /// Optional cancellation token — checked between SSE reads during streaming.
+    /// When cancelled, returns partial response with content accumulated so far.
+    cancel_token: Option<CancellationToken>,
 }
 
 impl DeepSeekClient {
@@ -50,7 +54,16 @@ impl DeepSeekClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_seconds))
             .build()?;
-        Ok(Self { cfg, client })
+        Ok(Self {
+            cfg,
+            client,
+            cancel_token: None,
+        })
+    }
+
+    /// Attach a cancellation token that will be checked during streaming.
+    pub fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel_token = Some(token);
     }
 
     fn resolved_endpoint(&self, is_chat: bool, is_fim: bool, is_strict_tools: bool) -> String {
@@ -82,7 +95,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, false, false))
+                .post(self.resolved_endpoint(false, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -258,18 +271,18 @@ impl DeepSeekClient {
             .collect();
 
         // If images are provided, convert the last User message to multipart content
-        if !req.images.is_empty() {
-            if let Some(last_user) = messages.iter_mut().rev().find(|m| m["role"] == "user") {
-                let text = last_user["content"].as_str().unwrap_or("").to_string();
-                let mut parts = vec![json!({"type": "text", "text": text})];
-                for img in &req.images {
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
-                    }));
-                }
-                last_user["content"] = json!(parts);
+        if !req.images.is_empty()
+            && let Some(last_user) = messages.iter_mut().rev().find(|m| m["role"] == "user")
+        {
+            let text = last_user["content"].as_str().unwrap_or("").to_string();
+            let mut parts = vec![json!({"type": "text", "text": text})];
+            for img in &req.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
+                }));
             }
+            last_user["content"] = json!(parts);
         }
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
@@ -308,15 +321,15 @@ impl DeepSeekClient {
             payload["response_format"] = fmt.clone();
         }
 
-        if let Some(logprobs) = req.logprobs {
-            if !thinking_enabled {
-                payload["logprobs"] = json!(logprobs);
-            }
+        if let Some(logprobs) = req.logprobs
+            && !thinking_enabled
+        {
+            payload["logprobs"] = json!(logprobs);
         }
-        if let Some(top_logprobs) = req.top_logprobs {
-            if !thinking_enabled {
-                payload["top_logprobs"] = json!(top_logprobs);
-            }
+        if let Some(top_logprobs) = req.top_logprobs
+            && !thinking_enabled
+        {
+            payload["top_logprobs"] = json!(top_logprobs);
         }
         if let Some(ref thinking) = req.thinking {
             payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
@@ -337,7 +350,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(true, false, false))
+                .post(self.resolved_endpoint(true, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -384,7 +397,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, true, false))
+                .post(self.resolved_endpoint(false, true, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -443,7 +456,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, true, false))
+                .post(self.resolved_endpoint(false, true, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -460,6 +473,14 @@ impl DeepSeekClient {
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in std::io::BufRead::lines(reader) {
+                            if let Some(ref ct) = self.cancel_token
+                                && ct.is_cancelled()
+                            {
+                                cb(StreamChunk::Done {
+                                    reason: Some("cancelled".to_string()),
+                                });
+                                break;
+                            }
                             let line = match line_result {
                                 Ok(l) => l,
                                 Err(e) => {
@@ -480,10 +501,10 @@ impl DeepSeekClient {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            if let Some(usage_value) = value.get("usage") {
-                                if !usage_value.is_null() {
-                                    usage = parse_usage_object(Some(usage_value));
-                                }
+                            if let Some(usage_value) = value.get("usage")
+                                && !usage_value.is_null()
+                            {
+                                usage = parse_usage_object(Some(usage_value));
                             }
                             let choice = value
                                 .get("choices")
@@ -560,7 +581,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(true, false, false))
+                .post(self.resolved_endpoint(true, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -584,6 +605,14 @@ impl DeepSeekClient {
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
+                            if let Some(ref ct) = self.cancel_token
+                                && ct.is_cancelled()
+                            {
+                                cb(StreamChunk::Done {
+                                    reason: Some("cancelled".to_string()),
+                                });
+                                break;
+                            }
                             let line = match line_result {
                                 Ok(l) => l,
                                 Err(e) => {
@@ -604,10 +633,10 @@ impl DeepSeekClient {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            if let Some(usage_value) = value.get("usage") {
-                                if !usage_value.is_null() {
-                                    usage = parse_usage_object(Some(usage_value));
-                                }
+                            if let Some(usage_value) = value.get("usage")
+                                && !usage_value.is_null()
+                            {
+                                usage = parse_usage_object(Some(usage_value));
                             }
                             let choice = value
                                 .get("choices")
@@ -787,7 +816,7 @@ impl DeepSeekClient {
         while attempt <= self.cfg.max_retries {
             let response = self
                 .client
-                .post(&self.resolved_endpoint(false, false, false))
+                .post(self.resolved_endpoint(false, false, false))
                 .bearer_auth(api_key)
                 .json(&payload)
                 .send();
@@ -808,6 +837,14 @@ impl DeepSeekClient {
 
                         let reader = std::io::BufReader::new(resp);
                         for line_result in reader.lines() {
+                            if let Some(ref ct) = self.cancel_token
+                                && ct.is_cancelled()
+                            {
+                                cb(StreamChunk::Done {
+                                    reason: Some("cancelled".to_string()),
+                                });
+                                break;
+                            }
                             let line = match line_result {
                                 Ok(l) => l,
                                 Err(e) => {
@@ -828,10 +865,10 @@ impl DeepSeekClient {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            if let Some(usage_value) = value.get("usage") {
-                                if !usage_value.is_null() {
-                                    usage = parse_usage_object(Some(usage_value));
-                                }
+                            if let Some(usage_value) = value.get("usage")
+                                && !usage_value.is_null()
+                            {
+                                usage = parse_usage_object(Some(usage_value));
                             }
                             let choice = value
                                 .get("choices")
@@ -1348,10 +1385,10 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
             break;
         }
         let value: Value = serde_json::from_str(chunk)?;
-        if let Some(usage_value) = value.get("usage") {
-            if !usage_value.is_null() {
-                usage = parse_usage_object(Some(usage_value));
-            }
+        if let Some(usage_value) = value.get("usage")
+            && !usage_value.is_null()
+        {
+            usage = parse_usage_object(Some(usage_value));
         }
         let choice = value
             .get("choices")
@@ -2681,5 +2718,30 @@ mod tests {
             client.resolved_endpoint(true, false, false),
             "https://custom.example.com/my-api"
         );
+    }
+
+    #[test]
+    fn set_cancel_token_stores_token() {
+        let cfg = LlmConfig::default();
+        let mut client = DeepSeekClient::new(cfg).unwrap();
+        assert!(client.cancel_token.is_none());
+
+        let token = CancellationToken::new();
+        client.set_cancel_token(token.clone());
+        assert!(client.cancel_token.is_some());
+        assert!(!client.cancel_token.as_ref().unwrap().is_cancelled());
+
+        token.cancel();
+        assert!(client.cancel_token.as_ref().unwrap().is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_token_reset_works() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(token.is_cancelled());
+        token.reset();
+        assert!(!token.is_cancelled());
     }
 }

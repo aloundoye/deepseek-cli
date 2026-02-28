@@ -526,10 +526,10 @@ impl McpManager {
         query: Option<&str>,
         max_results: usize,
     ) -> Result<Vec<McpTool>> {
-        if context_used_pct > 10.0 {
-            if let Some(q) = query {
-                return self.search_tools_by_relevance(q, max_results);
-            }
+        if context_used_pct > 10.0
+            && let Some(q) = query
+        {
+            return self.search_tools_by_relevance(q, max_results);
         }
         self.discover_tools()
     }
@@ -912,10 +912,10 @@ fn parse_sse_tools(server_id: &str, sse_text: &str) -> Result<Vec<McpTool>> {
         let data = chunk
             .strip_prefix("data: ")
             .or_else(|| chunk.lines().find_map(|l| l.strip_prefix("data: ")));
-        if let Some(json_str) = data {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                tools.extend(parse_mcp_tools_message(server_id, &value));
-            }
+        if let Some(json_str) = data
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
+        {
+            tools.extend(parse_mcp_tools_message(server_id, &value));
         }
     }
     if tools.is_empty() {
@@ -994,6 +994,186 @@ fn discover_stdio_tools(server: &McpServer) -> Result<Vec<McpTool>> {
     discovered.sort_by(|a, b| a.name.cmp(&b.name));
     discovered.dedup_by(|a, b| a.name == b.name);
     Ok(discovered)
+}
+
+/// A pooled MCP stdio connection — keeps a server process alive across requests.
+struct PooledConnection {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: mpsc::Receiver<serde_json::Value>,
+    _reader_handle: Option<thread::JoinHandle<()>>,
+    last_used: Instant,
+    next_request_id: u64,
+}
+
+/// Connection pool for MCP stdio servers. Keeps processes alive and reuses them
+/// across tool calls. Health checks before reuse, kills after idle timeout.
+pub struct McpConnectionPool {
+    connections: std::sync::Mutex<std::collections::HashMap<String, PooledConnection>>,
+    idle_timeout: Duration,
+}
+
+/// Maximum idle time before a pooled connection is killed.
+const MCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+impl McpConnectionPool {
+    /// Create a new empty connection pool.
+    pub fn new() -> Self {
+        Self {
+            connections: std::sync::Mutex::new(std::collections::HashMap::new()),
+            idle_timeout: MCP_POOL_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Execute a request against a pooled stdio server. Reuses existing connections
+    /// or creates a new one. Health checks the connection before reuse.
+    pub fn execute(
+        &self,
+        server: &McpServer,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let key = server.id.clone();
+        let mut pool = self.connections.lock().unwrap();
+
+        // Evict idle connections
+        pool.retain(|_, conn| conn.last_used.elapsed() < self.idle_timeout);
+
+        // Try reusing existing connection
+        if let Some(conn) = pool.get_mut(&key) {
+            // Health check: try_wait returns Some if process exited
+            if conn.child.try_wait().ok().flatten().is_some() {
+                pool.remove(&key);
+            } else {
+                let request_id = conn.next_request_id;
+                conn.next_request_id += 1;
+                conn.last_used = Instant::now();
+
+                if let Err(e) = write_mcp_request(&mut conn.stdin, request_id, method, params.clone()) {
+                    // Connection broken — remove and fall through to create new one
+                    let mut removed = pool.remove(&key).unwrap();
+                    let _ = removed.child.kill();
+                    let _ = removed.child.wait();
+                    let _ = e; // Connection broken — will create new one
+                } else {
+                    let _ = conn.stdin.flush();
+                    let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
+                    return match response {
+                        Some(value) => Ok(value),
+                        None => Err(anyhow!(
+                            "MCP pooled request timed out: method={method} timeout_ms={}",
+                            timeout.as_millis()
+                        )),
+                    };
+                }
+            }
+        }
+
+        // Create new connection
+        drop(pool); // Release lock during process spawn
+        let conn = self.create_connection(server)?;
+        let mut pool = self.connections.lock().unwrap();
+
+        let request_id = conn.next_request_id;
+        let mut conn = conn;
+        conn.next_request_id += 1;
+        conn.last_used = Instant::now();
+
+        write_mcp_request(&mut conn.stdin, request_id, method, params)?;
+        let _ = conn.stdin.flush();
+
+        let response = wait_for_mcp_response(&conn.rx, request_id, timeout);
+        pool.insert(key, conn);
+
+        match response {
+            Some(value) => Ok(value),
+            None => Err(anyhow!(
+                "MCP pooled request timed out: method={method} timeout_ms={}",
+                timeout.as_millis()
+            )),
+        }
+    }
+
+    /// Create a new pooled connection: spawn process, initialize MCP protocol.
+    fn create_connection(&self, server: &McpServer) -> Result<PooledConnection> {
+        let command = server
+            .command
+            .as_deref()
+            .ok_or_else(|| anyhow!("stdio transport requires command"))?;
+        let mut child = Command::new(command)
+            .args(&server.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start MCP stdio command: {command}"))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open MCP stdio stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to open MCP stdio stdout"))?;
+        let (tx, rx) = mpsc::channel::<serde_json::Value>();
+
+        let reader_handle = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Ok(Some(value)) = read_mcp_frame(&mut reader) {
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Send MCP initialize request
+        let init = json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "deepseek-cli",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        });
+        write_mcp_request(&mut stdin, 1, "initialize", init)?;
+        let _ = stdin.flush();
+
+        // Wait for initialize response (ID=1)
+        let _ = wait_for_mcp_response(&rx, 1, Duration::from_secs(10));
+
+        Ok(PooledConnection {
+            child,
+            stdin,
+            rx,
+            _reader_handle: Some(reader_handle),
+            last_used: Instant::now(),
+            next_request_id: 100, // Start after init
+        })
+    }
+
+    /// Gracefully shut down all pooled connections.
+    pub fn shutdown(&self) {
+        let mut pool = self.connections.lock().unwrap();
+        for (id, mut conn) in pool.drain() {
+            let _ = id;
+            let _ = conn.child.kill();
+            let _ = conn.child.wait();
+        }
+    }
+}
+
+impl Default for McpConnectionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for McpConnectionPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Execute one framed JSON-RPC request against an MCP stdio server.
@@ -1514,10 +1694,10 @@ fn wait_for_oauth_callback(
 fn extract_query_param(request: &str, param: &str) -> Option<String> {
     let query = request.split_whitespace().nth(1)?.split('?').nth(1)?;
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == param {
-                return Some(value.to_string());
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == param
+        {
+            return Some(value.to_string());
         }
     }
     None
@@ -2595,5 +2775,30 @@ data: {"other":"ignored"}
         let expected_url = format!("https://api.example.com/{home}");
         assert_eq!(server.url.as_deref(), Some(expected_url.as_str()));
         assert_eq!(server.args[0], format!("--home={home}"));
+    }
+
+    // ── T4.3: MCP connection pool tests ────────────────────────────────
+
+    #[test]
+    fn pool_default_creates_empty() {
+        let pool = McpConnectionPool::new();
+        let conns = pool.connections.lock().unwrap();
+        assert!(conns.is_empty(), "new pool should have no connections");
+    }
+
+    #[test]
+    fn pool_shutdown_is_idempotent() {
+        let pool = McpConnectionPool::new();
+        pool.shutdown();
+        pool.shutdown(); // Should not panic
+    }
+
+    #[test]
+    fn pool_drop_cleans_up() {
+        {
+            let _pool = McpConnectionPool::new();
+            // Drop implicitly calls shutdown
+        }
+        // No panic = success
     }
 }

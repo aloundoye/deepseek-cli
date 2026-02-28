@@ -246,7 +246,7 @@ impl TagExtractor {
     }
 
     fn set_cached(&self, path: &str, mtime: u64, tags: &[Tag]) -> Result<()> {
-        let cached: Vec<CachedTag> = tags.iter().map(|t| CachedTag::from(t)).collect();
+        let cached: Vec<CachedTag> = tags.iter().map(CachedTag::from).collect();
         let json = serde_json::to_string(&cached)?;
         self.cache_db.execute(
             "INSERT OR REPLACE INTO tag_cache (path, mtime_secs, tags_json) VALUES (?1, ?2, ?3)",
@@ -323,10 +323,10 @@ pub fn extract_tags_from_source(
             }
         }
 
-        if let (Some(name), Some(kind)) = (name, kind) {
-            if !name.is_empty() {
-                tags.push(Tag { name, kind, line });
-            }
+        if let (Some(name), Some(kind)) = (name, kind)
+            && !name.is_empty()
+        {
+            tags.push(Tag { name, kind, line });
         }
     }
 
