@@ -16,6 +16,11 @@ pub mod watch;
 
 pub use repo_map::clear_tag_cache;
 
+/// Whether the binary was compiled with real Candle ML backends.
+pub fn has_local_ml_feature() -> bool {
+    cfg!(feature = "local-ml")
+}
+
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use deepseek_core::{
@@ -1261,5 +1266,15 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn has_local_ml_feature_returns_bool() {
+        // Without local-ml feature compiled, should return false.
+        let result = super::has_local_ml_feature();
+        #[cfg(not(feature = "local-ml"))]
+        assert!(!result);
+        #[cfg(feature = "local-ml")]
+        assert!(result);
     }
 }

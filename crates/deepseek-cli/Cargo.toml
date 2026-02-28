@@ -45,6 +45,7 @@ deepseek-local-ml = { path = "../deepseek-local-ml" }
 ignore.workspace = true
 
 [features]
+default = ["local-ml"]
 local-ml = ["deepseek-agent/local-ml", "deepseek-local-ml/local-ml"]
 
 [dev-dependencies]

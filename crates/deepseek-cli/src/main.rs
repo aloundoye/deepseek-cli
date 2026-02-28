@@ -42,6 +42,7 @@ use commands::review::run_review;
 use commands::search::run_search;
 use commands::serve::{run_completions, run_native_host, run_serve};
 use commands::session::{SessionCmd, run_session_cmd};
+use commands::setup::run_setup;
 use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
@@ -359,6 +360,8 @@ enum Commands {
     },
     /// Show current agent status summary.
     Status,
+    /// Interactive setup wizard for API key, local ML, and privacy.
+    Setup(SetupArgs),
     /// Display token and cost usage.
     Usage(UsageArgs),
     /// Compact conversation history.
@@ -621,6 +624,16 @@ struct CompactArgs {
     /// Focus topic — compaction preserves context related to this topic.
     #[arg(long)]
     focus: Option<String>,
+}
+
+#[derive(Args, Clone, Default)]
+struct SetupArgs {
+    /// Enable local ML and privacy without interactive prompts.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    local_ml: bool,
+    /// Show current setup state without prompts.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    status: bool,
 }
 
 #[derive(Args, Clone, Default)]
@@ -1355,6 +1368,7 @@ fn run() -> Result<()> {
         Commands::Background { command } => run_background(&cwd, command, cli.json),
         Commands::Session { command } => run_session_cmd(&cwd, command, cli.json),
         Commands::Status => run_status(&cwd, cli.json),
+        Commands::Setup(args) => run_setup(&cwd, args, cli.json),
         Commands::Usage(args) => run_usage(&cwd, args, cli.json),
         Commands::Compact(args) => run_compact(&cwd, args, cli.json),
         Commands::Doctor(args) => run_doctor(&cwd, args, cli.json),
@@ -1460,5 +1474,35 @@ mod tests {
     fn json_schema_invalid_schema_errors() {
         let result = super::validate_json_schema("{}", "not valid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn setup_command_parses() {
+        let cli = Cli::try_parse_from(["deepseek", "setup"]).expect("parse setup");
+        assert!(matches!(cli.command, Some(Commands::Setup(_))));
+    }
+
+    #[test]
+    fn setup_local_ml_flag_parses() {
+        let cli = Cli::try_parse_from(["deepseek", "setup", "--local-ml"])
+            .expect("parse setup --local-ml");
+        if let Some(Commands::Setup(args)) = cli.command {
+            assert!(args.local_ml);
+            assert!(!args.status);
+        } else {
+            panic!("expected Setup command");
+        }
+    }
+
+    #[test]
+    fn setup_status_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["deepseek", "setup", "--status"]).expect("parse setup --status");
+        if let Some(Commands::Setup(args)) = cli.command {
+            assert!(args.status);
+            assert!(!args.local_ml);
+        } else {
+            panic!("expected Setup command");
+        }
     }
 }

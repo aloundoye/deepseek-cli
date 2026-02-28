@@ -188,6 +188,16 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             payload["plugins"]["enabled"].as_u64().unwrap_or(0),
             payload["plugins"]["installed"].as_u64().unwrap_or(0)
         );
+        println!(
+            "local_ml: enabled={} privacy={} autocomplete={}",
+            payload["local_ml"]["enabled"].as_bool().unwrap_or(false),
+            payload["local_ml"]["privacy_enabled"]
+                .as_bool()
+                .unwrap_or(false),
+            payload["local_ml"]["autocomplete_enabled"]
+                .as_bool()
+                .unwrap_or(false),
+        );
         if let Some(warnings) = payload["warnings"].as_array()
             && !warnings.is_empty()
         {
@@ -279,6 +289,11 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
         "plugins": {
             "installed": plugins.len(),
             "enabled": plugins.iter().filter(|p| p.enabled).count(),
+        },
+        "local_ml": {
+            "enabled": cfg.local_ml.enabled,
+            "privacy_enabled": cfg.local_ml.privacy.enabled,
+            "autocomplete_enabled": cfg.local_ml.autocomplete.enabled,
         },
         "checks": checks,
         "warnings": warnings,
@@ -833,4 +848,27 @@ pub(crate) fn run_clean(cwd: &Path, args: CleanArgs, json_mode: bool) -> Result<
         println!("removed:\n{}", removed.join("\n"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn doctor_includes_local_ml() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        // Ensure minimal config exists
+        let dir = cwd.join(".deepseek");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), "{}").unwrap();
+
+        let payload = doctor_payload(cwd, &DoctorArgs {}).unwrap();
+        let local_ml = &payload["local_ml"];
+        assert!(local_ml.is_object(), "doctor payload must include local_ml");
+        assert!(local_ml.get("enabled").is_some());
+        assert!(local_ml.get("privacy_enabled").is_some());
+        assert!(local_ml.get("autocomplete_enabled").is_some());
+    }
 }

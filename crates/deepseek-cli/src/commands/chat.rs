@@ -928,6 +928,12 @@ pub(crate) fn run_chat(
 
     let cfg = AppConfig::ensure(cwd)?;
     ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
+    // Offer local ML setup once after first successful API key configuration
+    if !json_mode {
+        if let Err(e) = super::setup::maybe_offer_local_ml(cwd, &cfg) {
+            eprintln!("local ML setup skipped: {e}");
+        }
+    }
     let mut engine = AgentEngine::new(cwd)?;
     if let Some(cli) = cli {
         apply_cli_flags(&mut engine, cli);
