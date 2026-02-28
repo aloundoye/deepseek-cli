@@ -243,7 +243,10 @@ fn render_inline_markdown(text: &str) -> String {
 
     while i < len {
         // Bold+italic: ***text***
-        if i + 2 < len && chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*'
+        if i + 2 < len
+            && chars[i] == '*'
+            && chars[i + 1] == '*'
+            && chars[i + 2] == '*'
             && let Some(end) = find_closing(&chars, i + 3, &['*', '*', '*'])
         {
             let inner: String = chars[i + 3..end].iter().collect();
@@ -253,7 +256,9 @@ fn render_inline_markdown(text: &str) -> String {
         }
 
         // Bold: **text**
-        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*'
+        if i + 1 < len
+            && chars[i] == '*'
+            && chars[i + 1] == '*'
             && let Some(end) = find_closing(&chars, i + 2, &['*', '*'])
         {
             let inner: String = chars[i + 2..end].iter().collect();
@@ -263,7 +268,9 @@ fn render_inline_markdown(text: &str) -> String {
         }
 
         // Bold (underscores): __text__
-        if i + 1 < len && chars[i] == '_' && chars[i + 1] == '_'
+        if i + 1 < len
+            && chars[i] == '_'
+            && chars[i + 1] == '_'
             && let Some(end) = find_closing(&chars, i + 2, &['_', '_'])
         {
             let inner: String = chars[i + 2..end].iter().collect();
@@ -273,7 +280,8 @@ fn render_inline_markdown(text: &str) -> String {
         }
 
         // Italic: *text* (single asterisk, not followed by another)
-        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*')
+        if chars[i] == '*'
+            && (i + 1 >= len || chars[i + 1] != '*')
             && let Some(end) = find_closing(&chars, i + 1, &['*'])
         {
             let inner: String = chars[i + 1..end].iter().collect();
@@ -283,7 +291,8 @@ fn render_inline_markdown(text: &str) -> String {
         }
 
         // Italic (underscore): _text_
-        if chars[i] == '_' && (i + 1 >= len || chars[i + 1] != '_')
+        if chars[i] == '_'
+            && (i + 1 >= len || chars[i + 1] != '_')
             && let Some(end) = find_closing(&chars, i + 1, &['_'])
         {
             // Avoid matching snake_case identifiers
@@ -302,7 +311,9 @@ fn render_inline_markdown(text: &str) -> String {
         }
 
         // Strikethrough: ~~text~~
-        if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~'
+        if i + 1 < len
+            && chars[i] == '~'
+            && chars[i + 1] == '~'
             && let Some(end) = find_closing(&chars, i + 2, &['~', '~'])
         {
             let inner: String = chars[i + 2..end].iter().collect();

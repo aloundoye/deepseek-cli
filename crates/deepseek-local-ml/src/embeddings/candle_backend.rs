@@ -163,21 +163,12 @@ impl EmbeddingsBackend for CandleEmbeddings {
                 padded_types[offset..offset + types.len()].copy_from_slice(types);
             }
 
-            let input_ids = Tensor::from_vec(
-                padded_ids,
-                (batch_size, batch_max_len),
-                &self.device,
-            )?;
-            let attention_mask = Tensor::from_vec(
-                padded_masks,
-                (batch_size, batch_max_len),
-                &self.device,
-            )?;
-            let token_type_ids = Tensor::from_vec(
-                padded_types,
-                (batch_size, batch_max_len),
-                &self.device,
-            )?;
+            let input_ids =
+                Tensor::from_vec(padded_ids, (batch_size, batch_max_len), &self.device)?;
+            let attention_mask =
+                Tensor::from_vec(padded_masks, (batch_size, batch_max_len), &self.device)?;
+            let token_type_ids =
+                Tensor::from_vec(padded_types, (batch_size, batch_max_len), &self.device)?;
 
             // Single forward pass for the entire mini-batch
             let hidden = self

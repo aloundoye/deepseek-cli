@@ -2156,6 +2156,7 @@ pub(crate) fn run_chat(
                         deepseek_core::StreamChunk::SecurityWarning { .. } => "SecurityWarning",
                         deepseek_core::StreamChunk::UsageUpdate { .. } => "UsageUpdate",
                         deepseek_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
+                        deepseek_core::StreamChunk::SnapshotRecorded { .. } => "SnapshotRecorded",
                         deepseek_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
@@ -2260,6 +2261,7 @@ pub(crate) fn run_chat(
                     }
                     deepseek_core::StreamChunk::UsageUpdate { .. } => {}
                     deepseek_core::StreamChunk::ClearStreamingText => {}
+                    deepseek_core::StreamChunk::SnapshotRecorded { .. } => {}
                     deepseek_core::StreamChunk::Done { .. } => {
                         // Flush any remaining partial line from the renderer
                         if let Ok(mut renderer) = md_clone.lock() {
@@ -3172,6 +3174,7 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
                 }
+                StreamChunk::SnapshotRecorded { .. } => {}
                 StreamChunk::Done { .. } => {}
             }));
 
@@ -4143,6 +4146,7 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     // In non-TUI mode, nothing to clear — text already
                     // written to stdout.
                 }
+                StreamChunk::SnapshotRecorded { .. } => {}
                 StreamChunk::Done { .. } => {
                     let _ = writeln!(handle);
                     let _ = handle.flush();

@@ -1346,6 +1346,12 @@ pub enum StreamChunk {
         cache_hit_tokens: u64,
         estimated_cost_usd: f64,
     },
+    /// A per-step snapshot was recorded for undo capability.
+    SnapshotRecorded {
+        snapshot_id: String,
+        tool_name: String,
+        files: Vec<String>,
+    },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1446,6 +1452,16 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "cache_hit_tokens": cache_hit_tokens,
             "estimated_cost_usd": estimated_cost_usd,
         }),
+        StreamChunk::SnapshotRecorded {
+            snapshot_id,
+            tool_name,
+            files,
+        } => serde_json::json!({
+            "type": "snapshot_recorded",
+            "snapshot_id": snapshot_id,
+            "tool_name": tool_name,
+            "files": files,
+        }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });
             if let Some(r) = reason {
@@ -1483,8 +1499,7 @@ impl CancellationToken {
 
     /// Check whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reset the token to "not cancelled" for reuse across turns.
@@ -3635,7 +3650,10 @@ mod tests {
         let token = CancellationToken::new();
         let clone = token.clone();
         token.cancel();
-        assert!(clone.is_cancelled(), "clone should see cancellation from original");
+        assert!(
+            clone.is_cancelled(),
+            "clone should see cancellation from original"
+        );
     }
 
     #[test]

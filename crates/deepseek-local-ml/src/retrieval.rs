@@ -205,13 +205,14 @@ impl HybridRetriever {
                 let bm25_path = PathBuf::from(&result.path);
                 let bm25_line = result.line;
 
-                let matched = chunk_spatial_index.iter().find(
-                    |(file_path, start_line, end_line, _)| {
-                        path_matches(file_path, &bm25_path)
-                            && bm25_line >= *start_line
-                            && bm25_line <= *end_line
-                    },
-                );
+                let matched =
+                    chunk_spatial_index
+                        .iter()
+                        .find(|(file_path, start_line, end_line, _)| {
+                            path_matches(file_path, &bm25_path)
+                                && bm25_line >= *start_line
+                                && bm25_line <= *end_line
+                        });
 
                 if let Some((_, _, _, chunk_id)) = matched {
                     bm25_rank_by_chunk
@@ -286,9 +287,8 @@ impl HybridRetriever {
                     // Re-sort the top-N by cross-encoder scores
                     let mut indexed: Vec<(usize, f32)> =
                         rerank_scores.into_iter().enumerate().collect();
-                    indexed.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    indexed
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                     let mut reranked_top: Vec<_> = indexed
                         .into_iter()
@@ -460,7 +460,10 @@ mod tests {
 
     #[test]
     fn path_matches_exact() {
-        assert!(path_matches(Path::new("src/main.rs"), Path::new("src/main.rs")));
+        assert!(path_matches(
+            Path::new("src/main.rs"),
+            Path::new("src/main.rs")
+        ));
     }
 
     #[test]
@@ -485,14 +488,8 @@ mod tests {
 
     #[test]
     fn rrf_fuses_both_sources() {
-        let vec_results = vec![
-            ("a".to_string(), 0.9),
-            ("b".to_string(), 0.8),
-        ];
-        let bm25_results = vec![
-            ("b".to_string(), 5.0),
-            ("c".to_string(), 3.0),
-        ];
+        let vec_results = vec![("a".to_string(), 0.9), ("b".to_string(), 0.8)];
+        let bm25_results = vec![("b".to_string(), 5.0), ("c".to_string(), 3.0)];
         let fused = reciprocal_rank_fusion(&vec_results, &bm25_results, 0.7, 60);
         // "b" should rank highest because it appears in both lists
         assert_eq!(fused[0].0, "b");

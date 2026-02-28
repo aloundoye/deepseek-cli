@@ -150,18 +150,18 @@ fn retrieval_respects_budget() {
 
     // Create a retriever that returns lots of chunks
     let retriever: RetrieverCallback = Arc::new(|_query, _k| {
-            let mut results = Vec::new();
-            for i in 0..100 {
-                results.push(RetrievalContext {
-                    file_path: format!("src/file_{}.rs", i),
-                    start_line: 1,
-                    end_line: 100,
-                    content: "x".repeat(10_000), // 10K chars each, ~2500 tokens
-                    score: 0.9 - i as f32 * 0.01,
-                });
-            }
-            Ok(results)
-        });
+        let mut results = Vec::new();
+        for i in 0..100 {
+            results.push(RetrievalContext {
+                file_path: format!("src/file_{}.rs", i),
+                start_line: 1,
+                end_line: 100,
+                content: "x".repeat(10_000), // 10K chars each, ~2500 tokens
+                score: 0.9 - i as f32 * 0.01,
+            });
+        }
+        Ok(results)
+    });
 
     let config = ToolLoopConfig {
         context_window_tokens: 10_000, // Small context window

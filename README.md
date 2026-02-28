@@ -4,17 +4,22 @@ DeepSeek CLI is a terminal-native coding agent written in Rust. It combines chat
 
 ## Highlights
 - **Agent intelligence**: Adaptive complexity (Simple/Medium/Complex), planning protocols, error recovery, stuck detection
+- **Agent profiles**: Task-specialized tool filtering (build/explore/plan) — reduces decision space for weaker models
+- **Doom loop detection**: Detects and breaks repeated identical tool calls with corrective guidance
+- **Model-tier prompts**: Separate system prompts optimized for `deepseek-chat` (action-biased) vs `deepseek-reasoner` (thinking-leveraging)
 - **Bootstrap context**: Automatic project awareness (file tree, git status, repo map, dependency analysis) on first turn
-- **Hybrid retrieval**: Vector + BM25 code search with RRF fusion — surfaces relevant code before the LLM responds
+- **Per-turn retrieval**: Vector + BM25 code search with RRF fusion — fires every turn, not just the first
 - **Privacy scanning**: 3-layer secret detection (path/content/builtin patterns) with redaction on tool outputs
 - **Ghost text**: Local ML-powered inline completions in the TUI (Tab to accept, Alt+Right for one word)
 - **Model routing**: Automatically routes complex tasks to `deepseek-reasoner`, simple tasks to `deepseek-chat`
+- **Step snapshots**: Per-tool-call file snapshots with content hashing for fine-grained undo
 - **14 lifecycle hooks**: SessionStart through TaskCompleted — extend behavior at every stage
 - **Interactive TUI**: Vim mode, @file autocomplete, !bash prefix, syntax highlighting, keyboard shortcuts
 - **Skills & subagents**: Forked execution, worktree isolation, custom agent definitions
 - **MCP integration**: JSON-RPC stdio/http transports, prompts as slash commands
 - **Permission engine**: 7 modes, glob allowlist/denylist, team-managed policy overlays
 - **Session persistence**: JSONL event log + SQLite projections, deterministic replay
+- **LLM compaction**: Structured LLM-based conversation compaction preserving goals, progress, and findings
 - **Local ML (opt-in)**: Candle-powered embeddings and code completion, HNSW vector index — runs fully offline
 
 ## Architecture
@@ -32,7 +37,7 @@ DeepSeek CLI is a Rust workspace organized into focused crates:
 | `deepseek-hooks` | 14 lifecycle events, `HookRuntime`, once/disabled fields, `PermissionDecision` |
 | `deepseek-local-ml` | Local ML via Candle: embeddings, completion, chunking, vector index, hybrid retrieval, privacy router |
 | `deepseek-store` | Session persistence (JSONL event log + SQLite projections) |
-| `deepseek-memory` | Long-term memory, shadow commits, checkpoints |
+| `deepseek-memory` | Long-term memory, shadow commits, checkpoints, step snapshots |
 | `deepseek-index` | Full-text code index (Tantivy), RAG retrieval with citations |
 | `deepseek-mcp` | MCP server management (JSON-RPC stdio/http transports) |
 | `deepseek-ui` | TUI rendering (ratatui/crossterm), autocomplete, vim mode, ML ghost text |
@@ -58,9 +63,13 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 - The loop continues until the LLM responds without tool calls (task complete)
 - Thinking mode (`deepseek-reasoner`) can be enabled for complex reasoning
 - Adaptive complexity: Simple/Medium/Complex classification with thinking budget escalation (8K→64K)
+- Agent profiles: task-type tool filtering (build/explore/plan) reduces the model's decision space
+- Doom loop detection: rolling hash window detects 3+ identical tool calls and injects corrective guidance
+- Model-tier prompts: `deepseek-chat` gets action-biased instructions, `deepseek-reasoner` gets thinking-leveraging
 - Bootstrap context: automatic project awareness (tree, git status, repo map, manifests) on first turn
-- Hybrid retrieval: vector + BM25 search with Reciprocal Rank Fusion (RRF)
-- Semantic compaction: preserves file/error/decision context when compacting long conversations
+- Per-turn retrieval: vector + BM25 search with RRF, fires every turn with remaining-budget awareness
+- LLM compaction: structured LLM-based summary (Goal/Completed/In Progress/Findings/Modified Files) with code-based fallback
+- Step snapshots: before/after file state captured per tool call with SHA-256 hashing and revert support
 - Error recovery: automatic guidance injection on failures, stuck detection after repeated errors
 - Model routing: Complex+escalated tasks route to `deepseek-reasoner` automatically
 
@@ -128,9 +137,6 @@ Run `deepseek --help` for full details. The most used commands are:
 - `deepseek replay run|list`: deterministic replay tooling
 - `deepseek benchmark ...`, `deepseek profile --benchmark`: benchmark workflows
 - `deepseek search "<query>"`: web search with provenance metadata
-- `deepseek remote-env ...`: remote profile orchestration (`list|add|remove|check|exec|run-agent|logs`)
-- `deepseek teleport ...`: handoff workflows (`export|import|link|consume`)
-- `deepseek visual ...`: visual artifact workflows (`list|analyze|show`)
 
 Useful global flags:
 - `--json`: machine-readable output
@@ -162,25 +168,6 @@ Publish strict review findings to a PR:
 
 ```bash
 deepseek review --pr 123 --publish --max-comments 20
-```
-
-Run a remote command over SSH profile:
-
-```bash
-deepseek remote-env exec <profile-id> --cmd "git status" --timeout-seconds 60
-```
-
-Create and consume one-time handoff links:
-
-```bash
-deepseek teleport link --ttl-minutes 30
-deepseek teleport consume --handoff-id <id> --token <token>
-```
-
-Run matrix benchmark and emit report:
-
-```bash
-deepseek benchmark run-matrix .github/benchmark/slo-matrix.json --strict --report-output report.md
 ```
 
 Generate shell completions:
@@ -262,7 +249,7 @@ See `docs/LOCAL_ML_GUIDE.md` for the full guide.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets    # 870 tests
+cargo test --workspace --all-targets    # 949 tests
 cargo build --release --bin deepseek
 ```
 

@@ -1,23 +1,38 @@
 //! System prompts for the tool-use agent loop.
 //!
-//! One stable system prompt with always-included planning/verification guidance.
-//! DeepSeek follows stable system constraints well — a single consistent
-//! instruction set is more robust than dynamically switching tiers.
+//! Two model-tier prompts: CHAT (action-biased, compensates for weaker reasoning)
+//! and REASONER (thinking-leveraging, grants more autonomy). Selected by model name.
 
-/// System prompt that makes deepseek-chat behave as an intelligent coding agent.
+/// Default/fallback system prompt used by both tiers. Kept as compatibility alias.
+pub const TOOL_USE_SYSTEM_PROMPT: &str = CHAT_SYSTEM_PROMPT;
+
+/// System prompt for `deepseek-chat` — action-biased, compensates for weak reasoning.
 ///
-/// Contains: tool policy, planning rubric, patch workflow, stop conditions.
-/// This is always the same regardless of task complexity — the model decides
-/// when to plan vs proceed based on the guidance.
-pub const TOOL_USE_SYSTEM_PROMPT: &str = r#"You are DeepSeek, an expert software engineering assistant operating in a terminal.
+/// Key principles:
+/// - "Just do it" bias: minimize planning, maximize action
+/// - Aggressive anti-hallucination: never fabricate anything
+/// - Explicit DO NOT list to constrain the weaker model
+/// - Strict verification requirements after every change
+pub const CHAT_SYSTEM_PROMPT: &str = r#"You are DeepSeek, an expert software engineering assistant operating in a terminal.
+
+## PRIME DIRECTIVE
+Do the work. Do not ask for permission. Do not explain what you will do. Just do it.
 
 ## CRITICAL RULES
 1. ALWAYS use tools to gather information. NEVER fabricate file contents, paths, or project structure.
 2. Read files before editing them. Search before guessing paths.
-3. Be concise: respond in 1-3 sentences unless showing code. No preamble. No lengthy plans.
+3. Be concise: respond in 1-3 sentences unless showing code. No preamble.
 4. Mimic existing code style. Never assume a library is available without checking.
 5. Do not add comments, docstrings, or type annotations unless asked.
 6. After making changes, verify with tests or relevant commands.
+
+## DO NOT
+- Guess file paths — use `fs_glob` or `fs_list` to find them.
+- Skip verification — run tests after every change.
+- Ask the user to do things you can do with tools.
+- Synthesize answers from memory — respond ONLY based on tool results.
+- Make changes beyond what was requested.
+- Edit a file you haven't read in this session.
 
 ## OUTPUT RULES
 - Minimize output tokens. Show results, not plans.
@@ -46,6 +61,40 @@ For multi-file refactors, migrations, or architectural changes:
 - Do NOT change a type/interface without grepping for all usages.
 - Do NOT skip running tests after changes.
 - Do NOT make changes beyond what was requested.
+"#;
+
+/// System prompt for `deepseek-reasoner` — leverages native chain-of-thought.
+///
+/// Key principles:
+/// - Grants autonomy: reasoner can self-plan via thinking
+/// - Less prescriptive than chat (reasoner self-plans)
+/// - Directs thinking to high-value tasks (planning, error analysis)
+/// - Same core safety rules (read before edit, verify)
+pub const REASONER_SYSTEM_PROMPT: &str = r#"You are DeepSeek, an expert software engineering assistant with extended thinking.
+
+## CORE RULES
+1. ALWAYS use tools to gather information. NEVER fabricate file contents, paths, or code.
+2. Read files before editing. Search before guessing paths.
+3. Be concise in your responses. Use thinking for internal planning.
+4. After changes, verify with tests or the build command.
+
+## THINKING STRATEGY
+Use your thinking capability strategically:
+- **Before complex edits**: Plan multi-file changes, trace impacts, verify understanding.
+- **After errors**: Analyze root cause in thinking before retrying.
+- **For architecture**: Think through dependency order and risks.
+- Do NOT use thinking for trivial operations (reading files, running commands).
+
+## WORKING PROTOCOL
+- Read every file before editing it.
+- If changing a type/interface, grep for all callers first.
+- Modify files in dependency order. Verify after each change.
+- State your plan in thinking, then execute. Show results, not plans.
+
+## DO NOT
+- Fabricate file paths or content.
+- Skip verification after changes.
+- Make changes beyond what was requested.
 "#;
 
 use crate::complexity::PromptComplexity;
@@ -203,9 +252,10 @@ After EVERY file modification, you MUST:\n\
 Every 5 tool calls, ask yourself: have I verified all file paths exist? \
 Am I working on the right files? Have I read the files I'm about to edit?\n";
 
-/// Build system prompt with model-specific additions.
+/// Build system prompt with model-specific base prompt selection.
 ///
-/// Layers the base prompt with complexity and model-specific guidance.
+/// Selects `CHAT_SYSTEM_PROMPT` or `REASONER_SYSTEM_PROMPT` by model name,
+/// then layers complexity and environment context on top.
 pub fn build_model_aware_system_prompt(
     project_memory: Option<&str>,
     system_prompt_override: Option<&str>,
@@ -215,27 +265,90 @@ pub fn build_model_aware_system_prompt(
     repo_map_summary: Option<&str>,
     model: &str,
 ) -> String {
-    let base = build_tool_use_system_prompt_with_complexity(
+    // If user provided a complete override, skip model selection
+    if system_prompt_override.is_some() {
+        return build_tool_use_system_prompt_with_complexity(
+            project_memory,
+            system_prompt_override,
+            system_prompt_append,
+            workspace_context,
+            complexity,
+            repo_map_summary,
+        );
+    }
+
+    // Select base prompt by model tier
+    let is_reasoner = model.contains("reasoner");
+    let base_prompt = if is_reasoner {
+        REASONER_SYSTEM_PROMPT
+    } else {
+        CHAT_SYSTEM_PROMPT
+    };
+
+    // Build with model-specific base
+    let base = build_tool_use_system_prompt_with_base(
+        base_prompt,
         project_memory,
-        system_prompt_override,
         system_prompt_append,
         workspace_context,
         complexity,
         repo_map_summary,
     );
 
-    // Don't inject model guidance if user provided a full override
-    if system_prompt_override.is_some() {
-        return base;
-    }
-
-    if model.contains("reasoner") {
+    // Add model-tier-specific guidance on top
+    if is_reasoner {
         format!("{base}{REASONER_GUIDANCE}")
     } else if complexity == PromptComplexity::Complex {
-        // For chat model on Complex tasks, add prescriptive verification
         format!("{base}{CHAT_PRESCRIPTIVE_GUIDANCE}")
     } else {
         base
+    }
+}
+
+/// Build system prompt from an explicit base prompt (used by model-aware builder).
+fn build_tool_use_system_prompt_with_base(
+    base_prompt: &str,
+    project_memory: Option<&str>,
+    system_prompt_append: Option<&str>,
+    workspace_context: Option<&WorkspaceContext>,
+    complexity: PromptComplexity,
+    repo_map_summary: Option<&str>,
+) -> String {
+    let mut parts = vec![base_prompt.to_string()];
+
+    if let Some(ctx) = workspace_context {
+        parts.push(format_environment_section(ctx));
+    }
+
+    if let Some(memory) = project_memory
+        && !memory.is_empty()
+    {
+        parts.push(format!(
+            "\n# Project Instructions (DEEPSEEK.md)\n\n{memory}"
+        ));
+    }
+
+    if let Some(append) = system_prompt_append
+        && !append.is_empty()
+    {
+        parts.push(format!("\n# Additional Instructions\n\n{append}"));
+    }
+
+    let base = parts.join("\n");
+
+    // Apply complexity injection (same logic as build_tool_use_system_prompt_with_complexity)
+    match complexity {
+        PromptComplexity::Complex => {
+            let mut prompt = format!("{base}{COMPLEX_REMINDER}");
+            if let Some(repo_map) = repo_map_summary
+                && !repo_map.is_empty()
+            {
+                prompt.push_str(&format!("\n## Project Files\n{repo_map}\n"));
+            }
+            prompt
+        }
+        PromptComplexity::Medium => format!("{base}{MEDIUM_GUIDANCE}"),
+        PromptComplexity::Simple => base,
     }
 }
 
@@ -344,10 +457,15 @@ mod tests {
 
     #[test]
     fn system_prompt_is_concise() {
-        let line_count = TOOL_USE_SYSTEM_PROMPT.lines().count();
+        let chat_lines = CHAT_SYSTEM_PROMPT.lines().count();
         assert!(
-            line_count < 50,
-            "system prompt should be concise (< 50 lines), got {line_count}"
+            chat_lines < 55,
+            "chat system prompt should be concise (< 55 lines), got {chat_lines}"
+        );
+        let reasoner_lines = REASONER_SYSTEM_PROMPT.lines().count();
+        assert!(
+            reasoner_lines < 30,
+            "reasoner prompt should be concise (< 30 lines), got {reasoner_lines}"
         );
     }
 
@@ -582,5 +700,137 @@ mod tests {
             !prompt.contains("Reasoner"),
             "override should skip model guidance"
         );
+    }
+
+    // ── T3.3: Dual-prompt model-tier tests ──
+
+    #[test]
+    fn chat_prompt_has_action_bias() {
+        assert!(
+            CHAT_SYSTEM_PROMPT.contains("PRIME DIRECTIVE"),
+            "chat should have prime directive"
+        );
+        assert!(
+            CHAT_SYSTEM_PROMPT.contains("Just do it"),
+            "chat should have action bias"
+        );
+        assert!(
+            CHAT_SYSTEM_PROMPT.contains("DO NOT"),
+            "chat should have explicit DO NOT section"
+        );
+    }
+
+    #[test]
+    fn reasoner_prompt_has_thinking_strategy() {
+        assert!(
+            REASONER_SYSTEM_PROMPT.contains("THINKING STRATEGY"),
+            "reasoner should have thinking strategy"
+        );
+        assert!(
+            REASONER_SYSTEM_PROMPT.contains("extended thinking"),
+            "reasoner should mention thinking capability"
+        );
+        assert!(
+            !REASONER_SYSTEM_PROMPT.contains("PRIME DIRECTIVE"),
+            "reasoner should NOT have chat's prime directive"
+        );
+    }
+
+    #[test]
+    fn both_prompts_share_core_rules() {
+        assert!(CHAT_SYSTEM_PROMPT.contains("NEVER fabricate"));
+        assert!(REASONER_SYSTEM_PROMPT.contains("NEVER fabricate"));
+        assert!(CHAT_SYSTEM_PROMPT.contains("Read files before editing"));
+        assert!(REASONER_SYSTEM_PROMPT.contains("Read"));
+    }
+
+    #[test]
+    fn model_aware_selects_correct_base() {
+        let chat = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "deepseek-chat",
+        );
+        let reasoner = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "deepseek-reasoner",
+        );
+        assert!(
+            chat.contains("PRIME DIRECTIVE"),
+            "chat should use CHAT_SYSTEM_PROMPT"
+        );
+        assert!(
+            reasoner.contains("THINKING STRATEGY"),
+            "reasoner should use REASONER_SYSTEM_PROMPT"
+        );
+        assert!(
+            !chat.contains("THINKING STRATEGY"),
+            "chat should NOT have reasoner content"
+        );
+        assert!(
+            !reasoner.contains("PRIME DIRECTIVE"),
+            "reasoner should NOT have chat content"
+        );
+    }
+
+    #[test]
+    fn model_aware_complexity_injection_works_on_both_tiers() {
+        let chat_complex = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "deepseek-chat",
+        );
+        let reasoner_complex = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "deepseek-reasoner",
+        );
+        assert!(
+            chat_complex.contains("COMPLEX TASK"),
+            "chat complex should get planning"
+        );
+        assert!(
+            reasoner_complex.contains("COMPLEX TASK"),
+            "reasoner complex should get planning"
+        );
+    }
+
+    #[test]
+    fn model_aware_preserves_memory_and_context() {
+        let ctx = WorkspaceContext {
+            cwd: "/project".to_string(),
+            git_branch: Some("main".to_string()),
+            os: "linux".to_string(),
+        };
+        let prompt = build_model_aware_system_prompt(
+            Some("Use tabs."),
+            None,
+            Some("Be brief."),
+            Some(&ctx),
+            PromptComplexity::Simple,
+            None,
+            "deepseek-chat",
+        );
+        assert!(prompt.contains("Use tabs."));
+        assert!(prompt.contains("Be brief."));
+        assert!(prompt.contains("/project"));
+        assert!(prompt.contains("main"));
     }
 }

@@ -184,7 +184,11 @@ fn semantic_chunk_file(
             "export_statement",
             "lexical_declaration",
         ][..],
-        "go" => &["function_declaration", "method_declaration", "type_declaration"][..],
+        "go" => &[
+            "function_declaration",
+            "method_declaration",
+            "type_declaration",
+        ][..],
         "java" => &[
             "class_declaration",
             "method_declaration",

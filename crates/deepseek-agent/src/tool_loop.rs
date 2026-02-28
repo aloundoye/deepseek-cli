@@ -62,6 +62,20 @@ const MID_CONVERSATION_REMINDER: &str =
 /// Maximum recent errors to track for stuck detection.
 const MAX_RECENT_ERRORS: usize = 10;
 
+/// Number of identical recent calls that triggers doom loop detection.
+const DOOM_LOOP_THRESHOLD: usize = 3;
+
+/// Size of the recent call history window for doom loop detection.
+const DOOM_LOOP_HISTORY_SIZE: usize = 10;
+
+/// Guidance injected when a doom loop is detected (model repeating the same tool call).
+const DOOM_LOOP_GUIDANCE: &str = "STOP — You are repeating the same action without making progress. \
+Try a DIFFERENT approach:\n\
+1. You already have the file contents — use them instead of re-reading.\n\
+2. Analyze the output you already have.\n\
+3. Try a different tool or different arguments.\n\
+4. If stuck, ask the user with user_question.";
+
 /// Number of consecutive failures on the same tool before circuit-breaking it.
 const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 
@@ -209,6 +223,8 @@ pub struct ToolLoopConfig {
     /// Initial context messages injected after the system prompt but before the
     /// user message. Used for bootstrap context (project structure, repo map, etc.).
     pub initial_context: Vec<ChatMessage>,
+    /// Active agent profile name for logging (e.g. "build", "explore", "plan").
+    pub profile_name: Option<String>,
 }
 
 /// A piece of retrieved code context from the workspace index.
@@ -242,6 +258,7 @@ impl Default for ToolLoopConfig {
             privacy_router: None,
             images: vec![],
             initial_context: vec![],
+            profile_name: None,
         }
     }
 }
@@ -286,6 +303,8 @@ pub struct ToolUseLoop<'a> {
     /// Actual tokens-per-char ratio derived from API responses. Starts at 0.25
     /// (the estimate_message_tokens default) and converges to the real ratio.
     actual_tokens_per_char: f64,
+    /// Doom loop tracker — detects when the model repeats the same tool call.
+    doom_loop_tracker: DoomLoopTracker,
 }
 
 /// Tracks consecutive failures for a single tool.
@@ -294,6 +313,64 @@ struct CircuitBreakerState {
     consecutive_failures: usize,
     /// Turns remaining in cooldown (0 = active).
     cooldown_remaining: usize,
+}
+
+/// Tracks repeated identical tool calls to detect doom loops — the model
+/// repeating the same action without progress. Uses a rolling window of
+/// (tool_name, args_hash) tuples.
+#[derive(Debug, Clone)]
+struct DoomLoopTracker {
+    /// Rolling window of recent (tool_name, args_hash) pairs.
+    recent_calls: Vec<(String, u64)>,
+    /// Whether doom loop guidance has been injected (reset when model uses a different call).
+    warning_injected: bool,
+}
+
+impl Default for DoomLoopTracker {
+    fn default() -> Self {
+        Self {
+            recent_calls: Vec::with_capacity(DOOM_LOOP_HISTORY_SIZE),
+            warning_injected: false,
+        }
+    }
+}
+
+impl DoomLoopTracker {
+    /// Record a tool call. Returns `true` if a doom loop is detected.
+    fn record(&mut self, tool_name: &str, args: &serde_json::Value) -> bool {
+        use std::hash::{Hash, Hasher};
+
+        // Hash the canonical JSON args to detect identical calls
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let canonical = serde_json::to_string(args).unwrap_or_default();
+        canonical.hash(&mut hasher);
+        let args_hash = hasher.finish();
+
+        let entry = (tool_name.to_string(), args_hash);
+
+        // Check if this is a different call than the last one — reset warning
+        if let Some(last) = self.recent_calls.last()
+            && *last != entry
+        {
+            self.warning_injected = false;
+        }
+
+        // Add to rolling window
+        self.recent_calls.push(entry.clone());
+        if self.recent_calls.len() > DOOM_LOOP_HISTORY_SIZE {
+            self.recent_calls.remove(0);
+        }
+
+        // Count occurrences of this exact call in recent history
+        let count = self.recent_calls.iter().filter(|c| **c == entry).count();
+
+        count >= DOOM_LOOP_THRESHOLD && !self.warning_injected
+    }
+
+    /// Mark that guidance has been injected for the current doom loop.
+    fn mark_warned(&mut self) {
+        self.warning_injected = true;
+    }
 }
 
 /// Tracks cumulative cost across the tool-use loop.
@@ -347,8 +424,7 @@ impl CostTracker {
         let output_tokens = self.total_output_tokens as f64;
 
         // Cache-hit tokens are charged at a discount
-        let effective_input = (input_tokens - cache_tokens)
-            + (cache_tokens * self.cache_discount);
+        let effective_input = (input_tokens - cache_tokens) + (cache_tokens * self.cache_discount);
         let input_cost = effective_input / 1_000_000.0 * self.cost_per_million_input;
         let output_cost = output_tokens / 1_000_000.0 * self.cost_per_million_output;
 
@@ -412,11 +488,16 @@ impl<'a> ToolUseLoop<'a> {
             circuit_breaker: HashMap::new(),
             cost_tracker: CostTracker::default(),
             actual_tokens_per_char: 0.25, // Default estimate, converges from API responses
+            doom_loop_tracker: DoomLoopTracker::default(),
         }
     }
 
     /// Check the tool result cache for a matching entry.
-    fn cache_lookup(&mut self, tool_name: &str, args: &serde_json::Value) -> Option<serde_json::Value> {
+    fn cache_lookup(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
         if !CACHEABLE_TOOLS.contains(&tool_name) {
             return None;
         }
@@ -433,12 +514,18 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Store a tool result in the cache.
-    fn cache_store(&mut self, tool_name: &str, args: &serde_json::Value, result: &serde_json::Value) {
+    fn cache_store(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &serde_json::Value,
+    ) {
         if !CACHEABLE_TOOLS.contains(&tool_name) {
             return;
         }
         let key = format!("{}:{}", tool_name, args);
-        self.tool_cache.insert(key, (result.clone(), Instant::now()));
+        self.tool_cache
+            .insert(key, (result.clone(), Instant::now()));
     }
 
     /// Invalidate cache entries for a given path (after a write tool modifies it).
@@ -494,8 +581,8 @@ impl<'a> ToolUseLoop<'a> {
             content: user_message.to_string(),
         });
 
-        // Inject retrieval context on first turn only
-        self.prepare_retrieval_context(user_message);
+        // Inject retrieval context on every user turn
+        self.inject_retrieval_context(user_message);
 
         self.execute_loop()
     }
@@ -508,6 +595,9 @@ impl<'a> ToolUseLoop<'a> {
         self.messages.push(ChatMessage::User {
             content: user_message.to_string(),
         });
+
+        // Inject retrieval context on every user turn (not just first)
+        self.inject_retrieval_context(user_message);
 
         self.execute_loop()
     }
@@ -556,8 +646,7 @@ impl<'a> ToolUseLoop<'a> {
                 self.prune_old_tool_outputs();
 
                 // Re-check after pruning
-                let post_prune_tokens =
-                    estimate_message_tokens(&self.messages) + tool_def_tokens;
+                let post_prune_tokens = estimate_message_tokens(&self.messages) + tool_def_tokens;
 
                 if post_prune_tokens > compact_threshold {
                     // Phase 2: Full compaction with structured summary
@@ -616,17 +705,28 @@ impl<'a> ToolUseLoop<'a> {
                 }
 
                 // T3.5: Update actual tokens-per-char ratio from API response
-                let total_chars: usize = self.messages.iter().map(|m| {
-                    match m {
-                        ChatMessage::System { content } | ChatMessage::User { content } => content.len(),
-                        ChatMessage::Assistant { content, reasoning_content, tool_calls } => {
+                let total_chars: usize = self
+                    .messages
+                    .iter()
+                    .map(|m| match m {
+                        ChatMessage::System { content } | ChatMessage::User { content } => {
+                            content.len()
+                        }
+                        ChatMessage::Assistant {
+                            content,
+                            reasoning_content,
+                            tool_calls,
+                        } => {
                             content.as_deref().map_or(0, str::len)
                                 + reasoning_content.as_deref().map_or(0, str::len)
-                                + tool_calls.iter().map(|tc| tc.arguments.len()).sum::<usize>()
+                                + tool_calls
+                                    .iter()
+                                    .map(|tc| tc.arguments.len())
+                                    .sum::<usize>()
                         }
                         ChatMessage::Tool { content, .. } => content.len(),
-                    }
-                }).sum();
+                    })
+                    .sum();
                 if total_chars > 0 && usage.prompt_tokens > 0 {
                     let new_ratio = usage.prompt_tokens as f64 / total_chars as f64;
                     // Exponential moving average to smooth the ratio
@@ -751,7 +851,8 @@ impl<'a> ToolUseLoop<'a> {
                                 } else {
                                     (*llm_call).clone()
                                 };
-                                let internal = tool_bridge::llm_tool_call_to_internal(&effective_call);
+                                let internal =
+                                    tool_bridge::llm_tool_call_to_internal(&effective_call);
                                 let proposal = tool_host.propose(internal);
                                 // Read-only tools are auto-approved
                                 let approved = ApprovedToolCall {
@@ -771,9 +872,8 @@ impl<'a> ToolUseLoop<'a> {
 
                 // Process results sequentially (updates messages, cache, events)
                 for (effective_call, result) in &parallel_results {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&effective_call.arguments)
-                            .unwrap_or(serde_json::json!({}));
+                    let args: serde_json::Value = serde_json::from_str(&effective_call.arguments)
+                        .unwrap_or(serde_json::json!({}));
                     let args_summary = summarize_args(&args);
 
                     self.emit(StreamChunk::ToolCallStart {
@@ -908,6 +1008,19 @@ impl<'a> ToolUseLoop<'a> {
                     });
                     // Clear error history to avoid re-triggering every turn
                     self.recent_errors.clear();
+                }
+            }
+
+            // Doom loop detection: check if the model is repeating identical calls
+            for llm_call in response.tool_calls.iter() {
+                let args: serde_json::Value =
+                    serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({}));
+                if self.doom_loop_tracker.record(&llm_call.name, &args) {
+                    self.messages.push(ChatMessage::System {
+                        content: DOOM_LOOP_GUIDANCE.to_string(),
+                    });
+                    self.doom_loop_tracker.mark_warned();
+                    break; // One guidance injection per turn
                 }
             }
 
@@ -1166,7 +1279,10 @@ impl<'a> ToolUseLoop<'a> {
 
         // ── Circuit breaker update ──
         // Track consecutive failures per tool for circuit-breaking.
-        let cb_state = self.circuit_breaker.entry(llm_call.name.clone()).or_default();
+        let cb_state = self
+            .circuit_breaker
+            .entry(llm_call.name.clone())
+            .or_default();
         if success {
             cb_state.consecutive_failures = 0;
             cb_state.cooldown_remaining = 0;
@@ -1752,8 +1868,7 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         // Track file paths from recent tool results — keep those untouched
-        let mut recent_paths: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut recent_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         for msg in self.messages[recent_boundary..].iter().rev() {
             if let ChatMessage::Tool { content, .. } = msg
                 && let Some(path) = extract_tool_path(content)
@@ -1769,9 +1884,7 @@ impl<'a> ToolUseLoop<'a> {
         for msg in &mut self.messages[1..recent_boundary] {
             if let ChatMessage::Tool { content, .. } = msg {
                 // Skip if already truncated or short
-                if content.len() <= max_kept_chars
-                    || content.contains(TRUNCATED_MARKER)
-                {
+                if content.len() <= max_kept_chars || content.contains(TRUNCATED_MARKER) {
                     continue;
                 }
                 // Keep results referencing files still active in recent turns
@@ -1836,7 +1949,9 @@ impl<'a> ToolUseLoop<'a> {
 
         let middle_count = keep_from - 1;
         let compacted_msgs = &self.messages[1..keep_from];
-        let summary = build_compaction_summary(compacted_msgs);
+        // Try LLM-based compaction first, fall back to code-based extraction
+        let summary = build_compaction_summary_with_llm(self.llm, compacted_msgs)
+            .unwrap_or_else(|_| build_compaction_summary(compacted_msgs));
 
         // Fire PreCompact hook if configured
         if let Some(ref hooks) = self.hooks {
@@ -1868,9 +1983,11 @@ impl<'a> ToolUseLoop<'a> {
         true
     }
 
-    /// Inject retrieval context from the workspace vector index before the first LLM call.
-    /// Budgets the context to at most 20% of the context window.
-    fn prepare_retrieval_context(&mut self, user_message: &str) {
+    /// Inject retrieval context from the workspace vector index before each LLM call.
+    ///
+    /// Fires on every user turn (not just turn 1) to keep multi-turn conversations
+    /// grounded in the codebase. Budget based on **remaining** context window.
+    fn inject_retrieval_context(&mut self, user_message: &str) {
         let retriever = match &self.config.retriever {
             Some(r) => r.clone(),
             None => return,
@@ -1882,8 +1999,20 @@ impl<'a> ToolUseLoop<'a> {
             _ => return,
         };
 
-        // Budget: max 20% of context window
-        let budget_tokens = self.config.context_window_tokens / 5;
+        // Budget: remaining context / 5 (not total context).
+        // This avoids starving long conversations of retrieval budget.
+        let current_tokens = estimate_message_tokens(&self.messages);
+        let remaining = self
+            .config
+            .context_window_tokens
+            .saturating_sub(current_tokens);
+
+        // Skip if context nearly full (< 500 tokens remaining budget)
+        let budget_tokens = remaining / 5;
+        if budget_tokens < 500 {
+            return;
+        }
+
         let mut context_parts = Vec::new();
         let mut token_estimate: u64 = 0;
 
@@ -2061,6 +2190,106 @@ fn build_compaction_summary(messages: &[ChatMessage]) -> String {
     let tool_counts = count_tool_usage(&tools_used);
     summary.push_str(&format!("Tools used: {tool_counts}\n"));
     summary
+}
+
+/// Template for LLM-based compaction. The LLM fills this in based on the conversation.
+const COMPACTION_TEMPLATE: &str = "Summarize this conversation into the following sections. \
+Be precise and factual — include file paths, function names, and error messages. \
+Keep each section to 2-5 bullet points. Output ONLY the filled template:\n\n\
+## Goal\n(What the user asked for)\n\n\
+## Completed\n(What was done successfully — include file paths)\n\n\
+## In Progress\n(What's partially done or pending)\n\n\
+## Key Findings\n(Important discoveries, errors hit, architectural decisions)\n\n\
+## Modified Files\n(List of files created, edited, or deleted)";
+
+/// Build a structured compaction summary using an LLM call.
+///
+/// Sends the conversation to `deepseek-chat` with a structured template.
+/// Falls back to code-based extraction on any error.
+fn build_compaction_summary_with_llm(
+    llm: &(dyn LlmClient + Send + Sync),
+    messages: &[ChatMessage],
+) -> Result<String> {
+    // Build a condensed representation of the conversation for the LLM
+    let mut conversation_text = String::new();
+    for msg in messages {
+        match msg {
+            ChatMessage::User { content } => {
+                conversation_text.push_str(&format!("USER: {}\n", truncate_line(content, 500)));
+            }
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if let Some(text) = content {
+                    conversation_text
+                        .push_str(&format!("ASSISTANT: {}\n", truncate_line(text, 500)));
+                }
+                for tc in tool_calls {
+                    conversation_text.push_str(&format!(
+                        "TOOL_CALL: {}({})\n",
+                        tc.name,
+                        truncate_line(&tc.arguments, 200)
+                    ));
+                }
+            }
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                conversation_text.push_str(&format!(
+                    "TOOL_RESULT[{tool_call_id}]: {}\n",
+                    truncate_line(content, 300)
+                ));
+            }
+            ChatMessage::System { content } => {
+                conversation_text.push_str(&format!("SYSTEM: {}\n", truncate_line(content, 200)));
+            }
+        }
+    }
+
+    // Skip if conversation is too short to be worth an LLM call
+    if conversation_text.len() < 200 {
+        return Err(anyhow!("conversation too short for LLM compaction"));
+    }
+
+    let request = ChatRequest {
+        model: deepseek_core::DEEPSEEK_V32_CHAT_MODEL.to_string(),
+        messages: vec![
+            ChatMessage::System {
+                content: COMPACTION_TEMPLATE.to_string(),
+            },
+            ChatMessage::User {
+                content: conversation_text,
+            },
+        ],
+        max_tokens: 2048,
+        temperature: Some(0.0),
+        top_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logprobs: None,
+        top_logprobs: None,
+        tools: vec![],
+        tool_choice: ToolChoice::none(),
+        thinking: None,
+        images: vec![],
+        response_format: None,
+    };
+
+    let response = llm.complete_chat(&request)?;
+    let text = response.text.trim().to_string();
+
+    // Validate the response has at least some structure
+    if text.contains("## Goal") || text.contains("## Completed") || text.contains("## Modified") {
+        Ok(text)
+    } else if text.len() > 50 {
+        // Acceptable even without perfect headers
+        Ok(text)
+    } else {
+        Err(anyhow!("LLM compaction produced empty or invalid response"))
+    }
 }
 
 /// Truncate a line to max_len chars, appending "..." if truncated.
@@ -4001,10 +4230,7 @@ mod tests {
         });
         // Cost: $0.54 + $0.55 = $1.09 — well above $0.50 threshold
         assert!(tracker.should_warn(), "should warn first time");
-        assert!(
-            !tracker.should_warn(),
-            "should NOT warn second time"
-        );
+        assert!(!tracker.should_warn(), "should NOT warn second time");
     }
 
     #[test]
@@ -4272,5 +4498,193 @@ mod tests {
     #[test]
     fn extract_tool_path_none_for_regular_text() {
         assert_eq!(extract_tool_path("Build succeeded"), None);
+    }
+
+    // ── Doom loop detection ──
+
+    #[test]
+    fn doom_loop_detects_repeated_identical_calls() {
+        let mut tracker = DoomLoopTracker::default();
+        let args = serde_json::json!({"file_path": "/src/main.rs"});
+
+        assert!(
+            !tracker.record("fs_read", &args),
+            "first call: no doom loop"
+        );
+        assert!(
+            !tracker.record("fs_read", &args),
+            "second call: no doom loop"
+        );
+        assert!(
+            tracker.record("fs_read", &args),
+            "third call: doom loop detected"
+        );
+    }
+
+    #[test]
+    fn doom_loop_no_false_positive_on_different_args() {
+        let mut tracker = DoomLoopTracker::default();
+
+        tracker.record("fs_read", &serde_json::json!({"file_path": "/a.rs"}));
+        tracker.record("fs_read", &serde_json::json!({"file_path": "/b.rs"}));
+        let detected = tracker.record("fs_read", &serde_json::json!({"file_path": "/c.rs"}));
+        assert!(!detected, "different args should not trigger doom loop");
+    }
+
+    #[test]
+    fn doom_loop_no_false_positive_on_different_tools() {
+        let mut tracker = DoomLoopTracker::default();
+        let args = serde_json::json!({"file_path": "/main.rs"});
+
+        tracker.record("fs_read", &args);
+        tracker.record("fs_glob", &args);
+        let detected = tracker.record("fs_grep", &args);
+        assert!(!detected, "different tools should not trigger doom loop");
+    }
+
+    #[test]
+    fn doom_loop_resets_warning_on_different_call() {
+        let mut tracker = DoomLoopTracker::default();
+        let args = serde_json::json!({"file_path": "/main.rs"});
+
+        tracker.record("fs_read", &args);
+        tracker.record("fs_read", &args);
+        assert!(tracker.record("fs_read", &args));
+        tracker.mark_warned();
+
+        // Same call again — no new warning because already warned
+        assert!(!tracker.record("fs_read", &args));
+
+        // Different call resets
+        tracker.record("fs_edit", &serde_json::json!({}));
+
+        // Now back to original — should detect again
+        tracker.record("fs_read", &args);
+        tracker.record("fs_read", &args);
+        assert!(
+            tracker.record("fs_read", &args),
+            "should detect after reset"
+        );
+    }
+
+    #[test]
+    fn doom_loop_warning_only_fires_once() {
+        let mut tracker = DoomLoopTracker::default();
+        let args = serde_json::json!({"file_path": "/main.rs"});
+
+        tracker.record("fs_read", &args);
+        tracker.record("fs_read", &args);
+        assert!(tracker.record("fs_read", &args));
+        tracker.mark_warned();
+
+        // Subsequent identical calls should NOT re-trigger
+        assert!(!tracker.record("fs_read", &args));
+        assert!(!tracker.record("fs_read", &args));
+    }
+
+    #[test]
+    fn doom_loop_respects_history_window() {
+        let mut tracker = DoomLoopTracker::default();
+        let target_args = serde_json::json!({"file_path": "/main.rs"});
+
+        // Two identical calls
+        tracker.record("fs_read", &target_args);
+        tracker.record("fs_read", &target_args);
+
+        // Fill with enough different calls to push the first two out of the window
+        for i in 0..DOOM_LOOP_HISTORY_SIZE {
+            tracker.record("fs_glob", &serde_json::json!({"pattern": format!("*.{i}")}));
+        }
+
+        // Now the original calls are outside the window — one more should not trigger
+        let detected = tracker.record("fs_read", &target_args);
+        assert!(!detected, "old calls outside window should not count");
+    }
+
+    #[test]
+    fn doom_loop_integration_injects_guidance() {
+        // Use the ScriptedLlm to simulate a model that makes the same tool call 3 times
+        let responses = vec![
+            // Turn 1: model calls fs_read with same args
+            LlmResponse {
+                text: String::new(),
+                reasoning_content: String::new(),
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: r#"{"file_path":"/main.rs"}"#.to_string(),
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: None,
+            },
+            // Turn 2: same call
+            LlmResponse {
+                text: String::new(),
+                reasoning_content: String::new(),
+                tool_calls: vec![LlmToolCall {
+                    id: "call_2".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: r#"{"file_path":"/main.rs"}"#.to_string(),
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: None,
+            },
+            // Turn 3: same call — should trigger doom loop guidance
+            LlmResponse {
+                text: String::new(),
+                reasoning_content: String::new(),
+                tool_calls: vec![LlmToolCall {
+                    id: "call_3".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: r#"{"file_path":"/main.rs"}"#.to_string(),
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: None,
+            },
+            // Turn 4: model gives final answer after guidance
+            LlmResponse {
+                text: "Done.".to_string(),
+                reasoning_content: String::new(),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: None,
+            },
+        ];
+
+        let llm = ScriptedLlm::new(responses);
+        let tool_result = ToolResult {
+            invocation_id: uuid::Uuid::nil(),
+            success: true,
+            output: serde_json::json!({"content": "fn main() {}"}),
+        };
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![tool_result.clone(), tool_result.clone(), tool_result],
+            true,
+        ));
+
+        let config = ToolLoopConfig {
+            max_turns: 10,
+            ..Default::default()
+        };
+
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let result = loop_.run("show me the main file").unwrap();
+        assert_eq!(result.response, "Done.");
+
+        // Verify doom loop guidance was injected
+        let has_doom_guidance = result.messages.iter().any(|m| {
+            matches!(m, ChatMessage::System { content } if content.contains("repeating the same action"))
+        });
+        assert!(
+            has_doom_guidance,
+            "doom loop guidance should be injected after 3 identical calls"
+        );
     }
 }

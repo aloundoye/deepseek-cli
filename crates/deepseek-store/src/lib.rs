@@ -3023,9 +3023,7 @@ impl Store {
         let cutoff = (Utc::now() - chrono::Duration::days(i64::from(delete_days))).to_rfc3339();
 
         // Collect session IDs to delete
-        let mut stmt = conn.prepare(
-            "SELECT session_id FROM sessions WHERE updated_at < ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE updated_at < ?1")?;
         let ids: Vec<String> = stmt
             .query_map(params![cutoff], |row| row.get(0))?
             .filter_map(|r| r.ok())
