@@ -199,10 +199,7 @@ impl OutputScanner {
                         warnings.push(InjectionWarning {
                             pattern_name: "base64_injection",
                             severity: Severity::Medium,
-                            matched_text: format!(
-                                "[base64 decoded to injection: {}]",
-                                pat.name
-                            ),
+                            matched_text: format!("[base64 decoded to injection: {}]", pat.name),
                         });
                         return; // one warning is enough
                     }

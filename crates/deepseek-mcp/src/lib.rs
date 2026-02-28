@@ -1050,7 +1050,9 @@ impl McpConnectionPool {
                 conn.next_request_id += 1;
                 conn.last_used = Instant::now();
 
-                if let Err(e) = write_mcp_request(&mut conn.stdin, request_id, method, params.clone()) {
+                if let Err(e) =
+                    write_mcp_request(&mut conn.stdin, request_id, method, params.clone())
+                {
                     // Connection broken — remove and fall through to create new one
                     let mut removed = pool.remove(&key).unwrap();
                     let _ = removed.child.kill();

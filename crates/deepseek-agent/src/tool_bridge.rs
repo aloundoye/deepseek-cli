@@ -50,10 +50,7 @@ pub fn llm_tool_call_to_internal(call: &LlmToolCall) -> ToolCall {
 /// 3. Levenshtein distance ≤ 2
 ///
 /// Returns `Some(corrected_name)` if a match is found, `None` if no repair possible.
-pub fn repair_tool_name(
-    api_name: &str,
-    available_tools: &[ToolDefinition],
-) -> Option<String> {
+pub fn repair_tool_name(api_name: &str, available_tools: &[ToolDefinition]) -> Option<String> {
     let tool_names: Vec<&str> = available_tools
         .iter()
         .map(|t| t.function.name.as_str())
@@ -66,7 +63,9 @@ pub fn repair_tool_name(
 
     // 2. Normalize: lowercase, replace hyphens with underscores
     let normalized = api_name.to_lowercase().replace('-', "_");
-    if let Some(name) = tool_names.iter().find(|n| n.to_lowercase().replace('-', "_") == normalized)
+    if let Some(name) = tool_names
+        .iter()
+        .find(|n| n.to_lowercase().replace('-', "_") == normalized)
     {
         return Some(name.to_string());
     }
@@ -75,9 +74,7 @@ pub fn repair_tool_name(
     let mut best_match: Option<(&str, usize)> = None;
     for name in &tool_names {
         let dist = strsim::levenshtein(api_name, name);
-        if dist <= 2
-            && best_match.as_ref().is_none_or(|(_, d)| dist < *d)
-        {
+        if dist <= 2 && best_match.as_ref().is_none_or(|(_, d)| dist < *d) {
             best_match = Some((name, dist));
         }
     }

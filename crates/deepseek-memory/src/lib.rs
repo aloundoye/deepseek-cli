@@ -10,6 +10,71 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+/// A per-step file snapshot for undo capability.
+///
+/// Captures the state of files before and after a write tool executes,
+/// enabling fine-grained undo without full git history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepSnapshot {
+    /// Unique snapshot ID.
+    pub id: Uuid,
+    /// Tool that triggered the snapshot.
+    pub tool_name: String,
+    /// Tool call ID for correlating with tool loop events.
+    pub tool_call_id: String,
+    /// When the snapshot was taken.
+    pub timestamp: String,
+    /// File states before the tool executed.
+    pub before: Vec<FileSnapshot>,
+    /// File states after the tool executed.
+    pub after: Vec<FileSnapshot>,
+}
+
+/// Snapshot of a single file's state (content hash + preview).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSnapshot {
+    /// Relative path from workspace root.
+    pub path: String,
+    /// SHA-256 hash of file content.
+    pub content_hash: String,
+    /// First 50 lines of content for quick preview.
+    pub preview: String,
+    /// Whether the file exists at this point.
+    pub exists: bool,
+}
+
+impl FileSnapshot {
+    /// Capture the current state of a file.
+    pub fn capture(workspace: &Path, file_path: &str) -> Self {
+        let abs_path = if Path::new(file_path).is_absolute() {
+            PathBuf::from(file_path)
+        } else {
+            workspace.join(file_path)
+        };
+
+        match fs::read_to_string(&abs_path) {
+            Ok(content) => {
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                let hash = format!("{:x}", hasher.finalize());
+                let preview: String = content.lines().take(50).collect::<Vec<_>>().join("\n");
+                Self {
+                    path: file_path.to_string(),
+                    content_hash: hash,
+                    preview,
+                    exists: true,
+                }
+            }
+            Err(_) => Self {
+                path: file_path.to_string(),
+                content_hash: String::new(),
+                preview: String::new(),
+                exists: false,
+            },
+        }
+    }
+}
+
 /// Result of a rewind action from the rewind picker.
 pub struct RewindResult {
     pub checkpoint: CheckpointRecord,
@@ -725,6 +790,108 @@ impl MemoryManager {
         };
         self.store.insert_transcript_export(&record)?;
         Ok(record)
+    }
+
+    // ── Per-Step Snapshots ──
+
+    /// Capture file state before a write tool executes.
+    ///
+    /// Returns file snapshots for the given paths. Call before executing
+    /// the tool, then pass to `record_step_snapshot()` after.
+    pub fn capture_before(&self, file_paths: &[&str]) -> Vec<FileSnapshot> {
+        file_paths
+            .iter()
+            .map(|p| FileSnapshot::capture(&self.workspace, p))
+            .collect()
+    }
+
+    /// Record a complete step snapshot (before + after states).
+    pub fn record_step_snapshot(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        before: Vec<FileSnapshot>,
+        file_paths: &[&str],
+    ) -> Result<StepSnapshot> {
+        let after: Vec<FileSnapshot> = file_paths
+            .iter()
+            .map(|p| FileSnapshot::capture(&self.workspace, p))
+            .collect();
+
+        let snapshot = StepSnapshot {
+            id: Uuid::now_v7(),
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            before,
+            after,
+        };
+
+        // Persist to snapshot log
+        let snapshots_dir = runtime_dir(&self.workspace).join("snapshots");
+        fs::create_dir_all(&snapshots_dir)?;
+        let path = snapshots_dir.join(format!("{}.json", snapshot.id));
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        fs::write(&path, json)?;
+
+        Ok(snapshot)
+    }
+
+    /// Revert to a snapshot's "before" state — restores files to their pre-tool state.
+    pub fn revert_to_snapshot(&self, snapshot_id: Uuid) -> Result<Vec<String>> {
+        let snapshots_dir = runtime_dir(&self.workspace).join("snapshots");
+        let path = snapshots_dir.join(format!("{snapshot_id}.json"));
+        let json = fs::read_to_string(&path)?;
+        let snapshot: StepSnapshot = serde_json::from_str(&json)?;
+
+        let mut restored = Vec::new();
+
+        for file_snap in &snapshot.before {
+            let abs_path = if Path::new(&file_snap.path).is_absolute() {
+                PathBuf::from(&file_snap.path)
+            } else {
+                self.workspace.join(&file_snap.path)
+            };
+
+            if !file_snap.exists {
+                // File didn't exist before — delete the new file
+                if abs_path.exists() {
+                    fs::remove_file(&abs_path)?;
+                    restored.push(format!("deleted {}", file_snap.path));
+                }
+            } else {
+                // We only have a preview (first 50 lines), not the full content.
+                // For a real revert, use the checkpoint system (git shadow commit).
+                // This is a best-effort revert for recently created files.
+                restored.push(format!("needs full revert: {}", file_snap.path));
+            }
+        }
+
+        Ok(restored)
+    }
+
+    /// List all step snapshots, newest first.
+    pub fn list_step_snapshots(&self) -> Result<Vec<StepSnapshot>> {
+        let snapshots_dir = runtime_dir(&self.workspace).join("snapshots");
+        if !snapshots_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(&snapshots_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json")
+                && let Ok(json) = fs::read_to_string(&path)
+                && let Ok(snapshot) = serde_json::from_str::<StepSnapshot>(&json)
+            {
+                snapshots.push(snapshot);
+            }
+        }
+
+        // Sort by timestamp descending (newest first)
+        snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(snapshots)
     }
 }
 
@@ -1499,5 +1666,128 @@ mod tests {
         let snapshot = PathBuf::from(&cp.snapshot_path);
         assert!(snapshot.join("text.txt").exists());
         assert!(!snapshot.join("binary.bin").exists());
+    }
+
+    // ── Per-step snapshots ──
+
+    fn make_test_workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("deepseek-snap-{name}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&dir).expect("create workspace");
+        // Initialize git so Store::new works
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output();
+        dir
+    }
+
+    #[test]
+    fn file_snapshot_captures_existing_file() {
+        let dir = make_test_workspace("snap-exist");
+        let file_path = dir.join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").expect("write");
+
+        let snap = FileSnapshot::capture(&dir, "test.rs");
+        assert!(snap.exists);
+        assert!(!snap.content_hash.is_empty());
+        assert!(snap.preview.contains("fn main()"));
+    }
+
+    #[test]
+    fn file_snapshot_captures_missing_file() {
+        let dir = make_test_workspace("snap-missing");
+        let snap = FileSnapshot::capture(&dir, "nonexistent.rs");
+        assert!(!snap.exists);
+        assert!(snap.content_hash.is_empty());
+    }
+
+    #[test]
+    fn step_snapshot_captures_before_and_after() {
+        let dir = make_test_workspace("snap-ba");
+
+        let file_path = dir.join("main.rs");
+        fs::write(&file_path, "fn main() {}").expect("write");
+
+        let manager = MemoryManager::new(&dir).expect("manager");
+        let before = manager.capture_before(&["main.rs"]);
+        assert_eq!(before.len(), 1);
+        assert!(before[0].exists);
+
+        // Simulate a tool modifying the file
+        fs::write(&file_path, "fn main() { println!(\"hello\"); }").expect("write");
+
+        let snapshot = manager
+            .record_step_snapshot("fs_edit", "call_1", before, &["main.rs"])
+            .expect("snapshot");
+
+        assert_eq!(snapshot.tool_name, "fs_edit");
+        assert_eq!(snapshot.tool_call_id, "call_1");
+        assert_eq!(snapshot.before.len(), 1);
+        assert_eq!(snapshot.after.len(), 1);
+        // Before and after should have different content hashes
+        assert_ne!(
+            snapshot.before[0].content_hash,
+            snapshot.after[0].content_hash
+        );
+    }
+
+    #[test]
+    fn list_step_snapshots_returns_newest_first() {
+        let dir = make_test_workspace("snap-list");
+
+        let file_path = dir.join("test.rs");
+        fs::write(&file_path, "v1").expect("write");
+
+        let manager = MemoryManager::new(&dir).expect("manager");
+
+        // Create two snapshots
+        let before1 = manager.capture_before(&["test.rs"]);
+        fs::write(&file_path, "v2").expect("write");
+        let snap1 = manager
+            .record_step_snapshot("fs_edit", "call_1", before1, &["test.rs"])
+            .expect("snap1");
+
+        let before2 = manager.capture_before(&["test.rs"]);
+        fs::write(&file_path, "v3").expect("write");
+        let snap2 = manager
+            .record_step_snapshot("fs_edit", "call_2", before2, &["test.rs"])
+            .expect("snap2");
+
+        let snapshots = manager.list_step_snapshots().expect("list");
+        assert_eq!(snapshots.len(), 2);
+        // Newest first
+        assert_eq!(snapshots[0].id, snap2.id);
+        assert_eq!(snapshots[1].id, snap1.id);
+    }
+
+    #[test]
+    fn step_snapshot_skips_for_nonexistent_files() {
+        let dir = make_test_workspace("snap-nofile");
+
+        let manager = MemoryManager::new(&dir).expect("manager");
+        let before = manager.capture_before(&["nonexistent.rs"]);
+        assert!(
+            !before[0].exists,
+            "capture of missing file should record exists=false"
+        );
+
+        // Create the file (simulating fs_write)
+        let file_path = dir.join("nonexistent.rs");
+        fs::write(&file_path, "// new file").expect("write");
+
+        let snapshot = manager
+            .record_step_snapshot("fs_write", "call_new", before, &["nonexistent.rs"])
+            .expect("snapshot");
+
+        assert!(!snapshot.before[0].exists, "before should be missing");
+        assert!(snapshot.after[0].exists, "after should exist");
     }
 }

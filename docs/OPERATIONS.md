@@ -41,7 +41,18 @@
   - **Context too large**: Reduce `agent_loop.context_bootstrap_max_tree_entries` or `context_bootstrap_max_repo_map_lines`.
   - **Context manager crash**: Set `agent_loop.context_bootstrap_enabled=false` to disable. File an issue with the error log.
 - Compaction data loss:
-  - Semantic compaction preserves key facts automatically. If critical context is lost, lower `context.auto_compact_threshold` to delay compaction.
+  - LLM-based compaction preserves goals, progress, findings, and modified files using a structured template. If critical context is lost, lower `context.auto_compact_threshold` to delay compaction.
+  - If LLM compaction fails (API error, timeout), it falls back to code-based extraction automatically.
+- Agent profile mismatch:
+  - If tools are unexpectedly unavailable, check if the wrong agent profile was selected. Ask/Context modes restrict to read-only tools. Planning keywords in Code mode restrict to plan-only tools.
+  - MCP tools always pass through profile filters.
+- Doom loop (agent repeating):
+  - If the agent repeats identical tool calls 3+ times, corrective guidance is injected automatically.
+  - If it persists, the circuit breaker will disable the tool after 3 failures.
+  - Manual intervention: cancel and rephrase the request, or switch to a different chat mode.
+- Step snapshot disk usage:
+  - Snapshots accumulate in `runtime_dir/snapshots/`. In long sessions, this can grow. Clean manually if needed.
+  - Snapshots only store content hashes and 50-line previews, not full file contents.
 
 ## Rollback strategy
 - Releases are immutable and versioned; keep at least one prior stable release.

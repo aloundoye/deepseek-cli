@@ -2,8 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use deepseek_core::{
     CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse,
-    LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model,
-    normalize_deepseek_profile,
+    LlmToolCall, StreamCallback, StreamChunk, normalize_deepseek_model, normalize_deepseek_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;

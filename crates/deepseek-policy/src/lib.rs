@@ -824,9 +824,9 @@ fn contains_forbidden_shell_tokens(cmd: &str) -> bool {
     // Single-pipe pipelines are allowed; each segment is validated separately.
     let forbidden = [
         "\n", "\r", ";", "&&", "||", // Command chaining
-        "`", "$(",   // Subshell / command substitution
+        "`", "$(", // Subshell / command substitution
         "<(", ">(",  // Process substitution
-        "<<<",        // Here-string
+        "<<<", // Here-string
     ];
     if forbidden.iter().any(|needle| cmd.contains(needle)) {
         return true;
@@ -2236,7 +2236,10 @@ mod tests {
         // A path under temp_dir should be allowed
         let test_path = dir.join("test_file.rs");
         let result = engine.check_path(test_path.to_str().unwrap());
-        assert!(result.is_ok(), "absolute path under workspace root should be allowed");
+        assert!(
+            result.is_ok(),
+            "absolute path under workspace root should be allowed"
+        );
     }
 
     #[test]
@@ -2244,7 +2247,10 @@ mod tests {
         let mut engine = PolicyEngine::new(PolicyConfig::default());
         engine.set_workspace_root(std::path::PathBuf::from("/workspace/project"));
         let result = engine.check_path("/etc/passwd");
-        assert!(result.is_err(), "absolute path outside workspace root should be blocked");
+        assert!(
+            result.is_err(),
+            "absolute path outside workspace root should be blocked"
+        );
     }
 
     #[test]

@@ -9,6 +9,12 @@
 //! is handled by the `CandleCompletion` backend with an optional draft model.
 
 /// Configuration for speculative decoding.
+///
+/// **Deprecated**: Speculative decoding is not production-wired. Focus local-ml
+/// investment on retrieval, privacy, and reranking instead.
+#[deprecated(
+    note = "speculative decoding is not production-wired; use retrieval/privacy/reranking instead"
+)]
 #[derive(Debug, Clone)]
 pub struct SpeculativeConfig {
     /// Number of tokens to draft speculatively before verification.
@@ -20,6 +26,7 @@ pub struct SpeculativeConfig {
     pub draft_model_id: String,
 }
 
+#[allow(deprecated)]
 impl Default for SpeculativeConfig {
     fn default() -> Self {
         Self {
@@ -43,6 +50,8 @@ pub struct VerificationResult {
 
 /// Verify a draft token sequence against target model logits.
 ///
+/// **Deprecated**: Speculative decoding is not production-wired.
+///
 /// For each drafted token, compares draft probability vs target probability.
 /// Accepts greedily from left until a rejection occurs.
 ///
@@ -53,6 +62,9 @@ pub struct VerificationResult {
 /// - `threshold`: Minimum acceptance ratio
 ///
 /// Returns a `VerificationResult` indicating how many tokens were accepted.
+#[deprecated(
+    note = "speculative decoding is not production-wired; use retrieval/privacy/reranking instead"
+)]
 pub fn verify_draft(
     draft_tokens: &[u32],
     draft_probs: &[f64],
@@ -86,6 +98,11 @@ pub fn verify_draft(
 }
 
 /// Compute the acceptance rate for monitoring/logging.
+///
+/// **Deprecated**: Speculative decoding is not production-wired.
+#[deprecated(
+    note = "speculative decoding is not production-wired; use retrieval/privacy/reranking instead"
+)]
 pub fn acceptance_rate(result: &VerificationResult) -> f64 {
     if result.proposed == 0 {
         return 0.0;
@@ -94,6 +111,7 @@ pub fn acceptance_rate(result: &VerificationResult) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -157,5 +175,17 @@ mod tests {
         let cfg = SpeculativeConfig::default();
         assert_eq!(cfg.draft_tokens, 5);
         assert!(cfg.acceptance_threshold > 0.0 && cfg.acceptance_threshold < 1.0);
+    }
+
+    #[test]
+    fn deprecated_items_still_compile() {
+        // This test ensures deprecated items remain usable with #[allow(deprecated)]
+        let _cfg = SpeculativeConfig::default();
+        let result = verify_draft(&[1], &[-0.1], &[-0.1], 0.5);
+        let _rate = acceptance_rate(&result);
+        assert_eq!(
+            result.proposed, 1,
+            "deprecated items compile with allow(deprecated)"
+        );
     }
 }

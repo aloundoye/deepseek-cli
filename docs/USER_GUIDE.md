@@ -115,13 +115,23 @@ deepseek plan "Refactor the authentication module"
 
 ## Chat Modes
 
-| Mode | Command | What it does |
-|------|---------|-------------|
-| **Code** (default) | `deepseek chat` | Full agent with all tools — reads, writes, runs commands |
-| **Ask** | `deepseek ask "..."` | Read-only — answers questions using code search, never modifies files |
-| **Context** | `/context` in chat | Read-only with focus on project structure and dependencies |
+| Mode | Command | What it does | Agent Profile |
+|------|---------|-------------|---------------|
+| **Code** (default) | `deepseek chat` | Full agent with all tools — reads, writes, runs commands | None (full tool set) or Plan (if planning keywords detected) |
+| **Ask** | `deepseek ask "..."` | Read-only — answers questions using code search, never modifies files | Explore (read-only tools only) |
+| **Context** | `/context` in chat | Read-only with focus on project structure and dependencies | Explore (read-only tools only) |
 
 Switch modes mid-conversation with slash commands: `/code`, `/ask`, `/context`.
+
+### Agent Profiles
+
+The agent automatically selects a tool profile based on your chat mode and prompt:
+
+- **Build**: All tools except browser/web. Used for coding tasks in Code mode.
+- **Explore**: Read-only tools only (`fs_read`, `fs_glob`, `fs_grep`, `bash_run`, `git_*`). Used for Ask and Context modes.
+- **Plan**: Like Explore but also blocks `bash_run`. Auto-selected in Code mode when you use planning words ("plan", "design", "review", "analyze") without implementation words ("implement", "fix", "write").
+
+MCP tools (`mcp__*`) always pass through regardless of profile.
 
 ---
 
@@ -281,6 +291,14 @@ Every prompt is automatically classified:
 - Simple and medium tasks use `deepseek-chat` (fast, efficient)
 - Complex tasks that hit errors automatically escalate to `deepseek-reasoner` (deeper thinking, up to 64K output)
 - After 3 consecutive successes, it de-escalates back to `deepseek-chat`
+- Each model gets its own optimized system prompt — `deepseek-chat` gets action-biased instructions ("just do it"), `deepseek-reasoner` gets thinking-leveraging instructions ("use your thinking for planning")
+
+### Doom Loop Detection
+
+If the agent repeats the same tool call identically 3+ times (e.g., reading the same file over and over), it gets corrective guidance:
+- "STOP — You are repeating the same action without making progress. Try a DIFFERENT approach."
+- The detection uses a rolling window of the last 10 tool calls with argument hashing
+- Resets automatically when the agent tries a different tool
 
 ### Error Recovery
 
@@ -288,13 +306,32 @@ Every prompt is automatically classified:
 - If it hits the same error 3+ times, it gets stronger guidance to try a completely different strategy
 - This resets on success
 
+### Per-Turn Retrieval
+
+When local ML is enabled, the retrieval pipeline fires on every turn — not just the first message:
+- Relevant code chunks are injected as context before each LLM call
+- Budget adapts to remaining context window (remaining_tokens / 5)
+- Skips when context is nearly full (< 500 tokens remaining)
+- Index updates incrementally using SHA-256 change detection
+
 ### Long Conversations
 
-When the conversation gets too long for the context window, older messages are compacted into a summary that preserves:
-- Which files were modified and read
-- What errors were encountered
-- Key decisions that were made
-- How many tool calls were made
+When the conversation gets too long for the context window, older messages are compacted using an LLM-based structured summary:
+- **Original goal** of the conversation
+- **What was completed** so far
+- **What is in progress**
+- **Key findings** and decisions
+- **Modified files** list
+
+Falls back to code-based extraction on error.
+
+### Step Snapshots
+
+Every tool call that modifies files captures a before/after snapshot:
+- File content is hashed (SHA-256) and a preview (first 50 lines) is stored
+- Snapshots persist as JSON in the runtime directory
+- Use `revert_to_snapshot()` to undo individual tool operations
+- The UI receives `SnapshotRecorded` events for each snapshot
 
 ---
 

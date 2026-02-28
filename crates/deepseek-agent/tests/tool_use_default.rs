@@ -792,9 +792,9 @@ fn spawn_task_calls_worker() -> Result<()> {
 
     // Wire a subagent worker
     let worker: deepseek_agent::SubagentWorkerFn = Arc::new(move |task| {
-            *worker_called_clone.lock().unwrap() = true;
-            Ok(format!("Subagent completed: {}", task.goal))
-        });
+        *worker_called_clone.lock().unwrap() = true;
+        Ok(format!("Subagent completed: {}", task.goal))
+    });
     engine.set_subagent_worker(worker);
 
     let output = engine.chat_with_options(
@@ -868,9 +868,9 @@ fn spawn_task_role_maps_correctly() -> Result<()> {
     )?;
 
     let worker: deepseek_agent::SubagentWorkerFn = Arc::new(move |task| {
-            *captured_role_clone.lock().unwrap() = format!("{:?}", task.role);
-            Ok("Done".to_string())
-        });
+        *captured_role_clone.lock().unwrap() = format!("{:?}", task.role);
+        Ok("Done".to_string())
+    });
     engine.set_subagent_worker(worker);
 
     let _output = engine.chat_with_options(

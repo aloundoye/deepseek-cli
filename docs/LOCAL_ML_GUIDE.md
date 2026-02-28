@@ -1,10 +1,18 @@
 # Local ML Guide
 
-DeepSeek CLI includes an optional local ML layer that runs entirely on your machine. It provides:
+DeepSeek CLI includes an optional local ML layer that runs entirely on your machine. It serves as an **intelligence compensator** — improving the quality of information the LLM receives, not replacing it.
 
-- **Hybrid code retrieval** — automatically surfaces relevant code chunks before the LLM responds
+**Core value (keep & double down):**
+- **Hybrid code retrieval** — automatically surfaces relevant code chunks before the LLM responds (every turn, not just the first)
 - **Privacy scanning** — detects and redacts secrets in tool outputs before they reach the API
+- **Cross-encoder reranking** — improves retrieval quality by re-scoring results with a learned model
+
+**Supporting features:**
 - **Ghost text** — inline code completions in the TUI, powered by local models
+- **Local routing** — routes simple non-project questions to a local model (project-context queries always go to the API)
+
+**Deprecated (not production-wired):**
+- **Speculative decoding** — draft+verify acceleration. Marked `#[deprecated]` — focus on retrieval/privacy/reranking instead.
 
 All of this is **off by default**. No models are bundled — they're downloaded from HuggingFace on first use.
 
@@ -67,7 +75,9 @@ When you ask a question, the retrieval pipeline:
 
 This means the LLM starts with relevant code context instead of being blind.
 
-The index is built lazily on first query and updates incrementally when files change.
+The index is built lazily on first query and updates incrementally when files change (SHA-256 change detection).
+
+Retrieval fires on **every turn** of the conversation (not just the first), with budget based on remaining context window. This keeps multi-turn conversations grounded in actual code.
 
 **Configuration:**
 

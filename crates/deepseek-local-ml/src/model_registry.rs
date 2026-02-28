@@ -120,7 +120,20 @@ pub fn find_embedding_model(model_id: &str) -> Option<&'static ModelEntry> {
     EMBEDDING_MODELS.iter().find(|m| m.model_id == model_id)
 }
 
+/// Returns the recommended default embedding model for local retrieval.
+pub fn default_embedding_model() -> &'static ModelEntry {
+    // Jina Code v2 — code-optimized, high quality, long context
+    &EMBEDDING_MODELS[2]
+}
+
+/// Returns the recommended default completion model for local ghost text.
+pub fn default_completion_model() -> &'static ModelEntry {
+    // DeepSeek Coder 1.3B — best code quality at small size
+    &COMPLETION_MODELS[0]
+}
+
 /// Detect the architecture from a model ID.
+#[cfg(any(test, feature = "local-ml"))]
 pub fn detect_completion_architecture(model_id: &str) -> CompletionArchitecture {
     let lower = model_id.to_ascii_lowercase();
     if lower.contains("deepseek") {
@@ -137,6 +150,7 @@ pub fn detect_completion_architecture(model_id: &str) -> CompletionArchitecture 
 }
 
 /// Detect the embedding architecture from a model ID.
+#[cfg(any(test, feature = "local-ml"))]
 pub fn detect_embedding_architecture(model_id: &str) -> EmbeddingArchitecture {
     let lower = model_id.to_ascii_lowercase();
     if lower.contains("bge") {
@@ -195,6 +209,29 @@ mod tests {
         assert_eq!(
             detect_embedding_architecture("jinaai/jina-embeddings-v2-base-code"),
             EmbeddingArchitecture::JinaCode
+        );
+    }
+
+    #[test]
+    fn default_embedding_model_is_code_specialized() {
+        let model = default_embedding_model();
+        assert!(
+            model.code_specialized,
+            "default embedding should be code-specialized"
+        );
+        assert!(model.model_id.contains("jina"), "should be Jina Code");
+    }
+
+    #[test]
+    fn default_completion_model_is_code_specialized() {
+        let model = default_completion_model();
+        assert!(
+            model.code_specialized,
+            "default completion should be code-specialized"
+        );
+        assert!(
+            model.model_id.contains("deepseek"),
+            "should be DeepSeek Coder"
         );
     }
 }

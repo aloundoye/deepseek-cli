@@ -1,3 +1,4 @@
+pub mod agent_profiles;
 mod analysis;
 pub mod apply;
 pub mod complexity;
@@ -14,6 +15,11 @@ mod verify;
 pub mod watch;
 
 pub use repo_map::clear_tag_cache;
+
+/// Whether the binary was compiled with real Candle ML backends.
+pub fn has_local_ml_feature() -> bool {
+    cfg!(feature = "local-ml")
+}
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -512,7 +518,10 @@ impl AgentEngine {
             None
         };
 
-        let system_prompt = prompts::build_tool_use_system_prompt_with_complexity(
+        // Select agent profile based on mode and prompt content
+        let profile = agent_profiles::select_profile(options.mode, prompt, complexity);
+
+        let mut system_prompt = prompts::build_tool_use_system_prompt_with_complexity(
             project_memory.as_deref(),
             options.system_prompt_override.as_deref(),
             options.system_prompt_append.as_deref(),
@@ -520,6 +529,11 @@ impl AgentEngine {
             complexity,
             repo_map_summary.as_deref(),
         );
+
+        // Append profile-specific system prompt addendum
+        if let Some(p) = profile {
+            system_prompt.push_str(p.system_prompt_addendum);
+        }
 
         let read_only = matches!(options.mode, ChatMode::Ask | ChatMode::Context);
 
@@ -555,6 +569,7 @@ impl AgentEngine {
             privacy_router: build_privacy_router(&self.cfg),
             images: options.images.clone(),
             initial_context,
+            profile_name: profile.map(|p| p.name.to_string()),
         };
 
         // Build tool list: built-in tools + MCP-discovered tools.
@@ -581,6 +596,11 @@ impl AgentEngine {
                     },
                 });
             }
+        }
+
+        // Apply agent profile tool filtering
+        if let Some(p) = profile {
+            tools = agent_profiles::filter_by_profile(tools, p);
         }
 
         let mut loop_ = tool_loop::ToolUseLoop::new(
@@ -1246,5 +1266,15 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn has_local_ml_feature_returns_bool() {
+        // Without local-ml feature compiled, should return false.
+        let result = super::has_local_ml_feature();
+        #[cfg(not(feature = "local-ml"))]
+        assert!(!result);
+        #[cfg(feature = "local-ml")]
+        assert!(result);
     }
 }

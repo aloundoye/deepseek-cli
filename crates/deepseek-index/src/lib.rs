@@ -694,9 +694,7 @@ mod tests {
 
         svc.build_chunk_index(&chunks).expect("build chunk index");
 
-        let results = svc
-            .query_chunks("compute", 5, None)
-            .expect("query chunks");
+        let results = svc.query_chunks("compute", 5, None).expect("query chunks");
         assert!(!results.is_empty(), "should find chunk-level results");
         assert_eq!(
             results[0].chunk_id, "chunk-001",

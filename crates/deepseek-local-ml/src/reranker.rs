@@ -79,9 +79,8 @@ pub mod candle_backend {
             let config_data = std::fs::read_to_string(config_path)?;
             let config: BertConfig = serde_json::from_str(&config_data)?;
 
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, device)?
-            };
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, device)? };
             let model = BertModel::load(vb, &config)?;
 
             let tokenizer = Tokenizer::from_file(tokenizer_path)
@@ -114,16 +113,15 @@ pub mod candle_backend {
                     .encode(pair, true)
                     .map_err(|e| anyhow::anyhow!("tokenization failed: {}", e))?;
 
-                let input_ids =
-                    Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
+                let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
                 let attention_mask =
                     Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
                 let token_type_ids =
                     Tensor::new(encoding.get_type_ids(), &self.device)?.unsqueeze(0)?;
 
-                let hidden = self
-                    .model
-                    .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+                let hidden =
+                    self.model
+                        .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
                 // Use [CLS] token output as the relevance score
                 let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.squeeze(0)?;

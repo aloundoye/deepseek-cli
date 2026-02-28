@@ -4718,7 +4718,8 @@ where
             continue;
         }
         // Alt+Right: accept one word of ML ghost text
-        if key.code == KeyCode::Right && key.modifiers == KeyModifiers::ALT
+        if key.code == KeyCode::Right
+            && key.modifiers == KeyModifiers::ALT
             && let Some(word) = ml_ghost.accept_word()
         {
             input.push_str(&word);
@@ -4728,7 +4729,9 @@ where
         }
         if key == bindings.autocomplete {
             // ML ghost text has highest priority
-            if cursor_pos >= input.len() && !input.starts_with('/') && ml_ghost.suggestion.is_some()
+            if cursor_pos >= input.len()
+                && !input.starts_with('/')
+                && ml_ghost.suggestion.is_some()
                 && let Some(text) = ml_ghost.accept_full()
             {
                 input.push_str(&text);
