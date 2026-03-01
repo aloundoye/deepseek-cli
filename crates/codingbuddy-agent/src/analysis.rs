@@ -50,10 +50,14 @@ pub fn analyze(
         content: user_prompt,
     });
 
-    let model = if options.force_max_think {
-        cfg.llm.max_think_model.clone()
+    let (model, is_reasoner) = if options.force_max_think {
+        let m = cfg.llm.max_think_model.clone();
+        let r = codingbuddy_core::is_reasoner_model(&m);
+        (m, r)
     } else {
-        cfg.llm.base_model.clone()
+        let m = cfg.llm.base_model.clone();
+        let r = codingbuddy_core::is_reasoner_model(&m);
+        (m, r)
     };
 
     let enforce_profile_shape = matches!(options.mode, ChatMode::Ask | ChatMode::Context)
@@ -68,18 +72,20 @@ pub fn analyze(
             messages: messages.clone(),
             tools: vec![],
             tool_choice: ToolChoice::none(),
-            max_tokens: 8192,
-            temperature: if options.force_max_think {
-                None
+            max_tokens: if is_reasoner {
+                codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
             } else {
-                Some(0.0)
+                8192
             },
+            // Reasoner rejects temperature; deepseek-chat needs 0.0 for determinism
+            temperature: if is_reasoner { None } else { Some(0.0) },
             top_p: None,
             presence_penalty: None,
             frequency_penalty: None,
             logprobs: None,
             top_logprobs: None,
-            thinking: if options.force_max_think {
+            // Reasoner thinks natively — ThinkingConfig is only for deepseek-chat
+            thinking: if options.force_max_think && !is_reasoner {
                 Some(codingbuddy_core::ThinkingConfig::enabled(16_384))
             } else {
                 None

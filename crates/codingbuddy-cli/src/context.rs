@@ -88,11 +88,7 @@ pub(crate) fn chat_options_from_cli(cli: &Cli, tools: bool, mode: ChatMode) -> C
     let force_max_think = cli
         .model
         .as_deref()
-        .map(|model| {
-            let lower = model.to_ascii_lowercase();
-            lower.contains("reasoner") || lower.contains("max") || lower.contains("high")
-        })
-        .unwrap_or(false);
+        .is_some_and(super::commands::chat::is_max_think_selection);
     ChatOptions {
         tools,
         force_max_think,

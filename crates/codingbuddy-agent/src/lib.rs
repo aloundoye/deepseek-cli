@@ -873,36 +873,39 @@ fn build_retriever_callback(
     }
 
     // Build embeddings backend: real Candle model with local-ml, deterministic mock without.
+    // Only use already-cached models — never block the main thread downloading.
+    // Models are pre-downloaded via `codingbuddy setup` or the first-time wizard.
     #[cfg(feature = "local-ml")]
     let embeddings: std::sync::Arc<dyn codingbuddy_local_ml::EmbeddingsBackend> = {
-        let mut mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
+        let mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
             &cfg.local_ml.cache_dir,
         ));
-        match mgr.ensure_model(&cfg.local_ml.embeddings.model_id) {
-            Ok(model_path) => {
-                let device = codingbuddy_local_ml::parse_device(&cfg.local_ml.device);
-                match codingbuddy_local_ml::CandleEmbeddings::load(
-                    &model_path.join("model.safetensors"),
-                    &model_path.join("config.json"),
-                    &model_path.join("tokenizer.json"),
-                    &device,
-                    cfg.local_ml.embeddings.normalize,
-                ) {
-                    Ok(emb) => std::sync::Arc::new(emb),
-                    Err(e) => {
-                        eprintln!(
-                            "[deepseek] candle embeddings load failed ({e}), falling back to mock"
-                        );
-                        std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384))
-                    }
+        if mgr.status(&cfg.local_ml.embeddings.model_id)
+            != codingbuddy_local_ml::ModelStatus::Ready
+        {
+            eprintln!(
+                "[codingbuddy] embedding model '{}' not cached, using mock (run `codingbuddy setup` to download)",
+                cfg.local_ml.embeddings.model_id
+            );
+            std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384))
+        } else {
+            let model_path = std::path::PathBuf::from(&cfg.local_ml.cache_dir)
+                .join(&cfg.local_ml.embeddings.model_id);
+            let device = codingbuddy_local_ml::parse_device(&cfg.local_ml.device);
+            match codingbuddy_local_ml::CandleEmbeddings::load(
+                &model_path.join("model.safetensors"),
+                &model_path.join("config.json"),
+                &model_path.join("tokenizer.json"),
+                &device,
+                cfg.local_ml.embeddings.normalize,
+            ) {
+                Ok(emb) => std::sync::Arc::new(emb),
+                Err(e) => {
+                    eprintln!(
+                        "[codingbuddy] candle embeddings load failed ({e}), falling back to mock"
+                    );
+                    std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384))
                 }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[deepseek] model '{}' not available ({e}), using mock embeddings",
-                    cfg.local_ml.embeddings.model_id
-                );
-                std::sync::Arc::new(codingbuddy_local_ml::MockEmbeddings::new(384))
             }
         }
     };

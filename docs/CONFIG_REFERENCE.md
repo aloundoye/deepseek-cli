@@ -188,7 +188,7 @@ Controls for automatic workspace context injection:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `model_id` | string | `"deepseek-ai/deepseek-coder-1.3b-base"` | Model for local code completion |
+| `model_id` | string | `"qwen2.5-coder-3b"` | Model for local code completion |
 | `max_tokens` | int | `64` | Max tokens for completion |
 | `temperature` | float | `0.2` | Sampling temperature |
 

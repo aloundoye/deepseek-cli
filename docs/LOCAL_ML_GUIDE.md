@@ -197,7 +197,7 @@ deepseek index watch               # Watch for file changes and auto-update
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `local_ml.completion.model_id` | `deepseek-ai/deepseek-coder-1.3b-base` | HuggingFace model ID |
+| `local_ml.completion.model_id` | `qwen2.5-coder-3b` | Model ID for local code completion |
 | `local_ml.completion.max_tokens` | `64` | Max tokens per completion |
 | `local_ml.completion.temperature` | `0.2` | Sampling temperature |
 

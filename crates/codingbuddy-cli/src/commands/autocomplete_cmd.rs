@@ -27,7 +27,7 @@ pub(crate) enum AutocompleteCmd {
 pub(crate) enum ModelAction {
     /// Set the autocomplete model.
     Set {
-        /// Model identifier (e.g. "deepseek-coder-1.3b-q4").
+        /// Model identifier (e.g. "qwen2.5-coder-3b").
         model_id: String,
     },
 }

@@ -33,6 +33,11 @@ pub fn normalize_codingbuddy_model(model: &str) -> Option<&'static str> {
     }
 }
 
+/// Returns true if the model name refers to the deepseek-reasoner (or any alias).
+pub fn is_reasoner_model(model: &str) -> bool {
+    normalize_codingbuddy_model(model) == Some(CODINGBUDDY_V32_REASONER_MODEL)
+}
+
 pub fn normalize_codingbuddy_profile(profile: &str) -> Option<&'static str> {
     let normalized = profile.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -3006,7 +3011,7 @@ impl Default for AutocompleteLocalConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model_id: "deepseek-coder-1.3b".to_string(),
+            model_id: "qwen2.5-coder-3b".to_string(),
             debounce_ms: 200,
             timeout_ms: 2000,
             max_tokens: 128,
@@ -3672,7 +3677,7 @@ mod tests {
     #[test]
     fn autocomplete_event_roundtrip() {
         let event = EventKind::Autocomplete {
-            model_id: "deepseek-coder-1.3b".to_string(),
+            model_id: "qwen2.5-coder-3b".to_string(),
             tokens_generated: 42,
             latency_ms: 150,
             accepted: true,

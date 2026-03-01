@@ -288,7 +288,7 @@ pub fn build_model_aware_system_prompt(
     }
 
     // Select base prompt by model tier
-    let is_reasoner = model.contains("reasoner");
+    let is_reasoner = codingbuddy_core::is_reasoner_model(model);
     let base_prompt = if is_reasoner {
         REASONER_SYSTEM_PROMPT
     } else {
