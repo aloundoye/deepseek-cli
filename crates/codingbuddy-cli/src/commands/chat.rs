@@ -926,12 +926,16 @@ pub(crate) fn run_chat(
 ) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
-    let cfg = AppConfig::ensure(cwd)?;
-    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
-    // Offer local ML setup once after first successful API key configuration
-    if !json_mode && let Err(e) = super::setup::maybe_offer_local_ml(cwd, &cfg) {
-        eprintln!("local ML setup skipped: {e}");
+    let mut cfg = AppConfig::ensure(cwd)?;
+    // Run first-time setup wizard once (provider, API key, local ML, privacy)
+    if !json_mode {
+        match super::setup::maybe_first_time_setup(cwd, &cfg) {
+            Ok(true) => cfg = AppConfig::ensure(cwd)?,
+            Ok(false) => {}
+            Err(e) => eprintln!("setup skipped: {e}"),
+        }
     }
+    ensure_llm_ready_with_cfg(Some(cwd), &cfg, json_mode)?;
     let mut engine = AgentEngine::new(cwd)?;
     if let Some(cli) = cli {
         apply_cli_flags(&mut engine, cli);
@@ -1216,6 +1220,58 @@ pub(crate) fn run_chat(
                             "model mode: auto ({} thinking=on-demand)",
                             cfg.llm.base_model
                         );
+                    }
+                }
+                SlashCommand::Provider(provider) => {
+                    let active = cfg.llm.active_provider();
+                    if let Some(name) = provider {
+                        if let Some(p) = cfg.llm.providers.get(&name) {
+                            if json_mode {
+                                print_json(&json!({
+                                    "provider": name,
+                                    "base_url": p.base_url,
+                                    "model": p.models.chat,
+                                }))?;
+                            } else {
+                                println!(
+                                    "Provider: {} ({}, model: {})",
+                                    name, p.base_url, p.models.chat
+                                );
+                                println!("To switch permanently, run: codingbuddy setup");
+                            }
+                        } else if json_mode {
+                            print_json(&json!({"error": format!("unknown provider: {name}")}))?;
+                        } else {
+                            println!("Unknown provider: {name}");
+                            let names: Vec<_> = cfg.llm.providers.keys().cloned().collect();
+                            println!("Available: {}", names.join(", "));
+                        }
+                    } else if json_mode {
+                        let names: Vec<_> = cfg.llm.providers.keys().cloned().collect();
+                        print_json(&json!({
+                            "provider": cfg.llm.provider,
+                            "base_url": active.base_url,
+                            "model": active.models.chat,
+                            "available": names,
+                        }))?;
+                    } else {
+                        println!(
+                            "Current provider: {} ({})",
+                            cfg.llm.provider, active.base_url
+                        );
+                        println!("Available providers:");
+                        for (name, p) in &cfg.llm.providers {
+                            let marker = if *name == cfg.llm.provider {
+                                " (active)"
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "  {} — {} (model: {}){}",
+                                name, p.base_url, p.models.chat, marker
+                            );
+                        }
+                        println!("\nSwitch permanently with: codingbuddy setup");
                     }
                 }
                 SlashCommand::Cost => {
@@ -2449,9 +2505,40 @@ pub(crate) fn run_chat_tui(
             std::thread::spawn(move || {
                 let mut mgr =
                     codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cache_dir));
-                let model_path = match mgr.ensure_model_with_progress(&model_id, |i, t| {
-                    eprintln!("[codingbuddy] downloading model file {}/{}", i + 1, t);
-                }) {
+                // Look up registry entry to get HF repo and GGUF filename
+                let entry = match codingbuddy_local_ml::model_registry::find_completion_model(
+                    &model_id,
+                ) {
+                    Some(e) if e.gguf_filename.is_some() => e,
+                    Some(_) => {
+                        eprintln!(
+                            "[codingbuddy] model '{model_id}' has no GGUF file configured, using mock"
+                        );
+                        return;
+                    }
+                    None => {
+                        eprintln!(
+                            "[codingbuddy] model '{model_id}' not found in registry, using mock"
+                        );
+                        return;
+                    }
+                };
+                let gguf_filename = entry.gguf_filename.unwrap();
+                let files = entry.download_files();
+                let model_path = match mgr.ensure_model_with_progress(
+                    &model_id,
+                    entry.hf_repo,
+                    &files,
+                    |current, total| {
+                        if current < total {
+                            eprintln!(
+                                "[codingbuddy] downloading model file {}/{}",
+                                current + 1,
+                                total
+                            );
+                        }
+                    },
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!(
@@ -2461,18 +2548,8 @@ pub(crate) fn run_chat_tui(
                     }
                 };
                 let device = codingbuddy_local_ml::parse_device(&device_str);
-                let gguf = std::fs::read_dir(&model_path).ok().and_then(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .find(|e| e.path().extension().is_some_and(|ext| ext == "gguf"))
-                        .map(|e| e.path())
-                });
-                let Some(gguf_path) = gguf else {
-                    eprintln!("[codingbuddy] no .gguf file found in model dir, using mock");
-                    return;
-                };
                 match codingbuddy_local_ml::CandleCompletion::load(
-                    &gguf_path,
+                    &model_path.join(gguf_filename),
                     &model_path.join("tokenizer.json"),
                     &device,
                 ) {
@@ -2636,6 +2713,46 @@ pub(crate) fn run_chat_tui(
                             "model mode: auto ({} thinking=on-demand)",
                             cfg.llm.base_model
                         )
+                    }
+                }
+                SlashCommand::Provider(provider) => {
+                    let active = cfg.llm.active_provider();
+                    if let Some(name) = provider {
+                        if let Some(p) = cfg.llm.providers.get(&name) {
+                            format!(
+                                "Provider: {} ({}, model: {})",
+                                name, p.base_url, p.models.chat
+                            )
+                        } else {
+                            format!(
+                                "Unknown provider: {}. Available: {}",
+                                name,
+                                cfg.llm
+                                    .providers
+                                    .keys()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    } else {
+                        let mut lines = vec![format!(
+                            "Current provider: {} ({})",
+                            cfg.llm.provider, active.base_url
+                        )];
+                        for (name, p) in &cfg.llm.providers {
+                            let marker = if *name == cfg.llm.provider {
+                                " *"
+                            } else {
+                                ""
+                            };
+                            lines.push(format!(
+                                "  {} — {} (model: {}){}",
+                                name, p.base_url, p.models.chat, marker
+                            ));
+                        }
+                        lines.push("Switch with: /provider <name>".to_string());
+                        lines.join("\n")
                     }
                 }
                 SlashCommand::Cost => {

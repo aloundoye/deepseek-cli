@@ -155,6 +155,7 @@ pub enum SlashCommand {
     Memory(Vec<String>),
     Config,
     Model(Option<String>),
+    Provider(Option<String>),
     Cost,
     Mcp(Vec<String>),
     Rewind(Vec<String>),
@@ -239,6 +240,7 @@ impl SlashCommand {
             "memory" => Self::Memory(args),
             "config" => Self::Config,
             "model" => Self::Model(args.first().cloned()),
+            "provider" => Self::Provider(args.first().cloned()),
             "cost" => Self::Cost,
             "mcp" => Self::Mcp(args),
             "rewind" => Self::Rewind(args),
@@ -6490,6 +6492,18 @@ mod tests {
         assert_eq!(SlashCommand::parse("/CONTEXT"), Some(SlashCommand::Context));
         assert_eq!(SlashCommand::parse("/EXIT"), Some(SlashCommand::Exit));
         assert_eq!(SlashCommand::parse("/Plan"), Some(SlashCommand::Plan));
+    }
+
+    #[test]
+    fn slash_provider_command_parses() {
+        assert!(matches!(
+            SlashCommand::parse("/provider"),
+            Some(SlashCommand::Provider(None))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/provider deepseek"),
+            Some(SlashCommand::Provider(Some(ref name))) if name == "deepseek"
+        ));
     }
 
     #[test]

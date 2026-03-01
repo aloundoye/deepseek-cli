@@ -7,7 +7,7 @@ use codingbuddy_mcp::McpTransport;
 use codingbuddy_memory::MemoryManager;
 use codingbuddy_policy::load_managed_settings;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Enhanced context and error handling
 use codingbuddy_errors::ErrorHandler;
@@ -1196,6 +1196,89 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Migrate legacy `.deepseek/` config directory to `.codingbuddy/`.
+///
+/// If `.deepseek/` exists but `.codingbuddy/` does not, copies settings files
+/// and the models directory. This runs once per session, early in startup.
+fn migrate_legacy_config(workspace: &Path) {
+    let legacy = workspace.join(".deepseek");
+    let target = workspace.join(".codingbuddy");
+
+    if !legacy.exists() || target.exists() {
+        return;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&target) {
+        eprintln!("Warning: could not create .codingbuddy/: {e}");
+        return;
+    }
+
+    let files_to_copy = ["settings.json", "settings.local.json", "config.toml"];
+    let mut migrated = Vec::new();
+
+    for name in &files_to_copy {
+        let src = legacy.join(name);
+        if src.exists() {
+            if let Err(e) = std::fs::copy(&src, target.join(name)) {
+                eprintln!("Warning: could not migrate {name}: {e}");
+            } else {
+                migrated.push(*name);
+            }
+        }
+    }
+
+    // Migrate models directory if present
+    let legacy_models = legacy.join("models");
+    let target_models = target.join("models");
+    if legacy_models.is_dir() && !target_models.exists() {
+        // Use symlink for models (can be large)
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::os::unix::fs::symlink(&legacy_models, &target_models) {
+                eprintln!("Warning: could not symlink models dir: {e}");
+            } else {
+                migrated.push("models/");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, copy the directory structure
+            if let Err(e) = std::fs::create_dir_all(&target_models) {
+                eprintln!("Warning: could not create models dir: {e}");
+            } else {
+                migrated.push("models/");
+            }
+        }
+    }
+
+    if !migrated.is_empty() {
+        eprintln!(
+            "Migrated config from .deepseek/ to .codingbuddy/ ({})",
+            migrated.join(", ")
+        );
+    }
+
+    // Also migrate user-level config: ~/.deepseek/ → ~/.codingbuddy/
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let legacy_user = home.join(".deepseek");
+        let target_user = home.join(".codingbuddy");
+        if legacy_user.exists() && !target_user.exists() {
+            if let Err(e) = std::fs::create_dir_all(&target_user) {
+                eprintln!("Warning: could not create ~/.codingbuddy/: {e}");
+            } else {
+                let src = legacy_user.join("settings.json");
+                if src.exists() {
+                    if let Err(e) = std::fs::copy(&src, target_user.join("settings.json")) {
+                        eprintln!("Warning: could not migrate ~/.deepseek/settings.json: {e}");
+                    } else {
+                        eprintln!("Migrated user config from ~/.deepseek/ to ~/.codingbuddy/");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     match run() {
         Ok(()) => std::process::exit(0),
@@ -1211,6 +1294,9 @@ fn run() -> Result<()> {
     let mut cli = Cli::parse();
     validate_cli_flags(&cli)?;
     let cwd = std::env::current_dir()?;
+
+    // Phase 0.4: Auto-migrate legacy .deepseek/ config to .codingbuddy/
+    migrate_legacy_config(&cwd);
 
     if cli.ide {
         // SAFETY: called before any threads are spawned in main()

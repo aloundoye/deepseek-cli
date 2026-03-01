@@ -878,7 +878,17 @@ fn build_retriever_callback(
         let mut mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
             &cfg.local_ml.cache_dir,
         ));
-        match mgr.ensure_model(&cfg.local_ml.embeddings.model_id) {
+        let emb_entry = codingbuddy_local_ml::model_registry::find_embedding_model(
+            &cfg.local_ml.embeddings.model_id,
+        );
+        let (emb_hf_repo, emb_files): (&str, Vec<&str>) = match emb_entry {
+            Some(entry) => (entry.hf_repo, entry.download_files()),
+            None => (
+                &cfg.local_ml.embeddings.model_id,
+                codingbuddy_local_ml::model_registry::DEFAULT_SAFETENSORS_FILES.to_vec(),
+            ),
+        };
+        match mgr.ensure_model(&cfg.local_ml.embeddings.model_id, emb_hf_repo, &emb_files) {
             Ok(model_path) => {
                 let device = codingbuddy_local_ml::parse_device(&cfg.local_ml.device);
                 match codingbuddy_local_ml::CandleEmbeddings::load(

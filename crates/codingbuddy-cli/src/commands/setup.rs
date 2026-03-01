@@ -10,57 +10,44 @@ use std::path::{Path, PathBuf};
 use crate::SetupArgs;
 use crate::output::print_json;
 
-/// Marker file that records we already offered local ML setup.
+/// Marker file that records we already ran first-time setup.
 const SETUP_MARKER: &str = ".setup_done";
 
-/// Called from `run_chat` after API key is resolved. Offers local ML setup
-/// once on first run, then writes a marker so it never asks again.
-pub(crate) fn maybe_offer_local_ml(cwd: &Path, cfg: &AppConfig) -> Result<()> {
+/// Called from `run_chat` on first run. Walks the user through the same
+/// setup wizard as `codingbuddy setup` (provider, API key, local ML, privacy),
+/// then writes a marker so it never asks again.
+///
+/// Returns `true` if the wizard ran and config was potentially modified.
+pub(crate) fn maybe_first_time_setup(cwd: &Path, cfg: &AppConfig) -> Result<bool> {
     let marker = AppConfig::project_settings_path(cwd)
         .parent()
         .map(|p| p.join(SETUP_MARKER))
         .unwrap_or_else(|| cwd.join(".codingbuddy").join(SETUP_MARKER));
 
     if marker.exists() {
-        return Ok(());
-    }
-
-    // If local ML is already configured, just write the marker and skip the prompt
-    if cfg.local_ml.enabled {
-        if let Some(parent) = marker.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&marker, "")?;
-        return Ok(());
+        return Ok(false);
     }
 
     // Only prompt in interactive terminals
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        return Ok(());
+        write_setup_marker(&marker)?;
+        return Ok(false);
+    }
+
+    // If everything is already configured, just write the marker
+    if has_api_key(cfg) && cfg.local_ml.enabled {
+        write_setup_marker(&marker)?;
+        return Ok(false);
     }
 
     println!();
-    println!("Local ML runs models on your machine for:");
-    println!("  - Code retrieval: surfaces relevant code before the LLM responds");
-    println!("  - Privacy scanning: detects and redacts secrets before they reach the API");
-    println!("  - Ghost text: inline code completions in the TUI");
-    println!();
+    println!("Welcome to CodingBuddy! Let's get you set up.\n");
 
-    let enable_ml = prompt_yes_no("Enable local ML? [Y/n]: ")?;
+    run_wizard_steps(cwd, cfg)?;
 
-    if enable_ml {
-        merge_local_ml_config(cwd, true, true)?;
-        println!();
-        download_required_models(cfg, false)?;
-        println!();
-    } else {
-        // User declined — record that too so we don't ask again
-        merge_local_ml_config(cwd, false, false)?;
-        println!();
-    }
-
+    println!("Setup complete!\n");
     write_setup_marker(&marker)?;
-    Ok(())
+    Ok(true)
 }
 
 fn write_setup_marker(marker: &Path) -> Result<()> {
@@ -68,6 +55,97 @@ fn write_setup_marker(marker: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(marker, "")?;
+    Ok(())
+}
+
+/// Shared 4-step wizard logic used by both `maybe_first_time_setup` and `run_interactive_wizard`.
+fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
+    // Step 1: Provider selection
+    println!("[1/4] Model Provider");
+    println!("  1. DeepSeek API (default)");
+    println!("  2. OpenAI-compatible (GLM-5, Qwen, Ollama, OpenRouter, custom endpoint)");
+    println!();
+
+    let provider_choice = prompt_choice("  Select [1-2]: ", 1, 2)?;
+
+    if provider_choice == 2 {
+        print!("  API base URL: ");
+        std::io::stdout().flush()?;
+        let mut base_url = String::new();
+        std::io::stdin().read_line(&mut base_url)?;
+        let base_url = base_url.trim().to_string();
+
+        print!("  Model name: ");
+        std::io::stdout().flush()?;
+        let mut model_name = String::new();
+        std::io::stdin().read_line(&mut model_name)?;
+        let model_name = model_name.trim().to_string();
+
+        print!("  API key env var (or empty for no auth): ");
+        std::io::stdout().flush()?;
+        let mut api_key_env = String::new();
+        std::io::stdin().read_line(&mut api_key_env)?;
+        let api_key_env = api_key_env.trim().to_string();
+
+        merge_provider_config(
+            cwd,
+            "openai-compat",
+            &base_url,
+            &model_name,
+            if api_key_env.is_empty() {
+                None
+            } else {
+                Some(&api_key_env)
+            },
+        )?;
+        println!("  Provider saved.\n");
+    } else {
+        println!("  Using DeepSeek API.\n");
+    }
+
+    // Step 2: API Key
+    println!("[2/4] API Key");
+    let env_var = if provider_choice == 2 {
+        "OPENAI_API_KEY".to_string()
+    } else {
+        cfg.llm.active_provider().api_key_env.clone()
+    };
+    if has_api_key(cfg) {
+        println!("  API key is set.\n");
+    } else {
+        println!(
+            "  Set {} in your environment, or run `codingbuddy setup` to reconfigure.\n",
+            env_var
+        );
+    }
+
+    // Step 3: Local ML
+    println!("[3/4] Local ML");
+    println!("  Local ML runs models on your machine for:");
+    println!("  - Code retrieval: surfaces relevant code before the LLM responds");
+    println!("  - Privacy scanning: detects and redacts secrets before they reach the API");
+    println!("  - Ghost text: inline code completions in the TUI\n");
+
+    let enable_ml = prompt_yes_no("  Enable local ML? [Y/n]: ")?;
+    println!();
+
+    // Step 4: Privacy Scanning
+    println!("[4/4] Privacy Scanning");
+    let enable_privacy = if enable_ml {
+        prompt_yes_no("  Enable privacy scanning? [Y/n]: ")?
+    } else {
+        false
+    };
+    println!();
+
+    // Write config and download models
+    if enable_ml || enable_privacy {
+        merge_local_ml_config(cwd, enable_ml, enable_privacy)?;
+    }
+    if enable_ml {
+        download_required_models(cfg, false)?;
+    }
+
     Ok(())
 }
 
@@ -137,7 +215,7 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
     Ok(())
 }
 
-/// `deepseek setup --local-ml` — non-interactive shortcut.
+/// `codingbuddy setup --local-ml` — non-interactive shortcut.
 fn run_local_ml_shortcut(cwd: &Path, json_mode: bool) -> Result<()> {
     let cfg = AppConfig::ensure(cwd)?;
 
@@ -174,94 +252,7 @@ fn run_interactive_wizard(cwd: &Path, json_mode: bool) -> Result<()> {
 
     println!("Welcome to CodingBuddy setup!\n");
 
-    // Step 1: Provider selection
-    println!("[1/4] Model Provider");
-    println!("  Select your model provider:");
-    println!("  1. DeepSeek API (default)");
-    println!("  2. OpenAI-compatible (GLM-5, Qwen, Ollama, OpenRouter, custom endpoint)");
-    println!();
-
-    let provider_choice = prompt_choice("  Select [1-2]: ", 1, 2)?;
-
-    if provider_choice == 2 {
-        // OpenAI-compatible — ask for endpoint, model, and API key env
-        print!("  API base URL: ");
-        std::io::stdout().flush()?;
-        let mut base_url = String::new();
-        std::io::stdin().read_line(&mut base_url)?;
-        let base_url = base_url.trim().to_string();
-
-        print!("  Model name: ");
-        std::io::stdout().flush()?;
-        let mut model_name = String::new();
-        std::io::stdin().read_line(&mut model_name)?;
-        let model_name = model_name.trim().to_string();
-
-        print!("  API key env var (or empty for no auth): ");
-        std::io::stdout().flush()?;
-        let mut api_key_env = String::new();
-        std::io::stdin().read_line(&mut api_key_env)?;
-        let api_key_env = api_key_env.trim().to_string();
-
-        merge_provider_config(
-            cwd,
-            "openai-compat",
-            &base_url,
-            &model_name,
-            if api_key_env.is_empty() {
-                None
-            } else {
-                Some(&api_key_env)
-            },
-        )?;
-        println!("  Provider saved.\n");
-    } else {
-        println!("  Using DeepSeek API.\n");
-    }
-
-    // Step 2: API Key
-    println!("[2/4] API Key");
-    let active_provider = cfg.llm.active_provider();
-    let env_var = if provider_choice == 2 {
-        "OPENAI_API_KEY".to_string() // the user may have entered a custom one
-    } else {
-        active_provider.api_key_env.clone()
-    };
-    if has_api_key(&cfg) {
-        println!("  API key is set.\n");
-    } else {
-        println!(
-            "  API key not found. Set {} or run `codingbuddy chat` to be prompted.\n",
-            env_var
-        );
-    }
-
-    // Step 3: Local ML
-    println!("[3/4] Local ML");
-    println!("  Local ML runs models on your machine for:");
-    println!("  - Code retrieval: surfaces relevant code before the LLM responds");
-    println!("  - Privacy scanning: detects and redacts secrets before they reach the API");
-    println!("  - Ghost text: inline code completions in the TUI\n");
-
-    let enable_ml = prompt_yes_no("  Enable local ML? [Y/n]: ")?;
-    println!();
-
-    // Step 4: Privacy Scanning
-    println!("[4/4] Privacy Scanning");
-    let enable_privacy = if enable_ml {
-        prompt_yes_no("  Enable privacy scanning? [Y/n]: ")?
-    } else {
-        false
-    };
-    println!();
-
-    // Write config and download models
-    if enable_ml || enable_privacy {
-        merge_local_ml_config(cwd, enable_ml, enable_privacy)?;
-    }
-    if enable_ml {
-        download_required_models(&cfg, false)?;
-    }
+    run_wizard_steps(cwd, &cfg)?;
 
     println!("\nSetup complete! Run `codingbuddy chat` to start.");
     Ok(())
@@ -276,14 +267,13 @@ fn download_required_models(cfg: &AppConfig, json_mode: bool) -> Result<Vec<(Str
     let embedding = model_registry::default_embedding_model();
     let completion = model_registry::default_completion_model();
 
-    let models = [
-        (embedding.model_id, embedding.display_name),
-        (completion.model_id, completion.display_name),
-    ];
+    let models = [embedding, completion];
 
     let mut results = Vec::new();
 
-    for (model_id, display_name) in &models {
+    for entry in &models {
+        let model_id = entry.model_id;
+        let display_name = entry.display_name;
         let status = manager.status(model_id);
         if status == ModelStatus::Ready {
             if !json_mode {
@@ -298,15 +288,21 @@ fn download_required_models(cfg: &AppConfig, json_mode: bool) -> Result<Vec<(Str
             std::io::stdout().flush()?;
         }
 
-        match manager.ensure_model_with_progress(model_id, |current, total| {
-            if !json_mode && total > 0 {
-                print!(
-                    "\r  Downloading {} ({})... [{}/{}]",
-                    display_name, model_id, current, total
-                );
-                let _ = std::io::stdout().flush();
-            }
-        }) {
+        let files = entry.download_files();
+        match manager.ensure_model_with_progress(
+            model_id,
+            entry.hf_repo,
+            &files,
+            |current, total| {
+                if !json_mode && total > 0 {
+                    print!(
+                        "\r  Downloading {} ({})... [{}/{}]",
+                        display_name, model_id, current, total
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            },
+        ) {
             Ok(_) => {
                 if !json_mode {
                     println!(
@@ -557,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_offer_skips_when_already_enabled() {
+    fn first_time_setup_skips_when_fully_configured() {
         let tmp = TempDir::new().unwrap();
         let cwd = tmp.path();
         let dir = cwd.join(".codingbuddy");
@@ -568,16 +564,21 @@ mod tests {
         )
         .unwrap();
 
+        // Set API key so has_api_key returns true
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "test-key") };
+
         let cfg = AppConfig::ensure(cwd).unwrap();
-        // Should write the marker without prompting (non-interactive in test)
-        maybe_offer_local_ml(cwd, &cfg).unwrap();
+        // Should write the marker without prompting (already configured + non-interactive)
+        maybe_first_time_setup(cwd, &cfg).unwrap();
 
         // Marker should exist
         assert!(dir.join(SETUP_MARKER).exists());
+
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
     }
 
     #[test]
-    fn maybe_offer_skips_when_marker_exists() {
+    fn first_time_setup_skips_when_marker_exists() {
         let tmp = TempDir::new().unwrap();
         let cwd = tmp.path();
         let dir = cwd.join(".codingbuddy");
@@ -587,7 +588,7 @@ mod tests {
 
         let cfg = AppConfig::ensure(cwd).unwrap();
         // Should return immediately — no prompt, no config change
-        maybe_offer_local_ml(cwd, &cfg).unwrap();
+        maybe_first_time_setup(cwd, &cfg).unwrap();
     }
 
     #[test]

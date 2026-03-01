@@ -38,16 +38,12 @@ impl ModelManager {
 
     /// Get the current status of a model. Returns `NotDownloaded` if unknown.
     pub fn status(&self, model_id: &str) -> ModelStatus {
-        // Check if the model directory exists and has files
-        let model_path = self.cache_dir.join(model_id);
         if let Some(status) = self.statuses.get(model_id) {
             return status.clone();
         }
-        if model_path.exists() && model_path.is_dir() {
-            // Check if it has at least a config file
-            if model_path.join("config.json").exists() {
-                return ModelStatus::Ready;
-            }
+        let model_path = self.cache_dir.join(model_id);
+        if model_path.is_dir() && has_model_files(&model_path) {
+            return ModelStatus::Ready;
         }
         ModelStatus::NotDownloaded
     }
@@ -82,89 +78,46 @@ impl ModelManager {
 
     /// Ensure a model is downloaded and ready. Without `local-ml` feature,
     /// this only checks if the model directory exists.
-    pub fn ensure_model(&mut self, model_id: &str) -> anyhow::Result<PathBuf> {
-        let model_path = self.cache_dir.join(model_id);
-        match self.status(model_id) {
-            ModelStatus::Ready => Ok(model_path),
-            ModelStatus::NotDownloaded => {
-                #[cfg(feature = "local-ml")]
-                {
-                    self.download_model(model_id)?;
-                    Ok(model_path)
-                }
-                #[cfg(not(feature = "local-ml"))]
-                {
-                    anyhow::bail!(
-                        "model '{}' not found and local-ml feature not enabled for download",
-                        model_id
-                    )
-                }
-            }
-            ModelStatus::Downloading => {
-                anyhow::bail!("model '{}' is currently downloading", model_id)
-            }
-            ModelStatus::Error(e) => {
-                anyhow::bail!("model '{}' has error: {}", model_id, e)
-            }
-        }
-    }
-
-    #[cfg(feature = "local-ml")]
-    fn download_model(&mut self, model_id: &str) -> anyhow::Result<()> {
-        use std::fs;
-
-        self.statuses
-            .insert(model_id.to_string(), ModelStatus::Downloading);
-
-        let model_path = self.cache_dir.join(model_id);
-        fs::create_dir_all(&model_path)?;
-
-        // Use hf-hub to download the model
-        let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.model(model_id.to_string());
-
-        // Download essential files
-        for filename in &["config.json", "tokenizer.json", "model.safetensors"] {
-            match repo.get(filename) {
-                Ok(path) => {
-                    let dest = model_path.join(filename);
-                    if !dest.exists() {
-                        fs::copy(path, dest)?;
-                    }
-                }
-                Err(_) => {
-                    // Some files are optional (e.g., model might be split)
-                    continue;
-                }
-            }
-        }
-
-        self.statuses
-            .insert(model_id.to_string(), ModelStatus::Ready);
-        Ok(())
+    ///
+    /// - `model_id`: internal identifier (used as cache directory name)
+    /// - `hf_repo`: HuggingFace repository to download from
+    /// - `files`: list of filenames to download from the repo
+    pub fn ensure_model(
+        &mut self,
+        model_id: &str,
+        hf_repo: &str,
+        files: &[&str],
+    ) -> anyhow::Result<PathBuf> {
+        self.ensure_model_with_progress(model_id, hf_repo, files, |_, _| {})
     }
 
     /// Like `ensure_model`, but calls `progress_cb(file_index, total_files)` for each file.
+    ///
+    /// The callback fires with `(0, total)` before downloading the first file,
+    /// `(1, total)` after the first file, etc. When the model is already ready,
+    /// a single `(total, total)` is emitted.
     pub fn ensure_model_with_progress<F: Fn(usize, usize)>(
         &mut self,
         model_id: &str,
+        hf_repo: &str,
+        files: &[&str],
         progress_cb: F,
     ) -> anyhow::Result<PathBuf> {
         let model_path = self.cache_dir.join(model_id);
         match self.status(model_id) {
             ModelStatus::Ready => {
-                progress_cb(1, 1);
+                progress_cb(files.len(), files.len());
                 Ok(model_path)
             }
             ModelStatus::NotDownloaded => {
                 #[cfg(feature = "local-ml")]
                 {
-                    self.download_model_with_progress(model_id, progress_cb)?;
+                    self.download_model(model_id, hf_repo, files, &progress_cb)?;
                     Ok(model_path)
                 }
                 #[cfg(not(feature = "local-ml"))]
                 {
-                    let _ = progress_cb;
+                    let _ = (hf_repo, files, progress_cb);
                     anyhow::bail!(
                         "model '{}' not found and local-ml feature not enabled for download",
                         model_id
@@ -181,10 +134,12 @@ impl ModelManager {
     }
 
     #[cfg(feature = "local-ml")]
-    fn download_model_with_progress<F: Fn(usize, usize)>(
+    fn download_model(
         &mut self,
         model_id: &str,
-        progress_cb: F,
+        hf_repo: &str,
+        files: &[&str],
+        progress_cb: &dyn Fn(usize, usize),
     ) -> anyhow::Result<()> {
         use std::fs;
 
@@ -195,11 +150,9 @@ impl ModelManager {
         fs::create_dir_all(&model_path)?;
 
         let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.model(model_id.to_string());
+        let repo = api.model(hf_repo.to_string());
 
-        let files = ["config.json", "tokenizer.json", "model.safetensors"];
         let total = files.len();
-
         for (i, filename) in files.iter().enumerate() {
             progress_cb(i, total);
             match repo.get(filename) {
@@ -220,6 +173,26 @@ impl ModelManager {
     }
 }
 
+/// Check if a model directory contains weight files (config.json for SafeTensors
+/// models, or any .gguf file for quantized models).
+fn has_model_files(dir: &std::path::Path) -> bool {
+    if dir.join("config.json").exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "gguf")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,10 +207,22 @@ mod tests {
         // Initially not downloaded
         assert_eq!(mgr.status("test-model"), ModelStatus::NotDownloaded);
 
-        // Create the model directory to simulate a ready model
+        // Create the model directory with config.json → Ready (safetensors model)
         fs::create_dir_all(dir.path().join("test-model")).unwrap();
         fs::write(dir.path().join("test-model/config.json"), "{}").unwrap();
         assert_eq!(mgr.status("test-model"), ModelStatus::Ready);
+    }
+
+    #[test]
+    fn status_detects_gguf_as_ready() {
+        let dir = TempDir::new().unwrap();
+        let mgr = ModelManager::new(dir.path().to_path_buf());
+
+        // Create model dir with a .gguf file (no config.json)
+        let model_dir = dir.path().join("gguf-model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.Q4_K_M.gguf"), "fake-weights").unwrap();
+        assert_eq!(mgr.status("gguf-model"), ModelStatus::Ready);
     }
 
     #[test]
@@ -250,7 +235,9 @@ mod tests {
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(model_dir.join("config.json"), "{}").unwrap();
 
-        let path = mgr.ensure_model("my-model").unwrap();
+        let path = mgr
+            .ensure_model("my-model", "org/my-model", &["config.json"])
+            .unwrap();
         assert_eq!(path, model_dir);
     }
 
@@ -264,15 +251,23 @@ mod tests {
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(model_dir.join("config.json"), "{}").unwrap();
 
-        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let called_clone = called.clone();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let files = &["config.json", "tokenizer.json", "model.safetensors"];
         let path = mgr
-            .ensure_model_with_progress("ready-model", move |_current, _total| {
-                called_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-            })
+            .ensure_model_with_progress(
+                "ready-model",
+                "org/ready-model",
+                files,
+                move |current, total| {
+                    calls_clone.lock().unwrap().push((current, total));
+                },
+            )
             .unwrap();
         assert_eq!(path, model_dir);
-        assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        let recorded = calls.lock().unwrap();
+        // Already-ready model emits a single (total, total) completion signal
+        assert_eq!(*recorded, vec![(3, 3)]);
     }
 
     #[test]

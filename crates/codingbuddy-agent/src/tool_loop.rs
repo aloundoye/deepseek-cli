@@ -1013,17 +1013,43 @@ impl<'a> ToolUseLoop<'a> {
                 }
             }
 
-            // Doom loop detection: check if the model is repeating identical calls
+            // Doom loop detection: check if the model is repeating identical calls.
+            // When detected, STOP the tool loop (blocking gate) — the model cannot
+            // continue without the user explicitly sending a new message.
+            let mut doom_loop_detected = false;
             for llm_call in response.tool_calls.iter() {
                 let args: serde_json::Value =
                     serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({}));
                 if self.doom_loop_tracker.record(&llm_call.name, &args) {
-                    self.messages.push(ChatMessage::System {
-                        content: DOOM_LOOP_GUIDANCE.to_string(),
-                    });
-                    self.doom_loop_tracker.mark_warned();
-                    break; // One guidance injection per turn
+                    doom_loop_detected = true;
+                    break;
                 }
+            }
+            if doom_loop_detected {
+                self.emit(StreamChunk::SecurityWarning {
+                    message: format!(
+                        "Doom loop detected: model repeated identical tool calls {}+ times. \
+                         Stopping to prevent infinite loop. Send a new message to continue.",
+                        DOOM_LOOP_THRESHOLD
+                    ),
+                });
+                self.messages.push(ChatMessage::System {
+                    content: DOOM_LOOP_GUIDANCE.to_string(),
+                });
+                self.doom_loop_tracker.mark_warned();
+                // Terminate the tool loop — this is a blocking gate.
+                // The model cannot continue; the user must send a new message.
+                self.emit(StreamChunk::Done {
+                    reason: Some("doom_loop".to_string()),
+                });
+                return Ok(ToolLoopResult {
+                    response: response.text.clone(),
+                    tool_calls_made,
+                    finish_reason: "doom_loop".to_string(),
+                    usage: total_usage,
+                    turns,
+                    messages: self.messages.clone(),
+                });
             }
 
             // Mid-conversation reminder: every N tool calls, inject a brief
@@ -1790,7 +1816,7 @@ impl<'a> ToolUseLoop<'a> {
         };
 
         // Strip sampling parameters and tool_choice for reasoner model (incompatible)
-        let is_reasoner = model.contains("reasoner");
+        let is_reasoner = codingbuddy_core::is_reasoner_model(&model);
         let temperature = if is_reasoner {
             None
         } else {
@@ -2743,13 +2769,14 @@ mod tests {
 
     #[test]
     fn max_turns_limit_stops_loop() {
-        // LLM always returns tool calls, never stops
+        // LLM always returns tool calls, never stops.
+        // Use different args each turn to avoid triggering doom loop detection.
         let infinite_tool_calls: Vec<LlmResponse> = (0..5)
             .map(|i| {
                 make_tool_response(vec![LlmToolCall {
                     id: format!("c{i}"),
                     name: "fs_read".to_string(),
-                    arguments: r#"{"path":"test.rs"}"#.to_string(),
+                    arguments: format!(r#"{{"path":"test_{i}.rs"}}"#),
                 }])
             })
             .collect();
@@ -4755,8 +4782,9 @@ mod tests {
     }
 
     #[test]
-    fn doom_loop_integration_injects_guidance() {
-        // Use the ScriptedLlm to simulate a model that makes the same tool call 3 times
+    fn doom_loop_terminates_loop_as_blocking_gate() {
+        // Use the ScriptedLlm to simulate a model that makes the same tool call 3 times.
+        // The doom loop gate should STOP the loop at turn 3 — turn 4 should never execute.
         let responses = vec![
             // Turn 1: model calls fs_read with same args
             LlmResponse {
@@ -4782,7 +4810,7 @@ mod tests {
                 finish_reason: "tool_calls".to_string(),
                 usage: None,
             },
-            // Turn 3: same call — should trigger doom loop guidance
+            // Turn 3: same call — should trigger doom loop gate and STOP
             LlmResponse {
                 text: String::new(),
                 reasoning_content: String::new(),
@@ -4794,9 +4822,9 @@ mod tests {
                 finish_reason: "tool_calls".to_string(),
                 usage: None,
             },
-            // Turn 4: model gives final answer after guidance
+            // Turn 4: should NEVER be reached — doom loop gate terminates the loop
             LlmResponse {
-                text: "Done.".to_string(),
+                text: "This should never appear.".to_string(),
                 reasoning_content: String::new(),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
@@ -4829,15 +4857,26 @@ mod tests {
         );
 
         let result = loop_.run("show me the main file").unwrap();
-        assert_eq!(result.response, "Done.");
 
-        // Verify doom loop guidance was injected
+        // The loop should terminate at doom loop detection (blocking gate)
+        assert_eq!(
+            result.finish_reason, "doom_loop",
+            "finish_reason should be doom_loop when gate triggers"
+        );
+
+        // Turn 4 should NOT have executed
+        assert_ne!(
+            result.response, "This should never appear.",
+            "doom loop gate should prevent further LLM calls"
+        );
+
+        // Verify doom loop guidance was injected into messages
         let has_doom_guidance = result.messages.iter().any(|m| {
             matches!(m, ChatMessage::System { content } if content.contains("repeating the same action"))
         });
         assert!(
             has_doom_guidance,
-            "doom loop guidance should be injected after 3 identical calls"
+            "doom loop guidance should be in messages for context if user continues"
         );
     }
 }

@@ -331,14 +331,17 @@ impl ApiClient {
         {
             payload["top_logprobs"] = json!(top_logprobs);
         }
-        if let Some(ref thinking) = req.thinking {
+        // Safety net: deepseek-reasoner thinks natively and rejects both
+        // `thinking` config AND `tool_choice` (HTTP 400). The callers should
+        // already omit these, but guard here as the last line of defense.
+        let is_reasoner = codingbuddy_core::is_reasoner_model(&req.model);
+        if !is_reasoner
+            && let Some(ref thinking) = req.thinking
+        {
             payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
         }
         if !req.tools.is_empty() {
             payload["tools"] = serde_json::to_value(&req.tools).unwrap_or(json!([]));
-            // Safety net: deepseek-reasoner rejects tool_choice (HTTP 400).
-            // The tool loop already strips it, but guard here as last defense.
-            let is_reasoner = req.model.to_ascii_lowercase().contains("reasoner");
             if !is_reasoner {
                 payload["tool_choice"] =
                     serde_json::to_value(&req.tool_choice).unwrap_or(json!("auto"));
@@ -1001,7 +1004,7 @@ impl ApiClient {
 /// Thinking-aware: `deepseek-chat` with thinking enabled can output up to 32K tokens,
 /// compared to 8K without thinking. `deepseek-reasoner` always outputs up to 64K.
 fn model_max_output_tokens(model: &str, thinking_enabled: bool) -> u32 {
-    if model.to_ascii_lowercase().contains("reasoner") {
+    if codingbuddy_core::is_reasoner_model(model) {
         codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS // 65536
     } else if thinking_enabled {
         codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS // 32768
@@ -1904,6 +1907,40 @@ mod tests {
         assert!(
             payload.get("tool_choice").is_none(),
             "tool_choice should be stripped for deepseek-reasoner"
+        );
+        // thinking config must also be stripped for reasoner (thinks natively)
+        assert!(
+            payload.get("thinking").is_none(),
+            "thinking should be stripped for deepseek-reasoner"
+        );
+    }
+
+    #[test]
+    fn reasoner_strips_thinking_config_from_payload() {
+        let cfg = LlmConfig::default();
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-reasoner".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(16_384)),
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req);
+        assert!(
+            payload.get("thinking").is_none(),
+            "thinking config must be stripped for deepseek-reasoner (thinks natively)"
         );
     }
 
