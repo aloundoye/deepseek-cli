@@ -28,15 +28,15 @@ pub(crate) fn maybe_first_time_setup(cwd: &Path, cfg: &AppConfig) -> Result<bool
         return Ok(false);
     }
 
-    // Only prompt in interactive terminals
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+    // If everything is already configured, just write the marker (no need to prompt)
+    if has_api_key(cfg) && cfg.local_ml.enabled {
         write_setup_marker(&marker)?;
         return Ok(false);
     }
 
-    // If everything is already configured, just write the marker
-    if has_api_key(cfg) && cfg.local_ml.enabled {
-        write_setup_marker(&marker)?;
+    // Only prompt in interactive terminals — skip without writing marker
+    // so the wizard will be offered again in a future interactive session.
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return Ok(false);
     }
 

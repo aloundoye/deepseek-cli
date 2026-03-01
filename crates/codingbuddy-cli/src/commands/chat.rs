@@ -57,9 +57,51 @@ use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
 use crate::commands::status::{current_ui_status, run_context, run_status, run_usage};
 
-fn is_max_think_selection(value: &str) -> bool {
+pub(crate) fn is_max_think_selection(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("reasoner") || lower.contains("max") || lower.contains("high")
+}
+
+/// Format `/provider` info as a plain-text string. Used by both TUI and non-TUI paths.
+fn format_provider_info(cfg: &AppConfig, provider: Option<String>) -> String {
+    let active = cfg.llm.active_provider();
+    if let Some(name) = provider {
+        if let Some(p) = cfg.llm.providers.get(&name) {
+            format!(
+                "Provider: {} ({}, model: {})\nTo switch permanently, run: codingbuddy setup",
+                name, p.base_url, p.models.chat
+            )
+        } else {
+            format!(
+                "Unknown provider: {}. Available: {}",
+                name,
+                cfg.llm
+                    .providers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    } else {
+        let mut lines = vec![format!(
+            "Current provider: {} ({})",
+            cfg.llm.provider, active.base_url
+        )];
+        for (name, p) in &cfg.llm.providers {
+            let marker = if *name == cfg.llm.provider {
+                " (active)"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {} — {} (model: {}){}",
+                name, p.base_url, p.models.chat, marker
+            ));
+        }
+        lines.push("Switch permanently with: codingbuddy setup".to_string());
+        lines.join("\n")
+    }
 }
 
 fn truncate_inline(text: &str, max_chars: usize) -> String {
@@ -1223,55 +1265,29 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Provider(provider) => {
-                    let active = cfg.llm.active_provider();
-                    if let Some(name) = provider {
-                        if let Some(p) = cfg.llm.providers.get(&name) {
-                            if json_mode {
+                    if json_mode {
+                        let active = cfg.llm.active_provider();
+                        if let Some(ref name) = provider {
+                            if let Some(p) = cfg.llm.providers.get(name) {
                                 print_json(&json!({
                                     "provider": name,
                                     "base_url": p.base_url,
                                     "model": p.models.chat,
                                 }))?;
                             } else {
-                                println!(
-                                    "Provider: {} ({}, model: {})",
-                                    name, p.base_url, p.models.chat
-                                );
-                                println!("To switch permanently, run: codingbuddy setup");
+                                print_json(&json!({"error": format!("unknown provider: {name}")}))?;
                             }
-                        } else if json_mode {
-                            print_json(&json!({"error": format!("unknown provider: {name}")}))?;
                         } else {
-                            println!("Unknown provider: {name}");
                             let names: Vec<_> = cfg.llm.providers.keys().cloned().collect();
-                            println!("Available: {}", names.join(", "));
+                            print_json(&json!({
+                                "provider": cfg.llm.provider,
+                                "base_url": active.base_url,
+                                "model": active.models.chat,
+                                "available": names,
+                            }))?;
                         }
-                    } else if json_mode {
-                        let names: Vec<_> = cfg.llm.providers.keys().cloned().collect();
-                        print_json(&json!({
-                            "provider": cfg.llm.provider,
-                            "base_url": active.base_url,
-                            "model": active.models.chat,
-                            "available": names,
-                        }))?;
                     } else {
-                        println!(
-                            "Current provider: {} ({})",
-                            cfg.llm.provider, active.base_url
-                        );
-                        println!("Available providers:");
-                        for (name, p) in &cfg.llm.providers {
-                            let marker = if *name == cfg.llm.provider {
-                                " (active)"
-                            } else {
-                                ""
-                            };
-                            println!(
-                                "  {} — {} (model: {}){}",
-                                name, p.base_url, p.models.chat, marker
-                            );
-                        }
-                        println!("\nSwitch permanently with: codingbuddy setup");
+                        println!("{}", format_provider_info(&cfg, provider));
                     }
                 }
                 SlashCommand::Cost => {
@@ -2506,24 +2522,24 @@ pub(crate) fn run_chat_tui(
                 let mut mgr =
                     codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cache_dir));
                 // Look up registry entry to get HF repo and GGUF filename
-                let entry = match codingbuddy_local_ml::model_registry::find_completion_model(
-                    &model_id,
-                ) {
-                    Some(e) if e.gguf_filename.is_some() => e,
-                    Some(_) => {
-                        eprintln!(
-                            "[codingbuddy] model '{model_id}' has no GGUF file configured, using mock"
-                        );
-                        return;
-                    }
-                    None => {
-                        eprintln!(
-                            "[codingbuddy] model '{model_id}' not found in registry, using mock"
-                        );
-                        return;
-                    }
-                };
-                let gguf_filename = entry.gguf_filename.unwrap();
+                let (entry, gguf_filename) =
+                    match codingbuddy_local_ml::model_registry::find_completion_model(&model_id) {
+                        Some(e) => match e.gguf_filename {
+                            Some(name) => (e, name),
+                            None => {
+                                eprintln!(
+                                    "[codingbuddy] model '{model_id}' has no GGUF file configured, using mock"
+                                );
+                                return;
+                            }
+                        },
+                        None => {
+                            eprintln!(
+                                "[codingbuddy] model '{model_id}' not found in registry, using mock"
+                            );
+                            return;
+                        }
+                    };
                 let files = entry.download_files();
                 let model_path = match mgr.ensure_model_with_progress(
                     &model_id,
@@ -2715,46 +2731,7 @@ pub(crate) fn run_chat_tui(
                         )
                     }
                 }
-                SlashCommand::Provider(provider) => {
-                    let active = cfg.llm.active_provider();
-                    if let Some(name) = provider {
-                        if let Some(p) = cfg.llm.providers.get(&name) {
-                            format!(
-                                "Provider: {} ({}, model: {})",
-                                name, p.base_url, p.models.chat
-                            )
-                        } else {
-                            format!(
-                                "Unknown provider: {}. Available: {}",
-                                name,
-                                cfg.llm
-                                    .providers
-                                    .keys()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        }
-                    } else {
-                        let mut lines = vec![format!(
-                            "Current provider: {} ({})",
-                            cfg.llm.provider, active.base_url
-                        )];
-                        for (name, p) in &cfg.llm.providers {
-                            let marker = if *name == cfg.llm.provider {
-                                " *"
-                            } else {
-                                ""
-                            };
-                            lines.push(format!(
-                                "  {} — {} (model: {}){}",
-                                name, p.base_url, p.models.chat, marker
-                            ));
-                        }
-                        lines.push("Switch with: /provider <name>".to_string());
-                        lines.join("\n")
-                    }
-                }
+                SlashCommand::Provider(provider) => format_provider_info(cfg, provider),
                 SlashCommand::Cost => {
                     let store = Store::new(cwd)?;
                     let usage = store.usage_summary(None, Some(24))?;

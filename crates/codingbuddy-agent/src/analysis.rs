@@ -55,7 +55,9 @@ pub fn analyze(
         let r = codingbuddy_core::is_reasoner_model(&m);
         (m, r)
     } else {
-        (cfg.llm.base_model.clone(), false)
+        let m = cfg.llm.base_model.clone();
+        let r = codingbuddy_core::is_reasoner_model(&m);
+        (m, r)
     };
 
     let enforce_profile_shape = matches!(options.mode, ChatMode::Ask | ChatMode::Context)
@@ -76,7 +78,7 @@ pub fn analyze(
                 8192
             },
             // Reasoner rejects temperature; deepseek-chat needs 0.0 for determinism
-            temperature: if options.force_max_think { None } else { Some(0.0) },
+            temperature: if is_reasoner { None } else { Some(0.0) },
             top_p: None,
             presence_penalty: None,
             frequency_penalty: None,

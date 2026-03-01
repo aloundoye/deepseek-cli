@@ -1242,12 +1242,9 @@ fn migrate_legacy_config(workspace: &Path) {
         }
         #[cfg(not(unix))]
         {
-            // On non-Unix, copy the directory structure
-            if let Err(e) = std::fs::create_dir_all(&target_models) {
-                eprintln!("Warning: could not create models dir: {e}");
-            } else {
-                migrated.push("models/");
-            }
+            // On non-Unix, symlinks aren't portable. Skip model migration —
+            // models will be re-downloaded on next use.
+            eprintln!("Note: model directory not migrated (non-Unix). Models will re-download on next use.");
         }
     }
 

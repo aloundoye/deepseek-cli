@@ -18,7 +18,7 @@ use codingbuddy_core::{
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
 use codingbuddy_llm::LlmClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -67,6 +67,9 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 
 /// Size of the recent call history window for doom loop detection.
 const DOOM_LOOP_HISTORY_SIZE: usize = 10;
+
+/// Finish reason emitted when the doom loop gate terminates the tool loop.
+const FINISH_REASON_DOOM_LOOP: &str = "doom_loop";
 
 /// Guidance injected when a doom loop is detected (model repeating the same tool call).
 const DOOM_LOOP_GUIDANCE: &str = "STOP — You are repeating the same action without making progress. \
@@ -321,7 +324,7 @@ struct CircuitBreakerState {
 #[derive(Debug, Clone)]
 struct DoomLoopTracker {
     /// Rolling window of recent (tool_name, args_hash) pairs.
-    recent_calls: Vec<(String, u64)>,
+    recent_calls: VecDeque<(String, u64)>,
     /// Whether doom loop guidance has been injected (reset when model uses a different call).
     warning_injected: bool,
 }
@@ -329,7 +332,7 @@ struct DoomLoopTracker {
 impl Default for DoomLoopTracker {
     fn default() -> Self {
         Self {
-            recent_calls: Vec::with_capacity(DOOM_LOOP_HISTORY_SIZE),
+            recent_calls: VecDeque::with_capacity(DOOM_LOOP_HISTORY_SIZE),
             warning_injected: false,
         }
     }
@@ -337,28 +340,28 @@ impl Default for DoomLoopTracker {
 
 impl DoomLoopTracker {
     /// Record a tool call. Returns `true` if a doom loop is detected.
-    fn record(&mut self, tool_name: &str, args: &serde_json::Value) -> bool {
+    ///
+    /// Hashes the raw args string directly (no JSON round-trip) for efficiency.
+    fn record(&mut self, tool_name: &str, raw_args: &str) -> bool {
         use std::hash::{Hash, Hasher};
 
-        // Hash the canonical JSON args to detect identical calls
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let canonical = serde_json::to_string(args).unwrap_or_default();
-        canonical.hash(&mut hasher);
+        raw_args.hash(&mut hasher);
         let args_hash = hasher.finish();
 
         let entry = (tool_name.to_string(), args_hash);
 
         // Check if this is a different call than the last one — reset warning
-        if let Some(last) = self.recent_calls.last()
+        if let Some(last) = self.recent_calls.back()
             && *last != entry
         {
             self.warning_injected = false;
         }
 
         // Add to rolling window
-        self.recent_calls.push(entry.clone());
+        self.recent_calls.push_back(entry.clone());
         if self.recent_calls.len() > DOOM_LOOP_HISTORY_SIZE {
-            self.recent_calls.remove(0);
+            self.recent_calls.pop_front();
         }
 
         // Count occurrences of this exact call in recent history
@@ -1018,9 +1021,7 @@ impl<'a> ToolUseLoop<'a> {
             // continue without the user explicitly sending a new message.
             let mut doom_loop_detected = false;
             for llm_call in response.tool_calls.iter() {
-                let args: serde_json::Value =
-                    serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({}));
-                if self.doom_loop_tracker.record(&llm_call.name, &args) {
+                if self.doom_loop_tracker.record(&llm_call.name, &llm_call.arguments) {
                     doom_loop_detected = true;
                     break;
                 }
@@ -1040,12 +1041,12 @@ impl<'a> ToolUseLoop<'a> {
                 // Terminate the tool loop — this is a blocking gate.
                 // The model cannot continue; the user must send a new message.
                 self.emit(StreamChunk::Done {
-                    reason: Some("doom_loop".to_string()),
+                    reason: Some(FINISH_REASON_DOOM_LOOP.to_string()),
                 });
                 return Ok(ToolLoopResult {
                     response: response.text.clone(),
                     tool_calls_made,
-                    finish_reason: "doom_loop".to_string(),
+                    finish_reason: FINISH_REASON_DOOM_LOOP.to_string(),
                     usage: total_usage,
                     turns,
                     messages: self.messages.clone(),
@@ -4685,18 +4686,18 @@ mod tests {
     #[test]
     fn doom_loop_detects_repeated_identical_calls() {
         let mut tracker = DoomLoopTracker::default();
-        let args = serde_json::json!({"file_path": "/src/main.rs"});
+        let args = r#"{"file_path":"/src/main.rs"}"#;
 
         assert!(
-            !tracker.record("fs_read", &args),
+            !tracker.record("fs_read", args),
             "first call: no doom loop"
         );
         assert!(
-            !tracker.record("fs_read", &args),
+            !tracker.record("fs_read", args),
             "second call: no doom loop"
         );
         assert!(
-            tracker.record("fs_read", &args),
+            tracker.record("fs_read", args),
             "third call: doom loop detected"
         );
     }
@@ -4705,44 +4706,44 @@ mod tests {
     fn doom_loop_no_false_positive_on_different_args() {
         let mut tracker = DoomLoopTracker::default();
 
-        tracker.record("fs_read", &serde_json::json!({"file_path": "/a.rs"}));
-        tracker.record("fs_read", &serde_json::json!({"file_path": "/b.rs"}));
-        let detected = tracker.record("fs_read", &serde_json::json!({"file_path": "/c.rs"}));
+        tracker.record("fs_read", r#"{"file_path":"/a.rs"}"#);
+        tracker.record("fs_read", r#"{"file_path":"/b.rs"}"#);
+        let detected = tracker.record("fs_read", r#"{"file_path":"/c.rs"}"#);
         assert!(!detected, "different args should not trigger doom loop");
     }
 
     #[test]
     fn doom_loop_no_false_positive_on_different_tools() {
         let mut tracker = DoomLoopTracker::default();
-        let args = serde_json::json!({"file_path": "/main.rs"});
+        let args = r#"{"file_path":"/main.rs"}"#;
 
-        tracker.record("fs_read", &args);
-        tracker.record("fs_glob", &args);
-        let detected = tracker.record("fs_grep", &args);
+        tracker.record("fs_read", args);
+        tracker.record("fs_glob", args);
+        let detected = tracker.record("fs_grep", args);
         assert!(!detected, "different tools should not trigger doom loop");
     }
 
     #[test]
     fn doom_loop_resets_warning_on_different_call() {
         let mut tracker = DoomLoopTracker::default();
-        let args = serde_json::json!({"file_path": "/main.rs"});
+        let args = r#"{"file_path":"/main.rs"}"#;
 
-        tracker.record("fs_read", &args);
-        tracker.record("fs_read", &args);
-        assert!(tracker.record("fs_read", &args));
+        tracker.record("fs_read", args);
+        tracker.record("fs_read", args);
+        assert!(tracker.record("fs_read", args));
         tracker.mark_warned();
 
         // Same call again — no new warning because already warned
-        assert!(!tracker.record("fs_read", &args));
+        assert!(!tracker.record("fs_read", args));
 
         // Different call resets
-        tracker.record("fs_edit", &serde_json::json!({}));
+        tracker.record("fs_edit", "{}");
 
         // Now back to original — should detect again
-        tracker.record("fs_read", &args);
-        tracker.record("fs_read", &args);
+        tracker.record("fs_read", args);
+        tracker.record("fs_read", args);
         assert!(
-            tracker.record("fs_read", &args),
+            tracker.record("fs_read", args),
             "should detect after reset"
         );
     }
@@ -4750,34 +4751,34 @@ mod tests {
     #[test]
     fn doom_loop_warning_only_fires_once() {
         let mut tracker = DoomLoopTracker::default();
-        let args = serde_json::json!({"file_path": "/main.rs"});
+        let args = r#"{"file_path":"/main.rs"}"#;
 
-        tracker.record("fs_read", &args);
-        tracker.record("fs_read", &args);
-        assert!(tracker.record("fs_read", &args));
+        tracker.record("fs_read", args);
+        tracker.record("fs_read", args);
+        assert!(tracker.record("fs_read", args));
         tracker.mark_warned();
 
         // Subsequent identical calls should NOT re-trigger
-        assert!(!tracker.record("fs_read", &args));
-        assert!(!tracker.record("fs_read", &args));
+        assert!(!tracker.record("fs_read", args));
+        assert!(!tracker.record("fs_read", args));
     }
 
     #[test]
     fn doom_loop_respects_history_window() {
         let mut tracker = DoomLoopTracker::default();
-        let target_args = serde_json::json!({"file_path": "/main.rs"});
+        let target_args = r#"{"file_path":"/main.rs"}"#;
 
         // Two identical calls
-        tracker.record("fs_read", &target_args);
-        tracker.record("fs_read", &target_args);
+        tracker.record("fs_read", target_args);
+        tracker.record("fs_read", target_args);
 
         // Fill with enough different calls to push the first two out of the window
         for i in 0..DOOM_LOOP_HISTORY_SIZE {
-            tracker.record("fs_glob", &serde_json::json!({"pattern": format!("*.{i}")}));
+            tracker.record("fs_glob", &format!(r#"{{"pattern":"*.{i}"}}"#));
         }
 
         // Now the original calls are outside the window — one more should not trigger
-        let detected = tracker.record("fs_read", &target_args);
+        let detected = tracker.record("fs_read", target_args);
         assert!(!detected, "old calls outside window should not count");
     }
 
