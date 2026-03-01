@@ -1,5 +1,5 @@
 [llm]
-# DeepSeek API model settings
+# CodingBuddy API model settings
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 provider = "deepseek"
@@ -54,9 +54,9 @@ max_lanes = 4
 max_concurrency = 2
 
 [git]
-# Verify-pass never commits automatically. Commit is explicit via /commit or deepseek git commit.
+# Verify-pass never commits automatically. Commit is explicit via /commit or codingbuddy git commit.
 auto_commit_on_verify_pass = false
-commit_message_template = "deepseek: {goal}"
+commit_message_template = "codingbuddy: {goal}"
 require_signing = false
 allowed_branch_patterns = []
 # commit_message_regex = "^(feat|fix|chore):\\s.+$"
@@ -84,17 +84,17 @@ allow_stub_fallback = false
 
 [plugins]
 enabled = true
-search_paths = [".deepseek/plugins", ".plugins"]
+search_paths = [".codingbuddy/plugins", ".plugins"]
 enable_hooks = false
 
 [plugins.catalog]
 enabled = true
-index_url = ".deepseek/plugins/catalog.json"
-signature_key = "deepseek-local-dev-key"
+index_url = ".codingbuddy/plugins/catalog.json"
+signature_key = "codingbuddy-local-dev-key"
 refresh_hours = 24
 
 [skills]
-paths = [".deepseek/skills", "~/.deepseek/skills"]
+paths = [".codingbuddy/skills", "~/.codingbuddy/skills"]
 hot_reload = true
 
 [usage]
@@ -123,7 +123,7 @@ strict_mode = true
 
 [ui]
 enable_tui = true
-keybindings_path = "~/.deepseek/keybindings.json"
+keybindings_path = "~/.codingbuddy/keybindings.json"
 reduced_motion = false
 statusline_mode = "minimal"
 # Thinking display mode in TUI: concise | raw

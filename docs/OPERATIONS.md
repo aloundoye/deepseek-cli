@@ -1,4 +1,4 @@
-# DeepSeek CLI Operations Playbook
+# CodingBuddy Operations Playbook
 
 ## Incident severity
 - SEV1: data loss, unsafe command execution, or widespread CLI crash.
@@ -7,7 +7,7 @@
 
 ## Immediate response
 1. Stop rollout and pin users to last known good release.
-2. Capture failing command, logs (`.deepseek/observe.log`), and event stream (`.deepseek/events.jsonl`).
+2. Capture failing command, logs (`.codingbuddy/observe.log`), and event stream (`.codingbuddy/events.jsonl`).
 3. Open incident issue with timeline and affected versions.
 
 ## Common failure modes and responses
@@ -23,7 +23,7 @@
   - Confirm no path traversal or secret-path attempts.
   - For healthcare deployments, tighten `[policy].block_paths` and `[policy].redact_patterns` for PHI/secret controls.
 - Patch conflicts / base drift:
-  - Inspect patch metadata in `.deepseek/patches/<id>.json`.
+  - Inspect patch metadata in `.codingbuddy/patches/<id>.json`.
   - Re-stage from current workspace state.
 - Index corruption:
   - Run `deepseek index build` to rebuild manifest + Tantivy index.
@@ -32,7 +32,7 @@
   - Re-run core workflow without plugins.
 - Local ML failures:
   - **Embeddings backend unavailable**: Falls back to `MockEmbeddings` (deterministic SHA-256 hash, not semantic but provides consistent retrieval). Set `local_ml.enabled=false` to disable entirely.
-  - **Vector index corruption**: Delete `.deepseek/vector_index.sqlite` and restart — lazy indexing rebuilds on next query.
+  - **Vector index corruption**: Delete `.codingbuddy/vector_index.sqlite` and restart — lazy indexing rebuilds on next query.
   - **Candle model load failure**: Check `local_ml.cache_dir` permissions and disk space. Falls back to mock backend automatically.
   - **Retrieval returns irrelevant results**: Rebuild index with `deepseek index --hybrid doctor`. Check `local_ml.chunker.window_size` settings.
   - **Privacy false positives**: Adjust `local_ml.privacy.path_globs` and `local_ml.privacy.content_patterns` in project config.

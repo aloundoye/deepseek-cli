@@ -5,9 +5,9 @@ This extension is a starter architecture for Chrome parity with a native messagi
 ## What It Adds
 
 - MV3 extension shell (`manifest.json`, `background.js`, `popup.html`, `popup.js`)
-- Native messaging host template (`native-messaging/com.deepseek.cli.template.json`)
+- Native messaging host template (`native-messaging/com.codingbuddy.cli.template.json`)
 - Installer script (`native-messaging/install_native_host.sh`)
-- Host wrapper script (`native-messaging/deepseek_native_host.sh`) that runs:
+- Host wrapper script (`native-messaging/codingbuddy_native_host.sh`) that runs:
 
 ```bash
 deepseek native-host
@@ -32,12 +32,12 @@ BROWSER=chromium ./install_native_host.sh <extension-id> /absolute/path/to/deeps
 
 ## Runtime Flow
 
-1. Extension service worker uses `chrome.runtime.connectNative("com.deepseek.cli")`.
+1. Extension service worker uses `chrome.runtime.connectNative("com.codingbuddy.cli")`.
 2. Native host launches `deepseek native-host`.
-3. Host bridges Chrome native messaging frames to DeepSeek JSON-RPC handler.
+3. Host bridges Chrome native messaging frames to CodingBuddy JSON-RPC handler.
 4. Extension sends JSON-RPC requests (`status`, `session/open`, `session/list`, `prompt/execute`, etc.).
 
 ## Notes
 
 - This is a parity-focused foundation, not a published store extension.
-- Keep extension and host IDs aligned (`com.deepseek.cli`).
+- Keep extension and host IDs aligned (`com.codingbuddy.cli`).

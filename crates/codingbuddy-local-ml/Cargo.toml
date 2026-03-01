@@ -1,0 +1,48 @@
+[package]
+name = "codingbuddy-local-ml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+local-ml = [
+    "candle-core", "candle-nn", "candle-transformers",
+    "tokenizers", "hf-hub", "usearch",
+    "tree-sitter", "tree-sitter-rust", "tree-sitter-python",
+    "tree-sitter-javascript", "tree-sitter-typescript",
+    "tree-sitter-go", "tree-sitter-java",
+]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rusqlite.workspace = true
+ignore.workspace = true
+regex.workspace = true
+rayon.workspace = true
+glob.workspace = true
+codingbuddy-core = { path = "../codingbuddy-core" }
+codingbuddy-index = { path = "../codingbuddy-index" }
+
+# Feature-gated ML dependencies
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "0.4", optional = true }
+usearch = { version = "2.21", optional = true }
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true

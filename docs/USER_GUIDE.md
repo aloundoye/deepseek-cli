@@ -1,6 +1,6 @@
-# DeepSeek CLI User Guide
+# CodingBuddy User Guide
 
-A complete guide to using DeepSeek CLI — from first install to advanced features.
+A complete guide to using CodingBuddy — from first install to advanced features.
 
 ---
 
@@ -82,15 +82,15 @@ Or persist it per-project:
 
 ```bash
 mkdir -p .deepseek
-echo '{"llm": {"api_key": "sk-..."}}' > .deepseek/settings.local.json
+echo '{"llm": {"api_key": "sk-..."}}' > .codingbuddy/settings.local.json
 ```
 
-Add `.deepseek/settings.local.json` to your `.gitignore`.
+Add `.codingbuddy/settings.local.json` to your `.gitignore`.
 
 ### Start chatting
 
 ```bash
-deepseek chat
+codingbuddy chat
 ```
 
 This opens the interactive TUI. Type your request and press Enter.
@@ -117,7 +117,7 @@ deepseek plan "Refactor the authentication module"
 
 | Mode | Command | What it does | Agent Profile |
 |------|---------|-------------|---------------|
-| **Code** (default) | `deepseek chat` | Full agent with all tools — reads, writes, runs commands | None (full tool set) or Plan (if planning keywords detected) |
+| **Code** (default) | `codingbuddy chat` | Full agent with all tools — reads, writes, runs commands | None (full tool set) or Plan (if planning keywords detected) |
 | **Ask** | `deepseek ask "..."` | Read-only — answers questions using code search, never modifies files | Explore (read-only tools only) |
 | **Context** | `/context` in chat | Read-only with focus on project structure and dependencies | Explore (read-only tools only) |
 
@@ -265,7 +265,7 @@ All write operations (edits, shell commands) require your approval unless you've
 
 ## How the Agent Thinks
 
-DeepSeek CLI wraps every conversation in intelligence layers. You don't need to configure these — they work automatically.
+CodingBuddy wraps every conversation in intelligence layers. You don't need to configure these — they work automatically.
 
 ### Project Awareness
 
@@ -386,7 +386,7 @@ deepseek permissions dry-run bash_run  # Test what would happen
 
 ### Team-Managed Policies
 
-Enterprise teams can lock settings via `.deepseek/managed-settings.json`:
+Enterprise teams can lock settings via `.codingbuddy/managed-settings.json`:
 
 ```json
 {
@@ -406,7 +406,7 @@ Hooks let you run shell commands at specific points in the agent lifecycle.
 
 ### Configuration
 
-Add to `.deepseek/settings.json`:
+Add to `.codingbuddy/settings.json`:
 
 ```json
 {
@@ -458,13 +458,13 @@ Skills are reusable prompt templates stored as markdown files.
 ### Location
 
 Skills are discovered from:
-1. `.deepseek/skills/` (project skills)
-2. `~/.deepseek/skills/` (user skills)
+1. `.codingbuddy/skills/` (project skills)
+2. `~/.codingbuddy/skills/` (user skills)
 3. Built-in skills
 
 ### Creating a Skill
 
-Create `.deepseek/skills/review-security.md`:
+Create `.codingbuddy/skills/review-security.md`:
 
 ```markdown
 ---
@@ -518,7 +518,7 @@ Subagents can run in isolated git worktrees — they get a full copy of the repo
 
 ### Custom Agents
 
-Define custom agents in `.deepseek/agents/`:
+Define custom agents in `.codingbuddy/agents/`:
 
 ```markdown
 ---
@@ -545,11 +545,11 @@ deepseek agents create <name>      # Create a new agent definition
 
 ## MCP Servers
 
-DeepSeek CLI supports the Model Context Protocol (MCP) for connecting to external tool servers.
+CodingBuddy supports the Model Context Protocol (MCP) for connecting to external tool servers.
 
 ### Configuration
 
-Add MCP servers to `.deepseek/settings.json`:
+Add MCP servers to `.codingbuddy/settings.json`:
 
 ```json
 {
@@ -643,7 +643,7 @@ deepseek replay run --session-id <id>  # Replay a session deterministically
 
 ## Code Index
 
-DeepSeek CLI can build a local code index for fast search across your project.
+CodingBuddy can build a local code index for fast search across your project.
 
 ```bash
 deepseek index build               # Build the index
@@ -704,10 +704,10 @@ Review output follows a structured findings schema with severity levels. Use `--
 
 Configuration merges in this order (later wins):
 
-1. `.deepseek/config.toml` (legacy)
-2. `~/.deepseek/settings.json` (user — applies to all projects)
-3. `.deepseek/settings.json` (project — shared with team)
-4. `.deepseek/settings.local.json` (local overrides — gitignored)
+1. `.codingbuddy/config.toml` (legacy)
+2. `~/.codingbuddy/settings.json` (user — applies to all projects)
+3. `.codingbuddy/settings.json` (project — shared with team)
+4. `.codingbuddy/settings.local.json` (local overrides — gitignored)
 
 ### View & Edit
 
@@ -756,7 +756,7 @@ See `docs/CONFIG_REFERENCE.md` for the full reference.
 Error: missing API key
 ```
 
-Set `DEEPSEEK_API_KEY` in your environment or add it to `.deepseek/settings.local.json`. In interactive mode, you'll be prompted if the key is missing.
+Set `DEEPSEEK_API_KEY` in your environment or add it to `.codingbuddy/settings.local.json`. In interactive mode, you'll be prompted if the key is missing.
 
 ### Rate Limits / Timeouts
 

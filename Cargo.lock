@@ -543,6 +543,410 @@ dependencies = [
 ]
 
 [[package]]
+name = "codingbuddy-agent"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "codingbuddy-context",
+ "codingbuddy-core",
+ "codingbuddy-diff",
+ "codingbuddy-hooks",
+ "codingbuddy-index",
+ "codingbuddy-llm",
+ "codingbuddy-local-ml",
+ "codingbuddy-mcp",
+ "codingbuddy-memory",
+ "codingbuddy-observe",
+ "codingbuddy-policy",
+ "codingbuddy-skills",
+ "codingbuddy-store",
+ "codingbuddy-subagent",
+ "codingbuddy-testkit",
+ "codingbuddy-tools",
+ "ignore",
+ "notify",
+ "regex",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "strsim",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-chrome"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tungstenite",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-cli"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "codingbuddy-agent",
+ "codingbuddy-chrome",
+ "codingbuddy-context",
+ "codingbuddy-core",
+ "codingbuddy-diff",
+ "codingbuddy-errors",
+ "codingbuddy-index",
+ "codingbuddy-jsonrpc",
+ "codingbuddy-local-ml",
+ "codingbuddy-mcp",
+ "codingbuddy-memory",
+ "codingbuddy-policy",
+ "codingbuddy-skills",
+ "codingbuddy-store",
+ "codingbuddy-subagent",
+ "codingbuddy-tools",
+ "codingbuddy-ui",
+ "crossterm",
+ "glob",
+ "ignore",
+ "regex",
+ "reqwest 0.13.2",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "termimad",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-context"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "ignore",
+ "indexmap",
+ "petgraph",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "streaming-iterator",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-go",
+ "tree-sitter-haskell",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+ "tree-sitter-zig",
+ "walkdir",
+]
+
+[[package]]
+name = "codingbuddy-core"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-diff"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codingbuddy-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-errors"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "codingbuddy-hooks"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wait-timeout",
+]
+
+[[package]]
+name = "codingbuddy-index"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "codingbuddy-core",
+ "ignore",
+ "notify",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tantivy",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-jsonrpc"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codingbuddy-agent",
+ "codingbuddy-context",
+ "codingbuddy-core",
+ "codingbuddy-errors",
+ "codingbuddy-store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-llm"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codingbuddy-core",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "codingbuddy-local-ml"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "codingbuddy-core",
+ "codingbuddy-index",
+ "glob",
+ "hf-hub",
+ "ignore",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokenizers",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "usearch",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-mcp"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "codingbuddy-store",
+ "glob",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-memory"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codingbuddy-core",
+ "codingbuddy-store",
+ "glob",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "codingbuddy-observe"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codingbuddy-core",
+ "reqwest 0.13.2",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-policy"
+version = "0.6.0"
+dependencies = [
+ "codingbuddy-core",
+ "glob",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codingbuddy-skills"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "codingbuddy-core",
+ "codingbuddy-store",
+ "glob",
+ "serde",
+ "serde_json",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "codingbuddy-store"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codingbuddy-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-subagent"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-testkit"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "codingbuddy-agent",
+ "codingbuddy-core",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "codingbuddy-tools"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "codingbuddy-chrome",
+ "codingbuddy-core",
+ "codingbuddy-diff",
+ "codingbuddy-hooks",
+ "codingbuddy-index",
+ "codingbuddy-memory",
+ "codingbuddy-policy",
+ "codingbuddy-store",
+ "glob",
+ "ignore",
+ "jsonschema",
+ "libc",
+ "pdf-extract",
+ "regex",
+ "reqwest 0.13.2",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+ "wait-timeout",
+ "walkdir",
+]
+
+[[package]]
+name = "codingbuddy-ui"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "codingbuddy-core",
+ "codingbuddy-store",
+ "crossterm",
+ "glob",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "syntect",
+ "uuid",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -951,410 +1355,6 @@ name = "data-encoding"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
-
-[[package]]
-name = "deepseek-agent"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "deepseek-context",
- "deepseek-core",
- "deepseek-diff",
- "deepseek-hooks",
- "deepseek-index",
- "deepseek-llm",
- "deepseek-local-ml",
- "deepseek-mcp",
- "deepseek-memory",
- "deepseek-observe",
- "deepseek-policy",
- "deepseek-skills",
- "deepseek-store",
- "deepseek-subagent",
- "deepseek-testkit",
- "deepseek-tools",
- "ignore",
- "notify",
- "regex",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "strsim",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-chrome"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "tungstenite",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-cli"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "base64 0.22.1",
- "chrono",
- "clap",
- "clap_complete",
- "crossterm",
- "deepseek-agent",
- "deepseek-chrome",
- "deepseek-context",
- "deepseek-core",
- "deepseek-diff",
- "deepseek-errors",
- "deepseek-index",
- "deepseek-jsonrpc",
- "deepseek-local-ml",
- "deepseek-mcp",
- "deepseek-memory",
- "deepseek-policy",
- "deepseek-skills",
- "deepseek-store",
- "deepseek-subagent",
- "deepseek-tools",
- "deepseek-ui",
- "glob",
- "ignore",
- "regex",
- "reqwest 0.13.2",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "termimad",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-context"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "ignore",
- "indexmap",
- "petgraph",
- "rayon",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "streaming-iterator",
- "tempfile",
- "tree-sitter",
- "tree-sitter-c-sharp",
- "tree-sitter-go",
- "tree-sitter-haskell",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-swift",
- "tree-sitter-typescript",
- "tree-sitter-zig",
- "walkdir",
-]
-
-[[package]]
-name = "deepseek-core"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "proptest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-diff"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "deepseek-core",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-errors"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "deepseek-hooks"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "uuid",
- "wait-timeout",
-]
-
-[[package]]
-name = "deepseek-index"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "deepseek-core",
- "ignore",
- "notify",
- "serde",
- "serde_json",
- "sha2",
- "tantivy",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-jsonrpc"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "deepseek-agent",
- "deepseek-context",
- "deepseek-core",
- "deepseek-errors",
- "deepseek-store",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-llm"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "deepseek-core",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "deepseek-local-ml"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "deepseek-core",
- "deepseek-index",
- "glob",
- "hf-hub",
- "ignore",
- "rayon",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokenizers",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "usearch",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-mcp"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "deepseek-store",
- "glob",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-memory"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "deepseek-core",
- "deepseek-store",
- "glob",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "deepseek-observe"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "deepseek-core",
- "reqwest 0.13.2",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-policy"
-version = "0.6.0"
-dependencies = [
- "deepseek-core",
- "glob",
- "proptest",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "deepseek-skills"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "deepseek-core",
- "deepseek-store",
- "glob",
- "serde",
- "serde_json",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "deepseek-store"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "deepseek-core",
- "rusqlite",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-subagent"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-testkit"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "deepseek-agent",
- "deepseek-core",
- "reqwest 0.13.2",
- "serde_json",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "deepseek-tools"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "deepseek-chrome",
- "deepseek-core",
- "deepseek-diff",
- "deepseek-hooks",
- "deepseek-index",
- "deepseek-memory",
- "deepseek-policy",
- "deepseek-store",
- "glob",
- "ignore",
- "jsonschema",
- "libc",
- "pdf-extract",
- "regex",
- "reqwest 0.13.2",
- "scraper",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
- "wait-timeout",
- "walkdir",
-]
-
-[[package]]
-name = "deepseek-ui"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "crossterm",
- "deepseek-core",
- "deepseek-store",
- "glob",
- "ratatui",
- "serde",
- "serde_json",
- "signal-hook",
- "syntect",
- "uuid",
-]
 
 [[package]]
 name = "deltae"

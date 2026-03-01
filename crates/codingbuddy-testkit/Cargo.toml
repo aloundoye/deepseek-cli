@@ -1,0 +1,17 @@
+[package]
+name = "codingbuddy-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+codingbuddy-core = { path = "../codingbuddy-core" }
+codingbuddy-agent = { path = "../codingbuddy-agent" }
+
+[dev-dependencies]
+reqwest = { workspace = true }
