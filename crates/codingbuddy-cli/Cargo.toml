@@ -1,0 +1,53 @@
+[package]
+name = "codingbuddy-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codingbuddy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+rpassword.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+glob.workspace = true
+regex.workspace = true
+crossterm.workspace = true
+base64.workspace = true
+termimad = "0.30"
+codingbuddy-agent = { path = "../codingbuddy-agent" }
+codingbuddy-core = { path = "../codingbuddy-core" }
+codingbuddy-diff = { path = "../codingbuddy-diff" }
+codingbuddy-index = { path = "../codingbuddy-index" }
+codingbuddy-policy = { path = "../codingbuddy-policy" }
+codingbuddy-store = { path = "../codingbuddy-store" }
+codingbuddy-tools = { path = "../codingbuddy-tools" }
+codingbuddy-ui = { path = "../codingbuddy-ui" }
+codingbuddy-memory = { path = "../codingbuddy-memory" }
+codingbuddy-mcp = { path = "../codingbuddy-mcp" }
+codingbuddy-skills = { path = "../codingbuddy-skills" }
+codingbuddy-subagent = { path = "../codingbuddy-subagent" }
+codingbuddy-jsonrpc = { path = "../codingbuddy-jsonrpc" }
+codingbuddy-context = { path = "../codingbuddy-context" }
+codingbuddy-errors = { path = "../codingbuddy-errors" }
+codingbuddy-chrome = { path = "../codingbuddy-chrome" }
+codingbuddy-local-ml = { path = "../codingbuddy-local-ml" }
+ignore.workspace = true
+
+[features]
+default = ["local-ml"]
+local-ml = ["codingbuddy-agent/local-ml", "codingbuddy-local-ml/local-ml"]
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

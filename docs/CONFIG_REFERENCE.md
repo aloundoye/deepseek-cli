@@ -1,11 +1,11 @@
 # Configuration Reference
 
-DeepSeek CLI merges configuration from these sources (later entries win):
+CodingBuddy merges configuration from these sources (later entries win):
 
-1. Legacy fallback: `.deepseek/config.toml`
-2. User config: `~/.deepseek/settings.json`
-3. Project config: `.deepseek/settings.json`
-4. Project-local overrides: `.deepseek/settings.local.json`
+1. Legacy fallback: `.codingbuddy/config.toml`
+2. User config: `~/.codingbuddy/settings.json`
+3. Project config: `.codingbuddy/settings.json`
+4. Project-local overrides: `.codingbuddy/settings.local.json`
 
 Run `deepseek config show` to view the merged configuration. API keys are redacted in output.
 
@@ -88,7 +88,7 @@ Controls for automatic workspace context injection:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable plugin discovery and execution |
-| `search_paths` | string[] | `[".deepseek/plugins",".plugins"]` | Directories to scan for plugins |
+| `search_paths` | string[] | `[".codingbuddy/plugins",".plugins"]` | Directories to scan for plugins |
 | `enable_hooks` | bool | `false` | Enable plugin hook execution |
 
 ### `plugins.catalog`
@@ -96,7 +96,7 @@ Controls for automatic workspace context injection:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable catalog sync |
-| `index_url` | string | `".deepseek/plugins/catalog.json"` | URL or path to catalog index |
+| `index_url` | string | `".codingbuddy/plugins/catalog.json"` | URL or path to catalog index |
 | `signature_key` | string | `"deepseek-local-dev-key"` | HMAC key for catalog signature verification |
 | `refresh_hours` | int | `24` | Catalog refresh interval |
 
@@ -104,7 +104,7 @@ Controls for automatic workspace context injection:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `paths` | string[] | `[".deepseek/skills","~/.deepseek/skills"]` | Skill search directories |
+| `paths` | string[] | `[".codingbuddy/skills","~/.codingbuddy/skills"]` | Skill search directories |
 | `hot_reload` | bool | `true` | Auto-reload skills on change |
 
 ## `usage` — Cost Tracking
@@ -149,7 +149,7 @@ Controls for automatic workspace context injection:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable_tui` | bool | `true` | Enable TUI in interactive terminals |
-| `keybindings_path` | string | `"~/.deepseek/keybindings.json"` | Custom keybindings file |
+| `keybindings_path` | string | `"~/.codingbuddy/keybindings.json"` | Custom keybindings file |
 | `reduced_motion` | bool | `false` | Disable animations |
 | `statusline_mode` | string | `"minimal"` | Status line verbosity |
 | `image_fallback` | string | `"open"` | Image display fallback (`open`, `path`, `none`) |

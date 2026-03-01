@@ -1,0 +1,17 @@
+[package]
+name = "codingbuddy-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tantivy.workspace = true
+notify.workspace = true
+uuid.workspace = true
+ignore.workspace = true
+codingbuddy-core = { path = "../codingbuddy-core" }

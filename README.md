@@ -1,6 +1,6 @@
-# DeepSeek CLI
+# CodingBuddy
 
-DeepSeek CLI is a terminal-native coding agent written in Rust. It combines chat, planning, tool execution, patch workflows, indexing, and long-running autopilot loops in one cross-platform CLI.
+CodingBuddy is a terminal-native coding agent written in Rust. It combines chat, planning, tool execution, patch workflows, indexing, and long-running autopilot loops in one cross-platform CLI.
 
 ## Highlights
 - **Agent intelligence**: Adaptive complexity (Simple/Medium/Complex), planning protocols, error recovery, stuck detection
@@ -11,6 +11,7 @@ DeepSeek CLI is a terminal-native coding agent written in Rust. It combines chat
 - **Per-turn retrieval**: Vector + BM25 code search with RRF fusion — fires every turn, not just the first
 - **Privacy scanning**: 3-layer secret detection (path/content/builtin patterns) with redaction on tool outputs
 - **Ghost text**: Local ML-powered inline completions in the TUI (Tab to accept, Alt+Right for one word)
+- **Multi-provider**: DeepSeek default, any OpenAI-compatible endpoint (GLM-5, Qwen, Ollama, OpenRouter, etc.) via setup wizard or `--model` flag
 - **Model routing**: Automatically routes complex tasks to `deepseek-reasoner`, simple tasks to `deepseek-chat`
 - **Step snapshots**: Per-tool-call file snapshots with content hashing for fine-grained undo
 - **14 lifecycle hooks**: SessionStart through TaskCompleted — extend behavior at every stage
@@ -24,32 +25,32 @@ DeepSeek CLI is a terminal-native coding agent written in Rust. It combines chat
 
 ## Architecture
 
-DeepSeek CLI is a Rust workspace organized into focused crates:
+CodingBuddy is a Rust workspace organized into focused crates:
 
 | Crate | Role |
 |-------|------|
-| `deepseek-cli` | CLI dispatch, argument parsing, 30+ subcommand handlers |
-| `deepseek-agent` | Agent engine, tool-use loop, complexity classifier, prompt construction, team mode |
-| `deepseek-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `EventEnvelope`), config loading |
-| `deepseek-llm` | LLM client (`LlmClient` trait), streaming, prompt cache |
-| `deepseek-tools` | Tool definitions (enriched descriptions), plugin manager, shell runner, sandbox wrapping |
-| `deepseek-policy` | Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings` |
-| `deepseek-hooks` | 14 lifecycle events, `HookRuntime`, once/disabled fields, `PermissionDecision` |
-| `deepseek-local-ml` | Local ML via Candle: embeddings, completion, chunking, vector index, hybrid retrieval, privacy router |
-| `deepseek-store` | Session persistence (JSONL event log + SQLite projections) |
-| `deepseek-memory` | Long-term memory, shadow commits, checkpoints, step snapshots |
-| `deepseek-index` | Full-text code index (Tantivy), RAG retrieval with citations |
-| `deepseek-mcp` | MCP server management (JSON-RPC stdio/http transports) |
-| `deepseek-ui` | TUI rendering (ratatui/crossterm), autocomplete, vim mode, ML ghost text |
-| `deepseek-diff` | Unified diff parsing, patch staging, and git-apply |
-| `deepseek-context` | Context enrichment, dependency analysis (petgraph), file relevance scoring |
-| `deepseek-skills` | Skill discovery, forked execution, frontmatter parsing |
-| `deepseek-subagent` | Background tasks, worktree isolation, custom agent definitions |
-| `deepseek-observe` | Structured logging |
-| `deepseek-jsonrpc` | JSON-RPC server for IDE integration |
-| `deepseek-chrome` | Chrome native host bridge |
-| `deepseek-errors` | Error types |
-| `deepseek-testkit` | Test utilities |
+| `codingbuddy-cli` | CLI dispatch, argument parsing, 24 subcommand handlers |
+| `codingbuddy-agent` | Agent engine, tool-use loop, complexity classifier, prompt construction, team mode |
+| `codingbuddy-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `EventEnvelope`), config loading, multi-provider config |
+| `codingbuddy-llm` | LLM client (`LlmClient` trait), streaming, prompt cache |
+| `codingbuddy-tools` | Tool definitions (enriched descriptions), plugin manager, shell runner, sandbox wrapping |
+| `codingbuddy-policy` | Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings` |
+| `codingbuddy-hooks` | 14 lifecycle events, `HookRuntime`, once/disabled fields, `PermissionDecision` |
+| `codingbuddy-local-ml` | Local ML via Candle: embeddings, completion, chunking, vector index, hybrid retrieval, privacy router |
+| `codingbuddy-store` | Session persistence (JSONL event log + SQLite projections) |
+| `codingbuddy-memory` | Long-term memory, shadow commits, checkpoints, step snapshots |
+| `codingbuddy-index` | Full-text code index (Tantivy), RAG retrieval with citations |
+| `codingbuddy-mcp` | MCP server management (JSON-RPC stdio/http transports) |
+| `codingbuddy-ui` | TUI rendering (ratatui/crossterm), autocomplete, vim mode, ML ghost text |
+| `codingbuddy-diff` | Unified diff parsing, patch staging, and git-apply |
+| `codingbuddy-context` | Context enrichment, dependency analysis (petgraph), file relevance scoring |
+| `codingbuddy-skills` | Skill discovery, forked execution, frontmatter parsing |
+| `codingbuddy-subagent` | Background tasks, worktree isolation, custom agent definitions |
+| `codingbuddy-observe` | Structured logging |
+| `codingbuddy-jsonrpc` | JSON-RPC server for IDE integration |
+| `codingbuddy-chrome` | Chrome native host bridge |
+| `codingbuddy-errors` | Error types |
+| `codingbuddy-testkit` | Test utilities |
 
 The default execution mode is the **tool-use loop** (think→act→observe):
 
@@ -68,7 +69,7 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 - Model-tier prompts: `deepseek-chat` gets action-biased instructions, `deepseek-reasoner` gets thinking-leveraging
 - Bootstrap context: automatic project awareness (tree, git status, repo map, manifests) on first turn
 - Per-turn retrieval: vector + BM25 search with RRF, fires every turn with remaining-budget awareness
-- LLM compaction: structured LLM-based summary (Goal/Completed/In Progress/Findings/Modified Files) with code-based fallback
+- LLM compaction: structured LLM-based summary (Goal/Completed/In Progress/Key Facts/Findings/Modified Files) with code-based fallback
 - Step snapshots: before/after file state captured per tool call with SHA-256 hashing and revert support
 - Error recovery: automatic guidance injection on failures, stuck detection after repeated errors
 - Model routing: Complex+escalated tasks route to `deepseek-reasoner` automatically
@@ -94,49 +95,49 @@ Invoke-WebRequest https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main
 ### Option 2: Build from source
 
 ```bash
-cargo build --release --bin deepseek
-./target/release/deepseek --help
+cargo build --release --bin codingbuddy
+./target/release/codingbuddy --help
 ```
 
 ## Quickstart
 
 ```bash
 export DEEPSEEK_API_KEY="<your-api-key>"
-deepseek chat
+codingbuddy chat
 ```
 
 Non-interactive examples:
 
 ```bash
-deepseek ask "Summarize this repository"
-deepseek plan "Implement feature X and list risks"
-deepseek autopilot "Execute plan and verify tests" --hours 2
+codingbuddy ask "Summarize this repository"
+codingbuddy plan "Implement feature X and list risks"
+codingbuddy autopilot "Execute plan and verify tests" --hours 2
 ```
 
 Credential behavior:
-- If the API key is missing in interactive TTY mode, DeepSeek CLI prompts for it before first model use.
-- You can persist the key for the current workspace in `.deepseek/settings.local.json`.
+- If the API key is missing in interactive TTY mode, CodingBuddy prompts for it before first model use.
+- You can persist the key for the current workspace in `.codingbuddy/settings.local.json`.
 - In non-interactive or JSON mode, missing credentials fail fast.
-- `deepseek config show` redacts `llm.api_key`.
+- `codingbuddy config show` redacts `llm.api_key`.
 
 ## Core Commands
 
-Run `deepseek --help` for full details. The most used commands are:
+Run `codingbuddy --help` for full details. The most used commands are:
 
-- `deepseek chat`: interactive chat session (TUI when enabled and running in a TTY)
-- `deepseek ask "<prompt>"`: one-shot response
-- `deepseek plan "<prompt>"`: generate a plan without running it
-- `deepseek run [session-id]`: continue execution for a session
-- `deepseek autopilot "<prompt>"`: bounded unattended loop
-- `deepseek review --diff|--staged|--pr <n>`: code review workflows
-- `deepseek exec "<command>"`: policy-enforced shell execution
-- `deepseek diff`, `deepseek apply`, `deepseek rewind`: patch/checkpoint lifecycle
-- `deepseek status`, `deepseek context`, `deepseek usage`: runtime and cost visibility
-- `deepseek index build|update|status|watch|query`: local code index operations
-- `deepseek permissions show|set|dry-run`: safety policy inspection and tuning
-- `deepseek replay run|list`: deterministic replay tooling
-- `deepseek benchmark ...`, `deepseek profile --benchmark`: benchmark workflows
-- `deepseek search "<query>"`: web search with provenance metadata
+- `codingbuddy chat`: interactive chat session (TUI when enabled and running in a TTY)
+- `codingbuddy ask "<prompt>"`: one-shot response
+- `codingbuddy plan "<prompt>"`: generate a plan without running it
+- `codingbuddy run [session-id]`: continue execution for a session
+- `codingbuddy autopilot "<prompt>"`: bounded unattended loop
+- `codingbuddy review --diff|--staged|--pr <n>`: code review workflows
+- `codingbuddy exec "<command>"`: policy-enforced shell execution
+- `codingbuddy diff`, `codingbuddy apply`, `codingbuddy rewind`: patch/checkpoint lifecycle
+- `codingbuddy status`, `codingbuddy context`, `codingbuddy usage`: runtime and cost visibility
+- `codingbuddy index build|update|status|watch|query`: local code index operations
+- `codingbuddy permissions show|set|dry-run`: safety policy inspection and tuning
+- `codingbuddy replay run|list`: deterministic replay tooling
+- `codingbuddy search "<query>"`: web search with provenance metadata
+- `codingbuddy setup`: interactive setup wizard (provider, API key, local ML, privacy)
 
 Useful global flags:
 - `--json`: machine-readable output
@@ -147,46 +148,46 @@ Useful global flags:
 Plan and execute:
 
 ```bash
-deepseek plan "Refactor auth middleware and keep behavior unchanged"
-deepseek run
+codingbuddy plan "Refactor auth middleware and keep behavior unchanged"
+codingbuddy run
 ```
 
 Autopilot with live status:
 
 ```bash
-deepseek autopilot "Fix flaky tests in crates/deepseek-cli" --hours 1
-deepseek autopilot status --follow
+codingbuddy autopilot "Fix flaky tests in crates/codingbuddy-cli" --hours 1
+codingbuddy autopilot status --follow
 ```
 
 Review staged changes:
 
 ```bash
-deepseek review --staged --focus correctness
+codingbuddy review --staged --focus correctness
 ```
 
 Publish strict review findings to a PR:
 
 ```bash
-deepseek review --pr 123 --publish --max-comments 20
+codingbuddy review --pr 123 --publish --max-comments 20
 ```
 
 Generate shell completions:
 
 ```bash
-deepseek completions --shell zsh > ~/.zsh/completions/_deepseek
+codingbuddy completions --shell zsh > ~/.zsh/completions/_codingbuddy
 ```
 
 ## Configuration
 
 Settings merge in order (later wins):
 
-1. `~/.deepseek/settings.json` (user — all projects)
-2. `.deepseek/settings.json` (project — shared with team)
-3. `.deepseek/settings.local.json` (local overrides — gitignore this)
+1. `~/.codingbuddy/settings.json` (user — all projects)
+2. `.codingbuddy/settings.json` (project — shared with team)
+3. `.codingbuddy/settings.local.json` (local overrides — gitignore this)
 
 ```bash
-deepseek config show               # View merged config (keys redacted)
-deepseek config edit               # Open in editor
+codingbuddy config show               # View merged config (keys redacted)
+codingbuddy config edit               # Open in editor
 ```
 
 Key settings:
@@ -222,10 +223,10 @@ An optional local intelligence layer — hybrid code retrieval, privacy scanning
 
 ```bash
 # Enable (mock backends, no download needed)
-echo '{"local_ml": {"enabled": true}}' > .deepseek/settings.json
+echo '{"local_ml": {"enabled": true}}' > .codingbuddy/settings.json
 
 # Enable with real ML models (requires --features local-ml build)
-cargo build --release --bin deepseek --features local-ml
+cargo build --release --bin codingbuddy --features local-ml
 ```
 
 | Feature | Mock Mode | Full ML Mode |
@@ -236,10 +237,10 @@ cargo build --release --bin deepseek --features local-ml
 | Vector index | BruteForce O(n) | HNSW via Usearch |
 
 ```bash
-deepseek privacy scan              # Find secrets in your project
-deepseek privacy redact-preview    # Preview what gets redacted
-deepseek index build               # Build hybrid index
-deepseek index --hybrid doctor     # Diagnose index issues
+codingbuddy privacy scan              # Find secrets in your project
+codingbuddy privacy redact-preview    # Preview what gets redacted
+codingbuddy index build               # Build hybrid index
+codingbuddy index --hybrid doctor     # Diagnose index issues
 ```
 
 See `docs/LOCAL_ML_GUIDE.md` for the full guide.
@@ -249,8 +250,8 @@ See `docs/LOCAL_ML_GUIDE.md` for the full guide.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets    # 949 tests
-cargo build --release --bin deepseek
+cargo test --workspace --all-targets    # 974 tests
+cargo build --release --bin codingbuddy
 ```
 
 ## Docs

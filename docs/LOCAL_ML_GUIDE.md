@@ -1,6 +1,6 @@
 # Local ML Guide
 
-DeepSeek CLI includes an optional local ML layer that runs entirely on your machine. It serves as an **intelligence compensator** — improving the quality of information the LLM receives, not replacing it.
+CodingBuddy includes an optional local ML layer that runs entirely on your machine. It serves as an **intelligence compensator** — improving the quality of information the LLM receives, not replacing it.
 
 **Core value (keep & double down):**
 - **Hybrid code retrieval** — automatically surfaces relevant code chunks before the LLM responds (every turn, not just the first)
@@ -24,7 +24,7 @@ All of this is **off by default**. No models are bundled — they're downloaded 
 
 ```bash
 mkdir -p .deepseek
-cat > .deepseek/settings.json << 'EOF'
+cat > .codingbuddy/settings.json << 'EOF'
 {
   "local_ml": {
     "enabled": true
@@ -33,7 +33,7 @@ cat > .deepseek/settings.json << 'EOF'
 EOF
 ```
 
-Or in your user config (`~/.deepseek/settings.json`) to enable globally.
+Or in your user config (`~/.codingbuddy/settings.json`) to enable globally.
 
 ### 2. That's it (mock mode)
 
@@ -205,7 +205,7 @@ deepseek index watch               # Watch for file changes and auto-update
 
 Models are stored in `~/.cache/deepseek/<model_id>/`. Set `local_ml.cache_dir` to change this.
 
-The vector index is stored in `.deepseek/vector_index.sqlite` in your project directory.
+The vector index is stored in `.codingbuddy/vector_index.sqlite` in your project directory.
 
 ---
 
@@ -241,4 +241,4 @@ The `local-ml` feature adds ~10MB to the binary and requires model downloads on 
 - Falls back to mock backends automatically on failure
 
 **Vector index corruption:**
-- Delete `.deepseek/vector_index.sqlite` and restart — lazy indexing rebuilds automatically
+- Delete `.codingbuddy/vector_index.sqlite` and restart — lazy indexing rebuilds automatically

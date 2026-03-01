@@ -1,27 +1,27 @@
 [workspace]
 members = [
-  "crates/deepseek-cli",
-  "crates/deepseek-core",
-  "crates/deepseek-agent",
-  "crates/deepseek-llm",
-  "crates/deepseek-tools",
-  "crates/deepseek-diff",
-  "crates/deepseek-index",
-  "crates/deepseek-store",
-  "crates/deepseek-policy",
-  "crates/deepseek-observe",
-  "crates/deepseek-testkit",
-  "crates/deepseek-ui",
-  "crates/deepseek-memory",
-  "crates/deepseek-mcp",
-  "crates/deepseek-subagent",
-  "crates/deepseek-skills",
-  "crates/deepseek-hooks",
-  "crates/deepseek-jsonrpc",
-  "crates/deepseek-chrome",
-  "crates/deepseek-context",
-  "crates/deepseek-errors",
-  "crates/deepseek-local-ml",
+  "crates/codingbuddy-cli",
+  "crates/codingbuddy-core",
+  "crates/codingbuddy-agent",
+  "crates/codingbuddy-llm",
+  "crates/codingbuddy-tools",
+  "crates/codingbuddy-diff",
+  "crates/codingbuddy-index",
+  "crates/codingbuddy-store",
+  "crates/codingbuddy-policy",
+  "crates/codingbuddy-observe",
+  "crates/codingbuddy-testkit",
+  "crates/codingbuddy-ui",
+  "crates/codingbuddy-memory",
+  "crates/codingbuddy-mcp",
+  "crates/codingbuddy-subagent",
+  "crates/codingbuddy-skills",
+  "crates/codingbuddy-hooks",
+  "crates/codingbuddy-jsonrpc",
+  "crates/codingbuddy-chrome",
+  "crates/codingbuddy-context",
+  "crates/codingbuddy-errors",
+  "crates/codingbuddy-local-ml",
 ]
 resolver = "2"
 
@@ -31,7 +31,7 @@ rust-version = "1.93"
 license-file = "LICENSE"
 license = "MIT"
 version = "0.6.0"
-authors = ["DeepSeek CLI Contributors"]
+authors = ["CodingBuddy Contributors"]
 
 [workspace.dependencies]
 anyhow = "1"

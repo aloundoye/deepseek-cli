@@ -1,4 +1,4 @@
-# DeepSeek CLI Release Guide
+# CodingBuddy Release Guide
 
 ## Goals
 - Produce immutable binaries for Linux, macOS, and Windows.

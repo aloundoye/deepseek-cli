@@ -1,6 +1,6 @@
 # IDE Extensions
 
-This directory contains starter IDE integrations that communicate with DeepSeek CLI via JSON-RPC over stdio.
+This directory contains starter IDE integrations that communicate with CodingBuddy CLI via JSON-RPC over stdio.
 
 ## VS Code
 
@@ -16,8 +16,8 @@ Path: `extensions/vscode`
 
 2. Run the extension in a VS Code Extension Development Host.
 3. Use commands:
-   - `DeepSeek: Start RPC Server`
-   - `DeepSeek: Status`
+   - `CodingBuddy: Start RPC Server`
+   - `CodingBuddy: Status`
 
 The extension starts `deepseek serve --transport stdio` and sends JSON-RPC requests.
 
@@ -27,7 +27,7 @@ Path: `extensions/jetbrains`
 
 1. Open `extensions/jetbrains` in IntelliJ IDEA.
 2. Run Gradle task `runIde`.
-3. In the spawned IDE, use `Tools -> DeepSeek Status`.
+3. In the spawned IDE, use `Tools -> CodingBuddy Status`.
 
 The plugin starts `deepseek serve --transport stdio` and sends JSON-RPC `initialize` and `status` requests.
 
