@@ -36,7 +36,7 @@ use codingbuddy_core::{
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
 use codingbuddy_llm::LlmClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -98,7 +98,7 @@ pub struct ToolUseLoop<'a> {
     escalation: crate::complexity::EscalationSignals,
     /// Recent error messages for stuck detection. When the same error
     /// appears 3+ times, inject stronger guidance to try a different approach.
-    recent_errors: Vec<String>,
+    recent_errors: VecDeque<String>,
     /// Whether error recovery guidance has been injected this escalation cycle.
     recovery_injected: bool,
     /// Pre-compiled output scanner for injection/secret detection.
@@ -113,14 +113,13 @@ pub struct ToolUseLoop<'a> {
     circuit_breaker: HashMap<String, CircuitBreakerState>,
     /// Cumulative cost tracking across the session.
     cost_tracker: CostTracker,
-    /// Actual tokens-per-char ratio derived from API responses. Starts at 0.25
-    /// (the estimate_message_tokens default) and converges to the real ratio.
-    actual_tokens_per_char: f64,
     /// Doom loop tracker — detects when the model repeats the same tool call.
     doom_loop_tracker: DoomLoopTracker,
     /// User directives extracted from conversation ("always X", "never Y", etc.).
     /// These survive compaction by being re-injected after the system message.
     pinned_directives: Vec<String>,
+    /// Pre-computed workspace path string for hook inputs (avoids repeated allocation).
+    workspace_path_str: String,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -141,6 +140,12 @@ impl<'a> ToolUseLoop<'a> {
             messages.push(msg.clone());
         }
 
+        let workspace_path_str = config
+            .workspace
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+
         Self {
             llm,
             tool_host,
@@ -154,15 +159,15 @@ impl<'a> ToolUseLoop<'a> {
             event_cb: None,
             checkpoint_cb: None,
             escalation: crate::complexity::EscalationSignals::default(),
-            recent_errors: Vec::new(),
+            recent_errors: VecDeque::new(),
             recovery_injected: false,
             output_scanner: codingbuddy_policy::output_scanner::OutputScanner::new(),
             tool_cache: HashMap::new(),
             circuit_breaker: HashMap::new(),
             cost_tracker: CostTracker::default(),
-            actual_tokens_per_char: 0.25, // Default estimate, converges from API responses
             doom_loop_tracker: DoomLoopTracker::default(),
             pinned_directives: Vec::new(),
+            workspace_path_str,
         }
     }
 
@@ -251,32 +256,29 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Run the loop with a user message.
     pub fn run(&mut self, user_message: &str) -> Result<ToolLoopResult> {
-        self.messages.push(ChatMessage::User {
-            content: user_message.to_string(),
-        });
-
-        // Extract and pin user directives so they survive compaction
-        self.collect_directives(user_message);
-
-        // Inject retrieval context on every user turn
-        self.inject_retrieval_context(user_message);
-
-        self.execute_loop()
+        self.add_user_turn(user_message, false)
     }
 
     /// Continue the conversation with additional user input (multi-turn).
     pub fn continue_with(&mut self, user_message: &str) -> Result<ToolLoopResult> {
-        // Strip reasoning from prior turns before adding new user message
-        strip_prior_reasoning_content(&mut self.messages);
+        self.add_user_turn(user_message, true)
+    }
+
+    /// Shared logic for adding a user turn and executing the loop.
+    fn add_user_turn(
+        &mut self,
+        user_message: &str,
+        is_continuation: bool,
+    ) -> Result<ToolLoopResult> {
+        if is_continuation {
+            strip_prior_reasoning_content(&mut self.messages);
+        }
 
         self.messages.push(ChatMessage::User {
             content: user_message.to_string(),
         });
 
-        // Extract and pin user directives so they survive compaction
         self.collect_directives(user_message);
-
-        // Inject retrieval context on every user turn (not just first)
         self.inject_retrieval_context(user_message);
 
         self.execute_loop()
@@ -301,12 +303,16 @@ impl<'a> ToolUseLoop<'a> {
         let mut nudge_count: usize = 0;
         let mut last_model = self.config.model.clone();
 
-        // Pre-compute tool definition token estimate (tools are immutable during the loop)
+        // Pre-compute immutable values used inside the loop
         let tool_def_tokens: u64 = self
             .tools
             .iter()
             .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
             .sum();
+        let prune_threshold =
+            (self.config.context_window_tokens as f64 * PRUNE_THRESHOLD_PCT) as u64;
+        let compact_threshold =
+            (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
 
         loop {
             // Check turn limit
@@ -329,11 +335,6 @@ impl<'a> ToolUseLoop<'a> {
             // Phase 2 (95%): Full compaction with structured summary
             let message_tokens = estimate_message_tokens(&self.messages);
             let estimated_tokens = message_tokens + tool_def_tokens;
-
-            let prune_threshold =
-                (self.config.context_window_tokens as f64 * PRUNE_THRESHOLD_PCT) as u64;
-            let compact_threshold =
-                (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
 
             if estimated_tokens > prune_threshold {
                 // Phase 1: Lightweight pruning — trim old tool outputs
@@ -428,37 +429,11 @@ impl<'a> ToolUseLoop<'a> {
                         self.cost_tracker.max_budget_usd.unwrap_or(0.0)
                     ));
                 }
-
-                // T3.5: Update actual tokens-per-char ratio from API response
-                let total_chars: usize = self
-                    .messages
-                    .iter()
-                    .map(|m| match m {
-                        ChatMessage::System { content } | ChatMessage::User { content } => {
-                            content.len()
-                        }
-                        ChatMessage::Assistant {
-                            content,
-                            reasoning_content,
-                            tool_calls,
-                        } => {
-                            content.as_deref().map_or(0, str::len)
-                                + reasoning_content.as_deref().map_or(0, str::len)
-                                + tool_calls
-                                    .iter()
-                                    .map(|tc| tc.arguments.len())
-                                    .sum::<usize>()
-                        }
-                        ChatMessage::Tool { content, .. } => content.len(),
-                    })
-                    .sum();
-                if total_chars > 0 && usage.prompt_tokens > 0 {
-                    let new_ratio = usage.prompt_tokens as f64 / total_chars as f64;
-                    // Exponential moving average to smooth the ratio
-                    self.actual_tokens_per_char =
-                        0.7 * self.actual_tokens_per_char + 0.3 * new_ratio;
-                }
             }
+
+            // Evict expired cache entries to prevent unbounded memory growth
+            self.tool_cache
+                .retain(|_, (_, ts)| ts.elapsed().as_secs() < TOOL_CACHE_TTL_SECS);
 
             // T3.3: Decrement circuit breaker cooldowns at start of each turn
             for state in self.circuit_breaker.values_mut() {
@@ -1621,9 +1596,9 @@ impl<'a> ToolUseLoop<'a> {
             .trim()
             .to_string();
         if !normalized.is_empty() {
-            self.recent_errors.push(normalized);
+            self.recent_errors.push_back(normalized);
             if self.recent_errors.len() > MAX_RECENT_ERRORS {
-                self.recent_errors.remove(0);
+                self.recent_errors.pop_front();
             }
         }
     }
@@ -1633,7 +1608,7 @@ impl<'a> ToolUseLoop<'a> {
     /// Returns 0 if no errors recorded. Used for stuck detection — when the same
     /// error appears 3+ times, we inject stronger recovery guidance.
     fn repeated_error_count(&self) -> usize {
-        if let Some(last) = self.recent_errors.last() {
+        if let Some(last) = self.recent_errors.back() {
             self.recent_errors.iter().filter(|e| e == &last).count()
         } else {
             0
@@ -1924,13 +1899,9 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
-    /// Get the workspace path as a string for hook inputs.
+    /// Get the workspace path as a string for hook inputs (pre-computed in `new()`).
     fn workspace_str(&self) -> String {
-        self.config
-            .workspace
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
+        self.workspace_path_str.clone()
     }
 
     /// Emit a stream chunk to the callback.

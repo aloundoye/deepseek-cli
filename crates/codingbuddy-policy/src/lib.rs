@@ -471,7 +471,7 @@ impl PolicyEngine {
     }
 
     pub fn check_command(&self, cmd: &str) -> Result<(), PolicyError> {
-        if contains_forbidden_shell_tokens(cmd) {
+        if shell_parse::contains_forbidden_constructs(cmd) {
             return Err(PolicyError::CommandInjection);
         }
         let segments = split_pipeline_segments(cmd)?;
@@ -819,10 +819,6 @@ fn allow_pattern_matches(pattern: &str, cmd_tokens: &[&str]) -> bool {
         }
     }
     true
-}
-
-fn contains_forbidden_shell_tokens(cmd: &str) -> bool {
-    shell_parse::contains_forbidden_constructs(cmd)
 }
 
 fn split_pipeline_segments(cmd: &str) -> Result<Vec<&str>, PolicyError> {
