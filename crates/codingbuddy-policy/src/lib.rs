@@ -335,12 +335,18 @@ pub enum PolicyError {
     DangerousCommand,
 }
 
+/// Decision recorded in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditDecision {
+    AutoApproved,
+}
+
 /// Audit log entry recorded when permissions are auto-approved (e.g. bypass mode).
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub tool_name: String,
-    pub mode: String,
-    pub decision: String,
+    pub mode: PermissionMode,
+    pub decision: AuditDecision,
     pub timestamp: std::time::SystemTime,
 }
 
@@ -581,8 +587,8 @@ impl PolicyEngine {
                 if let Ok(mut log) = self.audit_log.lock() {
                     log.push(AuditEntry {
                         tool_name: call.name.clone(),
-                        mode: "bypass".to_string(),
-                        decision: "auto_approved".to_string(),
+                        mode: PermissionMode::BypassPermissions,
+                        decision: AuditDecision::AutoApproved,
                         timestamp: std::time::SystemTime::now(),
                     });
                 }
@@ -2352,7 +2358,7 @@ mod tests {
         let entries = engine.audit_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].tool_name, "fs.edit");
-        assert_eq!(entries[0].mode, "bypass");
-        assert_eq!(entries[0].decision, "auto_approved");
+        assert_eq!(entries[0].mode, PermissionMode::BypassPermissions);
+        assert_eq!(entries[0].decision, AuditDecision::AutoApproved);
     }
 }

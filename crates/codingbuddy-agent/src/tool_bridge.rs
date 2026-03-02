@@ -6,7 +6,6 @@
 
 use codingbuddy_core::{ChatMessage, LlmToolCall, ToolCall, ToolDefinition, ToolName, ToolResult};
 use codingbuddy_policy::output_scanner::{InjectionWarning, OutputScanner};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum characters for tool output before truncation.
 pub const MAX_TOOL_OUTPUT_CHARS: usize = 25_000;
@@ -238,39 +237,11 @@ fn format_tool_output(output: &serde_json::Value, success: bool) -> String {
 /// Maximum output lines before truncation with continuation hint.
 const MAX_TOOL_OUTPUT_LINES: usize = 10_000;
 
-/// Monotonic counter for generating unique overflow IDs.
-static OVERFLOW_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Save full output to `.codingbuddy/overflow/{id}.txt` when truncating.
-///
-/// Returns the overflow ID on success, or `None` if the write failed.
-fn save_overflow(full_text: &str) -> Option<String> {
-    let id = OVERFLOW_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let overflow_id = format!("{ts}_{id}");
-
-    // Use workspace root (cwd) to place overflow files at project-level .codingbuddy/
-    let base = std::env::current_dir().unwrap_or_default();
-    let dir = base.join(".codingbuddy/overflow");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return None;
-    }
-    let path = dir.join(format!("{overflow_id}.txt"));
-    if std::fs::write(&path, full_text).is_err() {
-        return None;
-    }
-    Some(overflow_id)
-}
-
 /// Truncate output to max chars/lines, appending a structured continuation hint.
 ///
 /// When output exceeds limits, shows the first portion plus a structured notice
 /// telling the model exactly how to get more. This helps DeepSeek understand
 /// what was cut and how to continue reading with offset parameters.
-/// Full output is saved to `.codingbuddy/overflow/` for later retrieval.
 fn truncate_output(text: &str, max_chars: usize) -> String {
     let line_count = text.lines().count();
     let needs_char_truncation = text.len() > max_chars;
@@ -297,9 +268,6 @@ fn truncate_output(text: &str, max_chars: usize) -> String {
     let total_lines = line_count;
     let shown_lines = truncated.lines().count();
     let total_chars = text.len();
-
-    // Save full output to disk for later retrieval
-    let _ = save_overflow(text);
 
     format!(
         "{truncated}\n\n[OUTPUT TRUNCATED: {shown_lines}/{total_lines} lines, \

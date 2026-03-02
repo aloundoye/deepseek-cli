@@ -512,17 +512,19 @@ impl<'a> ToolUseLoop<'a> {
                 // Allows up to MAX_NUDGE_ATTEMPTS nudges per turn before letting through.
                 // NOTE: No `tool_calls_made.is_empty()` guard — the model can revert to
                 // hallucination at any point, even after using tools earlier.
+                let has_unverified_refs = has_unverified_file_references(&text, &tool_calls_made);
+                let has_shell_cmd = contains_shell_command_pattern(&text);
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
                     && (text.len() > HALLUCINATION_NUDGE_THRESHOLD
-                        || has_unverified_file_references(&text, &tool_calls_made)
-                        || contains_shell_command_pattern(&text));
+                        || has_unverified_refs
+                        || has_shell_cmd);
 
                 if should_nudge {
                     // Don't emit this attempt — inject a nudge and retry
                     nudge_count += 1;
                     let trigger = if text.len() > HALLUCINATION_NUDGE_THRESHOLD {
                         "long_response"
-                    } else if has_unverified_file_references(&text, &tool_calls_made) {
+                    } else if has_unverified_refs {
                         "unverified_file_ref"
                     } else {
                         "shell_command_pattern"
@@ -1864,17 +1866,15 @@ impl<'a> ToolUseLoop<'a> {
         }
         self.pinned_directives.truncate(20);
 
-        // P2.7: Snapshot state before mutation so we can restore on invalid result.
-        let saved_messages = self.messages.clone();
-        let saved_directives = self.pinned_directives.clone();
-
+        // Build the new message list in a local vec, validate, then swap.
+        // This avoids cloning the entire (potentially large) messages vec for rollback.
         let summary_msg = ChatMessage::User {
             content: format!(
                 "CONVERSATION_HISTORY (compacted from {middle_count} messages):\n{summary}"
             ),
         };
-        let kept = self.messages[keep_from..].to_vec();
-        self.messages = vec![system, summary_msg];
+
+        let mut new_messages = vec![system, summary_msg];
 
         // Re-inject pinned user directives so they survive compaction.
         // Placed as a System message right after the summary so the model
@@ -1886,27 +1886,28 @@ impl<'a> ToolUseLoop<'a> {
                 .map(|d| format!("- {d}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            self.messages.push(ChatMessage::System {
+            new_messages.push(ChatMessage::System {
                 content: format!(
                     "USER DIRECTIVES (must follow throughout this conversation):\n{directives_text}"
                 ),
             });
         }
 
-        self.messages.extend(kept);
+        new_messages.extend(self.messages[keep_from..].to_vec());
 
         // P2.7: Post-compaction validation — ensure the result is structurally sound.
         // Must have at least 2 messages and start with a System message.
-        if self.messages.len() < 2 || !matches!(&self.messages[0], ChatMessage::System { .. }) {
+        if new_messages.len() < 2
+            || !matches!(&new_messages[0], ChatMessage::System { .. })
+        {
             eprintln!(
-                "[compact] post-compaction validation failed: {} messages, restoring state",
-                self.messages.len()
+                "[compact] post-compaction validation failed: {} messages, discarding",
+                new_messages.len()
             );
-            self.messages = saved_messages;
-            self.pinned_directives = saved_directives;
             return false;
         }
 
+        self.messages = new_messages;
         true
     }
 

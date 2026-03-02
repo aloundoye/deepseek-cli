@@ -120,12 +120,13 @@ fn path_is_covered(mentioned: &str, accessed_paths: &[AccessedPath]) -> bool {
         }
         // Directory coverage: if accessed path is a directory, check prefix
         if ap.is_directory {
-            let dir_prefix = if ap.path.ends_with('/') {
-                ap.path.clone()
-            } else {
-                format!("{}/", ap.path)
-            };
-            if normalized.starts_with(&dir_prefix) {
+            if ap.path.ends_with('/') {
+                if normalized.starts_with(&ap.path) {
+                    return true;
+                }
+            } else if normalized.starts_with(&ap.path)
+                && normalized.as_bytes().get(ap.path.len()) == Some(&b'/')
+            {
                 return true;
             }
         }
