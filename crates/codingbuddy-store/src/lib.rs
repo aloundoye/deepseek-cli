@@ -3249,6 +3249,13 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::PrivacyRedaction { .. } => "PrivacyRedaction@v1",
         EventKind::PrivacyBlock { .. } => "PrivacyBlock@v1",
         EventKind::Autocomplete { .. } => "Autocomplete@v1",
+        EventKind::CompactionTriggered { .. } => "CompactionTriggered@v1",
+        EventKind::DoomLoopDetected { .. } => "DoomLoopDetected@v1",
+        EventKind::CircuitBreakerTripped { .. } => "CircuitBreakerTripped@v1",
+        EventKind::HallucinationNudgeFired { .. } => "HallucinationNudgeFired@v1",
+        EventKind::ToolCacheHit { .. } => "ToolCacheHit@v1",
+        EventKind::ErrorRecoveryTriggered { .. } => "ErrorRecoveryTriggered@v1",
+        EventKind::ModelRoutingChanged { .. } => "ModelRoutingChanged@v1",
     }
 }
 

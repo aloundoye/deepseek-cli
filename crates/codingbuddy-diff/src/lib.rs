@@ -342,4 +342,194 @@ mod tests {
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+
+    // ── extract_target_files tests ──
+
+    #[test]
+    fn extract_target_files_from_standard_diff() {
+        let diff = "\
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let files = extract_target_files(diff);
+        assert_eq!(files, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn extract_target_files_from_multi_file_diff() {
+        let diff = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1 +1 @@
+-x
++y
+--- a/bar.rs
++++ b/bar.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let files = extract_target_files(diff);
+        assert_eq!(files, vec!["bar.rs", "foo.rs"]); // BTreeSet sorts
+    }
+
+    #[test]
+    fn extract_target_files_skips_dev_null() {
+        let diff = "\
+--- /dev/null
++++ b/new_file.rs
+@@ -0,0 +1 @@
++content
+";
+        let files = extract_target_files(diff);
+        assert_eq!(files, vec!["new_file.rs"]);
+    }
+
+    #[test]
+    fn extract_target_files_empty_diff() {
+        assert!(extract_target_files("").is_empty());
+    }
+
+    #[test]
+    fn extract_target_files_deduplicates() {
+        let diff = "\
+--- a/same.rs
++++ b/same.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let files = extract_target_files(diff);
+        assert_eq!(files, vec!["same.rs"]);
+    }
+
+    // ── parse_patch_path tests ──
+
+    #[test]
+    fn parse_patch_path_strips_a_prefix() {
+        assert_eq!(
+            parse_patch_path("a/src/lib.rs"),
+            Some("src/lib.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_patch_path_strips_b_prefix() {
+        assert_eq!(
+            parse_patch_path("b/src/lib.rs"),
+            Some("src/lib.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_patch_path_no_prefix() {
+        assert_eq!(
+            parse_patch_path("src/lib.rs"),
+            Some("src/lib.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_patch_path_dev_null_returns_none() {
+        assert_eq!(parse_patch_path("/dev/null"), None);
+    }
+
+    #[test]
+    fn parse_patch_path_empty_returns_none() {
+        assert_eq!(parse_patch_path(""), None);
+        // After stripping a/ prefix, nothing remains
+        assert_eq!(parse_patch_path("a/"), None);
+    }
+
+    // ── sha256_hex tests ──
+
+    #[test]
+    fn sha256_hex_deterministic() {
+        let h1 = sha256_hex(b"hello");
+        let h2 = sha256_hex(b"hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // SHA-256 = 64 hex chars
+    }
+
+    #[test]
+    fn sha256_hex_different_inputs() {
+        assert_ne!(sha256_hex(b"a"), sha256_hex(b"b"));
+    }
+
+    // ── hash_workspace_state tests ──
+
+    #[test]
+    fn hash_workspace_state_changes_when_file_changes() {
+        let ws = std::env::temp_dir().join(format!("cb-diff-hash-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("f.txt"), "v1").unwrap();
+
+        let h1 = hash_workspace_state(&ws, &["f.txt".to_string()]).unwrap();
+        fs::write(ws.join("f.txt"), "v2").unwrap();
+        let h2 = hash_workspace_state(&ws, &["f.txt".to_string()]).unwrap();
+
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_workspace_state_handles_missing_files() {
+        let ws = std::env::temp_dir().join(format!("cb-diff-missing-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+
+        // Should not panic on missing file — uses [0] sentinel
+        let h = hash_workspace_state(&ws, &["nonexistent.rs".to_string()]).unwrap();
+        assert!(!h.is_empty());
+    }
+
+    // ── PatchStore CRUD tests ──
+
+    #[test]
+    fn patch_store_list_returns_empty_initially() {
+        let ws = std::env::temp_dir().join(format!("cb-diff-list-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        let store = PatchStore::new(&ws).unwrap();
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn patch_store_stage_and_list_roundtrip() {
+        let ws = std::env::temp_dir().join(format!("cb-diff-rt-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("x.txt"), "orig").unwrap();
+
+        let store = PatchStore::new(&ws).unwrap();
+        let diff = "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-orig\n+new\n";
+        let patch = store.stage(diff, &[]).unwrap();
+
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].patch_id, patch.patch_id);
+        assert_eq!(listed[0].target_files, vec!["x.txt"]);
+        assert!(!listed[0].applied);
+    }
+
+    #[test]
+    fn patch_store_read_unknown_id_errors() {
+        let ws = std::env::temp_dir().join(format!("cb-diff-unknown-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        let store = PatchStore::new(&ws).unwrap();
+        assert!(store.read_patch(Uuid::nil()).is_err());
+    }
+
+    #[test]
+    fn patch_store_stage_with_base_blob() {
+        let ws = std::env::temp_dir().join(format!("cb-diff-blob-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+
+        let store = PatchStore::new(&ws).unwrap();
+        let diff = "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n";
+        let patch = store.stage(diff, b"explicit base content").unwrap();
+
+        // base_sha256 should be the hash of the explicit blob, not workspace files
+        assert_eq!(patch.base_sha256, sha256_hex(b"explicit base content"));
+    }
 }

@@ -593,4 +593,159 @@ mod tests {
 
         Ok(())
     }
+
+    // ── should_include_file tests ──
+
+    #[test]
+    fn includes_source_files_by_extension() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mgr = ContextManager::new(dir.path())?;
+        assert!(mgr.should_include_file(Path::new("src/main.rs")));
+        assert!(mgr.should_include_file(Path::new("app.tsx")));
+        assert!(mgr.should_include_file(Path::new("main.py")));
+        assert!(mgr.should_include_file(Path::new("Server.java")));
+        assert!(mgr.should_include_file(Path::new("main.go")));
+        Ok(())
+    }
+
+    #[test]
+    fn excludes_non_source_files() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mgr = ContextManager::new(dir.path())?;
+        assert!(!mgr.should_include_file(Path::new("README.md")));
+        assert!(!mgr.should_include_file(Path::new("config.toml")));
+        assert!(!mgr.should_include_file(Path::new("data.json")));
+        assert!(!mgr.should_include_file(Path::new("image.png")));
+        Ok(())
+    }
+
+    // ── import pattern tests ──
+
+    #[test]
+    fn rust_import_pattern_matches() {
+        let patterns = ContextManager::build_import_patterns();
+        let rs = patterns.get("rs").unwrap();
+        assert!(rs.is_match("use crate::utils;"));
+        assert!(rs.is_match("pub use crate::models::User;"));
+        assert!(rs.is_match("mod tests;"));
+        assert!(rs.is_match("extern crate serde;"));
+    }
+
+    #[test]
+    fn python_import_pattern_matches() {
+        let patterns = ContextManager::build_import_patterns();
+        let py = patterns.get("py").unwrap();
+        assert!(py.is_match("import os"));
+        assert!(py.is_match("from pathlib import Path"));
+        assert!(py.is_match("import json"));
+    }
+
+    #[test]
+    fn js_import_pattern_matches() {
+        let patterns = ContextManager::build_import_patterns();
+        let js = patterns.get("js").unwrap();
+        // Direct string imports and require() calls
+        assert!(js.is_match(r#"import 'react'"#));
+        assert!(js.is_match(r#"require("express")"#));
+    }
+
+    // ── track_recent_file tests ──
+
+    #[test]
+    fn track_recent_file_deduplicates() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let mut mgr = ContextManager::new(dir.path())?;
+
+        let path = dir.path().join("a.rs");
+        mgr.track_recent_file(path.clone());
+        mgr.track_recent_file(path.clone());
+        mgr.track_recent_file(path);
+
+        assert_eq!(mgr.recent_files.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn track_recent_file_respects_max() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut mgr = ContextManager::new(dir.path())?;
+        mgr.max_recent_files = 3;
+
+        for i in 0..5 {
+            let p = dir.path().join(format!("f{i}.rs"));
+            fs::write(&p, format!("fn f{i}() {{}}")).unwrap();
+            mgr.track_recent_file(p);
+        }
+
+        assert_eq!(mgr.recent_files.len(), 3);
+        Ok(())
+    }
+
+    // ── compress_context tests ──
+
+    #[test]
+    fn short_context_not_compressed() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mgr = ContextManager::new(dir.path())?;
+        let short = "line 1\nline 2\nline 3\n";
+        let result = mgr.compress_context(short, 1000);
+        assert_eq!(result, short);
+        Ok(())
+    }
+
+    // ── ContextSelector tests ──
+
+    #[test]
+    fn context_selector_empty_query_returns_empty() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("test.rs"), "fn test() {}").unwrap();
+        let mut selector = ContextSelector::new(dir.path())?;
+        let suggestions = selector.update_context("");
+        assert!(suggestions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn context_selector_finds_at_mentioned_files() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("router.rs"), "fn route() {}").unwrap();
+        let mut selector = ContextSelector::new(dir.path())?;
+        let suggestions = selector.update_context("fix the @router handler");
+        // Should find router.rs via the @router mention
+        let paths: Vec<String> = suggestions
+            .iter()
+            .map(|s| s.path.display().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.contains("router")),
+            "should find router.rs via @mention, got: {:?}",
+            paths
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn analyze_workspace_builds_graph() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("a.rs"), "fn alpha() {}").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn beta() {}").unwrap();
+        let mut mgr = ContextManager::new(dir.path())?;
+        mgr.analyze_workspace()?;
+        assert_eq!(mgr.file_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn re_analyze_does_not_duplicate_nodes() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("a.rs"), "fn alpha() {}").unwrap();
+        let mut mgr = ContextManager::new(dir.path())?;
+        mgr.analyze_workspace()?;
+        let count1 = mgr.file_count();
+        mgr.analyze_workspace()?;
+        let count2 = mgr.file_count();
+        assert_eq!(count1, count2, "re-analysis should not duplicate nodes");
+        Ok(())
+    }
 }

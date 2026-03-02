@@ -880,8 +880,7 @@ fn build_retriever_callback(
         let mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
             &cfg.local_ml.cache_dir,
         ));
-        if mgr.status(&cfg.local_ml.embeddings.model_id)
-            != codingbuddy_local_ml::ModelStatus::Ready
+        if mgr.status(&cfg.local_ml.embeddings.model_id) != codingbuddy_local_ml::ModelStatus::Ready
         {
             eprintln!(
                 "[codingbuddy] embedding model '{}' not cached, using mock (run `codingbuddy setup` to download)",

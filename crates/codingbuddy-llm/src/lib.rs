@@ -335,9 +335,7 @@ impl ApiClient {
         // `thinking` config AND `tool_choice` (HTTP 400). The callers should
         // already omit these, but guard here as the last line of defense.
         let is_reasoner = codingbuddy_core::is_reasoner_model(&req.model);
-        if !is_reasoner
-            && let Some(ref thinking) = req.thinking
-        {
+        if !is_reasoner && let Some(ref thinking) = req.thinking {
             payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
         }
         if !req.tools.is_empty() {

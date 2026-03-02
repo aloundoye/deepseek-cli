@@ -130,7 +130,7 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
         },
         // Tool-use loop: model responds with text (no tool calls) → loop exits
         LlmResponse {
-            text: "Updated demo.txt successfully.".to_string(),
+            text: "Task completed successfully.".to_string(),
             finish_reason: "stop".to_string(),
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
@@ -150,7 +150,7 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
     )?;
 
     assert!(
-        output.contains("Updated") || output.contains("demo"),
+        output.contains("Task completed") || output.contains("successfully"),
         "expected tool-use loop fallback response, got: {output}"
     );
     Ok(())

@@ -51,7 +51,8 @@ pub struct ModelEntry {
 }
 
 /// Default files to download for SafeTensors (non-GGUF) models.
-pub const DEFAULT_SAFETENSORS_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+pub const DEFAULT_SAFETENSORS_FILES: &[&str] =
+    &["config.json", "tokenizer.json", "model.safetensors"];
 
 impl ModelEntry {
     /// Returns the list of files to download from HuggingFace.
@@ -261,9 +262,6 @@ mod tests {
             model.code_specialized,
             "default completion should be code-specialized"
         );
-        assert!(
-            model.model_id.contains("qwen"),
-            "should be Qwen2.5 Coder"
-        );
+        assert!(model.model_id.contains("qwen"), "should be Qwen2.5 Coder");
     }
 }

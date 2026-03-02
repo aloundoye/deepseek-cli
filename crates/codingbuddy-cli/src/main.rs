@@ -1244,7 +1244,9 @@ fn migrate_legacy_config(workspace: &Path) {
         {
             // On non-Unix, symlinks aren't portable. Skip model migration —
             // models will be re-downloaded on next use.
-            eprintln!("Note: model directory not migrated (non-Unix). Models will re-download on next use.");
+            eprintln!(
+                "Note: model directory not migrated (non-Unix). Models will re-download on next use."
+            );
         }
     }
 

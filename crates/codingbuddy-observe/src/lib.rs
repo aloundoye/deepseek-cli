@@ -191,4 +191,136 @@ mod tests {
         assert!(request.contains("POST /collect"));
         assert!(request.contains("telemetry.event"));
     }
+
+    // ── Log file tests ──
+
+    #[test]
+    fn record_event_writes_to_log_file() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-observe-log-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let observer = Observer::new(
+            &workspace,
+            &TelemetryConfig {
+                enabled: false,
+                endpoint: None,
+            },
+        )
+        .expect("observer");
+        observer.record_event(&sample_event()).expect("record");
+
+        let log_content = fs::read_to_string(&observer.log_path).expect("read log");
+        assert!(log_content.contains("EVENT"));
+        assert!(log_content.contains("TurnAdded"));
+    }
+
+    #[test]
+    fn multiple_events_append_to_log() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-observe-multi-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let observer = Observer::new(
+            &workspace,
+            &TelemetryConfig {
+                enabled: false,
+                endpoint: None,
+            },
+        )
+        .expect("observer");
+        observer.record_event(&sample_event()).expect("record 1");
+        observer.record_event(&sample_event()).expect("record 2");
+
+        let log_content = fs::read_to_string(&observer.log_path).expect("read log");
+        let event_lines: Vec<&str> = log_content
+            .lines()
+            .filter(|l| l.contains("EVENT"))
+            .collect();
+        assert_eq!(event_lines.len(), 2);
+    }
+
+    // ── Verbose / warn logging tests ──
+
+    #[test]
+    fn verbose_mode_defaults_to_off() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-observe-verbose-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let observer = Observer::new(
+            &workspace,
+            &TelemetryConfig {
+                enabled: false,
+                endpoint: None,
+            },
+        )
+        .expect("observer");
+        assert!(!observer.is_verbose());
+    }
+
+    #[test]
+    fn set_verbose_toggles_mode() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-observe-toggle-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let mut observer = Observer::new(
+            &workspace,
+            &TelemetryConfig {
+                enabled: false,
+                endpoint: None,
+            },
+        )
+        .expect("observer");
+        observer.set_verbose(true);
+        assert!(observer.is_verbose());
+        observer.set_verbose(false);
+        assert!(!observer.is_verbose());
+    }
+
+    #[test]
+    fn warn_log_writes_to_log_file() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-observe-warn-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let observer = Observer::new(
+            &workspace,
+            &TelemetryConfig {
+                enabled: false,
+                endpoint: None,
+            },
+        )
+        .expect("observer");
+        observer.warn_log("something went wrong");
+
+        let log_content = fs::read_to_string(&observer.log_path).expect("read log");
+        assert!(log_content.contains("WARN"));
+        assert!(log_content.contains("something went wrong"));
+    }
+
+    // ── Event serialization tests ──
+
+    #[test]
+    fn event_serializes_with_session_id() {
+        let event = sample_event();
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains(&event.session_id.to_string()));
+    }
+
+    #[test]
+    fn telemetry_sink_requires_endpoint_when_enabled() {
+        let sink = telemetry_sink(&TelemetryConfig {
+            enabled: true,
+            endpoint: None,
+        })
+        .expect("sink");
+        assert!(sink.is_none(), "no endpoint → no sink even when enabled");
+    }
+
+    #[test]
+    fn telemetry_sink_none_when_disabled() {
+        let sink = telemetry_sink(&TelemetryConfig {
+            enabled: false,
+            endpoint: Some("http://example.com".to_string()),
+        })
+        .expect("sink");
+        assert!(sink.is_none());
+    }
 }

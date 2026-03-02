@@ -514,24 +514,28 @@ fn first_turn_tool_choice_required() -> Result<()> {
     Ok(())
 }
 
-/// Subsequent turns (after tool results) use tool_choice=auto.
+/// After 2+ tool results, tool_choice switches to auto.
+/// (First 2 LLM calls per user question force tool_choice=required to prevent hallucination.)
 #[test]
 fn subsequent_turns_tool_choice_auto() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
     fs::write(temp.path().join("test.txt"), "data\n")?;
+    fs::write(temp.path().join("other.txt"), "more data\n")?;
 
     let (llm, captured) = CapturingLlm::new(vec![
-        // Turn 1: tool call
+        // Turn 1: first tool call (1 tool result → still required)
         tool_call_response(vec![("call_1", "fs_read", r#"{"path":"test.txt"}"#)]),
-        // Turn 2: text response (after tool results in messages)
-        text_response("File read successfully."),
+        // Turn 2: second tool call (2 tool results → switches to auto)
+        tool_call_response(vec![("call_2", "fs_read", r#"{"path":"other.txt"}"#)]),
+        // Turn 3: text response (after 2+ tool results)
+        text_response("Files read successfully."),
     ]);
     let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
     let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
 
     let _output = engine.chat_with_options(
-        "Read test.txt",
+        "Read test.txt and other.txt",
         ChatOptions {
             tools: true,
             ..Default::default()
@@ -539,12 +543,23 @@ fn subsequent_turns_tool_choice_auto() -> Result<()> {
     )?;
 
     let requests = captured.lock().unwrap();
-    assert!(requests.len() >= 2, "should have at least 2 LLM calls");
-    // Second request should have tool_choice=auto (because tool results exist)
+    assert!(requests.len() >= 3, "should have at least 3 LLM calls");
+    // First 2 requests should use required (strengthened tool forcing)
+    assert_eq!(
+        requests[0].tool_choice,
+        codingbuddy_core::ToolChoice::required(),
+        "first turn should use tool_choice=required"
+    );
     assert_eq!(
         requests[1].tool_choice,
+        codingbuddy_core::ToolChoice::required(),
+        "second turn (1 tool result) should still use required"
+    );
+    // Third request should switch to auto (2+ tool results)
+    assert_eq!(
+        requests[2].tool_choice,
         codingbuddy_core::ToolChoice::auto(),
-        "subsequent turn should use tool_choice=auto"
+        "after 2+ tool results should use tool_choice=auto"
     );
     Ok(())
 }

@@ -212,6 +212,7 @@ pub enum ToolName {
     IndexQuery,
     PatchStage,
     PatchApply,
+    PatchDirect,
     DiagnosticsCheck,
     ChromeNavigate,
     ChromeClick,
@@ -257,6 +258,7 @@ impl ToolName {
             "index_query" => Self::IndexQuery,
             "patch_stage" => Self::PatchStage,
             "patch_apply" => Self::PatchApply,
+            "patch_direct" => Self::PatchDirect,
             "diagnostics_check" => Self::DiagnosticsCheck,
             "chrome_navigate" => Self::ChromeNavigate,
             "chrome_click" => Self::ChromeClick,
@@ -303,6 +305,7 @@ impl ToolName {
             "index.query" => Self::IndexQuery,
             "patch.stage" => Self::PatchStage,
             "patch.apply" => Self::PatchApply,
+            "patch.direct" => Self::PatchDirect,
             "diagnostics.check" => Self::DiagnosticsCheck,
             "chrome.navigate" => Self::ChromeNavigate,
             "chrome.click" => Self::ChromeClick,
@@ -348,6 +351,7 @@ impl ToolName {
             Self::IndexQuery => "index.query",
             Self::PatchStage => "patch.stage",
             Self::PatchApply => "patch.apply",
+            Self::PatchDirect => "patch.direct",
             Self::DiagnosticsCheck => "diagnostics.check",
             Self::ChromeNavigate => "chrome.navigate",
             Self::ChromeClick => "chrome.click",
@@ -392,6 +396,7 @@ impl ToolName {
             Self::IndexQuery => "index_query",
             Self::PatchStage => "patch_stage",
             Self::PatchApply => "patch_apply",
+            Self::PatchDirect => "patch_direct",
             Self::DiagnosticsCheck => "diagnostics_check",
             Self::ChromeNavigate => "chrome_navigate",
             Self::ChromeClick => "chrome_click",
@@ -471,6 +476,7 @@ impl ToolName {
                 | Self::MultiEdit
                 | Self::PatchStage
                 | Self::PatchApply
+                | Self::PatchDirect
                 | Self::BashRun
                 | Self::NotebookEdit
         )
@@ -496,6 +502,7 @@ impl ToolName {
         Self::IndexQuery,
         Self::PatchStage,
         Self::PatchApply,
+        Self::PatchDirect,
         Self::DiagnosticsCheck,
         Self::ChromeNavigate,
         Self::ChromeClick,
@@ -1051,6 +1058,49 @@ pub enum EventKind {
         latency_ms: u64,
         accepted: bool,
     },
+
+    // ── Tool loop intelligence events ──
+    /// Context compaction was triggered in the tool loop.
+    #[serde(alias = "CompactionTriggeredV1")]
+    CompactionTriggered {
+        phase: String,
+        pre_tokens: u64,
+        post_tokens: u64,
+        messages_before: u64,
+        messages_after: u64,
+    },
+    /// Doom loop detected — model repeated identical tool calls.
+    #[serde(alias = "DoomLoopDetectedV1")]
+    DoomLoopDetected {
+        tool_name: String,
+        repeat_count: u64,
+    },
+    /// Circuit breaker tripped — tool disabled after consecutive failures.
+    #[serde(alias = "CircuitBreakerTrippedV1")]
+    CircuitBreakerTripped {
+        tool_name: String,
+        consecutive_failures: u64,
+        cooldown_turns: u64,
+    },
+    /// Anti-hallucination nudge fired — model responded without using tools.
+    #[serde(alias = "HallucinationNudgeFiredV1")]
+    HallucinationNudgeFired { nudge_count: u64, trigger: String },
+    /// Tool result cache hit — returned cached result instead of re-executing.
+    #[serde(alias = "ToolCacheHitV1")]
+    ToolCacheHit { tool_name: String },
+    /// Error recovery guidance injected after tool failures.
+    #[serde(alias = "ErrorRecoveryTriggeredV1")]
+    ErrorRecoveryTriggered {
+        level: String,
+        repeated_error_count: u64,
+    },
+    /// Model routing changed (e.g. escalation to reasoner or de-escalation).
+    #[serde(alias = "ModelRoutingChangedV1")]
+    ModelRoutingChanged {
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
 }
 
 impl EventKind {
@@ -1212,6 +1262,15 @@ impl EventKind {
             Self::PrivacyRedaction { .. } | Self::PrivacyBlock { .. } => "privacy",
 
             Self::Autocomplete { .. } => "autocomplete",
+
+            // Tool loop intelligence
+            Self::CompactionTriggered { .. }
+            | Self::DoomLoopDetected { .. }
+            | Self::CircuitBreakerTripped { .. }
+            | Self::HallucinationNudgeFired { .. }
+            | Self::ToolCacheHit { .. }
+            | Self::ErrorRecoveryTriggered { .. }
+            | Self::ModelRoutingChanged { .. } => "tool_loop",
         }
     }
 
@@ -3795,5 +3854,127 @@ mod tests {
         let ds = &providers["deepseek"];
         assert_eq!(ds.base_url, "https://api.deepseek.com");
         assert_eq!(ds.models.chat, "deepseek-chat");
+    }
+
+    // ── Phase 3 EventKind variant tests ──
+
+    #[test]
+    fn tool_loop_event_kinds_serialize_roundtrip() {
+        let events: Vec<EventKind> = vec![
+            EventKind::CompactionTriggered {
+                phase: "full".to_string(),
+                pre_tokens: 100_000,
+                post_tokens: 50_000,
+                messages_before: 40,
+                messages_after: 10,
+            },
+            EventKind::DoomLoopDetected {
+                tool_name: "fs_read".to_string(),
+                repeat_count: 3,
+            },
+            EventKind::CircuitBreakerTripped {
+                tool_name: "shell_exec".to_string(),
+                consecutive_failures: 3,
+                cooldown_turns: 2,
+            },
+            EventKind::HallucinationNudgeFired {
+                nudge_count: 1,
+                trigger: "long_response".to_string(),
+            },
+            EventKind::ToolCacheHit {
+                tool_name: "fs_read".to_string(),
+            },
+            EventKind::ErrorRecoveryTriggered {
+                level: "stuck".to_string(),
+                repeated_error_count: 3,
+            },
+            EventKind::ModelRoutingChanged {
+                from_model: "deepseek-chat".to_string(),
+                to_model: "deepseek-reasoner".to_string(),
+                reason: "escalation".to_string(),
+            },
+        ];
+
+        for event in &events {
+            let json = serde_json::to_string(event).expect("serialize");
+            let restored: EventKind = serde_json::from_str(&json).expect("deserialize");
+            // Verify roundtrip by re-serializing
+            let json2 = serde_json::to_string(&restored).expect("re-serialize");
+            assert_eq!(json, json2, "roundtrip mismatch for {:?}", event);
+        }
+    }
+
+    #[test]
+    fn tool_loop_event_kinds_have_correct_category() {
+        assert_eq!(
+            EventKind::CompactionTriggered {
+                phase: "full".into(),
+                pre_tokens: 0,
+                post_tokens: 0,
+                messages_before: 0,
+                messages_after: 0,
+            }
+            .category(),
+            "tool_loop"
+        );
+        assert_eq!(
+            EventKind::DoomLoopDetected {
+                tool_name: "x".into(),
+                repeat_count: 3,
+            }
+            .category(),
+            "tool_loop"
+        );
+        assert_eq!(
+            EventKind::CircuitBreakerTripped {
+                tool_name: "x".into(),
+                consecutive_failures: 3,
+                cooldown_turns: 2,
+            }
+            .category(),
+            "tool_loop"
+        );
+        assert_eq!(
+            EventKind::HallucinationNudgeFired {
+                nudge_count: 1,
+                trigger: "x".into(),
+            }
+            .category(),
+            "tool_loop"
+        );
+        assert_eq!(
+            EventKind::ToolCacheHit {
+                tool_name: "x".into(),
+            }
+            .category(),
+            "tool_loop"
+        );
+        assert_eq!(
+            EventKind::ErrorRecoveryTriggered {
+                level: "recovery".into(),
+                repeated_error_count: 1,
+            }
+            .category(),
+            "tool_loop"
+        );
+        assert_eq!(
+            EventKind::ModelRoutingChanged {
+                from_model: "a".into(),
+                to_model: "b".into(),
+                reason: "escalation".into(),
+            }
+            .category(),
+            "tool_loop"
+        );
+    }
+
+    #[test]
+    fn tool_loop_events_are_not_tool_events() {
+        // tool_loop events should NOT be classified as tool events
+        let event = EventKind::DoomLoopDetected {
+            tool_name: "fs_read".into(),
+            repeat_count: 3,
+        };
+        assert!(!event.is_tool_event());
     }
 }

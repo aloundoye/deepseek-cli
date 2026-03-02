@@ -9,6 +9,24 @@
 //! - Maximum turns reached
 //! - Context window overflow after compaction
 //! - Unrecoverable error
+//!
+//! # Module structure
+//!
+//! - [`types`] — Public types, configuration, and callback signatures
+//! - [`safety`] — Doom loop detection, circuit breaker, cost tracking
+//! - [`anti_hallucination`] — File reference validation, shell command detection, directive extraction
+//! - [`compaction`] — Context pruning and compaction summaries
+//! - [`helpers`] — Small utility functions
+
+pub mod types;
+
+mod anti_hallucination;
+mod compaction;
+mod helpers;
+mod safety;
+
+// Re-export public API from submodules
+pub use types::*;
 
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
@@ -18,39 +36,32 @@ use codingbuddy_core::{
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
 use codingbuddy_llm::LlmClient;
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::tool_bridge;
 
-/// Default maximum turns (LLM calls) before stopping the loop.
-pub const DEFAULT_MAX_TURNS: usize = 50;
+use anti_hallucination::{
+    HALLUCINATION_NUDGE, HALLUCINATION_NUDGE_THRESHOLD, MAX_NUDGE_ATTEMPTS,
+    contains_shell_command_pattern, extract_user_directives, has_unverified_file_references,
+};
+use compaction::{
+    COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
+    build_compaction_summary_with_llm, extract_tool_path,
+};
+use helpers::{is_read_only_api_name, summarize_args};
+use safety::{
+    CIRCUIT_BREAKER_COOLDOWN_TURNS, CIRCUIT_BREAKER_THRESHOLD, CircuitBreakerState, CostTracker,
+    DOOM_LOOP_GUIDANCE, DOOM_LOOP_THRESHOLD, DoomLoopTracker, ERROR_RECOVERY_GUIDANCE,
+    FINISH_REASON_DOOM_LOOP, MAX_RECENT_ERRORS, STUCK_DETECTION_GUIDANCE,
+};
 
 /// Context window usage percentage that triggers lightweight pruning (Phase 1).
-/// Prunes old tool outputs (>3 turns old) while keeping recent context intact.
 pub const PRUNE_THRESHOLD_PCT: f64 = 0.80;
 
 /// Context window usage percentage that triggers full compaction (Phase 2).
 pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
-
-/// Target context usage after compaction.
-pub const COMPACTION_TARGET_PCT: f64 = 0.80;
-
-/// Tool outputs older than this many "turn groups" (User→Assistant→Tool cycles)
-/// from the end are eligible for pruning. Only the last write per file is kept.
-const PRUNE_AGE_TURNS: usize = 3;
-
-/// If the model's response (with no tool calls) exceeds this many
-/// characters, it's likely hallucinating a long answer instead of using tools.
-/// We inject a nudge to get it back on track.
-const HALLUCINATION_NUDGE_THRESHOLD: usize = 300;
-
-/// Maximum number of hallucination nudges before letting the response through.
-/// After this many nudges without the model using tools, it may be a legitimate
-/// non-code question — let it answer.
-const MAX_NUDGE_ATTEMPTS: usize = 3;
 
 /// Every N tool calls, inject a brief system reminder to keep the model on track.
 const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
@@ -59,212 +70,11 @@ const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
 const MID_CONVERSATION_REMINDER: &str =
     "Reminder: Verify changes with tests. Be concise. Use tools — do not guess.";
 
-/// Maximum recent errors to track for stuck detection.
-const MAX_RECENT_ERRORS: usize = 10;
-
-/// Number of identical recent calls that triggers doom loop detection.
-const DOOM_LOOP_THRESHOLD: usize = 3;
-
-/// Size of the recent call history window for doom loop detection.
-const DOOM_LOOP_HISTORY_SIZE: usize = 10;
-
-/// Finish reason emitted when the doom loop gate terminates the tool loop.
-const FINISH_REASON_DOOM_LOOP: &str = "doom_loop";
-
-/// Guidance injected when a doom loop is detected (model repeating the same tool call).
-const DOOM_LOOP_GUIDANCE: &str = "STOP — You are repeating the same action without making progress. \
-Try a DIFFERENT approach:\n\
-1. You already have the file contents — use them instead of re-reading.\n\
-2. Analyze the output you already have.\n\
-3. Try a different tool or different arguments.\n\
-4. If stuck, ask the user with user_question.";
-
-/// Number of consecutive failures on the same tool before circuit-breaking it.
-const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
-
-/// Number of turns a circuit-broken tool remains disabled.
-const CIRCUIT_BREAKER_COOLDOWN_TURNS: usize = 2;
-
-/// Default budget threshold (USD) at which a warning is emitted.
-const DEFAULT_COST_WARNING_USD: f64 = 0.50;
-
 /// TTL for cached read-only tool results (in seconds).
 const TOOL_CACHE_TTL_SECS: u64 = 60;
 
 /// Tools whose results can be cached (all read-only).
 const CACHEABLE_TOOLS: &[&str] = &["fs_read", "fs_glob", "fs_grep", "fs_list", "index_query"];
-
-/// Guidance injected on first escalation (compile error, test failure).
-const ERROR_RECOVERY_GUIDANCE: &str = "ERROR RECOVERY: The previous attempt failed. Before retrying:\n\
-1. Re-read the error message carefully\n\
-2. Read the file that caused the error\n\
-3. Check if your approach was wrong (wrong file, wrong function, wrong assumption)\n\
-4. Consider an alternative approach if the same error repeats";
-
-/// Stronger nudge injected when the same error appears 3+ times.
-const STUCK_DETECTION_GUIDANCE: &str = "STUCK DETECTION: You've hit the same error 3+ times. \
-Your current approach is not working. Take a step back:\n\
-1. Read the FULL file, not just the section you're editing\n\
-2. Search for examples of similar working code in the codebase\n\
-3. Consider if the error indicates a fundamental misunderstanding";
-
-/// Message injected when the model tries to answer a question about the codebase
-/// without using any tools first.
-const HALLUCINATION_NUDGE: &str = "STOP. You are answering without using tools. \
-Your response likely contains fabricated information. You MUST use tools first. \
-Start with fs_list or fs_glob to explore the project, then fs_read for specific files. \
-Do NOT guess or synthesize answers from memory.";
-
-/// Record of a single tool call made during the loop.
-#[derive(Debug, Clone)]
-pub struct ToolCallRecord {
-    pub tool_name: String,
-    pub tool_call_id: String,
-    pub args_summary: String,
-    pub success: bool,
-    pub duration_ms: u64,
-}
-
-/// Result of running the tool-use loop.
-#[derive(Debug, Clone)]
-pub struct ToolLoopResult {
-    /// Final text response from the LLM.
-    pub response: String,
-    /// All tool calls made during the loop.
-    pub tool_calls_made: Vec<ToolCallRecord>,
-    /// Why the loop stopped.
-    pub finish_reason: String,
-    /// Aggregated token usage across all LLM calls.
-    pub usage: TokenUsage,
-    /// Number of LLM calls made.
-    pub turns: usize,
-    /// Full conversation messages (for continuing the conversation).
-    pub messages: Vec<ChatMessage>,
-}
-
-/// Callback for requesting tool approval from the user.
-/// Returns `true` if approved, `false` if denied.
-pub type ApprovalCallback = Arc<dyn Fn(&codingbuddy_core::ToolCall) -> Result<bool> + Send + Sync>;
-
-/// Callback for asking the user a question during tool execution.
-pub type UserQuestionCallback = Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
-
-/// Callback for event logging (tool proposed/result events).
-pub type EventCallback = Arc<dyn Fn(EventKind) + Send + Sync>;
-
-/// Callback for creating a checkpoint before destructive tool calls.
-/// The second argument contains the files about to be modified (if known).
-pub type CheckpointCallback = Arc<dyn Fn(&str, &[PathBuf]) -> Result<()> + Send + Sync>;
-
-/// Callback for executing a subagent task (spawn_task tool).
-pub type SubagentWorker = Arc<dyn Fn(SubagentRequest) -> Result<String> + Send + Sync>;
-
-/// Result of invoking a skill (returned by SkillRunner callback).
-#[derive(Debug, Clone)]
-pub struct SkillInvocationResult {
-    /// The rendered skill prompt.
-    pub rendered_prompt: String,
-    /// Whether the skill should run in an isolated context.
-    pub forked: bool,
-    /// Tools allowed (empty = all).
-    pub allowed_tools: Vec<String>,
-    /// Tools disallowed.
-    pub disallowed_tools: Vec<String>,
-    /// Whether model auto-invocation is disabled.
-    pub disable_model_invocation: bool,
-}
-
-/// Callback for looking up and running a skill by name.
-/// Returns `None` if the skill is not found.
-pub type SkillRunner =
-    Arc<dyn Fn(&str, Option<&str>) -> Result<Option<SkillInvocationResult>> + Send + Sync>;
-
-/// Callback for injecting relevant code context before LLM calls.
-/// Takes `(query, max_results)` and returns matching code chunks.
-pub type RetrieverCallback =
-    Arc<dyn Fn(&str, usize) -> Result<Vec<RetrievalContext>> + Send + Sync>;
-
-/// Request to spawn a subagent task.
-#[derive(Debug, Clone)]
-pub struct SubagentRequest {
-    pub prompt: String,
-    pub task_name: String,
-    pub subagent_type: String,
-    pub model_override: Option<String>,
-    pub max_turns: Option<usize>,
-    pub run_in_background: bool,
-}
-
-/// Configuration for the tool-use loop.
-pub struct ToolLoopConfig {
-    pub model: String,
-    pub max_tokens: u32,
-    pub temperature: Option<f32>,
-    pub context_window_tokens: u64,
-    pub max_turns: usize,
-    /// When true, use read-only tools only (Ask/Context mode).
-    pub read_only: bool,
-    /// Thinking configuration — enables chain-of-thought reasoning for the main model.
-    pub thinking: Option<codingbuddy_core::ThinkingConfig>,
-    /// Model name used by `extended_thinking` agent-level tool.
-    pub extended_thinking_model: String,
-    /// Detected complexity of the user prompt.
-    pub complexity: crate::complexity::PromptComplexity,
-    /// Optional worker for executing spawn_task subagents.
-    pub subagent_worker: Option<SubagentWorker>,
-    /// Optional callback for looking up and running skills (slash commands).
-    pub skill_runner: Option<SkillRunner>,
-    /// Workspace root path (for subagent spawning).
-    pub workspace: Option<PathBuf>,
-    /// Optional retriever callback for injecting relevant code context before LLM calls.
-    /// Takes (query, max_results) and returns matching code chunks.
-    pub retriever: Option<RetrieverCallback>,
-    /// Optional privacy router for scanning tool outputs before appending to messages.
-    pub privacy_router: Option<Arc<codingbuddy_local_ml::PrivacyRouter>>,
-    /// Images to include with the LLM request (multimodal).
-    pub images: Vec<codingbuddy_core::ImageContent>,
-    /// Initial context messages injected after the system prompt but before the
-    /// user message. Used for bootstrap context (project structure, repo map, etc.).
-    pub initial_context: Vec<ChatMessage>,
-    /// Active agent profile name for logging (e.g. "build", "explore", "plan").
-    pub profile_name: Option<String>,
-}
-
-/// A piece of retrieved code context from the workspace index.
-#[derive(Debug, Clone)]
-pub struct RetrievalContext {
-    pub file_path: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub content: String,
-    pub score: f32,
-}
-
-impl Default for ToolLoopConfig {
-    fn default() -> Self {
-        Self {
-            model: codingbuddy_core::CODINGBUDDY_V32_CHAT_MODEL.to_string(),
-            max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
-            temperature: None,
-            context_window_tokens: 128_000,
-            max_turns: DEFAULT_MAX_TURNS,
-            read_only: false,
-            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(
-                crate::complexity::MEDIUM_THINK_BUDGET,
-            )),
-            extended_thinking_model: codingbuddy_core::CODINGBUDDY_V32_REASONER_MODEL.to_string(),
-            complexity: crate::complexity::PromptComplexity::Medium,
-            subagent_worker: None,
-            skill_runner: None,
-            workspace: None,
-            retriever: None,
-            privacy_router: None,
-            images: vec![],
-            initial_context: vec![],
-            profile_name: None,
-        }
-    }
-}
 
 /// The core tool-use conversation loop.
 ///
@@ -308,149 +118,9 @@ pub struct ToolUseLoop<'a> {
     actual_tokens_per_char: f64,
     /// Doom loop tracker — detects when the model repeats the same tool call.
     doom_loop_tracker: DoomLoopTracker,
-}
-
-/// Tracks consecutive failures for a single tool.
-#[derive(Debug, Clone, Default)]
-struct CircuitBreakerState {
-    consecutive_failures: usize,
-    /// Turns remaining in cooldown (0 = active).
-    cooldown_remaining: usize,
-}
-
-/// Tracks repeated identical tool calls to detect doom loops — the model
-/// repeating the same action without progress. Uses a rolling window of
-/// (tool_name, args_hash) tuples.
-#[derive(Debug, Clone)]
-struct DoomLoopTracker {
-    /// Rolling window of recent (tool_name, args_hash) pairs.
-    recent_calls: VecDeque<(String, u64)>,
-    /// Whether doom loop guidance has been injected (reset when model uses a different call).
-    warning_injected: bool,
-}
-
-impl Default for DoomLoopTracker {
-    fn default() -> Self {
-        Self {
-            recent_calls: VecDeque::with_capacity(DOOM_LOOP_HISTORY_SIZE),
-            warning_injected: false,
-        }
-    }
-}
-
-impl DoomLoopTracker {
-    /// Record a tool call. Returns `true` if a doom loop is detected.
-    ///
-    /// Hashes the raw args string directly (no JSON round-trip) for efficiency.
-    fn record(&mut self, tool_name: &str, raw_args: &str) -> bool {
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        raw_args.hash(&mut hasher);
-        let args_hash = hasher.finish();
-
-        let entry = (tool_name.to_string(), args_hash);
-
-        // Check if this is a different call than the last one — reset warning
-        if let Some(last) = self.recent_calls.back()
-            && *last != entry
-        {
-            self.warning_injected = false;
-        }
-
-        // Add to rolling window
-        self.recent_calls.push_back(entry.clone());
-        if self.recent_calls.len() > DOOM_LOOP_HISTORY_SIZE {
-            self.recent_calls.pop_front();
-        }
-
-        // Count occurrences of this exact call in recent history
-        let count = self.recent_calls.iter().filter(|c| **c == entry).count();
-
-        count >= DOOM_LOOP_THRESHOLD && !self.warning_injected
-    }
-
-    /// Mark that guidance has been injected for the current doom loop.
-    fn mark_warned(&mut self) {
-        self.warning_injected = true;
-    }
-}
-
-/// Tracks cumulative cost across the tool-use loop.
-#[derive(Debug, Clone)]
-pub struct CostTracker {
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cache_hit_tokens: u64,
-    pub total_reasoning_tokens: u64,
-    /// Per-million-token pricing for input.
-    pub cost_per_million_input: f64,
-    /// Per-million-token pricing for output.
-    pub cost_per_million_output: f64,
-    /// Discount factor for cache-hit tokens (e.g. 0.1 means 90% discount).
-    pub cache_discount: f64,
-    /// Optional hard budget cap. If set, loop stops when exceeded.
-    pub max_budget_usd: Option<f64>,
-    /// Whether the user has already been warned about cost threshold.
-    warned: bool,
-}
-
-impl Default for CostTracker {
-    fn default() -> Self {
-        Self {
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_hit_tokens: 0,
-            total_reasoning_tokens: 0,
-            cost_per_million_input: 0.27,
-            cost_per_million_output: 1.10,
-            cache_discount: 0.1,
-            max_budget_usd: None,
-            warned: false,
-        }
-    }
-}
-
-impl CostTracker {
-    /// Record token usage from an API response.
-    pub fn record(&mut self, usage: &TokenUsage) {
-        self.total_input_tokens += usage.prompt_tokens;
-        self.total_output_tokens += usage.completion_tokens;
-        self.total_cache_hit_tokens += usage.prompt_cache_hit_tokens;
-        self.total_reasoning_tokens += usage.reasoning_tokens;
-    }
-
-    /// Compute estimated cumulative cost in USD.
-    pub fn estimated_cost_usd(&self) -> f64 {
-        let input_tokens = self.total_input_tokens as f64;
-        let cache_tokens = self.total_cache_hit_tokens as f64;
-        let output_tokens = self.total_output_tokens as f64;
-
-        // Cache-hit tokens are charged at a discount
-        let effective_input = (input_tokens - cache_tokens) + (cache_tokens * self.cache_discount);
-        let input_cost = effective_input / 1_000_000.0 * self.cost_per_million_input;
-        let output_cost = output_tokens / 1_000_000.0 * self.cost_per_million_output;
-
-        input_cost + output_cost
-    }
-
-    /// Whether the cost has exceeded the hard budget cap.
-    pub fn over_budget(&self) -> bool {
-        self.max_budget_usd
-            .is_some_and(|cap| self.estimated_cost_usd() > cap)
-    }
-
-    /// Whether the cost has passed the warning threshold but not yet warned.
-    pub fn should_warn(&mut self) -> bool {
-        if self.warned {
-            return false;
-        }
-        if self.estimated_cost_usd() > DEFAULT_COST_WARNING_USD {
-            self.warned = true;
-            return true;
-        }
-        false
-    }
+    /// User directives extracted from conversation ("always X", "never Y", etc.).
+    /// These survive compaction by being re-injected after the system message.
+    pinned_directives: Vec<String>,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -492,6 +162,7 @@ impl<'a> ToolUseLoop<'a> {
             cost_tracker: CostTracker::default(),
             actual_tokens_per_char: 0.25, // Default estimate, converges from API responses
             doom_loop_tracker: DoomLoopTracker::default(),
+            pinned_directives: Vec::new(),
         }
     }
 
@@ -584,6 +255,9 @@ impl<'a> ToolUseLoop<'a> {
             content: user_message.to_string(),
         });
 
+        // Extract and pin user directives so they survive compaction
+        self.collect_directives(user_message);
+
         // Inject retrieval context on every user turn
         self.inject_retrieval_context(user_message);
 
@@ -599,10 +273,24 @@ impl<'a> ToolUseLoop<'a> {
             content: user_message.to_string(),
         });
 
+        // Extract and pin user directives so they survive compaction
+        self.collect_directives(user_message);
+
         // Inject retrieval context on every user turn (not just first)
         self.inject_retrieval_context(user_message);
 
         self.execute_loop()
+    }
+
+    /// Extract user directives from a message and add them to the pinned set.
+    fn collect_directives(&mut self, text: &str) {
+        for directive in extract_user_directives(text) {
+            if !self.pinned_directives.contains(&directive) {
+                self.pinned_directives.push(directive);
+            }
+        }
+        // Cap at 20 to bound memory/token usage
+        self.pinned_directives.truncate(20);
     }
 
     /// The main loop: call LLM, execute tools, feed results back, repeat.
@@ -611,6 +299,14 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
+        let mut last_model = self.config.model.clone();
+
+        // Pre-compute tool definition token estimate (tools are immutable during the loop)
+        let tool_def_tokens: u64 = self
+            .tools
+            .iter()
+            .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
+            .sum();
 
         loop {
             // Check turn limit
@@ -632,11 +328,6 @@ impl<'a> ToolUseLoop<'a> {
             // Phase 1 (80%): Prune old tool outputs to free space without losing structure
             // Phase 2 (95%): Full compaction with structured summary
             let message_tokens = estimate_message_tokens(&self.messages);
-            let tool_def_tokens: u64 = self
-                .tools
-                .iter()
-                .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
-                .sum();
             let estimated_tokens = message_tokens + tool_def_tokens;
 
             let prune_threshold =
@@ -655,7 +346,20 @@ impl<'a> ToolUseLoop<'a> {
                     // Phase 2: Full compaction with structured summary
                     let target =
                         (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64;
+                    let pre_msg_count = self.messages.len() as u64;
                     let compacted = self.compact_messages(target);
+                    if compacted {
+                        let post_tokens = estimate_message_tokens(&self.messages) + tool_def_tokens;
+                        if let Some(ref cb) = self.event_cb {
+                            cb(EventKind::CompactionTriggered {
+                                phase: "full".to_string(),
+                                pre_tokens: post_prune_tokens,
+                                post_tokens,
+                                messages_before: pre_msg_count,
+                                messages_after: self.messages.len() as u64,
+                            });
+                        }
+                    }
                     if !compacted {
                         self.emit(StreamChunk::Done {
                             reason: Some("context window full".to_string()),
@@ -675,6 +379,24 @@ impl<'a> ToolUseLoop<'a> {
             // Build and send the LLM request
             turns += 1;
             let request = self.build_request();
+
+            // Emit model routing event when the model changes (escalation/de-escalation)
+            if request.model != last_model {
+                if let Some(ref cb) = self.event_cb {
+                    let reason = if codingbuddy_core::is_reasoner_model(&request.model) {
+                        "escalation"
+                    } else {
+                        "de-escalation"
+                    };
+                    cb(EventKind::ModelRoutingChanged {
+                        from_model: last_model.clone(),
+                        to_model: request.model.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                last_model = request.model.clone();
+            }
+
             let response = if let Some(ref cb) = self.stream_cb {
                 self.llm.complete_chat_streaming(&request, cb.clone())?
             } else {
@@ -769,6 +491,19 @@ impl<'a> ToolUseLoop<'a> {
                 if should_nudge {
                     // Don't emit this attempt — inject a nudge and retry
                     nudge_count += 1;
+                    let trigger = if text.len() > HALLUCINATION_NUDGE_THRESHOLD {
+                        "long_response"
+                    } else if has_unverified_file_references(&text, &tool_calls_made) {
+                        "unverified_file_ref"
+                    } else {
+                        "shell_command_pattern"
+                    };
+                    if let Some(ref cb) = self.event_cb {
+                        cb(EventKind::HallucinationNudgeFired {
+                            nudge_count: nudge_count as u64,
+                            trigger: trigger.to_string(),
+                        });
+                    }
                     self.messages.push(ChatMessage::Assistant {
                         content: Some(text),
                         reasoning_content: None,
@@ -871,25 +606,47 @@ impl<'a> ToolUseLoop<'a> {
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().expect("parallel tool thread panicked"))
+                        .map(|h| {
+                            h.join().unwrap_or_else(|panic_payload| {
+                                let panic_msg = panic_payload
+                                    .downcast_ref::<String>()
+                                    .map(|s| s.as_str())
+                                    .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                                    .unwrap_or("unknown panic");
+                                let error_call = LlmToolCall {
+                                    id: String::new(),
+                                    name: "parallel_tool_panic".to_string(),
+                                    arguments: String::new(),
+                                };
+                                let error_result = codingbuddy_core::ToolResult {
+                                    invocation_id: uuid::Uuid::nil(),
+                                    success: false,
+                                    output: serde_json::json!(format!(
+                                        "Internal error: parallel tool execution panicked: {panic_msg}"
+                                    )),
+                                };
+                                (error_call, error_result)
+                            })
+                        })
                         .collect()
                 });
 
                 // Process results sequentially (updates messages, cache, events)
                 for (effective_call, result) in &parallel_results {
                     let args: serde_json::Value = serde_json::from_str(&effective_call.arguments)
-                        .unwrap_or(serde_json::json!({}));
+                        .unwrap_or_else(|e| {
+                            eprintln!(
+                                "[tool_loop] failed to parse tool arguments for '{}': {e}",
+                                effective_call.name
+                            );
+                            serde_json::json!({})
+                        });
                     let args_summary = summarize_args(&args);
 
                     self.emit(StreamChunk::ToolCallStart {
                         tool_name: effective_call.name.clone(),
                         args_summary: args_summary.clone(),
                     });
-
-                    // Cache store for successful read-only results
-                    if result.success {
-                        self.cache_store(&effective_call.name, &args, &result.output);
-                    }
 
                     // Scan for escalation signals
                     if let Some(output_str) = result.output.as_str() {
@@ -906,33 +663,25 @@ impl<'a> ToolUseLoop<'a> {
                         result,
                         Some(&self.output_scanner),
                     );
-                    let msg = if self.config.privacy_router.is_some() {
-                        match msg {
-                            ChatMessage::Tool {
-                                tool_call_id,
-                                content,
-                            } => {
-                                let filtered = self.apply_privacy_to_output(&content);
-                                ChatMessage::Tool {
-                                    tool_call_id,
-                                    content: filtered,
-                                }
-                            }
-                            other => other,
+                    let msg = self.apply_privacy_to_message(msg);
+
+                    // Cache store AFTER privacy filtering — cache only holds filtered data.
+                    // We extract the filtered content from the message we're about to push.
+                    if result.success {
+                        if let ChatMessage::Tool { ref content, .. } = msg {
+                            self.cache_store(
+                                &effective_call.name,
+                                &args,
+                                &serde_json::Value::String(content.clone()),
+                            );
+                        } else {
+                            self.cache_store(&effective_call.name, &args, &result.output);
                         }
-                    } else {
-                        msg
-                    };
+                    }
+
                     self.messages.push(msg);
 
-                    for warning in &injection_warnings {
-                        self.emit(codingbuddy_core::StreamChunk::SecurityWarning {
-                            message: format!(
-                                "{:?} — {} (matched: {})",
-                                warning.severity, warning.pattern_name, warning.matched_text
-                            ),
-                        });
-                    }
+                    self.emit_injection_warnings(&injection_warnings);
 
                     self.emit(StreamChunk::ToolCallEnd {
                         tool_name: effective_call.name.clone(),
@@ -1000,6 +749,12 @@ impl<'a> ToolUseLoop<'a> {
                     && !was_escalated_before_batch
                     && !self.recovery_injected
                 {
+                    if let Some(ref cb) = self.event_cb {
+                        cb(EventKind::ErrorRecoveryTriggered {
+                            level: "recovery".to_string(),
+                            repeated_error_count: 1,
+                        });
+                    }
                     self.messages.push(ChatMessage::System {
                         content: ERROR_RECOVERY_GUIDANCE.to_string(),
                     });
@@ -1007,7 +762,14 @@ impl<'a> ToolUseLoop<'a> {
                 }
 
                 // Stuck detection: same error 3+ times → stronger nudge
-                if self.repeated_error_count() >= 3 {
+                let repeated_count = self.repeated_error_count();
+                if repeated_count >= 3 {
+                    if let Some(ref cb) = self.event_cb {
+                        cb(EventKind::ErrorRecoveryTriggered {
+                            level: "stuck".to_string(),
+                            repeated_error_count: repeated_count as u64,
+                        });
+                    }
                     self.messages.push(ChatMessage::System {
                         content: STUCK_DETECTION_GUIDANCE.to_string(),
                     });
@@ -1020,13 +782,24 @@ impl<'a> ToolUseLoop<'a> {
             // When detected, STOP the tool loop (blocking gate) — the model cannot
             // continue without the user explicitly sending a new message.
             let mut doom_loop_detected = false;
+            let mut doom_loop_tool = String::new();
             for llm_call in response.tool_calls.iter() {
-                if self.doom_loop_tracker.record(&llm_call.name, &llm_call.arguments) {
+                if self
+                    .doom_loop_tracker
+                    .record(&llm_call.name, &llm_call.arguments)
+                {
                     doom_loop_detected = true;
+                    doom_loop_tool = llm_call.name.clone();
                     break;
                 }
             }
             if doom_loop_detected {
+                if let Some(ref cb) = self.event_cb {
+                    cb(EventKind::DoomLoopDetected {
+                        tool_name: doom_loop_tool,
+                        repeat_count: DOOM_LOOP_THRESHOLD as u64,
+                    });
+                }
                 self.emit(StreamChunk::SecurityWarning {
                     message: format!(
                         "Doom loop detected: model repeated identical tool calls {}+ times. \
@@ -1125,6 +898,8 @@ impl<'a> ToolUseLoop<'a> {
 
         // Convert LLM call to internal format
         let tool_call = tool_bridge::llm_tool_call_to_internal(&llm_call);
+        // Save parsed args before tool_call is moved into propose()
+        let parsed_args = tool_call.args.clone();
 
         // ── JSON schema validation ──
         // Validate arguments against the tool's schema before executing.
@@ -1170,12 +945,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: None,
                 prompt: None,
                 session_type: None,
-                workspace: self
-                    .config
-                    .workspace
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
+                workspace: self.workspace_str(),
             };
             let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
             if hook_result.blocked {
@@ -1250,9 +1020,13 @@ impl<'a> ToolUseLoop<'a> {
 
         // ── Cache lookup ──
         // For read-only tools, check if we have a recent cached result.
-        let cached_args = serde_json::from_str::<serde_json::Value>(&llm_call.arguments)
-            .unwrap_or(serde_json::json!({}));
-        if let Some(cached_result) = self.cache_lookup(&llm_call.name, &cached_args) {
+        // Reuse the already-parsed args from tool_call instead of re-parsing.
+        if let Some(cached_result) = self.cache_lookup(&llm_call.name, &parsed_args) {
+            if let Some(ref cb) = self.event_cb {
+                cb(EventKind::ToolCacheHit {
+                    tool_name: llm_call.name.clone(),
+                });
+            }
             let duration = start.elapsed().as_millis() as u64;
             let result = codingbuddy_core::ToolResult {
                 invocation_id: proposal.invocation_id,
@@ -1266,14 +1040,7 @@ impl<'a> ToolUseLoop<'a> {
                 Some(&self.output_scanner),
             );
             self.messages.push(msg);
-            for warning in &injection_warnings {
-                self.emit(codingbuddy_core::StreamChunk::SecurityWarning {
-                    message: format!(
-                        "{:?} — {} (matched: {})",
-                        warning.severity, warning.pattern_name, warning.matched_text
-                    ),
-                });
-            }
+            self.emit_injection_warnings(&injection_warnings);
             self.emit(StreamChunk::ToolCallEnd {
                 tool_name: llm_call.name.clone(),
                 duration_ms: duration,
@@ -1290,12 +1057,18 @@ impl<'a> ToolUseLoop<'a> {
             return Ok(records);
         }
 
+        // Extract modified paths once for write tools (used for checkpoint + cache invalidation)
+        let modified_paths = if tool_bridge::is_write_tool(&llm_call.name) {
+            tool_bridge::extract_modified_paths(&llm_call.name, &llm_call.arguments)
+        } else {
+            Vec::new()
+        };
+
         // Create checkpoint before destructive tool calls
-        if tool_bridge::is_write_tool(&llm_call.name)
+        if !modified_paths.is_empty()
             && let Some(ref cp) = self.checkpoint_cb
         {
-            let modified = tool_bridge::extract_modified_paths(&llm_call.name, &llm_call.arguments);
-            let _ = cp("before tool execution", &modified);
+            let _ = cp("before tool execution", &modified_paths);
         }
 
         // Execute the approved tool
@@ -1321,22 +1094,22 @@ impl<'a> ToolUseLoop<'a> {
             cb_state.consecutive_failures += 1;
             if cb_state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
                 cb_state.cooldown_remaining = CIRCUIT_BREAKER_COOLDOWN_TURNS;
+                if let Some(ref cb) = self.event_cb {
+                    cb(EventKind::CircuitBreakerTripped {
+                        tool_name: llm_call.name.clone(),
+                        consecutive_failures: CIRCUIT_BREAKER_THRESHOLD as u64,
+                        cooldown_turns: CIRCUIT_BREAKER_COOLDOWN_TURNS as u64,
+                    });
+                }
                 cb_state.consecutive_failures = 0; // Reset count for next cycle
             }
         }
 
-        // ── Cache store / invalidate ──
-        // Cache successful read-only results; invalidate on write tools.
-        if success {
-            self.cache_store(&llm_call.name, &cached_args, &result.output);
-        }
-        if tool_bridge::is_write_tool(&llm_call.name) {
-            // Invalidate cache entries for any paths this write tool modifies
-            let modified = tool_bridge::extract_modified_paths(&llm_call.name, &llm_call.arguments);
-            for path in &modified {
-                if let Some(path_str) = path.to_str() {
-                    self.cache_invalidate_path(path_str);
-                }
+        // ── Cache invalidate ──
+        // NOTE: Cache store moved below privacy filtering so cache only holds filtered data.
+        for path in &modified_paths {
+            if let Some(path_str) = path.to_str() {
+                self.cache_invalidate_path(path_str);
             }
         }
 
@@ -1360,18 +1133,11 @@ impl<'a> ToolUseLoop<'a> {
             let input = HookInput {
                 event: HookEvent::PostToolUse.as_str().to_string(),
                 tool_name: Some(llm_call.name.clone()),
-                tool_input: Some(
-                    serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({})),
-                ),
+                tool_input: Some(parsed_args.clone()),
                 tool_result: Some(result.output.clone()),
                 prompt: None,
                 session_type: None,
-                workspace: self
-                    .config
-                    .workspace
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
+                workspace: self.workspace_str(),
             };
             let _ = hooks.fire(HookEvent::PostToolUse, &input);
         }
@@ -1405,35 +1171,25 @@ impl<'a> ToolUseLoop<'a> {
             &result,
             Some(&self.output_scanner),
         );
-        // Apply privacy router to tool output if configured
-        let msg = if self.config.privacy_router.is_some() {
-            match msg {
-                ChatMessage::Tool {
-                    tool_call_id,
-                    content,
-                } => {
-                    let filtered = self.apply_privacy_to_output(&content);
-                    ChatMessage::Tool {
-                        tool_call_id,
-                        content: filtered,
-                    }
-                }
-                other => other,
+        let msg = self.apply_privacy_to_message(msg);
+
+        // ── Cache store (after privacy filtering) ──
+        // Cache successful read-only results with privacy-filtered content.
+        if success {
+            if let ChatMessage::Tool { ref content, .. } = msg {
+                self.cache_store(
+                    &llm_call.name,
+                    &parsed_args,
+                    &serde_json::Value::String(content.clone()),
+                );
+            } else {
+                self.cache_store(&llm_call.name, &parsed_args, &result.output);
             }
-        } else {
-            msg
-        };
+        }
+
         self.messages.push(msg);
 
-        // Emit security warnings to user
-        for warning in &injection_warnings {
-            self.emit(codingbuddy_core::StreamChunk::SecurityWarning {
-                message: format!(
-                    "{:?} — {} (matched: {})",
-                    warning.severity, warning.pattern_name, warning.matched_text
-                ),
-            });
-        }
+        self.emit_injection_warnings(&injection_warnings);
 
         records.push(ToolCallRecord {
             tool_name: llm_call.name.clone(),
@@ -1450,7 +1206,13 @@ impl<'a> ToolUseLoop<'a> {
     fn handle_agent_level_tool(&mut self, llm_call: &LlmToolCall) -> Result<Vec<ToolCallRecord>> {
         let start = Instant::now();
         let args: serde_json::Value =
-            serde_json::from_str(&llm_call.arguments).unwrap_or(serde_json::json!({}));
+            serde_json::from_str(&llm_call.arguments).unwrap_or_else(|e| {
+                eprintln!(
+                    "[tool_loop] failed to parse agent tool arguments for '{}': {e}",
+                    llm_call.name
+                );
+                serde_json::json!({})
+            });
 
         let args_summary = summarize_args(&args);
 
@@ -1516,9 +1278,14 @@ impl<'a> ToolUseLoop<'a> {
             summary: "ok".to_string(),
         });
 
+        // Truncate agent-level tool output to prevent context overflow.
+        // Agent tools (spawn_task, skill, extended_thinking) can produce very large
+        // outputs that eat context window budget.
+        let content = tool_bridge::truncate_agent_output(&result_content);
+
         self.messages.push(ChatMessage::Tool {
             tool_call_id: llm_call.id.clone(),
-            content: result_content,
+            content,
         });
 
         Ok(vec![ToolCallRecord {
@@ -1611,13 +1378,7 @@ impl<'a> ToolUseLoop<'a> {
                     tool_result: None,
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self
-                        .config
-                        .workspace
-                        .as_deref()
-                        .unwrap_or(std::path::Path::new("."))
-                        .display()
-                        .to_string(),
+                    workspace: self.workspace_str(),
                 };
                 let _ = hooks.fire(HookEvent::SubagentStart, &input);
             }
@@ -1639,13 +1400,7 @@ impl<'a> ToolUseLoop<'a> {
                         .map(|r| serde_json::Value::String(r.clone())),
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self
-                        .config
-                        .workspace
-                        .as_deref()
-                        .unwrap_or(std::path::Path::new("."))
-                        .display()
-                        .to_string(),
+                    workspace: self.workspace_str(),
                 };
                 let _ = hooks.fire(HookEvent::SubagentStop, &input);
             }
@@ -1777,17 +1532,21 @@ impl<'a> ToolUseLoop<'a> {
             self.tools.clone()
         };
 
-        // Force tool use on the first turn for each new question so the model
-        // explores the codebase instead of fabricating an answer.
+        // Force tool use on the first 2 LLM calls for each new question so the model
+        // explores the codebase instead of fabricating an answer. DeepSeek-chat needs
+        // stronger forcing than Claude — it tends to answer from memory on the first turn,
+        // then switch to tools only after being nudged.
         let last_user_idx = self
             .messages
             .iter()
             .rposition(|m| matches!(m, ChatMessage::User { .. }))
             .unwrap_or(0);
-        let has_tool_results_this_turn = self.messages[last_user_idx..]
+        let tool_call_count_this_turn = self.messages[last_user_idx..]
             .iter()
-            .any(|m| matches!(m, ChatMessage::Tool { .. }));
-        let tool_choice = if !has_tool_results_this_turn && !self.config.read_only {
+            .filter(|m| matches!(m, ChatMessage::Tool { .. }))
+            .count();
+        // Require tool use for the first 2 LLM rounds per user question (Code mode only)
+        let tool_choice = if tool_call_count_this_turn < 2 && !self.config.read_only {
             ToolChoice::required()
         } else {
             ToolChoice::auto()
@@ -1930,12 +1689,9 @@ impl<'a> ToolUseLoop<'a> {
                 {
                     continue;
                 }
-                // Truncate: keep first 200 chars + marker
-                let truncated = format!(
-                    "{}\n{}",
-                    &content[..max_kept_chars.min(content.len())],
-                    TRUNCATED_MARKER,
-                );
+                // Truncate: keep first 200 chars + marker (safe on multi-byte UTF-8)
+                let safe_end = content.floor_char_boundary(max_kept_chars.min(content.len()));
+                let truncated = format!("{}\n{}", &content[..safe_end], TRUNCATED_MARKER,);
                 *content = truncated;
             }
         }
@@ -1999,15 +1755,22 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(serde_json::Value::String(summary.clone())),
                 prompt: None,
                 session_type: None,
-                workspace: self
-                    .config
-                    .workspace
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
+                workspace: self.workspace_str(),
             };
             let _ = hooks.fire(HookEvent::PreCompact, &input);
         }
+
+        // Scan compacted messages for any directives we haven't captured yet
+        for msg in compacted_msgs {
+            if let ChatMessage::User { content } = msg {
+                for directive in extract_user_directives(content) {
+                    if !self.pinned_directives.contains(&directive) {
+                        self.pinned_directives.push(directive);
+                    }
+                }
+            }
+        }
+        self.pinned_directives.truncate(20);
 
         let summary_msg = ChatMessage::User {
             content: format!(
@@ -2016,6 +1779,24 @@ impl<'a> ToolUseLoop<'a> {
         };
         let kept = self.messages[keep_from..].to_vec();
         self.messages = vec![system, summary_msg];
+
+        // Re-inject pinned user directives so they survive compaction.
+        // Placed as a System message right after the summary so the model
+        // always sees them regardless of how many compaction rounds occur.
+        if !self.pinned_directives.is_empty() {
+            let directives_text = self
+                .pinned_directives
+                .iter()
+                .map(|d| format!("- {d}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.messages.push(ChatMessage::System {
+                content: format!(
+                    "USER DIRECTIVES (must follow throughout this conversation):\n{directives_text}"
+                ),
+            });
+        }
+
         self.messages.extend(kept);
         true
     }
@@ -2111,6 +1892,47 @@ impl<'a> ToolUseLoop<'a> {
         output.to_string()
     }
 
+    /// Emit injection/secret warnings detected by the output scanner.
+    fn emit_injection_warnings(
+        &self,
+        warnings: &[codingbuddy_policy::output_scanner::InjectionWarning],
+    ) {
+        for warning in warnings {
+            self.emit(StreamChunk::SecurityWarning {
+                message: format!(
+                    "{:?} — {} (matched: {})",
+                    warning.severity, warning.pattern_name, warning.matched_text
+                ),
+            });
+        }
+    }
+
+    /// Apply privacy router to a tool message, redacting sensitive content if configured.
+    fn apply_privacy_to_message(&self, msg: ChatMessage) -> ChatMessage {
+        if let ChatMessage::Tool {
+            tool_call_id,
+            content,
+        } = msg
+        {
+            let filtered = self.apply_privacy_to_output(&content);
+            ChatMessage::Tool {
+                tool_call_id,
+                content: filtered,
+            }
+        } else {
+            msg
+        }
+    }
+
+    /// Get the workspace path as a string for hook inputs.
+    fn workspace_str(&self) -> String {
+        self.config
+            .workspace
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    }
+
     /// Emit a stream chunk to the callback.
     fn emit(&self, chunk: StreamChunk) {
         if let Some(ref cb) = self.stream_cb {
@@ -2121,362 +1943,11 @@ impl<'a> ToolUseLoop<'a> {
 
 /// Extract a file path from a tool result string, if present.
 /// Handles both JSON-formatted results (with "path"/"file_path" keys) and plain text.
-fn extract_tool_path(content: &str) -> Option<String> {
-    // Try parsing as JSON object with "path" or "file_path" key
-    if content.starts_with('{')
-        && let Ok(obj) = serde_json::from_str::<serde_json::Value>(content)
-        && let Some(map) = obj.as_object()
-    {
-        if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
-            return Some(path.to_string());
-        }
-        if let Some(path) = map.get("file_path").and_then(|v| v.as_str()) {
-            return Some(path.to_string());
-        }
-    }
-    // Try as string containing a path-like pattern at the start
-    if (content.starts_with('/') || content.starts_with("./"))
-        && let Some(line) = content.lines().next()
-    {
-        let trimmed = line.trim();
-        if trimmed.len() < 256 && !trimmed.contains(' ') {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-/// Build a structured summary from messages being compacted.
-///
-/// Extracts key facts: files modified/read, errors encountered, key decisions,
-/// and tool usage counts. This preserves important context that would otherwise
-/// be lost during compaction.
-fn build_compaction_summary(messages: &[ChatMessage]) -> String {
-    let mut files_read: Vec<String> = Vec::new();
-    let mut files_modified: Vec<String> = Vec::new();
-    let mut tools_used: Vec<String> = Vec::new();
-    let mut errors_hit: Vec<String> = Vec::new();
-    let mut key_decisions: Vec<String> = Vec::new();
-
-    for msg in messages {
-        match msg {
-            ChatMessage::Assistant {
-                tool_calls,
-                content,
-                ..
-            } => {
-                for tc in tool_calls {
-                    tools_used.push(tc.name.clone());
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        && let Some(path) = args
-                            .get("file_path")
-                            .or(args.get("path"))
-                            .and_then(|v| v.as_str())
-                    {
-                        if tc.name.contains("read")
-                            || tc.name.contains("glob")
-                            || tc.name.contains("grep")
-                        {
-                            files_read.push(path.to_string());
-                        } else {
-                            files_modified.push(path.to_string());
-                        }
-                    }
-                }
-                if let Some(text) = content
-                    && text.len() > 50
-                    && text.len() < 500
-                {
-                    key_decisions.push(truncate_line(text, 150));
-                }
-            }
-            ChatMessage::Tool { content, .. } => {
-                let lower = content.to_ascii_lowercase();
-                if lower.contains("error")
-                    || lower.contains("failed")
-                    || lower.contains("not found")
-                {
-                    errors_hit.push(truncate_line(content, 100));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    files_read.sort();
-    files_read.dedup();
-    files_modified.sort();
-    files_modified.dedup();
-
-    let mut summary = String::new();
-    if !files_modified.is_empty() {
-        summary.push_str(&format!("Files modified: {}\n", files_modified.join(", ")));
-    }
-    if !files_read.is_empty() {
-        summary.push_str(&format!("Files read: {}\n", files_read.join(", ")));
-    }
-    if !errors_hit.is_empty() {
-        summary.push_str(&format!("Errors encountered: {}\n", errors_hit.join("; ")));
-    }
-    if !key_decisions.is_empty() {
-        summary.push_str("Key decisions:\n");
-        for d in key_decisions.iter().take(5) {
-            summary.push_str(&format!("- {d}\n"));
-        }
-    }
-    let tool_counts = count_tool_usage(&tools_used);
-    summary.push_str(&format!("Tools used: {tool_counts}\n"));
-    summary
-}
-
-/// Template for LLM-based compaction. The LLM fills this in based on the conversation.
-const COMPACTION_TEMPLATE: &str = "Summarize this conversation into the following sections. \
-Be precise and factual — include file paths, function names, and error messages. \
-Keep each section to 2-5 bullet points. Output ONLY the filled template:\n\n\
-## Goal\n(What the user asked for)\n\n\
-## Completed\n(What was done successfully — include file paths)\n\n\
-## In Progress\n(What's partially done or pending)\n\n\
-## Key Facts Established\n\
-(Important facts the user stated or that were discovered during the conversation. \
-Include: file paths discussed, decisions made, user preferences stated, corrections given. \
-These facts must be preserved across compaction so the model does not lose context.)\n\n\
-## Key Findings\n(Important discoveries, errors hit, architectural decisions)\n\n\
-## Modified Files\n(List of files created, edited, or deleted)";
-
-/// Build a structured compaction summary using an LLM call.
-///
-/// Sends the conversation to `deepseek-chat` with a structured template.
-/// Falls back to code-based extraction on any error.
-fn build_compaction_summary_with_llm(
-    llm: &(dyn LlmClient + Send + Sync),
-    messages: &[ChatMessage],
-) -> Result<String> {
-    // Build a condensed representation of the conversation for the LLM
-    let mut conversation_text = String::new();
-    for msg in messages {
-        match msg {
-            ChatMessage::User { content } => {
-                conversation_text.push_str(&format!("USER: {}\n", truncate_line(content, 500)));
-            }
-            ChatMessage::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                if let Some(text) = content {
-                    conversation_text
-                        .push_str(&format!("ASSISTANT: {}\n", truncate_line(text, 500)));
-                }
-                for tc in tool_calls {
-                    conversation_text.push_str(&format!(
-                        "TOOL_CALL: {}({})\n",
-                        tc.name,
-                        truncate_line(&tc.arguments, 200)
-                    ));
-                }
-            }
-            ChatMessage::Tool {
-                tool_call_id,
-                content,
-            } => {
-                conversation_text.push_str(&format!(
-                    "TOOL_RESULT[{tool_call_id}]: {}\n",
-                    truncate_line(content, 300)
-                ));
-            }
-            ChatMessage::System { content } => {
-                conversation_text.push_str(&format!("SYSTEM: {}\n", truncate_line(content, 200)));
-            }
-        }
-    }
-
-    // Skip if conversation is too short to be worth an LLM call
-    if conversation_text.len() < 200 {
-        return Err(anyhow!("conversation too short for LLM compaction"));
-    }
-
-    let request = ChatRequest {
-        model: codingbuddy_core::CODINGBUDDY_V32_CHAT_MODEL.to_string(),
-        messages: vec![
-            ChatMessage::System {
-                content: COMPACTION_TEMPLATE.to_string(),
-            },
-            ChatMessage::User {
-                content: conversation_text,
-            },
-        ],
-        max_tokens: 2048,
-        temperature: Some(0.0),
-        top_p: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logprobs: None,
-        top_logprobs: None,
-        tools: vec![],
-        tool_choice: ToolChoice::none(),
-        thinking: None,
-        images: vec![],
-        response_format: None,
-    };
-
-    let response = llm.complete_chat(&request)?;
-    let text = response.text.trim().to_string();
-
-    // Validate the response has at least some structure
-    if text.contains("## Goal") || text.contains("## Completed") || text.contains("## Modified") {
-        Ok(text)
-    } else if text.len() > 50 {
-        // Acceptable even without perfect headers
-        Ok(text)
-    } else {
-        Err(anyhow!("LLM compaction produced empty or invalid response"))
-    }
-}
-
-/// Truncate a line to max_len chars, appending "..." if truncated.
-fn truncate_line(text: &str, max_len: usize) -> String {
-    let first_line = text.lines().next().unwrap_or(text);
-    if first_line.len() <= max_len {
-        first_line.to_string()
-    } else {
-        format!("{}...", &first_line[..max_len])
-    }
-}
-
-/// Count tool usage into a human-readable summary (e.g. "fs_read×5, fs_edit×2").
-fn count_tool_usage(tools: &[String]) -> String {
-    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for name in tools {
-        *counts.entry(name.as_str()).or_default() += 1;
-    }
-    if counts.is_empty() {
-        return "none".to_string();
-    }
-    counts
-        .iter()
-        .map(|(name, count)| format!("{name}×{count}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Check if a tool API name is read-only.
-fn is_read_only_api_name(name: &str) -> bool {
-    matches!(
-        name,
-        "fs_read"
-            | "fs_glob"
-            | "fs_grep"
-            | "fs_list"
-            | "git_status"
-            | "git_diff"
-            | "git_show"
-            | "web_search"
-            | "web_fetch"
-            | "notebook_read"
-            | "index_query"
-            | "extended_thinking"
-            | "think_deeply"
-            | "user_question"
-            | "spawn_task"
-            | "task_output"
-            | "task_list"
-            | "task_get"
-            | "diagnostics_check"
-    )
-}
-
-/// Produce a short summary of tool arguments for display.
-fn summarize_args(args: &serde_json::Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(obj) = args.as_object() {
-        for (key, val) in obj {
-            let short = match val {
-                serde_json::Value::String(s) => {
-                    if s.len() > 60 {
-                        format!("{key}=\"{}...\"", &s[..57])
-                    } else {
-                        format!("{key}=\"{s}\"")
-                    }
-                }
-                serde_json::Value::Number(n) => format!("{key}={n}"),
-                serde_json::Value::Bool(b) => format!("{key}={b}"),
-                _ => format!("{key}=..."),
-            };
-            parts.push(short);
-        }
-    }
-    if parts.is_empty() {
-        return "()".to_string();
-    }
-    parts.join(", ")
-}
-
-/// Known file extensions for path detection.
-const FILE_EXTENSIONS: &[&str] = &[
-    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".cpp", ".c", ".h", ".hpp", ".rb",
-    ".swift", ".kt", ".sh", ".sql", ".json", ".toml", ".yaml", ".yml", ".md", ".html", ".css",
-    ".scss", ".vue", ".svelte", ".zig", ".ex", ".exs",
-];
-
-/// Detect when the model mentions file paths without having called fs_read/fs_glob first.
-/// Returns true if the text references paths that haven't been verified by tool calls.
-fn has_unverified_file_references(text: &str, tool_calls_made: &[ToolCallRecord]) -> bool {
-    use std::sync::LazyLock;
-    static FILE_REF_PATTERN: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\b[\w./\-]+\.\w{1,6}\b").unwrap());
-
-    let mentioned_paths: Vec<&str> = FILE_REF_PATTERN
-        .find_iter(text)
-        .map(|m| m.as_str())
-        .filter(|p| {
-            // Must look like a real file path, not a dot-access pattern
-            let has_known_ext = FILE_EXTENSIONS.iter().any(|ext| p.ends_with(ext));
-            let has_path_sep = p.contains('/');
-            (has_known_ext || has_path_sep)
-                && !p.starts_with("self.")
-                && !p.starts_with("req.")
-                && !p.starts_with("resp.")
-                && !p.starts_with("cfg.")
-                && !p.contains('(')
-        })
-        .collect();
-
-    if mentioned_paths.is_empty() {
-        return false;
-    }
-
-    // Check if any read/glob/grep tool was called (the model at least tried to look)
-    let used_read_tools = tool_calls_made.iter().any(|tc| {
-        tc.tool_name == "fs_read"
-            || tc.tool_name == "fs.read"
-            || tc.tool_name == "fs_glob"
-            || tc.tool_name == "fs.glob"
-            || tc.tool_name == "fs_grep"
-            || tc.tool_name == "fs.grep"
-            || tc.tool_name == "fs_list"
-            || tc.tool_name == "fs.list"
-    });
-
-    // If any path is mentioned but no read/search tools were used, flag it.
-    // Even a single unverified file reference (e.g. "cat audit.md") should trigger.
-    !used_read_tools && !mentioned_paths.is_empty()
-}
-
-/// Detect when the model outputs shell commands as text instead of using tools.
-/// Catches patterns like `cat file.rs`, `grep pattern`, `find . -name ...` etc.
-/// that appear inside code blocks or as bare commands.
-fn contains_shell_command_pattern(text: &str) -> bool {
-    use std::sync::LazyLock;
-    static SHELL_PATTERNS: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?m)(?:^```(?:bash|sh|shell|zsh)?\s*\n\s*(?:cat|head|tail|grep|find|ls|sed|awk)\s+|^\s*\$\s+(?:cat|head|tail|grep|find|ls|sed|awk)\s+)"
-        ).unwrap()
-    });
-    SHELL_PATTERNS.is_match(text)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::anti_hallucination::split_sentences;
+    use super::compaction::COMPACTION_TEMPLATE;
+    use super::safety::DOOM_LOOP_HISTORY_SIZE;
     use super::*;
     use codingbuddy_core::{LlmResponse, ToolCall, ToolProposal, ToolResult};
     use std::collections::VecDeque;
@@ -3043,26 +2514,51 @@ mod tests {
             default_tools(),
         );
 
-        // Add a tool result message to simulate a later turn
+        // Add 2 tool result messages — after 2 tool calls, should switch to auto
         loop_.messages.push(ChatMessage::Tool {
             tool_call_id: "call_1".to_string(),
             content: "file content".to_string(),
+        });
+        loop_.messages.push(ChatMessage::Tool {
+            tool_call_id: "call_2".to_string(),
+            content: "another file".to_string(),
         });
 
         let request = loop_.build_request();
         assert_eq!(
             request.tool_choice,
             ToolChoice::auto(),
-            "subsequent turns should use tool_choice=auto"
+            "after 2+ tool results should use tool_choice=auto"
+        );
+
+        // With only 1 tool result, should still force required (strengthened forcing)
+        let llm2 = ScriptedLlm::new(vec![]);
+        let tool_host2 = Arc::new(MockToolHost::new(vec![], true));
+        let mut loop2 = ToolUseLoop::new(
+            &llm2,
+            tool_host2,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+        loop2.messages.push(ChatMessage::Tool {
+            tool_call_id: "call_1".to_string(),
+            content: "one result".to_string(),
+        });
+        let request2 = loop2.build_request();
+        assert_eq!(
+            request2.tool_choice,
+            ToolChoice::required(),
+            "with only 1 tool result, should still force required"
         );
     }
 
     #[test]
-    fn hallucination_nudge_triggers_at_300_chars() {
-        // Response of exactly 301 chars should trigger nudge
-        let text_301 = "x".repeat(301);
+    fn hallucination_nudge_triggers_at_threshold() {
+        // Response exceeding HALLUCINATION_NUDGE_THRESHOLD should trigger nudge
+        let over_threshold = "x".repeat(HALLUCINATION_NUDGE_THRESHOLD + 1);
         let llm = ScriptedLlm::new(vec![
-            make_text_response(&text_301),
+            make_text_response(&over_threshold),
             make_text_response("OK"), // after nudge
         ]);
         let tool_host = Arc::new(MockToolHost::new(vec![], true));
@@ -3079,9 +2575,9 @@ mod tests {
         assert_eq!(result.response, "OK");
         assert_eq!(result.turns, 2, "nudge should have triggered an extra turn");
 
-        // Response of exactly 300 chars should NOT trigger nudge
-        let text_300 = "y".repeat(300);
-        let llm2 = ScriptedLlm::new(vec![make_text_response(&text_300)]);
+        // Response at exactly the threshold should NOT trigger nudge
+        let at_threshold = "y".repeat(HALLUCINATION_NUDGE_THRESHOLD);
+        let llm2 = ScriptedLlm::new(vec![make_text_response(&at_threshold)]);
         let tool_host2 = Arc::new(MockToolHost::new(vec![], true));
 
         let mut loop2 = ToolUseLoop::new(
@@ -3093,7 +2589,10 @@ mod tests {
         );
 
         let result2 = loop2.run("describe the project").unwrap();
-        assert_eq!(result2.turns, 1, "300 chars should not trigger nudge");
+        assert_eq!(
+            result2.turns, 1,
+            "at-threshold response should not trigger nudge"
+        );
     }
 
     #[test]
@@ -3119,6 +2618,30 @@ mod tests {
 
         // Short text with no path-like patterns should not flag
         assert!(!has_unverified_file_references("Hello, world!", &[]));
+
+        // Dot-access patterns should not flag (module access, not file paths)
+        assert!(!has_unverified_file_references(
+            "Use self.config and fmt.Println for output",
+            &[]
+        ));
+
+        // Version numbers should not flag
+        assert!(!has_unverified_file_references(
+            "Update to v0.6 or version 2.34",
+            &[]
+        ));
+
+        // URL-like patterns should not flag
+        assert!(!has_unverified_file_references(
+            "See https.example and http.server docs",
+            &[]
+        ));
+
+        // New extensions should flag
+        assert!(has_unverified_file_references(
+            "Check the .env file and config.ini",
+            &[]
+        ));
     }
 
     #[test]
@@ -4605,7 +4128,7 @@ mod tests {
             assert!(
                 content.contains("[output pruned"),
                 "old tool output should be pruned, got: {}",
-                &content[..50.min(content.len())]
+                &content[..content.floor_char_boundary(50.min(content.len()))]
             );
             assert!(
                 content.len() < 500,
@@ -4688,10 +4211,7 @@ mod tests {
         let mut tracker = DoomLoopTracker::default();
         let args = r#"{"file_path":"/src/main.rs"}"#;
 
-        assert!(
-            !tracker.record("fs_read", args),
-            "first call: no doom loop"
-        );
+        assert!(!tracker.record("fs_read", args), "first call: no doom loop");
         assert!(
             !tracker.record("fs_read", args),
             "second call: no doom loop"
@@ -4742,10 +4262,7 @@ mod tests {
         // Now back to original — should detect again
         tracker.record("fs_read", args);
         tracker.record("fs_read", args);
-        assert!(
-            tracker.record("fs_read", args),
-            "should detect after reset"
-        );
+        assert!(tracker.record("fs_read", args), "should detect after reset");
     }
 
     #[test]
@@ -4878,6 +4395,148 @@ mod tests {
         assert!(
             has_doom_guidance,
             "doom loop guidance should be in messages for context if user continues"
+        );
+    }
+
+    // ── User directive extraction tests ──
+
+    #[test]
+    fn extract_directives_finds_always_never() {
+        let text =
+            "Please always use snake_case for variable names. Never commit directly to main.";
+        let directives = extract_user_directives(text);
+        assert_eq!(directives.len(), 2);
+        assert!(directives[0].contains("always use snake_case"));
+        assert!(directives[1].contains("Never commit"));
+    }
+
+    #[test]
+    fn extract_directives_skips_questions() {
+        let text = "Should I always use tabs? Never mind about that.";
+        let directives = extract_user_directives(text);
+        // "Should I always use tabs?" ends with '?' so it's skipped
+        // "Never mind about that." should still be captured
+        assert_eq!(directives.len(), 1);
+        assert!(directives[0].contains("Never mind"));
+    }
+
+    #[test]
+    fn extract_directives_skips_short_fragments() {
+        let text = "always\nnever\nprefer X for all Y operations in the codebase";
+        let directives = extract_user_directives(text);
+        // "always" and "never" are too short (< 10 chars)
+        assert_eq!(directives.len(), 1);
+        assert!(directives[0].contains("prefer X"));
+    }
+
+    #[test]
+    fn extract_directives_caps_at_limit() {
+        // 12 directive-containing sentences should be capped at 10
+        let lines: Vec<String> = (0..12)
+            .map(|i| format!("Always do thing number {i} in the code"))
+            .collect();
+        let text = lines.join("\n");
+        let directives = extract_user_directives(&text);
+        assert_eq!(directives.len(), 10);
+    }
+
+    #[test]
+    fn extract_directives_handles_multiline_input() {
+        let text = "First, make sure all tests pass before committing.\n\
+                     Second, use the standard library whenever possible.\n\
+                     What do you think about this approach?";
+        let directives = extract_user_directives(text);
+        assert_eq!(directives.len(), 2);
+        assert!(directives[0].contains("make sure"));
+        assert!(directives[1].contains("use the standard"));
+    }
+
+    #[test]
+    fn directives_survive_compaction() {
+        // Build a ToolUseLoop, feed it a user message with directives,
+        // trigger compaction, and verify directives are re-injected.
+        let llm = ScriptedLlm::new(vec![
+            // First turn: tool call + result
+            make_tool_response(vec![LlmToolCall {
+                id: "c1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+            }]),
+            make_text_response("done with first task"),
+            // Second turn (after continue_with): text response
+            make_text_response("done with second task"),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(
+            vec![ToolResult {
+                invocation_id: uuid::Uuid::nil(),
+                success: true,
+                output: serde_json::json!("file contents here"),
+            }],
+            true,
+        ));
+
+        let config = ToolLoopConfig {
+            context_window_tokens: 200, // Very small window to force compaction
+            ..Default::default()
+        };
+        let mut tool_loop = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "You are a coding assistant.".to_string(),
+            vec![],
+        );
+
+        // First turn with a directive
+        let _ = tool_loop.run("Always use snake_case for variables. Read the file.");
+
+        // Verify directive was collected
+        assert!(
+            tool_loop
+                .pinned_directives
+                .iter()
+                .any(|d| d.contains("snake_case")),
+            "directive should be collected: {:?}",
+            tool_loop.pinned_directives
+        );
+
+        // Manually trigger compaction (simulate context pressure)
+        // The pinned_directives field should persist across compaction
+        let directives_before = tool_loop.pinned_directives.clone();
+
+        // Second turn
+        let _ = tool_loop.continue_with("Now prefer tabs over spaces. Fix the bug.");
+
+        // Directives from both turns should be present
+        assert!(
+            tool_loop
+                .pinned_directives
+                .iter()
+                .any(|d| d.contains("snake_case")),
+            "first directive should persist: {:?}",
+            tool_loop.pinned_directives
+        );
+        assert!(
+            tool_loop
+                .pinned_directives
+                .iter()
+                .any(|d| d.contains("prefer tabs")),
+            "second directive should be collected: {:?}",
+            tool_loop.pinned_directives
+        );
+        assert!(
+            tool_loop.pinned_directives.len() >= directives_before.len(),
+            "directives should accumulate"
+        );
+    }
+
+    #[test]
+    fn split_sentences_handles_periods_and_newlines() {
+        let text = "First sentence. Second sentence.\nThird line";
+        let sentences = split_sentences(text);
+        assert!(
+            sentences.len() >= 3,
+            "should split on periods and newlines: {sentences:?}"
         );
     }
 }
