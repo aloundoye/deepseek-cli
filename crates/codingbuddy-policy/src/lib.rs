@@ -335,6 +335,9 @@ pub enum PolicyError {
     DangerousCommand,
 }
 
+/// Maximum audit log entries before oldest are discarded.
+const MAX_AUDIT_ENTRIES: usize = 1000;
+
 /// Decision recorded in the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditDecision {
@@ -585,6 +588,10 @@ impl PolicyEngine {
         match self.permission_mode {
             PermissionMode::BypassPermissions => {
                 if let Ok(mut log) = self.audit_log.lock() {
+                    let len = log.len();
+                    if len >= MAX_AUDIT_ENTRIES {
+                        log.drain(..len / 2);
+                    }
                     log.push(AuditEntry {
                         tool_name: call.name.clone(),
                         mode: PermissionMode::BypassPermissions,

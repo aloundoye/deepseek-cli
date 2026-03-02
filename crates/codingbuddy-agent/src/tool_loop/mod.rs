@@ -81,6 +81,14 @@ const CACHEABLE_TOOLS: &[&str] = &["fs_read", "fs_glob", "fs_grep", "fs_list", "
 /// When exceeded, the oldest entry (by insertion order approximation) is evicted.
 const MAX_CACHE_ENTRIES: usize = 256;
 
+/// Cached tool result entry.
+struct CacheEntry {
+    result: serde_json::Value,
+    timestamp: Instant,
+    /// Unhashed "tool_name:args" string for path-based invalidation.
+    raw_key: String,
+}
+
 /// The core tool-use conversation loop.
 ///
 /// Implements the think→act→observe pattern where the LLM freely decides
@@ -109,12 +117,9 @@ pub struct ToolUseLoop<'a> {
     /// Pre-compiled output scanner for injection/secret detection.
     output_scanner: codingbuddy_policy::output_scanner::OutputScanner,
     /// Cache for read-only tool results. Keyed by SHA-256 hash of (tool_name, args).
-    /// Each entry stores (result, timestamp, raw_key) where raw_key is the
-    /// unhashed "tool_name:args" string used for path-based invalidation.
     /// Entries expire after `TOOL_CACHE_TTL_SECS`. Invalidated when write tools
     /// modify the cached path. Bounded at `MAX_CACHE_ENTRIES`.
-    /// Cache values: (result, timestamp, original_args_str for path-based invalidation)
-    tool_cache: HashMap<String, (serde_json::Value, Instant, String)>,
+    tool_cache: HashMap<String, CacheEntry>,
     /// Circuit breaker: tracks consecutive failures per tool name.
     /// When a tool fails `CIRCUIT_BREAKER_THRESHOLD` times in a row, it is
     /// disabled for `CIRCUIT_BREAKER_COOLDOWN_TURNS`.
@@ -128,8 +133,6 @@ pub struct ToolUseLoop<'a> {
     pinned_directives: Vec<String>,
     /// Pre-computed workspace path string for hook inputs (avoids repeated allocation).
     workspace_path_str: String,
-    /// Whether a verbosity nudge has been fired this turn (reset each user turn).
-    verbosity_nudge_fired: bool,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -178,7 +181,6 @@ impl<'a> ToolUseLoop<'a> {
             doom_loop_tracker: DoomLoopTracker::default(),
             pinned_directives: Vec::new(),
             workspace_path_str,
-            verbosity_nudge_fired: false,
         }
     }
 
@@ -208,10 +210,10 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         let key = Self::cache_key(tool_name, args);
-        if let Some((result, timestamp, _)) = self.tool_cache.get(&key)
-            && timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS
+        if let Some(entry) = self.tool_cache.get(&key)
+            && entry.timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS
         {
-            return Some(result.clone());
+            return Some(entry.result.clone());
         }
         // Expired or not found — remove it
         self.tool_cache.remove(&key);
@@ -231,14 +233,18 @@ impl<'a> ToolUseLoop<'a> {
         }
         let (key, raw) = Self::cache_key_with_raw(tool_name, args);
         self.tool_cache
-            .insert(key, (result.clone(), Instant::now(), raw));
+            .insert(key, CacheEntry {
+                result: result.clone(),
+                timestamp: Instant::now(),
+                raw_key: raw,
+            });
 
         // Evict oldest entry if cache exceeds maximum size (single insert → at most 1 eviction)
         if self.tool_cache.len() > MAX_CACHE_ENTRIES
             && let Some(oldest_key) = self
                 .tool_cache
                 .iter()
-                .min_by_key(|(_, (_, ts, _))| *ts)
+                .min_by_key(|(_, entry)| entry.timestamp)
                 .map(|(k, _)| k.clone())
         {
             self.tool_cache.remove(&oldest_key);
@@ -247,9 +253,9 @@ impl<'a> ToolUseLoop<'a> {
 
     /// Invalidate cache entries for a given path (after a write tool modifies it).
     fn cache_invalidate_path(&mut self, path: &str) {
-        self.tool_cache.retain(|_key, (_result, _ts, raw_key)| {
+        self.tool_cache.retain(|_key, entry| {
             // Invalidate any cached entry whose original args contain this path
-            !raw_key.contains(path)
+            !entry.raw_key.contains(path)
         });
     }
 
@@ -325,9 +331,6 @@ impl<'a> ToolUseLoop<'a> {
             strip_prior_reasoning_content(&mut self.messages);
         }
 
-        // Reset per-turn state
-        self.verbosity_nudge_fired = false;
-
         self.messages.push(ChatMessage::User {
             content: user_message.to_string(),
         });
@@ -355,6 +358,7 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
+        let mut verbosity_nudge_fired = false;
         let mut last_model = self.config.model.clone();
 
         // Pre-compute immutable values used inside the loop
@@ -487,7 +491,7 @@ impl<'a> ToolUseLoop<'a> {
 
             // Evict expired cache entries to prevent unbounded memory growth
             self.tool_cache
-                .retain(|_, (_, ts, _)| ts.elapsed().as_secs() < TOOL_CACHE_TTL_SECS);
+                .retain(|_, entry| entry.timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS);
 
             // T3.3: Decrement circuit breaker cooldowns at start of each turn
             for state in self.circuit_breaker.values_mut() {
@@ -512,8 +516,15 @@ impl<'a> ToolUseLoop<'a> {
                 // Allows up to MAX_NUDGE_ATTEMPTS nudges per turn before letting through.
                 // NOTE: No `tool_calls_made.is_empty()` guard — the model can revert to
                 // hallucination at any point, even after using tools earlier.
-                let has_unverified_refs = has_unverified_file_references(&text, &tool_calls_made);
-                let has_shell_cmd = contains_shell_command_pattern(&text);
+                let (has_unverified_refs, has_shell_cmd) =
+                    if nudge_count < MAX_NUDGE_ATTEMPTS {
+                        (
+                            has_unverified_file_references(&text, &tool_calls_made),
+                            contains_shell_command_pattern(&text),
+                        )
+                    } else {
+                        (false, false)
+                    };
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
                     && (text.len() > HALLUCINATION_NUDGE_THRESHOLD
                         || has_unverified_refs
@@ -556,10 +567,13 @@ impl<'a> ToolUseLoop<'a> {
 
                 // P1.6: Verbosity enforcement — if the response is too verbose
                 // (>400 words, no code blocks), inject a conciseness nudge once per turn.
-                let word_count = text.split_whitespace().count();
-                let has_code_blocks = text.contains("```");
-                if word_count > 400 && !has_code_blocks && !self.verbosity_nudge_fired {
-                    self.verbosity_nudge_fired = true;
+                let word_count = if !verbosity_nudge_fired && !text.contains("```") {
+                    text.split_whitespace().count()
+                } else {
+                    0
+                };
+                if word_count > 400 {
+                    verbosity_nudge_fired = true;
                     self.messages.push(ChatMessage::Assistant {
                         content: Some(text),
                         reasoning_content: None,
