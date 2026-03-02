@@ -54,6 +54,7 @@ fn build_router(cfg: &AppConfig) -> Result<PrivacyRouter> {
             _ => PrivacyPolicy::Redact,
         },
         store_raw_in_logs: cfg.local_ml.privacy.store_raw_in_logs,
+        strict_regex: false,
     };
     PrivacyRouter::new(privacy_cfg)
 }

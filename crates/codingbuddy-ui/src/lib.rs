@@ -3864,24 +3864,24 @@ where
         }
 
         // ── Model picker overlay ──────────────────────────────────────────
-        if model_picker.is_some() {
+        if let Some(ref mut mp) = model_picker {
             match key.code {
                 KeyCode::Up => {
-                    model_picker.as_mut().unwrap().up();
-                    let mp = model_picker.as_ref().unwrap();
+                    mp.up();
+                    mp.selected = mp.selected.min(MODEL_CHOICES.len().saturating_sub(1));
                     let (name, desc) = MODEL_CHOICES[mp.selected];
                     info_line = format!("Select model: > {name}  ({desc})");
                     continue;
                 }
                 KeyCode::Down => {
-                    model_picker.as_mut().unwrap().down();
-                    let mp = model_picker.as_ref().unwrap();
+                    mp.down();
+                    mp.selected = mp.selected.min(MODEL_CHOICES.len().saturating_sub(1));
                     let (name, desc) = MODEL_CHOICES[mp.selected];
                     info_line = format!("Select model: > {name}  ({desc})");
                     continue;
                 }
                 KeyCode::Enter => {
-                    let chosen = model_picker.as_ref().unwrap().confirm();
+                    let chosen = mp.confirm();
                     model_picker = None;
                     // Send the model selection as a /model command
                     let model_cmd = format!("/model {chosen}");

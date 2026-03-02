@@ -136,3 +136,55 @@ fn connection_string_detected() {
         "postgres connection string should be detected"
     );
 }
+
+#[test]
+fn test_invalid_regex_logs_warning() {
+    // Non-strict mode: invalid regex should be skipped with a warning, not error
+    let config = PrivacyConfig {
+        enabled: true,
+        sensitive_regex: vec![
+            "[invalid".to_string(),             // broken regex
+            r"sk-[a-zA-Z0-9]{20,}".to_string(), // valid regex
+        ],
+        strict_regex: false,
+        ..Default::default()
+    };
+    let router = PrivacyRouter::new(config);
+    assert!(
+        router.is_ok(),
+        "non-strict mode should succeed even with invalid regex"
+    );
+    // The valid pattern should still work
+    let router = router.unwrap();
+    let content = "key=sk-abcdefghijklmnopqrstuvwxyz";
+    let matches = router.scan_content(content);
+    // Should detect via the valid user regex (and/or builtin patterns)
+    assert!(
+        !matches.is_empty(),
+        "valid patterns should still be compiled and usable"
+    );
+}
+
+#[test]
+fn test_strict_mode_rejects_invalid_regex() {
+    let config = PrivacyConfig {
+        enabled: true,
+        sensitive_regex: vec!["[invalid".to_string()],
+        strict_regex: true,
+        ..Default::default()
+    };
+    let result = PrivacyRouter::new(config);
+    assert!(
+        result.is_err(),
+        "strict mode should return error for invalid regex"
+    );
+    let err_msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
+    assert!(
+        err_msg.contains("[invalid"),
+        "error should mention the invalid pattern, got: {}",
+        err_msg
+    );
+}

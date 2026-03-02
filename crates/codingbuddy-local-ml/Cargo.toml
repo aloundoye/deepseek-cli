@@ -25,6 +25,7 @@ ignore.workspace = true
 regex.workspace = true
 rayon.workspace = true
 glob.workspace = true
+toml = { workspace = true }
 codingbuddy-core = { path = "../codingbuddy-core" }
 codingbuddy-index = { path = "../codingbuddy-index" }
 

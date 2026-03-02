@@ -1008,6 +1008,7 @@ fn build_privacy_router(
             _ => codingbuddy_local_ml::PrivacyPolicy::Redact,
         },
         store_raw_in_logs: cfg.local_ml.privacy.store_raw_in_logs,
+        strict_regex: false,
     };
     codingbuddy_local_ml::PrivacyRouter::new(privacy_config)
         .ok()

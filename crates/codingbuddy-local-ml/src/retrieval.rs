@@ -235,6 +235,22 @@ impl HybridRetriever {
             }
         }
 
+        // Populate content for BM25-only chunks by reading from disk
+        for (_rank, chunk) in &mut bm25_only_chunks {
+            if chunk.content.is_empty()
+                && chunk.start_line > 0
+                && let Ok(file_content) = std::fs::read_to_string(&chunk.file_path)
+            {
+                let lines: Vec<&str> = file_content.lines().collect();
+                // start_line and end_line are 1-indexed in code chunks
+                let start = chunk.start_line.saturating_sub(1);
+                let end = chunk.end_line.min(lines.len());
+                if start < lines.len() {
+                    chunk.content = lines[start..end].join("\n");
+                }
+            }
+        }
+
         // Reciprocal Rank Fusion
         let k_rrf: f32 = 60.0;
         let mut fused_scores: HashMap<String, (f32, f32, f32)> = HashMap::new();
@@ -327,7 +343,11 @@ impl HybridRetriever {
     pub fn build_index(&mut self, workspace: &Path) -> Result<IndexBuildReport> {
         let start = std::time::Instant::now();
 
-        let chunks = crate::chunker::chunk_workspace(workspace, &self.chunk_config)?;
+        let mut chunks = crate::chunker::chunk_workspace(workspace, &self.chunk_config)?;
+
+        // Add metadata chunks (workspace members, directory structure, README)
+        let metadata_chunks = crate::chunker::chunk_workspace_metadata(workspace);
+        chunks.extend(metadata_chunks);
         let files: std::collections::HashSet<String> = chunks
             .iter()
             .map(|c| c.file_path.to_string_lossy().to_string())
@@ -495,6 +515,66 @@ mod tests {
         assert_eq!(fused[0].0, "b");
         // "c" is BM25-only, should still appear
         assert!(fused.iter().any(|(id, _)| id == "c"));
+    }
+
+    #[test]
+    fn test_bm25_only_chunks_have_content() {
+        // BM25-only results (not found by vector search) should have their
+        // content populated from disk rather than left empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Create a test file with a distinctive keyword
+        let content = "fn unique_bm25_keyword_function() {\n    println!(\"found via BM25\");\n}\n\nfn another_helper() {\n    println!(\"helper\");\n}\n";
+        std::fs::write(workspace.join("bm25_test.rs"), content).unwrap();
+
+        // Build tantivy index
+        let session = codingbuddy_core::Session {
+            session_id: uuid::Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: codingbuddy_core::SessionState::Idle,
+            budgets: codingbuddy_core::SessionBudgets {
+                per_turn_seconds: 10,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        let tantivy = codingbuddy_index::IndexService::new(&workspace).unwrap();
+        tantivy.build(&session).unwrap();
+
+        let embeddings = Arc::new(MockEmbeddings::new(64));
+        let index_path = tmp.path().join("index");
+        let mut retriever = HybridRetriever::new(
+            &index_path,
+            embeddings,
+            Some(tantivy),
+            0.7,
+            ChunkConfig {
+                chunk_lines: 10,
+                chunk_overlap: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        retriever.build_index(&workspace).unwrap();
+
+        let results = retriever
+            .search("unique_bm25_keyword_function", 10, &SearchFilter::default())
+            .unwrap();
+
+        // All results should have non-empty content
+        for result in &results {
+            assert!(
+                !result.chunk.content.is_empty(),
+                "chunk from {} (lines {}-{}) should have content populated",
+                result.chunk.file_path.display(),
+                result.chunk.start_line,
+                result.chunk.end_line
+            );
+        }
     }
 
     #[test]

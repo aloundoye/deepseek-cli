@@ -9,7 +9,7 @@ pub mod retrieval;
 pub mod speculative;
 pub mod vector_index;
 
-pub use chunker::{Chunk, ChunkConfig, ChunkManifest, ChunkStrategy};
+pub use chunker::{Chunk, ChunkConfig, ChunkManifest, ChunkStrategy, chunk_workspace_metadata};
 pub use completion::{GenOpts, LocalGenBackend, MockGenerator};
 pub use embeddings::{EmbeddingsBackend, MockEmbeddings};
 pub use model_manager::{ModelInfo, ModelManager, ModelStatus};

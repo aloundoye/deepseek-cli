@@ -476,7 +476,7 @@ pub struct SubagentConfig {
     pub compaction_enabled: bool,
     /// Model override for the subagent.
     pub model: Option<String>,
-    /// Tool restrictions — if non-empty, only these tools are available.
+    /// Tool restrictions -- if non-empty, only these tools are available.
     pub allowed_tools: Vec<String>,
     /// Tools to exclude from the subagent's toolset.
     pub disallowed_tools: Vec<String>,
@@ -505,6 +505,27 @@ impl SubagentConfig {
             disallowed_tools: def.disallowed_tools.clone(),
         }
     }
+}
+
+/// Detect whether an error message represents a policy-engine denial rather
+/// than a generic OS permission error. Only policy-specific patterns trigger
+/// the read-only fallback; OS errors like "Permission denied: /etc/shadow"
+/// do not.
+fn is_policy_denial(error_msg: &str) -> bool {
+    const POLICY_PATTERNS: &[&str] = &[
+        "denied by policy",
+        "blocked by policy",
+        "not in allowlist",
+        "not allowlisted",
+        "approval denied",
+        "locked mode",
+        "policy blocked",
+        "requires approval",
+        "command prefix is blocked by policy",
+        "path traversal denied",
+    ];
+    let lower = error_msg.to_lowercase();
+    POLICY_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 // ── SubagentManager ──
@@ -569,14 +590,10 @@ impl SubagentManager {
                                 };
                             }
                             Err(err) if attempts <= retries => {
-                                let err_msg = err.to_string().to_ascii_lowercase();
-                                // Detect permission denial errors and fall back to read-only
-                                if err_msg.contains("permission denied")
-                                    || err_msg.contains("approval denied")
-                                    || err_msg.contains("locked mode")
-                                    || err_msg.contains("policy blocked")
-                                    || err_msg.contains("not allowed")
-                                {
+                                // Detect policy denial errors and fall back to read-only.
+                                // Uses specific policy-engine patterns to avoid false positives
+                                // from OS-level permission errors (e.g. EACCES on /etc/shadow).
+                                if is_policy_denial(&err.to_string()) {
                                     current_task.read_only_fallback = true;
                                 }
                                 continue;
@@ -1198,5 +1215,107 @@ mod tests {
 
         let reviewer = defs.iter().find(|d| d.name == "reviewer").unwrap();
         assert_eq!(reviewer.model.as_deref(), Some("deepseek-reasoner"));
+    }
+
+    // ── P2.9: Policy denial detection precision ───────────────────────────
+
+    #[test]
+    fn test_os_permission_error_not_treated_as_policy_denial() {
+        // OS-level permission errors should NOT trigger read-only fallback
+        assert!(
+            !is_policy_denial("Permission denied (os error 13)"),
+            "OS EACCES should not be treated as policy denial"
+        );
+        assert!(
+            !is_policy_denial("Permission not allowed: /etc/shadow"),
+            "OS-level 'not allowed' should not be treated as policy denial"
+        );
+        assert!(
+            !is_policy_denial("open('/etc/passwd'): permission denied"),
+            "file-system permission denied should not match"
+        );
+        assert!(
+            !is_policy_denial("connection refused"),
+            "network errors should not match"
+        );
+        assert!(
+            !is_policy_denial("file not found: /tmp/missing.txt"),
+            "not-found errors should not match"
+        );
+
+        // Policy engine errors SHOULD trigger read-only fallback
+        assert!(
+            is_policy_denial("Permission denied by policy: fs_edit"),
+            "policy denial should match"
+        );
+        assert!(
+            is_policy_denial("command prefix is blocked by policy"),
+            "dangerous command policy should match"
+        );
+        assert!(
+            is_policy_denial("tool fs_write not in allowlist"),
+            "allowlist denial should match"
+        );
+        assert!(
+            is_policy_denial("Tool bash.run is not allowlisted"),
+            "not-allowlisted denial should match"
+        );
+        assert!(
+            is_policy_denial("approval denied by user"),
+            "user approval denial should match"
+        );
+        assert!(
+            is_policy_denial("locked mode blocks all non-read operations"),
+            "locked mode should match"
+        );
+        assert!(
+            is_policy_denial("fs.write policy blocked"),
+            "policy blocked should match"
+        );
+        assert!(
+            is_policy_denial("This operation requires approval"),
+            "requires approval should match"
+        );
+        assert!(
+            is_policy_denial("path traversal denied"),
+            "path traversal should match"
+        );
+    }
+
+    #[test]
+    fn test_os_permission_error_does_not_trigger_read_only_fallback() {
+        // End-to-end: OS permission error should NOT trigger read_only_fallback
+        let mut manager = SubagentManager::new(1);
+        manager.max_retries_per_task = 1;
+        let task = SubagentTask {
+            run_id: Uuid::now_v7(),
+            name: "read-etc".to_string(),
+            goal: "read system file".to_string(),
+            role: SubagentRole::Task,
+            team: "execution".to_string(),
+            read_only_fallback: false,
+            custom_agent: None,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_w = Arc::clone(&attempts);
+        let results = manager.run_tasks(vec![task], move |task| {
+            let count = attempts_w.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // OS-level error -- should NOT trigger read_only_fallback
+                anyhow::bail!("Permission not allowed: /etc/shadow (os error 13)")
+            }
+            // On retry, read_only_fallback should still be false
+            assert!(
+                !task.read_only_fallback,
+                "OS permission error should NOT set read_only_fallback"
+            );
+            Ok("retried without read-only".to_string())
+        });
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert!(
+            !results[0].used_read_only_fallback,
+            "OS error should not trigger read-only fallback"
+        );
     }
 }

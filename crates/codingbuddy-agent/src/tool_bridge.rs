@@ -6,6 +6,7 @@
 
 use codingbuddy_core::{ChatMessage, LlmToolCall, ToolCall, ToolDefinition, ToolName, ToolResult};
 use codingbuddy_policy::output_scanner::{InjectionWarning, OutputScanner};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum characters for tool output before truncation.
 pub const MAX_TOOL_OUTPUT_CHARS: usize = 25_000;
@@ -237,11 +238,39 @@ fn format_tool_output(output: &serde_json::Value, success: bool) -> String {
 /// Maximum output lines before truncation with continuation hint.
 const MAX_TOOL_OUTPUT_LINES: usize = 10_000;
 
+/// Monotonic counter for generating unique overflow IDs.
+static OVERFLOW_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Save full output to `.codingbuddy/overflow/{id}.txt` when truncating.
+///
+/// Returns the overflow ID on success, or `None` if the write failed.
+fn save_overflow(full_text: &str) -> Option<String> {
+    let id = OVERFLOW_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let overflow_id = format!("{ts}_{id}");
+
+    // Use workspace root (cwd) to place overflow files at project-level .codingbuddy/
+    let base = std::env::current_dir().unwrap_or_default();
+    let dir = base.join(".codingbuddy/overflow");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(format!("{overflow_id}.txt"));
+    if std::fs::write(&path, full_text).is_err() {
+        return None;
+    }
+    Some(overflow_id)
+}
+
 /// Truncate output to max chars/lines, appending a structured continuation hint.
 ///
 /// When output exceeds limits, shows the first portion plus a structured notice
 /// telling the model exactly how to get more. This helps DeepSeek understand
 /// what was cut and how to continue reading with offset parameters.
+/// Full output is saved to `.codingbuddy/overflow/` for later retrieval.
 fn truncate_output(text: &str, max_chars: usize) -> String {
     let line_count = text.lines().count();
     let needs_char_truncation = text.len() > max_chars;
@@ -269,8 +298,14 @@ fn truncate_output(text: &str, max_chars: usize) -> String {
     let shown_lines = truncated.lines().count();
     let total_chars = text.len();
 
+    // Save full output to disk for later retrieval
+    let _ = save_overflow(text);
+
     format!(
-        "{truncated}\n\n[Output truncated: {shown_lines}/{total_lines} lines, \
+        "{truncated}\n\n[OUTPUT TRUNCATED: {total_lines} lines / {total_chars} bytes total. \
+         Full output saved. Use fs_grep to search the full content or \
+         fs_read with start_line/end_line to read specific sections.]\n\n\
+         [Output truncated: {shown_lines}/{total_lines} lines, \
          {boundary}/{total_chars} chars shown. \
          To see more, re-run with a more specific query or use offset/limit parameters.]"
     )
@@ -606,5 +641,39 @@ mod tests {
         let result = truncate_output(&big, MAX_TOOL_OUTPUT_CHARS);
         assert!(result.contains("lines"));
         assert!(result.contains("chars shown"));
+    }
+
+    // ── P1.5: Output truncation with disk offload ─────────────────────────
+
+    #[test]
+    fn test_truncation_adds_hint() {
+        let big = "x".repeat(30_000);
+        let result = truncate_output(&big, MAX_TOOL_OUTPUT_CHARS);
+        assert!(
+            result.contains("[OUTPUT TRUNCATED:"),
+            "truncated output should contain the OUTPUT TRUNCATED hint"
+        );
+        assert!(
+            result.contains("bytes total"),
+            "hint should include byte count"
+        );
+        assert!(
+            result.contains("Full output saved"),
+            "hint should mention disk offload"
+        );
+        assert!(
+            result.contains("fs_grep"),
+            "hint should suggest fs_grep for searching"
+        );
+        assert!(
+            result.contains("fs_read with start_line/end_line"),
+            "hint should suggest fs_read with line range"
+        );
+        // Verify the original line/byte counts are present
+        assert!(
+            result.contains("30000 bytes total"),
+            "hint should show original byte count, got: {}",
+            &result[result.len().saturating_sub(200)..]
+        );
     }
 }

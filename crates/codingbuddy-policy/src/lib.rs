@@ -335,7 +335,16 @@ pub enum PolicyError {
     DangerousCommand,
 }
 
+/// Audit log entry recorded when permissions are auto-approved (e.g. bypass mode).
 #[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub tool_name: String,
+    pub mode: String,
+    pub decision: String,
+    pub timestamp: std::time::SystemTime,
+}
+
+#[derive(Debug)]
 pub struct PolicyEngine {
     cfg: PolicyConfig,
     secret_regexes: Vec<Regex>,
@@ -345,6 +354,26 @@ pub struct PolicyEngine {
     /// Workspace root for path canonicalization. Absolute paths under this root
     /// are permitted; symlinks resolving outside it are blocked.
     workspace_root: Option<std::path::PathBuf>,
+    /// Audit trail for auto-approved tool calls.
+    audit_log: std::sync::Mutex<Vec<AuditEntry>>,
+}
+
+impl Clone for PolicyEngine {
+    fn clone(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            secret_regexes: self.secret_regexes.clone(),
+            permission_mode: self.permission_mode,
+            sandbox_auto_allow_bash: self.sandbox_auto_allow_bash,
+            workspace_root: self.workspace_root.clone(),
+            audit_log: std::sync::Mutex::new(
+                self.audit_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+        }
+    }
 }
 
 impl PolicyEngine {
@@ -368,6 +397,7 @@ impl PolicyEngine {
             permission_mode,
             sandbox_auto_allow_bash: false,
             workspace_root: None,
+            audit_log: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -383,6 +413,14 @@ impl PolicyEngine {
     /// Set the workspace root for path canonicalization and symlink checks.
     pub fn set_workspace_root(&mut self, root: std::path::PathBuf) {
         self.workspace_root = Some(root);
+    }
+
+    /// Return a snapshot of the audit log entries.
+    pub fn audit_entries(&self) -> Vec<AuditEntry> {
+        self.audit_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn from_app_config(cfg: &codingbuddy_core::PolicyConfig) -> Self {
@@ -539,7 +577,17 @@ impl PolicyEngine {
         let is_mcp = call.name.starts_with("mcp__");
 
         match self.permission_mode {
-            PermissionMode::BypassPermissions => false,
+            PermissionMode::BypassPermissions => {
+                if let Ok(mut log) = self.audit_log.lock() {
+                    log.push(AuditEntry {
+                        tool_name: call.name.clone(),
+                        mode: "bypass".to_string(),
+                        decision: "auto_approved".to_string(),
+                        timestamp: std::time::SystemTime::now(),
+                    });
+                }
+                false
+            }
             PermissionMode::Locked => {
                 // In locked mode, all non-read tools require approval (and will be denied).
                 if is_mcp {
@@ -2283,5 +2331,28 @@ mod tests {
             "echo hello > out.txt"
         ));
         assert!(shell_parse::has_redirection_operator("cat < input.txt"));
+    }
+
+    #[test]
+    fn bypass_mode_creates_audit_entry() {
+        let engine = PolicyEngine::new(PolicyConfig {
+            permission_mode: PermissionMode::BypassPermissions,
+            ..PolicyConfig::default()
+        });
+        assert!(engine.audit_entries().is_empty());
+
+        let call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: serde_json::json!({"path": "/tmp/test.rs"}),
+            requires_approval: false,
+        };
+        let needs = engine.requires_approval(&call);
+        assert!(!needs, "bypass mode should auto-approve");
+
+        let entries = engine.audit_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tool_name, "fs.edit");
+        assert_eq!(entries[0].mode, "bypass");
+        assert_eq!(entries[0].decision, "auto_approved");
     }
 }

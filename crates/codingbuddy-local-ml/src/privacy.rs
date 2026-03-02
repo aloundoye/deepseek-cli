@@ -22,6 +22,10 @@ pub struct PrivacyConfig {
     pub sensitive_regex: Vec<String>,
     pub policy: PrivacyPolicy,
     pub store_raw_in_logs: bool,
+    /// When true, return an error if any user-configured regex fails to compile.
+    /// When false (default), skip invalid patterns with a warning.
+    #[serde(default)]
+    pub strict_regex: bool,
 }
 
 impl Default for PrivacyConfig {
@@ -41,6 +45,7 @@ impl Default for PrivacyConfig {
             sensitive_regex: Vec::new(),
             policy: PrivacyPolicy::Redact,
             store_raw_in_logs: false,
+            strict_regex: false,
         }
     }
 }
@@ -87,11 +92,22 @@ impl PrivacyRouter {
             .filter_map(|g| glob::Pattern::new(g).ok())
             .collect();
 
-        let regex_patterns: Vec<Regex> = config
-            .sensitive_regex
-            .iter()
-            .filter_map(|r| Regex::new(r).ok())
-            .collect();
+        let mut regex_patterns: Vec<Regex> = Vec::new();
+        for pattern in &config.sensitive_regex {
+            match Regex::new(pattern) {
+                Ok(re) => regex_patterns.push(re),
+                Err(err) => {
+                    if config.strict_regex {
+                        return Err(anyhow::anyhow!(
+                            "invalid regex pattern '{}': {}",
+                            pattern,
+                            err
+                        ));
+                    }
+                    eprintln!("[privacy] invalid regex pattern '{}': {}", pattern, err);
+                }
+            }
+        }
 
         let builtin_patterns = build_builtin_secret_patterns();
 

@@ -16,6 +16,10 @@ pub struct ToolCallRecord {
     pub args_summary: String,
     pub success: bool,
     pub duration_ms: u64,
+    /// Raw JSON args for path extraction (anti-hallucination path-specific verification).
+    pub(crate) args_json: Option<String>,
+    /// First ~200 chars of result for consistency checks.
+    pub(crate) result_preview: Option<String>,
 }
 
 /// Result of running the tool-use loop.

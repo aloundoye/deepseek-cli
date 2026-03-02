@@ -432,35 +432,15 @@ impl HookRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let spawned = cmd.spawn().is_ok();
+        let spawn_result = cmd.spawn();
+        let spawned = spawn_result.is_ok();
 
-        // Spawn a reaper thread if needed to enforce timeout.
-        if spawned {
+        // Move the child handle into a reaper thread for timeout enforcement.
+        // Previously this re-spawned the command, causing double-execution.
+        if let Ok(mut child) = spawn_result {
             let timeout = Duration::from_secs(timeout_secs);
-            let cmd_str = command.to_string();
-            let ws = self.workspace.clone();
             std::thread::spawn(move || {
-                // Re-spawn so we can wait with timeout (the original handle is moved)
-                let shell = if cfg!(target_os = "windows") {
-                    "cmd"
-                } else {
-                    "sh"
-                };
-                let flag = if cfg!(target_os = "windows") {
-                    "/C"
-                } else {
-                    "-c"
-                };
-                if let Ok(mut child) = Command::new(shell)
-                    .arg(flag)
-                    .arg(&cmd_str)
-                    .current_dir(&ws)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    && let Ok(None) = child.wait_timeout(timeout)
-                {
+                if let Ok(None) = child.wait_timeout(timeout) {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
@@ -490,11 +470,11 @@ impl HookRuntime {
         _schema: Option<&serde_json::Value>,
         input: &HookInput,
     ) -> HookRun {
-        // Expand template variables.
+        // Expand template variables with shell escaping to prevent injection.
         let context_json = serde_json::to_string(input).unwrap_or_default();
         let expanded = prompt_template
-            .replace("{{event}}", &input.event)
-            .replace("{{context}}", &context_json);
+            .replace("{{event}}", &shell_escape(&input.event))
+            .replace("{{context}}", &shell_escape(&context_json));
 
         // For now, treat the expanded prompt as a shell command that outputs HookOutput JSON.
         // In production, this would call the LLM API.
@@ -534,6 +514,25 @@ impl HookRuntime {
 
     /// Run a command hook handler: pipe JSON on stdin, parse stdout JSON for decisions.
     fn run_command_handler(&self, command: &str, input: &HookInput, timeout_secs: u64) -> HookRun {
+        // P0.5: Reject commands with dangerous shell constructs before execution.
+        if contains_dangerous_shell_constructs(command) {
+            return HookRun {
+                handler_description: format!("command: {command}"),
+                success: false,
+                timed_out: false,
+                exit_code: None,
+                output: HookOutput {
+                    additional_context: Some(
+                        "Hook command rejected: contains dangerous shell constructs \
+                         ($(...), backticks, process substitution, or here-strings)"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+                blocked: true,
+            };
+        }
+
         let input_json = serde_json::to_string(input).unwrap_or_default();
 
         let shell = if cfg!(target_os = "windows") {
@@ -695,6 +694,22 @@ pub fn merge_skill_hooks(
             .extend(handlers);
     }
     merged
+}
+
+/// Escape a string for safe inclusion in a single-quoted shell argument.
+/// Closes the current single-quote, inserts an escaped single-quote, and reopens.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Returns true if the command string contains dangerous shell constructs
+/// that could enable command injection: `$(`, backtick, `>(`, `<(`, `<<<`.
+fn contains_dangerous_shell_constructs(cmd: &str) -> bool {
+    cmd.contains("$(")
+        || cmd.contains('`')
+        || cmd.contains(">(")
+        || cmd.contains("<(")
+        || cmd.contains("<<<")
 }
 
 fn build_command(path: &Path) -> Command {

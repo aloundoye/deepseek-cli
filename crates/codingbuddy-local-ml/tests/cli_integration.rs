@@ -57,6 +57,7 @@ fn privacy_scan_finds_env_files() {
         sensitive_regex: vec![],
         policy: PrivacyPolicy::Redact,
         store_raw_in_logs: false,
+        strict_regex: false,
     };
     let router = PrivacyRouter::new(config).unwrap();
 

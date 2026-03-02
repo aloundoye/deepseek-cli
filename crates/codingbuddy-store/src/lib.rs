@@ -809,19 +809,49 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Session {
-                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap(),
+                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 workspace_root: row.get(1)?,
                 baseline_commit: row.get(2)?,
-                status: serde_json::from_str(&row.get::<_, String>(3)?).unwrap(),
-                budgets: serde_json::from_str(&row.get::<_, String>(4)?).unwrap(),
+                status: serde_json::from_str(&row.get::<_, String>(3)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                budgets: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 active_plan_id: row
                     .get::<_, Option<String>>(5)?
-                    .map(|v| Uuid::parse_str(&v).unwrap()),
+                    .map(|v| {
+                        Uuid::parse_str(&v).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })
+                    })
+                    .transpose()?,
             })
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            match row {
+                Ok(session) => out.push(session),
+                Err(e) => eprintln!("[store] skipping corrupt session row: {e}"),
+            }
         }
         Ok(out)
     }
@@ -834,9 +864,27 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![session_id.to_string()], |row| {
             Ok(codingbuddy_core::RunRecord {
-                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap(),
-                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str()).unwrap(),
-                status: serde_json::from_str(&row.get::<_, String>(2)?).unwrap(),
+                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str()).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                status: serde_json::from_str(&row.get::<_, String>(2)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 prompt: row.get(3)?,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
@@ -844,7 +892,10 @@ impl Store {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            match row {
+                Ok(run) => out.push(run),
+                Err(e) => eprintln!("[store] skipping corrupt run row: {e}"),
+            }
         }
         Ok(out)
     }

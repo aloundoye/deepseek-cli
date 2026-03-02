@@ -183,21 +183,19 @@ impl ContextManager {
         let from_dir = from_path.parent()?;
         let import = import.trim().trim_matches('"').trim_matches('`');
 
-        // Try different resolution strategies
-        let candidates = [
-            // Direct relative path
-            from_dir.join(import),
-            // With extension
-            from_dir.join(format!("{}.rs", import)),
-            from_dir.join(format!("{}.js", import)),
-            from_dir.join(format!("{}.ts", import)),
-            from_dir.join(format!("{}.py", import)),
-            // Module/index file
-            from_dir.join(import).join("mod.rs"),
-            from_dir.join(import).join("index.js"),
-            from_dir.join(import).join("index.ts"),
-            from_dir.join(import).join("__init__.py"),
-        ];
+        let source_ext = from_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let (extensions, index_files) = extensions_for_language(source_ext);
+
+        // Try different resolution strategies based on source language
+        let mut candidates = vec![from_dir.join(import)];
+
+        for ext in extensions {
+            candidates.push(from_dir.join(format!("{import}.{ext}")));
+        }
+
+        for index in index_files {
+            candidates.push(from_dir.join(import).join(index));
+        }
 
         for candidate in candidates {
             if candidate.exists() {
@@ -425,6 +423,23 @@ impl ContextManager {
         }
 
         compressed.join("\n")
+    }
+}
+
+/// Returns the file extensions and index file names appropriate for a given
+/// source file language. When the language is unknown, falls back to trying
+/// all extensions (preserving the original behaviour).
+fn extensions_for_language(source_ext: &str) -> (&[&str], &[&str]) {
+    match source_ext.to_ascii_lowercase().as_str() {
+        "rs" => (&["rs"], &["mod.rs"]),
+        "js" | "jsx" | "mjs" => (&["js", "jsx", "mjs"], &["index.js"]),
+        "ts" | "tsx" => (&["ts", "tsx", "d.ts"], &["index.ts"]),
+        "py" => (&["py"], &["__init__.py"]),
+        // Unknown language -- try everything (original behaviour)
+        _ => (
+            &["rs", "js", "jsx", "mjs", "ts", "tsx", "d.ts", "py"],
+            &["mod.rs", "index.js", "index.ts", "__init__.py"],
+        ),
     }
 }
 
@@ -747,5 +762,91 @@ mod tests {
         let count2 = mgr.file_count();
         assert_eq!(count1, count2, "re-analysis should not duplicate nodes");
         Ok(())
+    }
+
+    // ── P2.6: Language-scoped import resolution ──
+
+    #[test]
+    fn test_rust_import_does_not_try_js_extensions() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        // Create a .js file named "foo.js" -- should NOT be found from a .rs context
+        fs::write(dir.path().join("foo.js"), "export function foo() {}").unwrap();
+
+        // Create a .rs source file that tries to import "foo"
+        let source_rs = dir.path().join("main.rs");
+        fs::write(&source_rs, "mod foo;\nfn main() {}").unwrap();
+
+        let mgr = ContextManager::new(dir.path())?;
+
+        // Resolve "foo" from a .rs file context -- should return None because
+        // only .rs and mod.rs extensions are tried, and foo.js should not match.
+        let resolved = mgr.resolve_import(&source_rs, "foo");
+        assert!(
+            resolved.is_none(),
+            "resolving 'foo' from a .rs file should NOT find foo.js, got: {:?}",
+            resolved
+        );
+
+        // Now create a foo.rs -- THAT should be found
+        fs::write(dir.path().join("foo.rs"), "pub fn foo() {}").unwrap();
+        let resolved = mgr.resolve_import(&source_rs, "foo");
+        assert!(
+            resolved.is_some(),
+            "resolving 'foo' from a .rs file should find foo.rs"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_js_import_does_not_try_rs_extensions() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        // Create only a .rs file
+        fs::write(dir.path().join("utils.rs"), "pub fn help() {}").unwrap();
+
+        let source_js = dir.path().join("app.js");
+        fs::write(&source_js, "import './utils'").unwrap();
+
+        let mgr = ContextManager::new(dir.path())?;
+
+        let resolved = mgr.resolve_import(&source_js, "./utils");
+        assert!(
+            resolved.is_none(),
+            "resolving './utils' from a .js file should NOT find utils.rs, got: {:?}",
+            resolved
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extensions_for_language_coverage() {
+        // Verify each language returns the right extensions
+        let (exts, idx) = extensions_for_language("rs");
+        assert_eq!(exts, &["rs"]);
+        assert_eq!(idx, &["mod.rs"]);
+
+        let (exts, idx) = extensions_for_language("js");
+        assert!(exts.contains(&"js"));
+        assert!(exts.contains(&"jsx"));
+        assert!(exts.contains(&"mjs"));
+        assert!(idx.contains(&"index.js"));
+
+        let (exts, idx) = extensions_for_language("ts");
+        assert!(exts.contains(&"ts"));
+        assert!(exts.contains(&"tsx"));
+        assert!(exts.contains(&"d.ts"));
+        assert!(idx.contains(&"index.ts"));
+
+        let (exts, idx) = extensions_for_language("py");
+        assert_eq!(exts, &["py"]);
+        assert_eq!(idx, &["__init__.py"]);
+
+        // Unknown language falls back to all
+        let (exts, idx) = extensions_for_language("go");
+        assert!(exts.len() > 4, "unknown language should try all extensions");
+        assert!(idx.len() > 2, "unknown language should try all index files");
     }
 }

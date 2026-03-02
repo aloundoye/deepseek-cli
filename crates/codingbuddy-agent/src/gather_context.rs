@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use toml::Table as TomlTable;
 
 const HEAVY_DIRS: &[&str] = &[
     ".git",
@@ -54,6 +55,111 @@ struct ManifestEntry {
     path: String,
     name: String,
     excerpt: String,
+}
+
+/// Extract workspace metadata (workspace members, build system) from the project root.
+///
+/// Tries, in order:
+/// 1. `Cargo.toml` — looks for `[workspace] members` array
+/// 2. `package.json` — looks for `"workspaces"` array
+/// 3. `go.work` — looks for `use` directives
+///
+/// Returns a formatted string with workspace info, or `None` if no workspace is detected.
+pub(crate) fn extract_workspace_metadata(workspace_root: &Path) -> Option<String> {
+    // Try Cargo.toml first
+    let cargo_path = workspace_root.join("Cargo.toml");
+    if cargo_path.exists()
+        && let Ok(content) = fs::read_to_string(&cargo_path)
+        && let Ok(parsed) = content.parse::<TomlTable>()
+        && let Some(members) = parsed
+            .get("workspace")
+            .and_then(|ws| ws.get("members"))
+            .and_then(|m| m.as_array())
+    {
+        let member_paths: Vec<String> = members
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !member_paths.is_empty() {
+            let mut lines = Vec::new();
+            lines.push("Workspace metadata:".to_string());
+            lines.push("  Build system: Cargo".to_string());
+            lines.push(format!(
+                "  Workspace members: {} crates",
+                member_paths.len()
+            ));
+            for member in &member_paths {
+                lines.push(format!("  - {member}"));
+            }
+            return Some(lines.join("\n"));
+        }
+    }
+
+    // Try package.json
+    let pkg_path = workspace_root.join("package.json");
+    if pkg_path.exists()
+        && let Ok(content) = fs::read_to_string(&pkg_path)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(workspaces) = parsed.get("workspaces").and_then(|w| w.as_array())
+    {
+        let workspace_paths: Vec<String> = workspaces
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !workspace_paths.is_empty() {
+            let mut lines = Vec::new();
+            lines.push("Workspace metadata:".to_string());
+            lines.push("  Build system: npm/yarn".to_string());
+            lines.push(format!(
+                "  Workspace members: {} packages",
+                workspace_paths.len()
+            ));
+            for member in &workspace_paths {
+                lines.push(format!("  - {member}"));
+            }
+            return Some(lines.join("\n"));
+        }
+    }
+
+    // Try go.work
+    let gowork_path = workspace_root.join("go.work");
+    if gowork_path.exists()
+        && let Ok(content) = fs::read_to_string(&gowork_path)
+    {
+        let mut modules = Vec::new();
+        let mut in_use_block = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("use (") || trimmed == "use (" {
+                in_use_block = true;
+                continue;
+            }
+            if in_use_block && trimmed == ")" {
+                in_use_block = false;
+                continue;
+            }
+            if in_use_block && !trimmed.is_empty() {
+                modules.push(trimmed.to_string());
+            } else if trimmed.starts_with("use ") && !trimmed.contains('(') {
+                let module = trimmed.trim_start_matches("use ").trim();
+                if !module.is_empty() {
+                    modules.push(module.to_string());
+                }
+            }
+        }
+        if !modules.is_empty() {
+            let mut lines = Vec::new();
+            lines.push("Workspace metadata:".to_string());
+            lines.push("  Build system: Go".to_string());
+            lines.push(format!("  Workspace members: {} modules", modules.len()));
+            for module in &modules {
+                lines.push(format!("  - {module}"));
+            }
+            return Some(lines.join("\n"));
+        }
+    }
+
+    None
 }
 
 pub fn gather_for_prompt(
@@ -162,6 +268,12 @@ pub fn gather_for_prompt(
         lines.push("Project type: unknown".to_string());
     } else {
         lines.push(format!("Project type: {}", project_types.join(", ")));
+    }
+
+    // Workspace metadata (multi-crate/multi-package info)
+    if let Some(ws_meta) = extract_workspace_metadata(&repo_root) {
+        lines.push(String::new());
+        lines.push(ws_meta);
     }
 
     lines.push(String::new());
@@ -1133,5 +1245,100 @@ mod tests {
         assert!(bootstrap.packet.contains("Directory structure:"));
         assert!(bootstrap.packet.contains("Build manifests:"));
         assert!(bootstrap.packet.contains("Key source files:"));
+    }
+
+    #[test]
+    fn test_workspace_metadata_extracts_cargo_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let cargo_toml = "[workspace]\nmembers = [\n    \"crates/alpha\",\n    \"crates/beta\",\n    \"crates/gamma\",\n]\nresolver = \"2\"\n\n[workspace.package]\nedition = \"2024\"\n";
+        std::fs::write(ws.join("Cargo.toml"), cargo_toml).unwrap();
+
+        let result = extract_workspace_metadata(ws);
+        assert!(result.is_some(), "should detect Cargo workspace");
+        let text = result.unwrap();
+        assert!(
+            text.contains("Build system: Cargo"),
+            "should identify Cargo build system: {text}"
+        );
+        assert!(
+            text.contains("3 crates"),
+            "should report 3 workspace members: {text}"
+        );
+        assert!(
+            text.contains("crates/alpha"),
+            "should list crates/alpha: {text}"
+        );
+        assert!(
+            text.contains("crates/beta"),
+            "should list crates/beta: {text}"
+        );
+        assert!(
+            text.contains("crates/gamma"),
+            "should list crates/gamma: {text}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_metadata_extracts_npm_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let package_json = r#"{
+    "name": "monorepo",
+    "workspaces": ["packages/web", "packages/api", "packages/shared"]
+}"#;
+        std::fs::write(ws.join("package.json"), package_json).unwrap();
+
+        let result = extract_workspace_metadata(ws);
+        assert!(result.is_some(), "should detect npm workspaces");
+        let text = result.unwrap();
+        assert!(
+            text.contains("Build system: npm/yarn"),
+            "should identify npm/yarn: {text}"
+        );
+        assert!(
+            text.contains("3 packages"),
+            "should report 3 packages: {text}"
+        );
+        assert!(
+            text.contains("packages/web"),
+            "should list packages/web: {text}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_metadata_extracts_go_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        let go_work = "go 1.21\n\nuse (\n    ./cmd/server\n    ./pkg/lib\n)\n";
+        std::fs::write(ws.join("go.work"), go_work).unwrap();
+
+        let result = extract_workspace_metadata(ws);
+        assert!(result.is_some(), "should detect go.work");
+        let text = result.unwrap();
+        assert!(
+            text.contains("Build system: Go"),
+            "should identify Go: {text}"
+        );
+        assert!(
+            text.contains("2 modules"),
+            "should report 2 modules: {text}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_metadata_returns_none_for_no_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+
+        // No manifest files at all
+        let result = extract_workspace_metadata(ws);
+        assert!(
+            result.is_none(),
+            "should return None when no workspace detected"
+        );
     }
 }

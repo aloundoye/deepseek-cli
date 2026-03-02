@@ -150,7 +150,12 @@ impl SkillManager {
                 });
             }
         }
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        // Sort by (id, scope_rank) so higher-priority scopes come first,
+        // then dedup by id -- the first (highest-priority) entry wins.
+        out.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| scope_rank(&a.scope).cmp(&scope_rank(&b.scope)))
+        });
         out.dedup_by(|a, b| a.id == b.id);
         Ok(out)
     }
@@ -258,11 +263,6 @@ impl SkillManager {
     }
 
     /// Run a skill in forked (isolated) mode.
-    ///
-    /// Returns a `SkillRunOutput` with `forked: true`. The caller is responsible
-    /// for spawning the actual isolated ToolUseLoop context (e.g. via `SubagentWorker`).
-    /// Tool restrictions (`allowed_tools`, `disallowed_tools`) from the skill's
-    /// frontmatter are included in the output for the caller to enforce.
     pub fn run_forked(
         &self,
         skill_id: &str,
@@ -281,6 +281,16 @@ impl SkillManager {
     }
 }
 
+/// Returns a numeric rank for skill scope, used to ensure higher-priority
+/// scopes win during deduplication. Lower rank = higher priority.
+fn scope_rank(scope: &SkillScope) -> u8 {
+    match scope {
+        SkillScope::User => 0,
+        SkillScope::Project => 1,
+        SkillScope::BuiltIn => 2,
+    }
+}
+
 /// Parse a comma-separated list from an optional frontmatter value.
 fn parse_comma_list(value: Option<&String>) -> Vec<String> {
     value
@@ -293,14 +303,12 @@ fn parse_comma_list(value: Option<&String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ── Context Budget ─────────────────────────────────────────────────────────
+// ── Context Budget ──
 
-/// Default skill description budget: 2% of 128K context ≈ 2560 tokens ≈ 10240 chars.
+/// Default skill description budget: 2% of 128K context = 2560 tokens = 10240 chars.
 pub const DEFAULT_SKILL_BUDGET_CHARS: usize = 10_240;
 
 /// Trim skill summaries to fit within a character budget.
-/// Skills are processed in order; once the budget is exhausted, remaining
-/// summaries are replaced with a placeholder.
 pub fn apply_context_budget(skills: &[SkillEntry], budget_chars: usize) -> Vec<SkillEntry> {
     let mut result = skills.to_vec();
     let mut used = 0_usize;
@@ -310,7 +318,6 @@ pub fn apply_context_budget(skills: &[SkillEntry], budget_chars: usize) -> Vec<S
             skill.summary = "[budget exceeded]".to_string();
         } else if skill.summary.len() > remaining {
             let end = remaining.saturating_sub(3);
-            // Ensure we don't split a multi-byte char
             let safe_end = skill.summary.floor_char_boundary(end);
             skill.summary = format!("{}...", &skill.summary[..safe_end]);
         }
@@ -319,24 +326,17 @@ pub fn apply_context_budget(skills: &[SkillEntry], budget_chars: usize) -> Vec<S
     result
 }
 
-// ── Custom Slash Commands ──────────────────────────────────────────────────
+// ── Custom Slash Commands ──
 
 /// A custom slash command loaded from `.codingbuddy/commands/` or `~/.codingbuddy/commands/`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomCommand {
-    /// The command name (derived from filename, e.g. "deploy" from "deploy.md").
     pub name: String,
-    /// Source file path.
     pub path: PathBuf,
-    /// Short description (from `description:` frontmatter or first paragraph).
     pub description: String,
-    /// Whether to suppress model invocation (dry run only).
     pub disable_model_invocation: bool,
-    /// Context mode: "normal" or "fork" (run in subagent).
     pub context: String,
-    /// The rendered prompt body (after variable substitution).
     pub body: String,
-    /// Scoped lifecycle hooks declared in frontmatter (e.g. `hooks.PreToolUse: echo check`).
     #[serde(default)]
     pub hooks: std::collections::HashMap<String, Vec<String>>,
 }
@@ -350,7 +350,6 @@ pub fn load_custom_commands(workspace: &Path) -> Vec<CustomCommand> {
     if let Some(user) = user_dir {
         load_commands_from_dir(&user, &mut commands);
     }
-    // Dedup by name (project-level wins)
     let mut seen = std::collections::HashSet::new();
     commands.retain(|c| seen.insert(c.name.clone()));
     commands
@@ -405,7 +404,6 @@ fn load_commands_from_dir(dir: &Path, out: &mut Vec<CustomCommand>) {
             .get("context")
             .cloned()
             .unwrap_or_else(|| "normal".to_string());
-        // Parse hooks.* keys from frontmatter
         let mut hooks = std::collections::HashMap::<String, Vec<String>>::new();
         for (key, value) in &frontmatter {
             if let Some(event_name) = key.strip_prefix("hooks.") {
@@ -442,7 +440,7 @@ fn parse_command_frontmatter(raw: &str) -> (std::collections::HashMap<String, St
                 map.insert(key.trim().to_string(), val.trim().to_string());
             }
         }
-        let body_start = end + 4; // "\n---"
+        let body_start = end + 4;
         let body = after_first[body_start..].trim_start_matches('\n');
         return (map, body);
     }
@@ -514,7 +512,6 @@ mod tests {
         assert!(lint.description.is_empty());
         assert_eq!(lint.context, "normal");
 
-        // Test variable substitution
         let rendered = render_custom_command(deploy, "v2.0", &workspace, "sess-123");
         assert!(rendered.contains("v2.0"));
         assert!(rendered.contains(&workspace.to_string_lossy().to_string()));
@@ -586,7 +583,6 @@ mod tests {
             })
             .collect();
         let result = apply_context_budget(&skills, 100);
-        // First 3 skills fit (30*3=90), 4th is truncated (10 remaining), 5th is budget exceeded
         assert_eq!(result[0].summary.len(), 30);
         assert!(result[3].summary.ends_with("..."));
         assert_eq!(result[4].summary, "[budget exceeded]");
@@ -619,8 +615,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // ── P5-06: Forked execution ──────────────────────────────────────────
-
     #[test]
     fn skill_forked_isolates_context() {
         let workspace =
@@ -628,7 +622,6 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace");
         let manager = SkillManager::new(&workspace).expect("manager");
 
-        // Create a skill with context: fork
         let source = workspace.join("forked-skill");
         fs::create_dir_all(&source).expect("source");
         fs::write(
@@ -638,7 +631,6 @@ mod tests {
         .expect("skill file");
         manager.install(&source).expect("install");
 
-        // run_forked should return forked=true
         let output = manager
             .run_forked("forked-skill", Some("tests"), &[])
             .expect("run_forked");
@@ -646,12 +638,9 @@ mod tests {
         assert!(output.rendered_prompt.contains("tests"));
         assert!(output.rendered_prompt.contains("isolated context"));
 
-        // Regular run should also detect fork from frontmatter
         let output2 = manager.run("forked-skill", Some("lint"), &[]).expect("run");
-        assert!(output2.forked); // context: fork in frontmatter
+        assert!(output2.forked);
     }
-
-    // ── P5-07: Allowed-tools enforcement ─────────────────────────────────
 
     #[test]
     fn allowed_tools_enforced() {
@@ -679,12 +668,9 @@ mod tests {
 
     #[test]
     fn disallowed_tools_filtered() {
-        // Verify the existing filter_tool_definitions works with our data
         let skills = parse_comma_list(Some(&"bash_run, fs_edit".to_string()));
         assert_eq!(skills, vec!["bash_run", "fs_edit"]);
     }
-
-    // ── P5-08: Skill auto-invocation by model ────────────────────────────
 
     #[test]
     fn skill_invocation_by_model() {
@@ -693,7 +679,6 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace");
         let manager = SkillManager::new(&workspace).expect("manager");
 
-        // Skill with model invocation disabled
         let source = workspace.join("no-invoke-skill");
         fs::create_dir_all(&source).expect("source");
         fs::write(
@@ -707,7 +692,6 @@ mod tests {
         assert!(output.disable_model_invocation);
         assert!(!output.forked);
 
-        // Skill without the flag — model CAN invoke it
         let source2 = workspace.join("auto-skill");
         fs::create_dir_all(&source2).expect("source2");
         fs::write(
@@ -719,5 +703,88 @@ mod tests {
 
         let output2 = manager.run("auto-skill", None, &[]).expect("run");
         assert!(!output2.disable_model_invocation);
+    }
+
+    // ── P2.8: Skill dedup preserves scope priority ──
+
+    #[test]
+    fn test_user_skill_overrides_builtin_same_id() {
+        let user_skill = SkillEntry {
+            id: "deploy".to_string(),
+            name: "User Deploy".to_string(),
+            path: PathBuf::from("/home/user/.codingbuddy/skills/deploy/SKILL.md"),
+            summary: "User-level deploy skill".to_string(),
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+            scope: SkillScope::User,
+            context: "normal".to_string(),
+            disable_model_invocation: false,
+        };
+
+        let builtin_skill = SkillEntry {
+            id: "deploy".to_string(),
+            name: "BuiltIn Deploy".to_string(),
+            path: PathBuf::from("/opt/codingbuddy/skills/deploy/SKILL.md"),
+            summary: "Built-in deploy skill".to_string(),
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+            scope: SkillScope::BuiltIn,
+            context: "normal".to_string(),
+            disable_model_invocation: false,
+        };
+
+        let project_skill = SkillEntry {
+            id: "deploy".to_string(),
+            name: "Project Deploy".to_string(),
+            path: PathBuf::from("/workspace/.codingbuddy/skills/deploy/SKILL.md"),
+            summary: "Project-level deploy skill".to_string(),
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+            scope: SkillScope::Project,
+            context: "fork".to_string(),
+            disable_model_invocation: false,
+        };
+
+        // BuiltIn first, User second -- User should still win
+        let mut skills = vec![builtin_skill.clone(), user_skill.clone()];
+        skills.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| scope_rank(&a.scope).cmp(&scope_rank(&b.scope)))
+        });
+        skills.dedup_by(|a, b| a.id == b.id);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "User Deploy");
+        assert_eq!(skills[0].scope, SkillScope::User);
+
+        // User wins over Project and BuiltIn
+        let mut skills = vec![
+            builtin_skill.clone(),
+            project_skill.clone(),
+            user_skill.clone(),
+        ];
+        skills.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| scope_rank(&a.scope).cmp(&scope_rank(&b.scope)))
+        });
+        skills.dedup_by(|a, b| a.id == b.id);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "User Deploy");
+
+        // Project wins over BuiltIn when no User skill
+        let mut skills = vec![builtin_skill, project_skill];
+        skills.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| scope_rank(&a.scope).cmp(&scope_rank(&b.scope)))
+        });
+        skills.dedup_by(|a, b| a.id == b.id);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Project Deploy");
+        assert_eq!(skills[0].scope, SkillScope::Project);
+    }
+
+    #[test]
+    fn test_scope_rank_ordering() {
+        assert!(scope_rank(&SkillScope::User) < scope_rank(&SkillScope::Project));
+        assert!(scope_rank(&SkillScope::Project) < scope_rank(&SkillScope::BuiltIn));
     }
 }

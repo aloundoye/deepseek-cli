@@ -1,5 +1,7 @@
 //! Anti-hallucination mechanisms: file reference validation, shell command
-//! detection, and user directive extraction.
+//! detection, numeric consistency checking, and user directive extraction.
+
+use std::collections::HashSet;
 
 use super::types::ToolCallRecord;
 
@@ -34,9 +36,103 @@ const DOT_ACCESS_PREFIXES: &[&str] = &[
     "env.", "log.", "err.", "ctx.", "v0.", "v1.", "v2.", "v3.", "e.g.", "i.e.",
 ];
 
+/// Tool names that represent read/search operations for path extraction.
+const READ_TOOL_NAMES: &[&str] = &[
+    "fs_read", "fs.read", "fs_glob", "fs.glob", "fs_grep", "fs.grep", "fs_list", "fs.list",
+];
+
 // ── File reference validation ──
 
+/// Represents an accessed path with its type (file or directory).
+#[derive(Debug)]
+struct AccessedPath {
+    path: String,
+    is_directory: bool,
+}
+
+/// Extract file paths that the model actually accessed via tool calls.
+/// Parses `args_json` for `"path"` or `"file_path"` keys.
+/// For directory-listing tools (fs_glob, fs_list), also records the path as a directory.
+fn extract_accessed_paths(tool_calls_made: &[ToolCallRecord]) -> Vec<AccessedPath> {
+    let mut accessed = Vec::new();
+    let mut seen = HashSet::new();
+
+    let dir_tools = ["fs_glob", "fs.glob", "fs_list", "fs.list"];
+
+    for tc in tool_calls_made {
+        if !READ_TOOL_NAMES.contains(&tc.tool_name.as_str()) {
+            continue;
+        }
+
+        let is_dir_tool = dir_tools.contains(&tc.tool_name.as_str());
+
+        // Try to extract path from args_json
+        if let Some(ref args_json) = tc.args_json
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args_json)
+        {
+            for key in &["path", "file_path"] {
+                if let Some(path_val) = parsed.get(key).and_then(|v| v.as_str()) {
+                    let normalized = path_val.trim_start_matches("./").to_string();
+                    if seen.insert(normalized.clone()) {
+                        accessed.push(AccessedPath {
+                            path: normalized,
+                            is_directory: is_dir_tool,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Fallback: try to extract path from args_summary (e.g. `path="src/main.rs"`)
+        if accessed.is_empty() {
+            for segment in tc.args_summary.split('"') {
+                let trimmed = segment.trim();
+                if trimmed.contains('/') || FILE_EXTENSIONS.iter().any(|ext| trimmed.ends_with(ext))
+                {
+                    let normalized = trimmed.trim_start_matches("./").to_string();
+                    if seen.insert(normalized.clone()) {
+                        accessed.push(AccessedPath {
+                            path: normalized,
+                            is_directory: is_dir_tool,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    accessed
+}
+
+/// Check whether a mentioned path is covered by any accessed path.
+///
+/// Exact match: the mentioned path equals an accessed path (or vice versa).
+/// Directory coverage: if a directory was listed (fs_glob/fs_list), any path
+/// under that directory is considered covered.
+fn path_is_covered(mentioned: &str, accessed_paths: &[AccessedPath]) -> bool {
+    let normalized = mentioned.trim_start_matches("./");
+    for ap in accessed_paths {
+        // Exact match (either way)
+        if ap.path == normalized {
+            return true;
+        }
+        // Directory coverage: if accessed path is a directory, check prefix
+        if ap.is_directory {
+            let dir_prefix = if ap.path.ends_with('/') {
+                ap.path.clone()
+            } else {
+                format!("{}/", ap.path)
+            };
+            if normalized.starts_with(&dir_prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Detect when the model mentions file paths without having called fs_read/fs_glob first.
+/// Uses path-specific verification: reading file A does NOT verify claims about file B.
 /// Returns true if the text references paths that haven't been verified by tool calls.
 pub(crate) fn has_unverified_file_references(
     text: &str,
@@ -67,21 +163,29 @@ pub(crate) fn has_unverified_file_references(
         return false;
     }
 
-    // Check if any read/glob/grep tool was called (the model at least tried to look)
-    let used_read_tools = tool_calls_made.iter().any(|tc| {
-        tc.tool_name == "fs_read"
-            || tc.tool_name == "fs.read"
-            || tc.tool_name == "fs_glob"
-            || tc.tool_name == "fs.glob"
-            || tc.tool_name == "fs_grep"
-            || tc.tool_name == "fs.grep"
-            || tc.tool_name == "fs_list"
-            || tc.tool_name == "fs.list"
-    });
+    // If no read tools were used at all, any file reference is unverified
+    let has_read_tools = tool_calls_made
+        .iter()
+        .any(|tc| READ_TOOL_NAMES.contains(&tc.tool_name.as_str()));
+    if !has_read_tools {
+        return true;
+    }
 
-    // If any path is mentioned but no read/search tools were used, flag it.
-    // Even a single unverified file reference (e.g. "cat audit.md") should trigger.
-    !used_read_tools && !mentioned_paths.is_empty()
+    // Path-specific verification: build set of actually-accessed paths and check
+    // each mentioned path against it
+    let accessed_paths = extract_accessed_paths(tool_calls_made);
+
+    // If we could not extract any specific paths from tool calls (e.g. args_json
+    // was None for all), fall back to the blanket "read tool was used" heuristic
+    // to avoid false positives.
+    if accessed_paths.is_empty() {
+        return false;
+    }
+
+    // Check if ANY mentioned path is NOT covered by accessed paths
+    mentioned_paths
+        .iter()
+        .any(|mentioned| !path_is_covered(mentioned, &accessed_paths))
 }
 
 // ── Shell command detection ──
@@ -97,6 +201,66 @@ pub(crate) fn contains_shell_command_pattern(text: &str) -> bool {
         ).unwrap()
     });
     SHELL_PATTERNS.is_match(text)
+}
+
+// ── Numeric consistency checking ──
+
+/// Check the response text for numeric claims that contradict tool call results.
+///
+/// Scans for patterns like "6 crates", "22 files", etc. and cross-references
+/// against tool result previews. Returns a correction message if a discrepancy
+/// is found, or `None` if everything is consistent or there is insufficient
+/// evidence to judge.
+pub(crate) fn check_response_consistency(
+    response_text: &str,
+    tool_calls_made: &[ToolCallRecord],
+) -> Option<String> {
+    use std::sync::LazyLock;
+
+    // Match patterns like "6 crates", "22 files", "3 errors"
+    static NUMERIC_CLAIM: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(\d+)\s+(crate|file|member|module|package|function|test|error|warning)s?",
+        )
+        .unwrap()
+    });
+
+    // Collect all tool result text for evidence searching
+    let mut result_text = String::new();
+    for tc in tool_calls_made {
+        if let Some(ref preview) = tc.result_preview {
+            result_text.push_str(preview);
+            result_text.push('\n');
+        }
+    }
+
+    if result_text.is_empty() {
+        return None;
+    }
+
+    let result_lower = result_text.to_ascii_lowercase();
+
+    for cap in NUMERIC_CLAIM.captures_iter(response_text) {
+        let claimed: usize = match cap[1].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let noun = &cap[2];
+
+        // Count occurrences of the noun in tool results as evidence
+        let actual = result_lower.matches(noun).count();
+
+        // Only flag if there is meaningful evidence (actual > 0) and a real
+        // discrepancy (difference > 1 to avoid off-by-one noise)
+        if actual > 0 && claimed.abs_diff(actual) > 1 {
+            return Some(format!(
+                "Your response claims {} {}s, but tool results show {}. Please verify and correct.",
+                claimed, noun, actual
+            ));
+        }
+    }
+
+    None
 }
 
 // ── User directive extraction ──
@@ -173,4 +337,161 @@ pub(crate) fn split_sentences(text: &str) -> Vec<&str> {
         sentences.push(seg);
     }
     sentences
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unverified_refs_path_specific() {
+        // Tool read "src/main.rs" but text mentions "src/lib.rs" — should flag
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: "path=\"src/main.rs\"".to_string(),
+            success: true,
+            duration_ms: 10,
+            args_json: Some(r#"{"path":"src/main.rs"}"#.to_string()),
+            result_preview: None,
+        }];
+        assert!(
+            has_unverified_file_references("Check src/lib.rs for the issue", &tool_calls),
+            "mentioning src/lib.rs when only src/main.rs was read should flag"
+        );
+    }
+
+    #[test]
+    fn test_verified_refs_exact_path_match() {
+        // Tool read "src/main.rs" and text mentions "src/main.rs" — should not flag
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: "path=\"src/main.rs\"".to_string(),
+            success: true,
+            duration_ms: 10,
+            args_json: Some(r#"{"path":"src/main.rs"}"#.to_string()),
+            result_preview: None,
+        }];
+        assert!(
+            !has_unverified_file_references(
+                "The file src/main.rs contains the entry point",
+                &tool_calls
+            ),
+            "mentioning src/main.rs when it was read should not flag"
+        );
+    }
+
+    #[test]
+    fn test_unverified_refs_parent_dir_coverage() {
+        // Reading a file in "src/" should cover references to files in "src/"
+        // via the parent directory heuristic
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_glob".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: "path=\"src\"".to_string(),
+            success: true,
+            duration_ms: 10,
+            args_json: Some(r#"{"path":"src"}"#.to_string()),
+            result_preview: None,
+        }];
+        assert!(
+            !has_unverified_file_references("Found src/main.rs in the directory", &tool_calls),
+            "mentioning src/main.rs when src/ was listed should not flag"
+        );
+    }
+
+    #[test]
+    fn test_unverified_refs_no_tool_calls() {
+        // No tool calls at all — any file reference is unverified
+        assert!(
+            has_unverified_file_references("Check src/main.rs for bugs", &[]),
+            "file ref with no tool calls should flag"
+        );
+    }
+
+    #[test]
+    fn test_consistency_check_catches_wrong_count() {
+        // Response says "6 crates" but tool results have many crate mentions
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: String::new(),
+            success: true,
+            duration_ms: 10,
+            args_json: None,
+            result_preview: Some(
+                "crate codingbuddy-cli\ncrate codingbuddy-agent\ncrate codingbuddy-core\n\
+                 crate codingbuddy-llm\ncrate codingbuddy-tools\ncrate codingbuddy-policy\n\
+                 crate codingbuddy-hooks\ncrate codingbuddy-store\ncrate codingbuddy-memory\n\
+                 crate codingbuddy-index\ncrate codingbuddy-mcp\ncrate codingbuddy-ui"
+                    .to_string(),
+            ),
+        }];
+        let result = check_response_consistency("This workspace has 6 crates total.", &tool_calls);
+        assert!(
+            result.is_some(),
+            "should detect discrepancy between claimed 6 and actual 12 crates"
+        );
+        let msg = result.unwrap();
+        assert!(msg.contains("6"), "correction should mention claimed count");
+        assert!(msg.contains("crate"), "correction should mention noun");
+    }
+
+    #[test]
+    fn test_consistency_check_no_false_positive() {
+        // Response says "3 errors" but no tool results mention errors — no evidence to contradict
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: String::new(),
+            success: true,
+            duration_ms: 10,
+            args_json: None,
+            result_preview: Some("fn main() { println!(\"hello\"); }".to_string()),
+        }];
+        let result = check_response_consistency("I found 3 errors in the code.", &tool_calls);
+        assert!(
+            result.is_none(),
+            "should not flag when tool results have no conflicting evidence"
+        );
+    }
+
+    #[test]
+    fn test_consistency_check_no_tool_results() {
+        // No tool result previews — should return None (insufficient evidence)
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_read".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: String::new(),
+            success: true,
+            duration_ms: 10,
+            args_json: None,
+            result_preview: None,
+        }];
+        let result = check_response_consistency("This workspace has 22 crates.", &tool_calls);
+        assert!(
+            result.is_none(),
+            "should not flag when there are no tool result previews"
+        );
+    }
+
+    #[test]
+    fn test_consistency_check_close_count_not_flagged() {
+        // Claimed 3 files, tool shows 2 — difference of 1, should NOT flag (off-by-one tolerance)
+        let tool_calls = vec![ToolCallRecord {
+            tool_name: "fs_glob".to_string(),
+            tool_call_id: "c1".to_string(),
+            args_summary: String::new(),
+            success: true,
+            duration_ms: 10,
+            args_json: None,
+            result_preview: Some("file: main.rs\nfile: lib.rs".to_string()),
+        }];
+        let result = check_response_consistency("Found 3 files in src/.", &tool_calls);
+        assert!(
+            result.is_none(),
+            "off-by-one difference should not trigger correction"
+        );
+    }
 }

@@ -172,7 +172,10 @@ impl McpManager {
         merged.extend(self.load_project_config()?.servers);
         // P5-13: Expand environment variables in all server configs
         for server in &mut merged {
-            expand_server_env_vars(server);
+            if let Err(e) = expand_server_env_vars(server) {
+                eprintln!("[mcp] {e}");
+                continue;
+            }
         }
         merged.sort_by(|a, b| a.id.cmp(&b.id));
         merged.dedup_by(|a, b| a.id == b.id); // first wins (managed > user > project)
@@ -673,17 +676,49 @@ pub fn expand_env_vars(input: &str) -> String {
     result
 }
 
+/// Check whether a string contains shell metacharacters that could enable injection.
+fn contains_shell_metacharacters(s: &str) -> bool {
+    s.contains(';')
+        || s.contains('|')
+        || s.contains('&')
+        || s.contains('$')
+        || s.contains('`')
+        || s.contains('(')
+        || s.contains(')')
+}
+
 /// Expand environment variables in all string fields of an MCP server config.
-pub fn expand_server_env_vars(server: &mut McpServer) {
-    server.id = expand_env_vars(&server.id);
-    server.name = expand_env_vars(&server.name);
-    if let Some(ref cmd) = server.command {
-        server.command = Some(expand_env_vars(cmd));
+/// Returns an error if any expanded value contains shell metacharacters.
+pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
+    let expanded_id = expand_env_vars(&server.id);
+    let expanded_name = expand_env_vars(&server.name);
+    let expanded_cmd = server.command.as_ref().map(|cmd| expand_env_vars(cmd));
+    let expanded_args: Vec<String> = server.args.iter().map(|a| expand_env_vars(a)).collect();
+    let expanded_url = server.url.as_ref().map(|url| expand_env_vars(url));
+
+    if let Some(ref cmd) = expanded_cmd
+        && contains_shell_metacharacters(cmd)
+    {
+        return Err(anyhow!(
+            "MCP server '{}': expanded command contains shell metacharacters: {cmd}",
+            server.id
+        ));
     }
-    server.args = server.args.iter().map(|a| expand_env_vars(a)).collect();
-    if let Some(ref url) = server.url {
-        server.url = Some(expand_env_vars(url));
+    for arg in &expanded_args {
+        if contains_shell_metacharacters(arg) {
+            return Err(anyhow!(
+                "MCP server '{}': expanded arg contains shell metacharacters: {arg}",
+                server.id
+            ));
+        }
     }
+
+    server.id = expanded_id;
+    server.name = expanded_name;
+    server.command = expanded_cmd;
+    server.args = expanded_args;
+    server.url = expanded_url;
+    Ok(())
 }
 
 /// Import MCP servers from Claude Desktop config file.
@@ -2256,9 +2291,29 @@ mod tests {
             metadata: serde_json::Value::Null,
             headers: vec![],
         };
-        expand_server_env_vars(&mut server);
+        expand_server_env_vars(&mut server).unwrap();
         assert_eq!(server.command.as_deref(), Some("node"));
         assert_eq!(server.args[0], "server.js");
+    }
+
+    #[test]
+    fn mcp_env_expansion_rejects_shell_injection() {
+        let mut server = McpServer {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("node; rm -rf /".to_string()),
+            args: vec![],
+            url: None,
+            enabled: true,
+            metadata: serde_json::Value::Null,
+            headers: vec![],
+        };
+        let result = expand_server_env_vars(&mut server);
+        assert!(
+            result.is_err(),
+            "should reject command with shell metacharacters"
+        );
     }
 
     #[test]
@@ -2784,7 +2839,7 @@ data: {"other":"ignored"}
             metadata: serde_json::Value::Null,
             headers: vec![],
         };
-        expand_server_env_vars(&mut server);
+        expand_server_env_vars(&mut server).unwrap();
         let expected_url = format!("https://api.example.com/{home}");
         assert_eq!(server.url.as_deref(), Some(expected_url.as_str()));
         assert_eq!(server.args[0], format!("--home={home}"));
