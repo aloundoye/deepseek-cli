@@ -133,6 +133,14 @@ pub fn tool_result_to_message(
     (msg, warnings)
 }
 
+/// Truncate agent-level tool output (extended_thinking, spawn_task, skill).
+///
+/// These tools bypass the normal `tool_result_to_message` pipeline, so they need
+/// their own truncation. Uses the standard limit.
+pub fn truncate_agent_output(text: &str) -> String {
+    truncate_output(text, MAX_TOOL_OUTPUT_CHARS)
+}
+
 /// Format a tool error as a `ChatMessage::Tool` with error content.
 pub fn tool_error_to_message(tool_call_id: &str, error: &str) -> ChatMessage {
     ChatMessage::Tool {
@@ -146,7 +154,13 @@ pub fn tool_error_to_message(tool_call_id: &str, error: &str) -> ChatMessage {
 pub fn is_write_tool(api_name: &str) -> bool {
     matches!(
         api_name,
-        "fs_edit" | "fs_write" | "bash_run" | "multi_edit" | "patch_apply" | "notebook_edit"
+        "fs_edit"
+            | "fs_write"
+            | "bash_run"
+            | "multi_edit"
+            | "patch_apply"
+            | "patch_direct"
+            | "notebook_edit"
     )
 }
 
@@ -176,7 +190,8 @@ pub fn extract_modified_paths(api_name: &str, args_json: &str) -> Vec<std::path:
                 }
             }
         }
-        "patch_apply" => {
+        "patch_apply" | "patch_direct" => {
+            // patch_direct doesn't have explicit paths in args, but we try anyway
             if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                 paths.push(std::path::PathBuf::from(p));
             }
@@ -219,22 +234,45 @@ fn format_tool_output(output: &serde_json::Value, success: bool) -> String {
     serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string())
 }
 
-/// Truncate output to max chars, appending a notice if truncated.
+/// Maximum output lines before truncation with continuation hint.
+const MAX_TOOL_OUTPUT_LINES: usize = 10_000;
+
+/// Truncate output to max chars/lines, appending a structured continuation hint.
+///
+/// When output exceeds limits, shows the first portion plus a structured notice
+/// telling the model exactly how to get more. This helps DeepSeek understand
+/// what was cut and how to continue reading with offset parameters.
 fn truncate_output(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let line_count = text.lines().count();
+    let needs_char_truncation = text.len() > max_chars;
+    let needs_line_truncation = line_count > MAX_TOOL_OUTPUT_LINES;
+
+    if !needs_char_truncation && !needs_line_truncation {
         return text.to_string();
     }
-    // Find a safe UTF-8 boundary
-    let boundary = text
-        .char_indices()
-        .take_while(|(i, _)| *i < max_chars.saturating_sub(80))
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
+
+    // Determine effective boundary: respect both char and line limits
+    let boundary = if needs_line_truncation && !needs_char_truncation {
+        // Line limit hit first — find the byte offset of line MAX_TOOL_OUTPUT_LINES
+        text.lines()
+            .take(MAX_TOOL_OUTPUT_LINES)
+            .map(|l| l.len() + 1) // +1 for newline
+            .sum::<usize>()
+            .min(text.len())
+    } else {
+        // Char limit — find safe UTF-8 boundary
+        text.floor_char_boundary(max_chars.saturating_sub(80))
+    };
+
     let truncated = &text[..boundary];
+    let total_lines = line_count;
+    let shown_lines = truncated.lines().count();
+    let total_chars = text.len();
+
     format!(
-        "{truncated}\n\n[Output truncated: showing {boundary}/{} chars. Use more specific queries to reduce output size.]",
-        text.len()
+        "{truncated}\n\n[Output truncated: {shown_lines}/{total_lines} lines, \
+         {boundary}/{total_chars} chars shown. \
+         To see more, re-run with a more specific query or use offset/limit parameters.]"
     )
 }
 
@@ -530,5 +568,43 @@ mod tests {
         assert!(err.contains("fs_read"));
         assert!(err.contains("fs_write"));
         assert!(err.contains("bash_run"));
+    }
+
+    #[test]
+    fn truncate_agent_output_large_text() {
+        let big = "x".repeat(30_000);
+        let result = truncate_agent_output(&big);
+        assert!(result.len() < 26_000);
+        assert!(result.contains("[Output truncated"));
+    }
+
+    #[test]
+    fn truncate_agent_output_small_text_passes_through() {
+        let small = "short response";
+        let result = truncate_agent_output(small);
+        assert_eq!(result, small);
+    }
+
+    #[test]
+    fn truncate_output_line_limit() {
+        // 15K very short lines (1 char each). Total chars = 30K (over char limit too),
+        // but verify line-based truncation works when char limit is generous.
+        let text = "x\n".repeat(15_000);
+        // Use a generous char limit so only line limit triggers
+        let result = truncate_output(&text, 100_000);
+        let result_lines = result.lines().count();
+        assert!(
+            result_lines <= MAX_TOOL_OUTPUT_LINES + 5,
+            "should truncate by line count, got {result_lines} lines"
+        );
+        assert!(result.contains("[Output truncated"));
+    }
+
+    #[test]
+    fn truncation_notice_includes_line_counts() {
+        let big = "x".repeat(30_000);
+        let result = truncate_output(&big, MAX_TOOL_OUTPUT_CHARS);
+        assert!(result.contains("lines"));
+        assert!(result.contains("chars shown"));
     }
 }

@@ -1,4 +1,5 @@
 pub mod output_scanner;
+pub mod shell_parse;
 
 use codingbuddy_core::ToolCall;
 use glob::Pattern;
@@ -470,7 +471,7 @@ impl PolicyEngine {
     }
 
     pub fn check_command(&self, cmd: &str) -> Result<(), PolicyError> {
-        if contains_forbidden_shell_tokens(cmd) {
+        if shell_parse::contains_forbidden_constructs(cmd) {
             return Err(PolicyError::CommandInjection);
         }
         let segments = split_pipeline_segments(cmd)?;
@@ -818,51 +819,6 @@ fn allow_pattern_matches(pattern: &str, cmd_tokens: &[&str]) -> bool {
         }
     }
     true
-}
-
-fn contains_forbidden_shell_tokens(cmd: &str) -> bool {
-    // Single-pipe pipelines are allowed; each segment is validated separately.
-    let forbidden = [
-        "\n", "\r", ";", "&&", "||", // Command chaining
-        "`", "$(", // Subshell / command substitution
-        "<(", ">(",  // Process substitution
-        "<<<", // Here-string
-    ];
-    if forbidden.iter().any(|needle| cmd.contains(needle)) {
-        return true;
-    }
-
-    // Background execution: trailing `&` (but not `&&` which is already checked)
-    let trimmed = cmd.trim();
-    if trimmed.ends_with('&') && !trimmed.ends_with("&&") {
-        return true;
-    }
-
-    // Output redirection: `>`, `>>`, `<` (but allow `|` which is a pipe)
-    // Use shell-words-style tokenization to detect redirection operators
-    has_redirection_operator(trimmed)
-}
-
-/// Detect shell redirection operators (`>`, `>>`, `<`) outside of quoted strings.
-/// Allows comparison operators inside quotes (e.g., `awk '{if ($1 > 5) print}'`).
-fn has_redirection_operator(cmd: &str) -> bool {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut prev_char = '\0';
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        match ch {
-            '\'' if !in_double && prev_char != '\\' => in_single = !in_single,
-            '"' if !in_single && prev_char != '\\' => in_double = !in_double,
-            '>' | '<' if !in_single && !in_double => return true,
-            _ => {}
-        }
-        prev_char = ch;
-        i += 1;
-    }
-    false
 }
 
 fn split_pipeline_segments(cmd: &str) -> Result<Vec<&str>, PolicyError> {
@@ -2315,13 +2271,17 @@ mod tests {
     #[test]
     fn quoted_angle_brackets_not_blocked() {
         // Inside quotes, > and < are not redirections
-        assert!(!has_redirection_operator("awk '{if ($1 > 5) print}'"));
-        assert!(!has_redirection_operator(r#"echo "a > b""#));
+        assert!(!shell_parse::has_redirection_operator(
+            "awk '{if ($1 > 5) print}'"
+        ));
+        assert!(!shell_parse::has_redirection_operator(r#"echo "a > b""#));
     }
 
     #[test]
     fn unquoted_angle_brackets_blocked() {
-        assert!(has_redirection_operator("echo hello > out.txt"));
-        assert!(has_redirection_operator("cat < input.txt"));
+        assert!(shell_parse::has_redirection_operator(
+            "echo hello > out.txt"
+        ));
+        assert!(shell_parse::has_redirection_operator("cat < input.txt"));
     }
 }

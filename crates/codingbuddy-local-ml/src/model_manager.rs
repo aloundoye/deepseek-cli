@@ -181,11 +181,7 @@ fn has_model_files(dir: &std::path::Path) -> bool {
     }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "gguf")
-            {
+            if entry.path().extension().is_some_and(|ext| ext == "gguf") {
                 return true;
             }
         }

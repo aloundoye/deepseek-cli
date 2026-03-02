@@ -702,4 +702,157 @@ mod tests {
         );
         assert_eq!(results[0].path, "lib.rs");
     }
+
+    // ── Helper function tests ──
+
+    #[test]
+    fn has_ignored_component_detects_git_dir() {
+        assert!(has_ignored_component(Path::new(".git/objects/abc")));
+        assert!(has_ignored_component(Path::new("src/.git/config")));
+    }
+
+    #[test]
+    fn has_ignored_component_detects_target_dir() {
+        assert!(has_ignored_component(Path::new("target/debug/build")));
+    }
+
+    #[test]
+    fn has_ignored_component_detects_codingbuddy_dir() {
+        assert!(has_ignored_component(Path::new(".codingbuddy/config.toml")));
+    }
+
+    #[test]
+    fn has_ignored_component_allows_normal_paths() {
+        assert!(!has_ignored_component(Path::new("src/lib.rs")));
+        assert!(!has_ignored_component(Path::new("crates/core/src/main.rs")));
+    }
+
+    #[test]
+    fn extract_match_line_finds_matching_line() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-match-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        let file = ws.join("sample.rs");
+        fs::write(&file, "line one\nfn target_func() {}\nline three\n").unwrap();
+
+        let (line, excerpt) = extract_match_line(&file, "target_func").unwrap();
+        assert_eq!(line, 2);
+        assert!(excerpt.contains("target_func"));
+    }
+
+    #[test]
+    fn extract_match_line_defaults_to_first_line() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-default-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        let file = ws.join("sample.txt");
+        fs::write(&file, "first line\nsecond line\n").unwrap();
+
+        let (line, _excerpt) = extract_match_line(&file, "nonexistent").unwrap();
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn extract_match_line_returns_none_for_missing_file() {
+        assert!(extract_match_line(Path::new("/no/such/file.rs"), "x").is_none());
+    }
+
+    // ── IndexService edge cases ──
+
+    #[test]
+    fn status_returns_none_before_build() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-status-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        let svc = IndexService::new(&ws).unwrap();
+        assert!(svc.status().unwrap().is_none());
+    }
+
+    #[test]
+    fn query_returns_stale_when_no_index() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-noindex-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("test.txt"), "hello world").unwrap();
+        let svc = IndexService::new(&ws).unwrap();
+
+        let response = svc.query("hello", 5, None).unwrap();
+        assert_eq!(response.freshness, "stale");
+    }
+
+    #[test]
+    fn build_indexes_multiple_files() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-multi-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.rs"), "fn alpha() {}").unwrap();
+        fs::write(ws.join("b.rs"), "fn beta() {}").unwrap();
+        fs::write(ws.join("c.rs"), "fn gamma() {}").unwrap();
+
+        let svc = IndexService::new(&ws).unwrap();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: ws.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 10,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        let manifest = svc.build(&session).unwrap();
+        assert_eq!(manifest.files.len(), 3);
+        assert!(manifest.fresh);
+        assert!(!manifest.corrupt);
+    }
+
+    #[test]
+    fn query_with_scope_filters_results() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-scope-{}", Uuid::now_v7()));
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::create_dir_all(ws.join("tests")).unwrap();
+        fs::write(ws.join("src/lib.rs"), "fn unique_target() {}").unwrap();
+        fs::write(ws.join("tests/test.rs"), "fn unique_target() {}").unwrap();
+
+        let svc = IndexService::new(&ws).unwrap();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: ws.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 10,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        svc.build(&session).unwrap();
+
+        let result = svc.query("unique_target", 10, Some("src/")).unwrap();
+        for hit in &result.results {
+            assert!(hit.path.starts_with("src/") || hit.path.contains("src/"));
+        }
+    }
+
+    #[test]
+    fn chunk_query_returns_empty_when_no_chunk_index() {
+        let ws = std::env::temp_dir().join(format!("cb-idx-nochunk-{}", Uuid::now_v7()));
+        fs::create_dir_all(&ws).unwrap();
+        let svc = IndexService::new(&ws).unwrap();
+        let results = svc.query_chunks("anything", 5, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn manifest_serialization_roundtrip() {
+        let manifest = Manifest {
+            baseline_commit: Some("abc123".to_string()),
+            files: BTreeMap::from([("src/lib.rs".to_string(), "sha256hex".to_string())]),
+            index_schema_version: 1,
+            ignore_rules_hash: "v1".to_string(),
+            fresh: true,
+            corrupt: false,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.baseline_commit, manifest.baseline_commit);
+        assert_eq!(restored.files.len(), 1);
+        assert!(restored.fresh);
+    }
 }

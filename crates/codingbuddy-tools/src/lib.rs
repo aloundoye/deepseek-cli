@@ -563,6 +563,31 @@ impl LocalToolHost {
                 let (applied, conflicts) = self.patches.apply(&self.workspace, patch_id)?;
                 Ok(json!({"patch_id": id, "applied": applied, "conflicts": conflicts}))
             }
+            "patch.direct" => {
+                // Single-step: stage + apply in one call. Ideal for DeepSeek-reasoner
+                // which naturally produces unified diffs when thinking.
+                let diff = call
+                    .args
+                    .get("unified_diff")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("unified_diff missing"))?;
+                let patch = self.patches.stage(diff, &[])?;
+                let (applied, conflicts) = self.patches.apply(&self.workspace, patch.patch_id)?;
+                if applied {
+                    Ok(json!({
+                        "applied": true,
+                        "patch_id": patch.patch_id.to_string(),
+                        "files": patch.target_files,
+                    }))
+                } else {
+                    Ok(json!({
+                        "applied": false,
+                        "patch_id": patch.patch_id.to_string(),
+                        "conflicts": conflicts,
+                        "files": patch.target_files,
+                    }))
+                }
+            }
             "fs.write" => {
                 let path = call
                     .args
@@ -1865,6 +1890,41 @@ Using dedicated tools provides structured output, better error handling, and cle
                         }
                     },
                     "required": ["patch_id"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "patch_direct".to_string(),
+                description: "Apply a unified diff directly to the workspace in one step. \
+This is the preferred tool for applying code changes when you have a unified diff. \
+Unlike patch_stage + patch_apply (which require two calls), this combines both steps. \
+\n\nThe diff must be in standard unified diff format:\n\
+```\n\
+--- a/path/to/file.rs\n\
++++ b/path/to/file.rs\n\
+@@ -10,3 +10,4 @@\n\
+ unchanged line\n\
+-old line\n\
++new line\n\
++added line\n\
+ unchanged line\n\
+```\n\n\
+Returns the list of affected files and whether the patch applied cleanly. \
+If there are conflicts, they are reported in the response. \
+For simple single-site edits, prefer fs_edit. Use this tool for multi-hunk or multi-file changes \
+where a unified diff is more natural.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "unified_diff": {
+                            "type": "string",
+                            "description": "The unified diff to apply. Must use standard unified diff format with --- a/ and +++ b/ headers."
+                        }
+                    },
+                    "required": ["unified_diff"]
                 }),
             },
         },
@@ -4629,6 +4689,7 @@ mod tests {
             "index_query",
             "patch_stage",
             "patch_apply",
+            "patch_direct",
             "diagnostics_check",
         ] {
             assert!(
