@@ -65,6 +65,7 @@ fn extract_accessed_paths(tool_calls_made: &[ToolCallRecord]) -> Vec<AccessedPat
         }
 
         let is_dir_tool = dir_tools.contains(&tc.tool_name.as_str());
+        let prev_len = accessed.len();
 
         // Try to extract path from args_json
         if let Some(ref args_json) = tc.args_json
@@ -83,8 +84,9 @@ fn extract_accessed_paths(tool_calls_made: &[ToolCallRecord]) -> Vec<AccessedPat
             }
         }
 
-        // Fallback: try to extract path from args_summary (e.g. `path="src/main.rs"`)
-        if accessed.is_empty() {
+        // Fallback: try to extract path from args_summary if args_json didn't yield results
+        let extracted_from_json = accessed.len() > prev_len;
+        if !extracted_from_json {
             for segment in tc.args_summary.split('"') {
                 let trimmed = segment.trim();
                 if trimmed.contains('/') || FILE_EXTENSIONS.iter().any(|ext| trimmed.ends_with(ext))
@@ -224,6 +226,11 @@ pub(crate) fn check_response_consistency(
         )
         .unwrap()
     });
+
+    // Early return: skip string building if no numeric claims in the response
+    if !NUMERIC_CLAIM.is_match(response_text) {
+        return None;
+    }
 
     // Collect all tool result text for evidence searching
     let mut result_text = String::new();

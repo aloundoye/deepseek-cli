@@ -68,8 +68,7 @@ struct ManifestEntry {
 pub(crate) fn extract_workspace_metadata(workspace_root: &Path) -> Option<String> {
     // Try Cargo.toml first
     let cargo_path = workspace_root.join("Cargo.toml");
-    if cargo_path.exists()
-        && let Ok(content) = fs::read_to_string(&cargo_path)
+    if let Ok(content) = fs::read_to_string(&cargo_path)
         && let Ok(parsed) = content.parse::<TomlTable>()
         && let Some(members) = parsed
             .get("workspace")
@@ -97,8 +96,7 @@ pub(crate) fn extract_workspace_metadata(workspace_root: &Path) -> Option<String
 
     // Try package.json
     let pkg_path = workspace_root.join("package.json");
-    if pkg_path.exists()
-        && let Ok(content) = fs::read_to_string(&pkg_path)
+    if let Ok(content) = fs::read_to_string(&pkg_path)
         && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(workspaces) = parsed.get("workspaces").and_then(|w| w.as_array())
     {
@@ -123,9 +121,7 @@ pub(crate) fn extract_workspace_metadata(workspace_root: &Path) -> Option<String
 
     // Try go.work
     let gowork_path = workspace_root.join("go.work");
-    if gowork_path.exists()
-        && let Ok(content) = fs::read_to_string(&gowork_path)
-    {
+    if let Ok(content) = fs::read_to_string(&gowork_path) {
         let mut modules = Vec::new();
         let mut in_use_block = false;
         for line in content.lines() {

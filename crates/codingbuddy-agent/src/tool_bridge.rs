@@ -302,12 +302,10 @@ fn truncate_output(text: &str, max_chars: usize) -> String {
     let _ = save_overflow(text);
 
     format!(
-        "{truncated}\n\n[OUTPUT TRUNCATED: {total_lines} lines / {total_chars} bytes total. \
-         Full output saved. Use fs_grep to search the full content or \
-         fs_read with start_line/end_line to read specific sections.]\n\n\
-         [Output truncated: {shown_lines}/{total_lines} lines, \
-         {boundary}/{total_chars} chars shown. \
-         To see more, re-run with a more specific query or use offset/limit parameters.]"
+        "{truncated}\n\n[OUTPUT TRUNCATED: {shown_lines}/{total_lines} lines, \
+         {boundary}/{total_chars} bytes shown. \
+         Use fs_grep to search the full content or \
+         fs_read with start_line/end_line to read specific sections.]"
     )
 }
 
@@ -401,7 +399,7 @@ mod tests {
         match msg {
             ChatMessage::Tool { content, .. } => {
                 assert!(content.len() < 26_000);
-                assert!(content.contains("[Output truncated"));
+                assert!(content.contains("[OUTPUT TRUNCATED:"));
             }
             _ => panic!("expected Tool message"),
         }
@@ -422,7 +420,7 @@ mod tests {
                     content.len() < 101_000,
                     "MCP output should truncate around 100K"
                 );
-                assert!(content.contains("[Output truncated"));
+                assert!(content.contains("[OUTPUT TRUNCATED:"));
             }
             _ => panic!("expected Tool message"),
         }
@@ -610,7 +608,7 @@ mod tests {
         let big = "x".repeat(30_000);
         let result = truncate_agent_output(&big);
         assert!(result.len() < 26_000);
-        assert!(result.contains("[Output truncated"));
+        assert!(result.contains("[OUTPUT TRUNCATED:"));
     }
 
     #[test]
@@ -632,7 +630,7 @@ mod tests {
             result_lines <= MAX_TOOL_OUTPUT_LINES + 5,
             "should truncate by line count, got {result_lines} lines"
         );
-        assert!(result.contains("[Output truncated"));
+        assert!(result.contains("[OUTPUT TRUNCATED:"));
     }
 
     #[test]
@@ -640,7 +638,7 @@ mod tests {
         let big = "x".repeat(30_000);
         let result = truncate_output(&big, MAX_TOOL_OUTPUT_CHARS);
         assert!(result.contains("lines"));
-        assert!(result.contains("chars shown"));
+        assert!(result.contains("bytes shown"));
     }
 
     // ── P1.5: Output truncation with disk offload ─────────────────────────
@@ -654,12 +652,8 @@ mod tests {
             "truncated output should contain the OUTPUT TRUNCATED hint"
         );
         assert!(
-            result.contains("bytes total"),
+            result.contains("bytes shown"),
             "hint should include byte count"
-        );
-        assert!(
-            result.contains("Full output saved"),
-            "hint should mention disk offload"
         );
         assert!(
             result.contains("fs_grep"),
@@ -669,10 +663,10 @@ mod tests {
             result.contains("fs_read with start_line/end_line"),
             "hint should suggest fs_read with line range"
         );
-        // Verify the original line/byte counts are present
+        // Verify the total byte count is present in the format "{boundary}/{total} bytes shown"
         assert!(
-            result.contains("30000 bytes total"),
-            "hint should show original byte count, got: {}",
+            result.contains("/30000 bytes shown"),
+            "hint should show total byte count, got: {}",
             &result[result.len().saturating_sub(200)..]
         );
     }

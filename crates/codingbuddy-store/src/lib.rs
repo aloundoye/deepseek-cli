@@ -13,6 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
+/// Convert a deserialization error into a `rusqlite` FromSqlConversionFailure.
+fn text_parse_err(
+    col: usize,
+    e: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e))
+}
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         1,
@@ -809,40 +817,17 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Session {
-                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
+                session_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())
+                    .map_err(|e| text_parse_err(0, e))?,
                 workspace_root: row.get(1)?,
                 baseline_commit: row.get(2)?,
-                status: serde_json::from_str(&row.get::<_, String>(3)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                budgets: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
+                status: serde_json::from_str(&row.get::<_, String>(3)?)
+                    .map_err(|e| text_parse_err(3, e))?,
+                budgets: serde_json::from_str(&row.get::<_, String>(4)?)
+                    .map_err(|e| text_parse_err(4, e))?,
                 active_plan_id: row
                     .get::<_, Option<String>>(5)?
-                    .map(|v| {
-                        Uuid::parse_str(&v).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                5,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })
-                    })
+                    .map(|v| Uuid::parse_str(&v).map_err(|e| text_parse_err(5, e)))
                     .transpose()?,
             })
         })?;
@@ -864,27 +849,12 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![session_id.to_string()], |row| {
             Ok(codingbuddy_core::RunRecord {
-                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str()).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                status: serde_json::from_str(&row.get::<_, String>(2)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
+                run_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())
+                    .map_err(|e| text_parse_err(0, e))?,
+                session_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str())
+                    .map_err(|e| text_parse_err(1, e))?,
+                status: serde_json::from_str(&row.get::<_, String>(2)?)
+                    .map_err(|e| text_parse_err(2, e))?,
                 prompt: row.get(3)?,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,

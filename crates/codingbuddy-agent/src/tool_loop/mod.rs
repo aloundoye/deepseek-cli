@@ -113,6 +113,7 @@ pub struct ToolUseLoop<'a> {
     /// unhashed "tool_name:args" string used for path-based invalidation.
     /// Entries expire after `TOOL_CACHE_TTL_SECS`. Invalidated when write tools
     /// modify the cached path. Bounded at `MAX_CACHE_ENTRIES`.
+    /// Cache values: (result, timestamp, original_args_str for path-based invalidation)
     tool_cache: HashMap<String, (serde_json::Value, Instant, String)>,
     /// Circuit breaker: tracks consecutive failures per tool name.
     /// When a tool fails `CIRCUIT_BREAKER_THRESHOLD` times in a row, it is
@@ -181,13 +182,19 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
-    /// Build a bounded cache key by hashing the tool name + args with SHA-256.
-    /// Returns the first 16 hex chars of the hash for a compact, fixed-size key.
-    fn cache_key(tool_name: &str, args: &serde_json::Value) -> String {
+    /// Build the raw cache input string and its SHA-256 hash key.
+    /// Returns `(hash_key, raw_string)` from a single `format!` call.
+    fn cache_key_with_raw(tool_name: &str, args: &serde_json::Value) -> (String, String) {
         use sha2::{Digest, Sha256};
         let raw = format!("{}:{}", tool_name, args);
         let hash = Sha256::digest(raw.as_bytes());
-        format!("{:x}", hash)[..16].to_string()
+        let bytes: [u8; 8] = hash[..8].try_into().unwrap();
+        (format!("{:016x}", u64::from_be_bytes(bytes)), raw)
+    }
+
+    /// Build a bounded cache key by hashing the tool name + args with SHA-256.
+    fn cache_key(tool_name: &str, args: &serde_json::Value) -> String {
+        Self::cache_key_with_raw(tool_name, args).0
     }
 
     /// Check the tool result cache for a matching entry.
@@ -201,7 +208,7 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         let key = Self::cache_key(tool_name, args);
-        if let Some((result, timestamp, _raw_key)) = self.tool_cache.get(&key)
+        if let Some((result, timestamp, _)) = self.tool_cache.get(&key)
             && timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS
         {
             return Some(result.clone());
@@ -222,24 +229,19 @@ impl<'a> ToolUseLoop<'a> {
         if !CACHEABLE_TOOLS.contains(&tool_name) {
             return;
         }
-        let raw_key = format!("{}:{}", tool_name, args);
-        let key = Self::cache_key(tool_name, args);
+        let (key, raw) = Self::cache_key_with_raw(tool_name, args);
         self.tool_cache
-            .insert(key, (result.clone(), Instant::now(), raw_key));
+            .insert(key, (result.clone(), Instant::now(), raw));
 
-        // Evict oldest entries if cache exceeds maximum size
-        while self.tool_cache.len() > MAX_CACHE_ENTRIES {
-            // Find the oldest entry by timestamp (LRU approximation)
-            if let Some(oldest_key) = self
+        // Evict oldest entry if cache exceeds maximum size (single insert → at most 1 eviction)
+        if self.tool_cache.len() > MAX_CACHE_ENTRIES
+            && let Some(oldest_key) = self
                 .tool_cache
                 .iter()
                 .min_by_key(|(_, (_, ts, _))| *ts)
                 .map(|(k, _)| k.clone())
-            {
-                self.tool_cache.remove(&oldest_key);
-            } else {
-                break;
-            }
+        {
+            self.tool_cache.remove(&oldest_key);
         }
     }
 
@@ -269,6 +271,19 @@ impl<'a> ToolUseLoop<'a> {
     /// Set the hook runtime for pre/post tool-use hooks.
     pub fn set_hooks(&mut self, hooks: HookRuntime) {
         self.hooks = Some(hooks);
+    }
+
+    /// Fire a hook event and log any failures.
+    fn fire_hook_logged(hooks: &HookRuntime, event: HookEvent, input: &HookInput) {
+        let result = hooks.fire(event, input);
+        for run in &result.runs {
+            if !run.success {
+                eprintln!(
+                    "[hooks] {:?} hook failed: {}",
+                    event, run.handler_description
+                );
+            }
+        }
     }
 
     /// Set the event callback for logging tool proposed/result events.
@@ -1196,15 +1211,7 @@ impl<'a> ToolUseLoop<'a> {
                 session_type: None,
                 workspace: self.workspace_str(),
             };
-            let hook_result = hooks.fire(HookEvent::PostToolUse, &input);
-            for run in &hook_result.runs {
-                if !run.success {
-                    eprintln!(
-                        "[hooks] PostToolUse hook failed: {}",
-                        run.handler_description
-                    );
-                }
-            }
+            Self::fire_hook_logged(hooks, HookEvent::PostToolUse, &input);
         }
 
         // Log ToolResult event
@@ -1257,15 +1264,10 @@ impl<'a> ToolUseLoop<'a> {
         self.emit_injection_warnings(&injection_warnings);
 
         // Build result preview for consistency checking (first ~200 chars)
-        let result_preview = result
-            .output
-            .as_str()
-            .map(|s| s.chars().take(200).collect::<String>())
-            .or_else(|| {
-                serde_json::to_string(&result.output)
-                    .ok()
-                    .map(|s| s.chars().take(200).collect::<String>())
-            });
+        let result_preview = result.output.as_str().map(|s| {
+            let end = s.floor_char_boundary(200.min(s.len()));
+            s[..end].to_string()
+        });
 
         records.push(ToolCallRecord {
             tool_name: llm_call.name.clone(),
@@ -1460,15 +1462,7 @@ impl<'a> ToolUseLoop<'a> {
                     session_type: None,
                     workspace: self.workspace_str(),
                 };
-                let hook_result = hooks.fire(HookEvent::SubagentStart, &input);
-                for run in &hook_result.runs {
-                    if !run.success {
-                        eprintln!(
-                            "[hooks] SubagentStart hook failed: {}",
-                            run.handler_description
-                        );
-                    }
-                }
+                Self::fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
             }
             let result = match worker(request) {
                 Ok(result) => Ok(result),
@@ -1490,15 +1484,7 @@ impl<'a> ToolUseLoop<'a> {
                     session_type: None,
                     workspace: self.workspace_str(),
                 };
-                let hook_result = hooks.fire(HookEvent::SubagentStop, &input);
-                for run in &hook_result.runs {
-                    if !run.success {
-                        eprintln!(
-                            "[hooks] SubagentStop hook failed: {}",
-                            run.handler_description
-                        );
-                    }
-                }
+                Self::fire_hook_logged(hooks, HookEvent::SubagentStop, &input);
             }
             result
         } else {
@@ -1863,15 +1849,7 @@ impl<'a> ToolUseLoop<'a> {
                 session_type: None,
                 workspace: self.workspace_str(),
             };
-            let hook_result = hooks.fire(HookEvent::PreCompact, &input);
-            for run in &hook_result.runs {
-                if !run.success {
-                    eprintln!(
-                        "[hooks] PreCompact hook failed: {}",
-                        run.handler_description
-                    );
-                }
-            }
+            Self::fire_hook_logged(hooks, HookEvent::PreCompact, &input);
         }
 
         // Scan compacted messages for any directives we haven't captured yet
