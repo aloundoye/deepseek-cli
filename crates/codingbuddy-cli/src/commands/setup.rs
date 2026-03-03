@@ -58,7 +58,30 @@ fn write_setup_marker(marker: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Collected wizard choices — written atomically after all steps complete.
+struct WizardState {
+    /// Custom provider info (only set if user chose option 2).
+    custom_provider: Option<CustomProviderChoice>,
+    /// Whether to enable local ML.
+    enable_ml: bool,
+    /// Detected device string (e.g. "metal", "cuda", "cpu").
+    detected_device: Option<String>,
+    /// Recommended completion model ID.
+    recommended_model: Option<&'static str>,
+    /// Whether to enable privacy scanning.
+    enable_privacy: bool,
+}
+
+struct CustomProviderChoice {
+    base_url: String,
+    model_name: String,
+    api_key_env: Option<String>,
+}
+
 /// Shared 4-step wizard logic used by both `maybe_first_time_setup` and `run_interactive_wizard`.
+///
+/// All choices are collected into `WizardState` and written atomically at the end,
+/// so partial config is never persisted if the user cancels mid-wizard.
 fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
     // Step 1: Provider selection
     println!("[1/4] Model Provider");
@@ -68,7 +91,7 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
 
     let provider_choice = prompt_choice("  Select [1-2]: ", 1, 2)?;
 
-    if provider_choice == 2 {
+    let custom_provider = if provider_choice == 2 {
         let base_url = loop {
             print!("  API base URL: ");
             std::io::stdout().flush()?;
@@ -93,21 +116,20 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
         std::io::stdin().read_line(&mut api_key_env)?;
         let api_key_env = api_key_env.trim().to_string();
 
-        merge_provider_config(
-            cwd,
-            "openai-compat",
-            &base_url,
-            &model_name,
-            if api_key_env.is_empty() {
+        println!("  Provider noted.\n");
+        Some(CustomProviderChoice {
+            base_url,
+            model_name,
+            api_key_env: if api_key_env.is_empty() {
                 None
             } else {
-                Some(&api_key_env)
+                Some(api_key_env)
             },
-        )?;
-        println!("  Provider saved.\n");
+        })
     } else {
         println!("  Using DeepSeek API.\n");
-    }
+        None
+    };
 
     // Step 2: API Key
     println!("[2/4] API Key");
@@ -142,7 +164,15 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
             codingbuddy_local_ml::hardware::DetectedDevice::Cuda => "NVIDIA GPU (CUDA)",
             codingbuddy_local_ml::hardware::DetectedDevice::Cpu => "CPU",
         };
-        println!("\n  Detected: {device_label}, {} MB RAM", hw.total_ram_mb);
+        let core_info = match (hw.performance_cores, hw.efficiency_cores) {
+            (Some(p), Some(e)) => format!(", {p}P+{e}E cores ({} threads)", hw.recommended_threads),
+            (Some(p), None) => format!(", {p} cores ({} threads)", hw.recommended_threads),
+            _ => format!(", {} threads", hw.recommended_threads),
+        };
+        println!(
+            "\n  Detected: {device_label}, {} MB RAM{core_info}",
+            hw.total_ram_mb
+        );
         let model = codingbuddy_local_ml::model_registry::recommend_completion_model(
             hw.available_for_models_mb,
         );
@@ -169,17 +199,42 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
     };
     println!();
 
-    // Write config and download models
-    if enable_ml || enable_privacy {
-        merge_local_ml_config(
+    // All choices collected — now write atomically.
+    let state = WizardState {
+        custom_provider,
+        enable_ml,
+        detected_device,
+        recommended_model,
+        enable_privacy,
+    };
+    apply_wizard_state(cwd, cfg, &state)?;
+
+    Ok(())
+}
+
+/// Write all wizard choices to config in one pass. Called only after all steps complete.
+fn apply_wizard_state(cwd: &Path, cfg: &AppConfig, state: &WizardState) -> Result<()> {
+    if let Some(ref cp) = state.custom_provider {
+        merge_provider_config(
             cwd,
-            enable_ml,
-            enable_privacy,
-            detected_device.as_deref(),
-            recommended_model,
+            "openai-compat",
+            &cp.base_url,
+            &cp.model_name,
+            cp.api_key_env.as_deref(),
         )?;
     }
-    if enable_ml {
+
+    if state.enable_ml || state.enable_privacy {
+        merge_local_ml_config(
+            cwd,
+            state.enable_ml,
+            state.enable_privacy,
+            state.detected_device.as_deref(),
+            state.recommended_model,
+        )?;
+    }
+
+    if state.enable_ml {
         download_required_models(cfg, false)?;
     }
 

@@ -266,16 +266,27 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
-    /// Invalidate cache entries for a given path (after a write tool modifies it).
-    /// Also invalidates entries referencing the parent directory (e.g., `fs_list` results).
+    /// Invalidate cache entries after a write tool modifies a path.
+    ///
+    /// Glob, list, and index queries can match any path, so we evict ALL of those
+    /// on any write. Only `fs_read` and `fs_grep` entries use path-containment checks.
     fn cache_invalidate_path(&mut self, path: &str) {
         let quoted = format!("\"{path}\"");
-        // Also invalidate parent directory entries (e.g. fs_list caches)
         let parent_quoted = path
             .rsplit_once('/')
             .map(|(parent, _)| format!("\"{parent}\""));
 
         self.tool_cache.retain(|_key, entry| {
+            // Always evict glob, list, and index queries — they could match any path.
+            // raw_key format is "tool_name:{args}", so starts_with avoids false matches
+            // from arguments that happen to contain these tool names.
+            if entry.raw_key.starts_with("fs_glob:")
+                || entry.raw_key.starts_with("fs_list:")
+                || entry.raw_key.starts_with("index_query:")
+            {
+                return false;
+            }
+            // For path-specific tools (fs_read, fs_grep, etc.), check containment.
             if entry.raw_key.contains(&quoted) {
                 return false;
             }
@@ -450,7 +461,6 @@ impl<'a> ToolUseLoop<'a> {
         let mut total_usage = TokenUsage::default();
         let mut turns: usize = 0;
         let mut nudge_count: usize = 0;
-        let mut verbosity_nudge_fired = false;
         let mut last_model = self.config.model.clone();
 
         // Pre-compute immutable values used inside the loop
@@ -463,6 +473,8 @@ impl<'a> ToolUseLoop<'a> {
             (self.config.context_window_tokens as f64 * PRUNE_THRESHOLD_PCT) as u64;
         let compact_threshold =
             (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
+
+        let mut verbosity_nudge_count: usize = 0;
 
         loop {
             // Check turn limit — on final turn, ask for a text-only summary.
@@ -707,27 +719,28 @@ impl<'a> ToolUseLoop<'a> {
                     });
                 }
 
-                // P1.6: Verbosity enforcement — if the response is too verbose
-                // (>400 words, no code blocks), inject a conciseness nudge once per turn.
-                let word_count = if !verbosity_nudge_fired && !text.contains("```") {
-                    text.split_whitespace().count()
-                } else {
-                    0
-                };
-                if word_count > 400 {
-                    verbosity_nudge_fired = true;
-                    self.messages.push(ChatMessage::Assistant {
-                        content: Some(text),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                    });
-                    self.messages.push(ChatMessage::User {
-                        content: format!(
-                            "Your response is too verbose ({word_count} words). \
-                             Keep responses under 200 words unless showing code. Rewrite concisely."
-                        ),
-                    });
-                    continue;
+                // Verbosity enforcement — strip code blocks before counting prose words.
+                // Nudge up to 2 times per turn, then let it through.
+                // Fast path: skip the strip_code_blocks allocation if total word count
+                // (including code) is under the threshold — most responses are short.
+                if verbosity_nudge_count < 2 && text.split_whitespace().count() > 400 {
+                    let prose = helpers::strip_code_blocks(&text);
+                    let word_count = prose.split_whitespace().count();
+                    if word_count > 400 {
+                        verbosity_nudge_count += 1;
+                        self.messages.push(ChatMessage::Assistant {
+                            content: Some(text),
+                            reasoning_content: None,
+                            tool_calls: vec![],
+                        });
+                        self.messages.push(ChatMessage::User {
+                            content: format!(
+                                "Your response is too verbose ({word_count} words of prose, excluding code). \
+                                 Keep responses under 200 words unless showing code. Rewrite concisely."
+                            ),
+                        });
+                        continue;
+                    }
                 }
 
                 // Append assistant message to history
@@ -853,7 +866,7 @@ impl<'a> ToolUseLoop<'a> {
                                 // Return pre-computed error
                                 if let Some(err_msg) = error {
                                     let error_result = codingbuddy_core::ToolResult {
-                                        invocation_id: uuid::Uuid::nil(),
+                                        invocation_id: uuid::Uuid::new_v4(),
                                         success: false,
                                         output: serde_json::json!(err_msg),
                                     };
@@ -863,7 +876,7 @@ impl<'a> ToolUseLoop<'a> {
                                 // Return cached result
                                 if let Some(cached_val) = cached {
                                     let result = codingbuddy_core::ToolResult {
-                                        invocation_id: uuid::Uuid::nil(),
+                                        invocation_id: uuid::Uuid::new_v4(),
                                         success: true,
                                         output: cached_val.clone(),
                                     };
@@ -896,7 +909,7 @@ impl<'a> ToolUseLoop<'a> {
                                     .or_else(|| panic_payload.downcast_ref::<&str>().copied())
                                     .unwrap_or("unknown panic");
                                 let error_result = codingbuddy_core::ToolResult {
-                                    invocation_id: uuid::Uuid::nil(),
+                                    invocation_id: uuid::Uuid::new_v4(),
                                     success: false,
                                     output: serde_json::json!(format!(
                                         "Internal error: parallel tool execution panicked: {panic_msg}"
@@ -2101,9 +2114,16 @@ impl<'a> ToolUseLoop<'a> {
 
         let middle_count = keep_from - 1;
         let compacted_msgs = &self.messages[1..keep_from];
-        // Try LLM-based compaction first, fall back to code-based extraction
-        let summary = build_compaction_summary_with_llm(self.llm, compacted_msgs)
-            .unwrap_or_else(|_| build_compaction_summary(compacted_msgs));
+        // Try LLM-based compaction first, fall back to code-based extraction on any error.
+        let summary = match build_compaction_summary_with_llm(self.llm, compacted_msgs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "[compact] LLM compaction failed: {e:#}; falling back to code-based extraction"
+                );
+                build_compaction_summary(compacted_msgs)
+            }
+        };
 
         // P2.7: Validate summary before applying compaction.
         // Reject empty or trivially short summaries that would lose context.

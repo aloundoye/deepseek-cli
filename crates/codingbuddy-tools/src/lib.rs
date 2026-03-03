@@ -1786,7 +1786,18 @@ Using dedicated tools provides structured output, better error handling, and cle
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "git_status".to_string(),
-                description: "Shows the working tree status (staged, unstaged, untracked files) in short format. Use this to see what files have been modified before committing or to verify the result of your changes. Prefer this over bash_run with 'git status'.".to_string(),
+                description: "Shows the working tree status (staged, unstaged, untracked files) in short format.\n\n\
+## When to use\n\
+- Before committing: check which files are staged, modified, or untracked\n\
+- After making changes: verify that only the intended files were modified\n\
+- Before creating a PR: ensure no unintended files are included\n\
+- To check for merge conflicts or unresolved state\n\n\
+## When NOT to use\n\
+- To see file contents — use fs_read instead\n\
+- To see actual diff of changes — use git_diff instead\n\
+- To see commit history — use bash_run with 'git log'\n\n\
+## Common mistakes\n\
+- Do NOT run bash_run with 'git status' — use this tool, it's faster and returns structured output".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -1799,7 +1810,20 @@ Using dedicated tools provides structured output, better error handling, and cle
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "git_diff".to_string(),
-                description: "Shows the unified diff of all unstaged changes in the working directory. Use this to review what has changed before staging or committing. Prefer this over bash_run with 'git diff'. For staged changes, use bash_run with 'git diff --cached'.".to_string(),
+                description: "Shows the unified diff of all unstaged changes in the working directory.\n\n\
+## When to use\n\
+- Before committing: review exactly what changed to write an accurate commit message\n\
+- After editing files: verify your changes are correct and complete\n\
+- To understand what modifications exist before deciding next steps\n\
+- To compare current working tree against the last commit\n\n\
+## When NOT to use\n\
+- To see staged changes — use bash_run with 'git diff --cached' instead\n\
+- To compare branches — use bash_run with 'git diff branch1..branch2'\n\
+- To see which files changed (without content) — use git_status instead\n\
+- To see a specific file's full content — use fs_read instead\n\n\
+## Common mistakes\n\
+- Do NOT run bash_run with 'git diff' — use this tool, it returns structured output\n\
+- This only shows UNSTAGED changes. If you just staged files, the diff will be empty".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2264,7 +2288,18 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_create".to_string(),
-                description: "Create a task to track progress on the current work. Returns the task ID.".to_string(),
+                description: "Create a task to track progress on the current work. Returns the task ID.\n\n\
+## When to use\n\
+- Complex multi-step work: break the work into trackable tasks before starting\n\
+- User provides multiple items: capture each as a separate task\n\
+- Non-trivial implementations: create tasks so the user can see progress\n\n\
+## When NOT to use\n\
+- Single trivial tasks (e.g. fixing a typo, answering a question)\n\
+- Tasks that can be completed in one step without tracking\n\n\
+## Tips\n\
+- Use imperative form for subject ('Fix auth bug', not 'Fixing auth bug')\n\
+- Include enough detail in description for another agent to complete the task\n\
+- After creating tasks, use task_update to set status as you work".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2290,7 +2325,18 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_update".to_string(),
-                description: "Update a task's status. Use to mark tasks as in_progress, completed, or failed.".to_string(),
+                description: "Update a task's status or details.\n\n\
+## When to use\n\
+- Mark a task as in_progress BEFORE starting work on it\n\
+- Mark a task as completed AFTER fully finishing the work\n\
+- Mark a task as failed if you encounter unresolvable blockers\n\
+- Update the outcome field with a summary when completing or failing\n\n\
+## When NOT to use\n\
+- Do NOT mark a task completed if tests are failing or implementation is partial\n\
+- Do NOT update tasks that don't exist — use task_list to check first\n\n\
+## Status workflow\n\
+pending → in_progress → completed (or failed)\n\
+Always set in_progress before starting, completed only when fully done".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2369,7 +2415,18 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_output".to_string(),
-                description: "Retrieve output from a running or completed background task. Use block=true to wait for completion, block=false for non-blocking status check.".to_string(),
+                description: "Retrieve output from a running or completed background task.\n\n\
+## When to use\n\
+- After spawning a background task with spawn_task(run_in_background=true)\n\
+- To check if a long-running task has finished (use block=false)\n\
+- To get the final result of a completed background task (use block=true)\n\n\
+## Parameters\n\
+- block=true (default): waits for the task to complete before returning\n\
+- block=false: returns immediately with current status, even if still running\n\
+- timeout: max wait time in ms (default 30000). Use longer timeouts for slow tasks\n\n\
+## Tips\n\
+- You will be automatically notified when background tasks complete — no need to poll\n\
+- If a task is still running with block=false, you'll get partial output and status 'running'".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2395,7 +2452,17 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_stop".to_string(),
-                description: "Stop a running background task by its ID.".to_string(),
+                description: "Stop a running background task by its ID.\n\n\
+## When to use\n\
+- A background task is taking too long and you want to cancel it\n\
+- The task's results are no longer needed (e.g. user changed direction)\n\
+- A task is stuck or producing errors and should be terminated\n\n\
+## When NOT to use\n\
+- To check task status — use task_output with block=false instead\n\
+- For tasks that have already completed — stopping has no effect\n\n\
+## Tips\n\
+- Returns success/failure status indicating whether the task was stopped\n\
+- Stopped tasks cannot be resumed — you would need to spawn a new one".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2454,7 +2521,18 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_get".to_string(),
-                description: "Retrieve full details of a task by its ID, including description, status, and dependencies.".to_string(),
+                description: "Retrieve full details of a task by its ID.\n\n\
+## When to use\n\
+- Before starting work on a task: read the full description and requirements\n\
+- To check task dependencies (blockedBy) before claiming it\n\
+- To understand the full context of what a task requires\n\n\
+## Returns\n\
+- subject, description, status (pending/in_progress/completed/failed)\n\
+- blocks: tasks waiting on this one\n\
+- blockedBy: tasks that must complete first\n\n\
+## Tips\n\
+- Use task_list for a summary of all tasks; use task_get for one task's full details\n\
+- Always verify blockedBy is empty before starting work on a task".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",
@@ -2472,7 +2550,18 @@ git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "task_list".to_string(),
-                description: "List all tasks in the task list with summary info: id, subject, status, owner, blockedBy.".to_string(),
+                description: "List all tasks in the task list with summary info.\n\n\
+## When to use\n\
+- To see what tasks are available to work on (status=pending, not blocked)\n\
+- To check overall progress on the project\n\
+- After completing a task, to find the next one to work on\n\
+- To verify task dependencies and identify blocked work\n\n\
+## Returns\n\
+For each task: id, subject, status, owner, blockedBy list\n\n\
+## Tips\n\
+- Prefer working on tasks in ID order (lowest first) — earlier tasks set up context\n\
+- Use task_get with a specific ID to see full description and requirements\n\
+- Tasks with non-empty blockedBy cannot be started until dependencies resolve".to_string(),
             strict: None,
                 parameters: json!({
                     "type": "object",

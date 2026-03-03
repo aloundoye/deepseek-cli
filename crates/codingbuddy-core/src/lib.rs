@@ -1418,6 +1418,8 @@ pub enum StreamChunk {
         tool_name: String,
         files: Vec<String>,
     },
+    /// A recoverable or non-recoverable error occurred during processing.
+    Error { message: String, recoverable: bool },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1527,6 +1529,14 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "snapshot_id": snapshot_id,
             "tool_name": tool_name,
             "files": files,
+        }),
+        StreamChunk::Error {
+            message,
+            recoverable,
+        } => serde_json::json!({
+            "type": "error",
+            "message": message,
+            "recoverable": recoverable,
         }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });
@@ -2024,8 +2034,26 @@ impl AppConfig {
             if !path.exists() {
                 continue;
             }
-            let raw = fs::read_to_string(path)?;
-            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            let raw = match fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "[config] warning: could not read {}: {e}; skipping",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[config] warning: malformed JSON in {}: {e}; skipping",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
             merge_json_value(&mut merged, &value);
         }
 
@@ -4120,5 +4148,30 @@ mod tests {
             repeat_count: 3,
         };
         assert!(!event.is_tool_event());
+    }
+
+    #[test]
+    fn config_load_skips_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let settings_dir = ws.join(".codingbuddy");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        // Write malformed JSON to the project settings file
+        std::fs::write(settings_dir.join("settings.json"), "{ invalid json !!!").unwrap();
+        // Should succeed (skip the bad file) rather than propagate an error
+        let result = AppConfig::load(ws);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn stream_chunk_error_serializes() {
+        let chunk = StreamChunk::Error {
+            message: "test error".into(),
+            recoverable: true,
+        };
+        let json = stream_chunk_to_event_json(&chunk);
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["message"], "test error");
+        assert_eq!(json["recoverable"], true);
     }
 }

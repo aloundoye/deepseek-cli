@@ -2235,6 +2235,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::UsageUpdate { .. } => "UsageUpdate",
                         codingbuddy_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
                         codingbuddy_core::StreamChunk::SnapshotRecorded { .. } => "SnapshotRecorded",
+                        codingbuddy_core::StreamChunk::Error { .. } => "Error",
                         codingbuddy_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
@@ -2249,6 +2250,7 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::SubagentFailed { run_id, name, error } => serde_json::json!({ "run_id": run_id, "name": name, "error": error }),
                         codingbuddy_core::StreamChunk::ImageData { label, .. } => serde_json::json!({ "label": label }),
                         codingbuddy_core::StreamChunk::WatchTriggered { digest, comment_count } => serde_json::json!({ "digest": digest, "comment_count": comment_count }),
+                        codingbuddy_core::StreamChunk::Error { message, recoverable } => serde_json::json!({ "message": message, "recoverable": recoverable }),
                         _ => serde_json::json!({}),
                     }
                 });
@@ -2335,6 +2337,13 @@ pub(crate) fn run_chat(
                         let out = std::io::stdout();
                         let mut handle = out.lock();
                         let _ = writeln!(handle, "  \x1b[33m⚠ Security:\x1b[0m {message}");
+                        let _ = handle.flush();
+                    }
+                    codingbuddy_core::StreamChunk::Error { message, .. } => {
+                        use std::io::Write as _;
+                        let err = std::io::stderr();
+                        let mut handle = err.lock();
+                        let _ = writeln!(handle, "  \x1b[31m✗ Error:\x1b[0m {message}");
                         let _ = handle.flush();
                     }
                     codingbuddy_core::StreamChunk::UsageUpdate { .. } => {}
@@ -3313,6 +3322,9 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::SecurityWarning { message } => {
                     let _ = tx_stream.send(TuiStreamEvent::Error(format!("⚠ Security: {message}")));
                 }
+                StreamChunk::Error { message, .. } => {
+                    let _ = tx_stream.send(TuiStreamEvent::Error(message));
+                }
                 StreamChunk::UsageUpdate { .. } => {}
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
@@ -4288,6 +4300,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                 }
                 StreamChunk::SecurityWarning { message } => {
                     let _ = writeln!(handle, "[security warning: {message}]");
+                    let _ = handle.flush();
+                }
+                StreamChunk::Error { message, .. } => {
+                    let _ = writeln!(handle, "[error: {message}]");
                     let _ = handle.flush();
                 }
                 StreamChunk::UsageUpdate { .. } => {}

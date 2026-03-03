@@ -36,6 +36,13 @@ pub struct HardwareInfo {
     /// GPU/accelerator memory in MB (e.g. Metal unified memory on macOS, VRAM on CUDA).
     /// `None` if no GPU detected or memory query failed.
     pub gpu_memory_mb: Option<u64>,
+    /// Number of performance cores (Apple Silicon P-cores, or `None` on other platforms).
+    pub performance_cores: Option<u32>,
+    /// Number of efficiency cores (Apple Silicon E-cores, or `None` on other platforms).
+    pub efficiency_cores: Option<u32>,
+    /// Recommended thread count for inference. Uses P-cores when available,
+    /// otherwise falls back to `available_parallelism() / 2`.
+    pub recommended_threads: u32,
 }
 
 const OS_RESERVE_MB: u64 = 4096;
@@ -54,11 +61,21 @@ pub fn detect_hardware() -> HardwareInfo {
             let (device, total_ram_mb) = detect_platform();
             let available_for_models_mb = total_ram_mb.saturating_sub(OS_RESERVE_MB);
             let gpu_memory_mb = detect_gpu_memory(device, total_ram_mb);
+            let (performance_cores, efficiency_cores) = detect_core_types();
+            let recommended_threads = performance_cores.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| (n.get() as u32) / 2)
+                    .unwrap_or(2)
+                    .max(1)
+            });
             HardwareInfo {
                 device,
                 total_ram_mb,
                 available_for_models_mb,
                 gpu_memory_mb,
+                performance_cores,
+                efficiency_cores,
+                recommended_threads,
             }
         })
         .clone()
@@ -152,6 +169,31 @@ fn detect_platform() -> (DetectedDevice, u64) {
     (DetectedDevice::Cpu, 8192)
 }
 
+/// Detect P-core and E-core counts (Apple Silicon via sysctl).
+///
+/// Returns `(performance_cores, efficiency_cores)`.
+/// On non-macOS-aarch64 platforms, both are `None`.
+fn detect_core_types() -> (Option<u32>, Option<u32>) {
+    let p = sysctl_u32("hw.perflevel0.physicalcpu");
+    let e = sysctl_u32("hw.perflevel1.physicalcpu");
+    (p, e)
+}
+
+/// Query a sysctl value as u32. Returns `None` on non-macOS or on any error.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn sysctl_u32(key: &str) -> Option<u32> {
+    let output = Command::new("sysctl").args(["-n", key]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn sysctl_u32(_key: &str) -> Option<u32> {
+    None
+}
+
 /// Read total RAM on macOS via `sysctl -n hw.memsize` (returns bytes).
 #[cfg(target_os = "macos")]
 fn macos_total_ram_mb() -> Option<u64> {
@@ -234,6 +276,29 @@ mod tests {
         if cfg!(target_arch = "aarch64") {
             assert_eq!(hw.device, DetectedDevice::Metal);
         }
+    }
+
+    #[test]
+    fn hardware_info_has_recommended_threads() {
+        let hw = detect_hardware();
+        assert!(
+            hw.recommended_threads >= 1,
+            "recommended_threads must be at least 1, got {}",
+            hw.recommended_threads
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn apple_silicon_detects_core_types() {
+        let hw = detect_hardware();
+        assert!(
+            hw.performance_cores.is_some(),
+            "Apple Silicon should detect P-cores"
+        );
+        let p = hw.performance_cores.unwrap();
+        assert!(p >= 2, "expected at least 2 P-cores, got {p}");
+        // E-cores may or may not exist (some M-series chips have them)
     }
 
     #[test]
