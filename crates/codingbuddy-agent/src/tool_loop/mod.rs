@@ -275,6 +275,34 @@ impl<'a> ToolUseLoop<'a> {
         });
     }
 
+    /// Persist a large tool output to disk and return a hint for the truncated message.
+    /// Writes to `.codingbuddy/tool_outputs/<hash>.txt` so the model can re-read it.
+    const LARGE_OUTPUT_THRESHOLD: usize = 50_000; // 50KB
+    fn persist_large_output(&self, tool_name: &str, raw_output: &str) -> Option<String> {
+        if raw_output.len() < Self::LARGE_OUTPUT_THRESHOLD {
+            return None;
+        }
+        let output_dir = std::path::Path::new(&self.workspace_path_str)
+            .join(".codingbuddy")
+            .join("tool_outputs");
+        if std::fs::create_dir_all(&output_dir).is_err() {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw_output.hash(&mut hasher);
+        let hash = hasher.finish();
+        let filename = format!("{tool_name}_{hash:016x}.txt");
+        let path = output_dir.join(&filename);
+        if std::fs::write(&path, raw_output).is_ok() {
+            Some(format!(
+                "\n[Full output saved to .codingbuddy/tool_outputs/{filename} — use fs_read to view]"
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Set the stream callback for real-time UI updates.
     pub fn set_stream_callback(&mut self, cb: StreamCallback) {
         self.stream_cb = Some(cb);
@@ -389,13 +417,49 @@ impl<'a> ToolUseLoop<'a> {
             (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
 
         loop {
-            // Check turn limit
+            // Check turn limit — on final turn, ask for a text-only summary.
             if turns >= self.config.max_turns {
+                // Inject a final system message asking for text-only summary
+                self.messages.push(ChatMessage::System {
+                    content: "MAXIMUM STEPS REACHED. Tools are now disabled. Respond with text only: \
+                        summarize what you accomplished, what remains incomplete, and any recommendations."
+                        .to_string(),
+                });
+                // Make one final LLM call with no tools to get a summary
+                let summary_request = ChatRequest {
+                    messages: self.messages.clone(),
+                    model: self.config.model.clone(),
+                    tools: Vec::new(),
+                    tool_choice: ToolChoice::none(),
+                    max_tokens: 2048,
+                    temperature: None,
+                    top_p: None,
+                    presence_penalty: None,
+                    frequency_penalty: None,
+                    logprobs: None,
+                    top_logprobs: None,
+                    thinking: None,
+                    images: vec![],
+                    response_format: None,
+                };
+                let summary_text = match self.llm.complete_chat(&summary_request) {
+                    Ok(resp) => {
+                        if let Some(u) = &resp.usage {
+                            total_usage.prompt_tokens += u.prompt_tokens;
+                            total_usage.completion_tokens += u.completion_tokens;
+                        }
+                        resp.text
+                    }
+                    Err(_) => String::new(),
+                };
+                if !summary_text.is_empty() {
+                    self.emit(StreamChunk::ContentDelta(summary_text.clone()));
+                }
                 self.emit(StreamChunk::Done {
                     reason: Some("max turns reached".to_string()),
                 });
                 return Ok(ToolLoopResult {
-                    response: String::new(),
+                    response: summary_text,
                     tool_calls_made,
                     finish_reason: "max_turns".to_string(),
                     usage: total_usage,
@@ -1342,6 +1406,12 @@ impl<'a> ToolUseLoop<'a> {
             },
         });
 
+        // Persist large outputs to disk so the model can re-read the full content.
+        let file_hint = result
+            .output
+            .as_str()
+            .and_then(|s| self.persist_large_output(&llm_call.name, s));
+
         // Convert result to ChatMessage::Tool and append, scanning for security issues
         let (msg, injection_warnings) = tool_bridge::tool_result_to_message(
             &llm_call.id,
@@ -1349,6 +1419,21 @@ impl<'a> ToolUseLoop<'a> {
             &result,
             Some(&self.output_scanner),
         );
+        // Append file persistence hint to the truncated message content.
+        let msg = if let Some(hint) = file_hint {
+            match msg {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => ChatMessage::Tool {
+                    tool_call_id,
+                    content: format!("{content}{hint}"),
+                },
+                other => other,
+            }
+        } else {
+            msg
+        };
         let msg = self.apply_privacy_to_message(msg);
 
         // ── Cache store (after privacy filtering) ──
@@ -2009,7 +2094,24 @@ impl<'a> ToolUseLoop<'a> {
             return false;
         }
 
+        let compacted_count = middle_count;
         self.messages = new_messages;
+
+        // Inject synthetic continuation to prevent model confusion after compaction.
+        // Only add when significant compaction occurred (5+ messages removed) and
+        // the last message is not already a User message.
+        if compacted_count >= 5 {
+            let last_is_user = self
+                .messages
+                .last()
+                .is_some_and(|m| matches!(m, ChatMessage::User { .. }));
+            if !last_is_user {
+                self.messages.push(ChatMessage::User {
+                    content: "Continue with your next steps if any remain, or summarize what was accomplished.".to_string(),
+                });
+            }
+        }
+
         true
     }
 
