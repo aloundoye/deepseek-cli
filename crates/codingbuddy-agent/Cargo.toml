@@ -26,6 +26,7 @@ codingbuddy-memory = { path = "../codingbuddy-memory" }
 codingbuddy-context = { path = "../codingbuddy-context" }
 codingbuddy-index = { path = "../codingbuddy-index" }
 codingbuddy-local-ml = { path = "../codingbuddy-local-ml" }
+codingbuddy-lsp = { path = "../codingbuddy-lsp" }
 reqwest.workspace = true
 base64.workspace = true
 chrono.workspace = true

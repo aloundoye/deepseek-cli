@@ -223,6 +223,58 @@ fn glob_command_matches(pattern: &str, cmd: &str) -> bool {
     cmd_tokens.len() >= pattern_tokens.len()
 }
 
+/// Returns a baseline set of safety-oriented permission rules that are always
+/// present regardless of user configuration. These protect against catastrophic
+/// actions (e.g. `rm -rf *`) and prompt for confirmation on destructive git
+/// operations and sensitive file edits.
+///
+/// Evaluation order (enforced by `evaluate_permission_rules`): deny > ask > allow.
+/// User rules are appended *after* these defaults, so a user "allow" cannot
+/// override a default "deny", but a user can still add stricter rules.
+#[must_use]
+pub fn default_deny_rules() -> Vec<PermissionRule> {
+    vec![
+        // Catastrophic file deletion -- always deny
+        PermissionRule {
+            rule: "Bash(rm -rf *)".to_string(),
+            decision: "deny".to_string(),
+        },
+        // Force-push -- ask for confirmation
+        PermissionRule {
+            rule: "Bash(git push --force*)".to_string(),
+            decision: "ask".to_string(),
+        },
+        PermissionRule {
+            rule: "Bash(git push -f*)".to_string(),
+            decision: "ask".to_string(),
+        },
+        // Editing secret / environment files -- ask
+        PermissionRule {
+            rule: "Edit(.env)".to_string(),
+            decision: "ask".to_string(),
+        },
+        PermissionRule {
+            rule: "Edit(.env.*)".to_string(),
+            decision: "ask".to_string(),
+        },
+        // Editing inside node_modules -- always deny
+        PermissionRule {
+            rule: "Edit(node_modules/**)".to_string(),
+            decision: "deny".to_string(),
+        },
+        // Hard reset -- ask for confirmation
+        PermissionRule {
+            rule: "Bash(git reset --hard*)".to_string(),
+            decision: "ask".to_string(),
+        },
+        // Discarding local changes -- ask for confirmation
+        PermissionRule {
+            rule: "Bash(git checkout -- *)".to_string(),
+            decision: "ask".to_string(),
+        },
+    ]
+}
+
 /// Evaluate permission rules against a tool call.
 /// Returns: "allow", "deny", "ask", or None if no rule matched.
 /// Evaluation order: deny > ask > allow (strongest match wins).
@@ -400,6 +452,15 @@ impl PolicyEngine {
                 .collect::<Vec<_>>();
         }
         let permission_mode = cfg.permission_mode;
+        // Prepend safety defaults so they are always evaluated first.
+        // Because deny > ask > allow in evaluate_permission_rules, user
+        // rules cannot downgrade a default "deny" to "allow".
+        let mut merged_rules = default_deny_rules();
+        merged_rules.extend(cfg.permission_rules.clone());
+        let cfg = PolicyConfig {
+            permission_rules: merged_rules,
+            ..cfg
+        };
         Self {
             cfg,
             secret_regexes,
@@ -557,6 +618,26 @@ impl PolicyEngine {
     }
 
     pub fn requires_approval(&self, call: &ToolCall) -> bool {
+        // BypassPermissions skips ALL checks -- this is intentional and requires
+        // both `--dangerously-skip-permissions` and `--allow-dangerously-skip-permissions`
+        // CLI flags to enable. It must be checked before permission rules so that
+        // default deny rules do not block bypass mode.
+        if self.permission_mode == PermissionMode::BypassPermissions {
+            if let Ok(mut log) = self.audit_log.lock() {
+                let len = log.len();
+                if len >= MAX_AUDIT_ENTRIES {
+                    log.drain(..len / 2);
+                }
+                log.push(AuditEntry {
+                    tool_name: call.name.clone(),
+                    mode: PermissionMode::BypassPermissions,
+                    decision: AuditDecision::AutoApproved,
+                    timestamp: std::time::SystemTime::now(),
+                });
+            }
+            return false;
+        }
+
         // Check persistent bash approvals (project-scoped, "don't ask again").
         if call.name == "bash.run"
             && let Some(cmd) = call.args.get("cmd").and_then(|v| v.as_str())
@@ -586,21 +667,8 @@ impl PolicyEngine {
         let is_mcp = call.name.starts_with("mcp__");
 
         match self.permission_mode {
-            PermissionMode::BypassPermissions => {
-                if let Ok(mut log) = self.audit_log.lock() {
-                    let len = log.len();
-                    if len >= MAX_AUDIT_ENTRIES {
-                        log.drain(..len / 2);
-                    }
-                    log.push(AuditEntry {
-                        tool_name: call.name.clone(),
-                        mode: PermissionMode::BypassPermissions,
-                        decision: AuditDecision::AutoApproved,
-                        timestamp: std::time::SystemTime::now(),
-                    });
-                }
-                false
-            }
+            // BypassPermissions is handled by the early return above.
+            PermissionMode::BypassPermissions => unreachable!(),
             PermissionMode::Locked => {
                 // In locked mode, all non-read tools require approval (and will be denied).
                 if is_mcp {
@@ -2391,5 +2459,181 @@ mod tests {
         assert_eq!(entries[0].tool_name, "fs.edit");
         assert_eq!(entries[0].mode, PermissionMode::BypassPermissions);
         assert_eq!(entries[0].decision, AuditDecision::AutoApproved);
+    }
+
+    // ── default_deny_rules tests ────────────────────────────────────────
+
+    #[test]
+    fn default_deny_rules_returns_expected_count() {
+        let rules = default_deny_rules();
+        assert_eq!(rules.len(), 8, "expected 8 default safety rules");
+    }
+
+    #[test]
+    fn default_deny_rules_present_in_new_engine() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        // Default PolicyConfig has no user rules, so all rules come from defaults.
+        assert!(
+            engine.cfg.permission_rules.len() >= 8,
+            "engine should contain at least 8 default deny rules, got {}",
+            engine.cfg.permission_rules.len()
+        );
+        // First rule should be the rm -rf deny.
+        assert_eq!(engine.cfg.permission_rules[0].rule, "Bash(rm -rf *)");
+        assert_eq!(engine.cfg.permission_rules[0].decision, "deny");
+    }
+
+    #[test]
+    fn default_deny_rules_prepended_before_user_rules() {
+        let cfg = PolicyConfig {
+            permission_rules: vec![PermissionRule {
+                rule: "Bash(npm *)".to_string(),
+                decision: "allow".to_string(),
+            }],
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg);
+        // 8 defaults + 1 user rule
+        assert_eq!(engine.cfg.permission_rules.len(), 9);
+        // Last rule should be the user rule.
+        assert_eq!(engine.cfg.permission_rules[8].rule, "Bash(npm *)");
+        assert_eq!(engine.cfg.permission_rules[8].decision, "allow");
+    }
+
+    #[test]
+    fn default_deny_rm_rf_blocks_destructive_command() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "rm -rf /"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("deny".to_string()));
+    }
+
+    #[test]
+    fn default_deny_rm_rf_blocks_wildcard_variant() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "rm -rf ."}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("deny".to_string()));
+    }
+
+    #[test]
+    fn default_deny_git_force_push_asks() {
+        let engine = PolicyEngine::default();
+        let call_long = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "git push --force origin main"}),
+            requires_approval: false,
+        };
+        let call_short = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "git push -f origin main"}),
+            requires_approval: false,
+        };
+        let result_long = evaluate_permission_rules(&engine.cfg.permission_rules, &call_long);
+        let result_short = evaluate_permission_rules(&engine.cfg.permission_rules, &call_short);
+        assert_eq!(result_long, Some("ask".to_string()));
+        assert_eq!(result_short, Some("ask".to_string()));
+    }
+
+    #[test]
+    fn default_deny_edit_env_asks() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": ".env"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("ask".to_string()));
+    }
+
+    #[test]
+    fn default_deny_edit_env_variant_asks() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": ".env.local"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("ask".to_string()));
+    }
+
+    #[test]
+    fn default_deny_edit_node_modules_blocks() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "fs.edit".to_string(),
+            args: json!({"path": "node_modules/lodash/index.js"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("deny".to_string()));
+    }
+
+    #[test]
+    fn default_deny_git_reset_hard_asks() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "git reset --hard HEAD~1"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("ask".to_string()));
+    }
+
+    #[test]
+    fn default_deny_git_checkout_discard_asks() {
+        let engine = PolicyEngine::default();
+        let call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "git checkout -- src/main.rs"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        assert_eq!(result, Some("ask".to_string()));
+    }
+
+    #[test]
+    fn default_deny_rules_do_not_match_safe_commands() {
+        let engine = PolicyEngine::default();
+        let safe = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "git status"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &safe);
+        // None of the default rules match "git status", so result should be None.
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn default_deny_user_allow_cannot_override_deny() {
+        // User tries to allow rm -rf, but default deny wins.
+        let cfg = PolicyConfig {
+            permission_rules: vec![PermissionRule {
+                rule: "Bash(rm -rf *)".to_string(),
+                decision: "allow".to_string(),
+            }],
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg);
+        let call = ToolCall {
+            name: "bash.run".to_string(),
+            args: json!({"cmd": "rm -rf /tmp/stuff"}),
+            requires_approval: false,
+        };
+        let result = evaluate_permission_rules(&engine.cfg.permission_rules, &call);
+        // deny wins over allow in evaluate_permission_rules
+        assert_eq!(result, Some("deny".to_string()));
     }
 }

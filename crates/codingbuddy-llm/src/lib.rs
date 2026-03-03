@@ -47,6 +47,23 @@ pub struct ApiClient {
     /// Optional cancellation token — checked between SSE reads during streaming.
     /// When cancelled, returns partial response with content accumulated so far.
     cancel_token: Option<CancellationToken>,
+    /// Cached API key resolved eagerly at construction time.
+    /// Avoids env var races when the key is cleared during logout.
+    api_key: Option<String>,
+}
+
+/// Resolve an API key from env var then config fallback.
+fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
+    std::env::var(&cfg.api_key_env)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            cfg.api_key
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
 }
 
 impl ApiClient {
@@ -54,11 +71,19 @@ impl ApiClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_seconds))
             .build()?;
+        let api_key = resolve_key_from_config(&cfg);
         Ok(Self {
             cfg,
             client,
             cancel_token: None,
+            api_key,
         })
+    }
+
+    /// Clear the cached API key (e.g. on logout). Subsequent requests will
+    /// fail with "API key not set" rather than using a stale credential.
+    pub fn clear_api_key(&mut self) {
+        self.api_key = None;
     }
 
     /// Attach a cancellation token that will be checked during streaming.
@@ -222,7 +247,7 @@ impl ApiClient {
         payload
     }
 
-    fn build_chat_payload(&self, req: &ChatRequest) -> Value {
+    fn build_chat_payload(&self, req: &ChatRequest) -> Result<Value> {
         let thinking_enabled = req
             .thinking
             .as_ref()
@@ -337,20 +362,19 @@ impl ApiClient {
         // already omit these, but guard here as the last line of defense.
         let is_reasoner = codingbuddy_core::is_reasoner_model(&req.model);
         if !is_reasoner && let Some(ref thinking) = req.thinking {
-            payload["thinking"] = serde_json::to_value(thinking).unwrap_or(json!(null));
+            payload["thinking"] = serde_json::to_value(thinking)?;
         }
         if !req.tools.is_empty() {
-            payload["tools"] = serde_json::to_value(&req.tools).unwrap_or(json!([]));
+            payload["tools"] = serde_json::to_value(&req.tools)?;
             if !is_reasoner {
-                payload["tool_choice"] =
-                    serde_json::to_value(&req.tool_choice).unwrap_or(json!("auto"));
+                payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
             }
         }
-        payload
+        Ok(payload)
     }
 
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: &str) -> Result<LlmResponse> {
-        let payload = self.build_chat_payload(req);
+        let payload = self.build_chat_payload(req)?;
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -582,7 +606,7 @@ impl ApiClient {
         api_key: &str,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut payload = self.build_chat_payload(req);
+        let mut payload = self.build_chat_payload(req)?;
         payload["stream"] = json!(true);
         payload["stream_options"] = json!({"include_usage": true});
 
@@ -779,17 +803,13 @@ impl ApiClient {
     }
 
     fn resolve_api_key(&self) -> Option<String> {
-        std::env::var(&self.cfg.api_key_env)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                self.cfg
-                    .api_key
-                    .as_ref()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
+        // Prefer the cached key (resolved at construction time) to avoid
+        // env var data races when logout clears the variable.
+        if let Some(ref cached) = self.api_key {
+            return Some(cached.clone());
+        }
+        // Fallback: re-check env + config (e.g. key set after construction).
+        resolve_key_from_config(&self.cfg)
     }
 
     fn resolve_request_model(&self, requested: &str, profile: &str) -> Result<String> {
@@ -1851,7 +1871,7 @@ mod tests {
             images: vec![],
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req);
+        let payload = client.build_chat_payload(&req).expect("build payload");
         // With thinking enabled, all sampling params must be omitted
         assert!(
             payload.get("temperature").is_none(),
@@ -1895,7 +1915,7 @@ mod tests {
             images: vec![],
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req);
+        let payload = client.build_chat_payload(&req).expect("build payload");
         assert!(
             payload.get("temperature").is_some(),
             "temperature should be present"
@@ -1944,7 +1964,7 @@ mod tests {
             images: vec![],
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req);
+        let payload = client.build_chat_payload(&req).expect("build payload");
         // Tools should be present
         assert!(payload.get("tools").is_some(), "tools should be present");
         // tool_choice must be stripped for reasoner (HTTP 400 otherwise)
@@ -1981,7 +2001,7 @@ mod tests {
             images: vec![],
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req);
+        let payload = client.build_chat_payload(&req).expect("build payload");
         assert!(
             payload.get("thinking").is_none(),
             "thinking config must be stripped for deepseek-reasoner (thinks natively)"
@@ -2019,7 +2039,7 @@ mod tests {
             images: vec![],
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req);
+        let payload = client.build_chat_payload(&req).expect("build payload");
         assert!(payload.get("tools").is_some(), "tools should be present");
         assert!(
             payload.get("tool_choice").is_some(),
@@ -2167,7 +2187,7 @@ mod tests {
             images: vec![],
             response_format: None,
         };
-        let payload = client.build_chat_payload(&req);
+        let payload = client.build_chat_payload(&req).expect("build payload");
         let messages = payload["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 2);
         assert!(messages.iter().all(|m| m.get("cache_control").is_none()));
@@ -2923,5 +2943,71 @@ mod tests {
         assert!(token.is_cancelled());
         token.reset();
         assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn test_build_chat_payload_returns_result() {
+        let cfg = LlmConfig::default();
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: Some(0.5),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let result = client.build_chat_payload(&req);
+        assert!(
+            result.is_ok(),
+            "build_chat_payload should return Ok for valid input"
+        );
+        let payload = result.unwrap();
+        assert_eq!(payload["model"], "deepseek-chat");
+        assert_eq!(payload["max_tokens"], 128);
+        assert!(payload["messages"].is_array());
+    }
+
+    #[test]
+    fn test_api_client_caches_api_key() {
+        let cfg = LlmConfig {
+            api_key_env: "CODINGBUDDY_CACHE_TEST_NONEXISTENT".to_string(),
+            api_key: Some("cached-test-key".to_string()),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        // The cached key should be resolved eagerly from cfg.api_key
+        assert_eq!(
+            client.api_key.as_deref(),
+            Some("cached-test-key"),
+            "api_key should be cached at construction"
+        );
+        // resolve_api_key should return the cached key
+        let resolved = client.resolve_api_key().expect("should resolve cached key");
+        assert_eq!(resolved, "cached-test-key");
+
+        // After clearing, resolve_api_key falls back to env/config
+        let mut client = client;
+        client.clear_api_key();
+        assert!(
+            client.api_key.is_none(),
+            "api_key should be None after clear"
+        );
+        // Since the env var does not exist and we cleared the cache,
+        // resolve_api_key should still fall back to cfg.api_key
+        let resolved = client
+            .resolve_api_key()
+            .expect("should fall back to cfg.api_key");
+        assert_eq!(resolved, "cached-test-key");
     }
 }

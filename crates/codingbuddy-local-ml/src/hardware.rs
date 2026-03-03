@@ -81,6 +81,69 @@ pub fn detect_hardware() -> HardwareInfo {
         .clone()
 }
 
+/// Return current available (free) system memory in MB.
+///
+/// Unlike `detect_hardware()` (which is cached once per process), this queries
+/// live memory pressure every time it is called.
+///
+/// - macOS: `sysctl vm.page_free_count` * `hw.pagesize`
+/// - Linux: `MemAvailable` from `/proc/meminfo`
+/// - Fallback: re-uses `detect_hardware().available_for_models_mb`
+pub fn available_memory_mb() -> u64 {
+    available_memory_mb_impl().unwrap_or_else(|| detect_hardware().available_for_models_mb)
+}
+
+#[cfg(target_os = "macos")]
+fn available_memory_mb_impl() -> Option<u64> {
+    // Read free page count and page size from sysctl
+    let free_output = Command::new("sysctl")
+        .args(["-n", "vm.page_free_count"])
+        .output()
+        .ok()?;
+    if !free_output.status.success() {
+        return None;
+    }
+    let free_pages: u64 = String::from_utf8_lossy(&free_output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+
+    let page_output = Command::new("sysctl")
+        .args(["-n", "hw.pagesize"])
+        .output()
+        .ok()?;
+    if !page_output.status.success() {
+        return None;
+    }
+    let page_size: u64 = String::from_utf8_lossy(&page_output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+
+    Some(free_pages * page_size / (1024 * 1024))
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory_mb_impl() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb_str = rest
+                .trim()
+                .strip_suffix("kB")
+                .or_else(|| rest.trim().strip_suffix("KB"))?;
+            let kb: u64 = kb_str.trim().parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn available_memory_mb_impl() -> Option<u64> {
+    None
+}
+
 /// Detect GPU memory in MB.
 ///
 /// - macOS Metal (Apple Silicon): uses unified memory, reports ~75% of total RAM
@@ -299,6 +362,24 @@ mod tests {
         let p = hw.performance_cores.unwrap();
         assert!(p >= 2, "expected at least 2 P-cores, got {p}");
         // E-cores may or may not exist (some M-series chips have them)
+    }
+
+    #[test]
+    fn available_memory_returns_nonzero() {
+        let mb = available_memory_mb();
+        assert!(mb > 0, "available_memory_mb should return > 0, got {mb}");
+    }
+
+    #[test]
+    fn available_memory_not_cached() {
+        // Calling twice should succeed (not panic). Values may differ slightly
+        // between calls because the function queries live memory pressure.
+        let a = available_memory_mb();
+        let b = available_memory_mb();
+        // Both should be reasonable (> 0 and < total)
+        let total = detect_hardware().total_ram_mb;
+        assert!(a > 0 && a <= total, "first call out of range: {a}");
+        assert!(b > 0 && b <= total, "second call out of range: {b}");
     }
 
     #[test]

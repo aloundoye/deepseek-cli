@@ -27,13 +27,18 @@ pub struct ModelInfo {
 struct PartialDownloadState {
     model_id: String,
     hf_repo: String,
-    /// SHA-256 digests of completed files (filename → digest).
+    /// SHA-256 digests of completed files (filename -> digest).
     completed_digests: BTreeMap<String, String>,
 }
 
 /// Maximum number of retries per file download.
 #[cfg(feature = "local-ml")]
 const MAX_DOWNLOAD_RETRIES: usize = 6;
+
+/// If an individual file download takes longer than this without completing,
+/// treat it as stalled and retry.
+#[cfg(feature = "local-ml")]
+const DOWNLOAD_STALL_TIMEOUT_SECS: u64 = 60;
 
 /// Manifest for a content-addressable model cache entry.
 ///
@@ -133,7 +138,7 @@ impl ModelManager {
     ///
     /// Checks manifest-based layout first, falls back to legacy `<model_id>/` dir.
     pub fn model_path(&self, model_id: &str) -> PathBuf {
-        // Legacy layout path — files are accessed directly from here
+        // Legacy layout path -- files are accessed directly from here
         self.cache_dir.join(model_id)
     }
 
@@ -319,6 +324,75 @@ impl ModelManager {
         let _ = std::fs::remove_file(self.partial_state_path(model_id));
     }
 
+    /// Download a single file with retry logic and stall detection.
+    ///
+    /// Returns `(filename, digest)` on success.
+    #[cfg(feature = "local-ml")]
+    fn download_single_file(
+        repo: &hf_hub::api::sync::ApiRepo,
+        filename: &str,
+        model_path: &Path,
+        blobs: &Path,
+    ) -> Result<(String, String), String> {
+        use std::fs;
+        use std::time::Instant;
+
+        let stall_timeout = std::time::Duration::from_secs(DOWNLOAD_STALL_TIMEOUT_SECS);
+        let mut last_error = None;
+
+        for attempt in 0..MAX_DOWNLOAD_RETRIES {
+            if attempt > 0 {
+                eprintln!("[model_manager] retry {attempt}/{MAX_DOWNLOAD_RETRIES} for {filename}");
+            }
+
+            let started = Instant::now();
+            let result = repo.get(filename);
+
+            // Stall detection: if the download took longer than the timeout and
+            // still failed, log it explicitly so the user knows why we retried.
+            if started.elapsed() > stall_timeout && result.is_err() {
+                eprintln!(
+                    "[model_manager] download of {filename} appears stalled (>{DOWNLOAD_STALL_TIMEOUT_SECS}s), retrying"
+                );
+            }
+
+            match result {
+                Ok(path) => {
+                    // Atomic copy: write to .partial temp, then rename
+                    let dest = model_path.join(filename);
+                    let partial_dest = model_path.join(format!("{filename}.partial"));
+                    if !dest.exists()
+                        && let Err(e) = fs::copy(&path, &partial_dest)
+                            .and_then(|_| fs::rename(&partial_dest, &dest))
+                    {
+                        last_error = Some(format!("copy/rename failed: {e}"));
+                        continue;
+                    }
+                    // Store as content-addressable blob
+                    if let Some(digest) = sha256_file(&dest) {
+                        let blob_path = blobs.join(format!("sha256-{digest}"));
+                        if !blob_path.exists() {
+                            let partial_blob = blobs.join(format!("sha256-{digest}.partial"));
+                            if let Err(e) = fs::copy(&dest, &partial_blob)
+                                .and_then(|_| fs::rename(&partial_blob, &blob_path))
+                            {
+                                last_error = Some(format!("blob store failed: {e}"));
+                                continue;
+                            }
+                        }
+                        return Ok((filename.to_string(), digest));
+                    }
+                    last_error = Some("sha256 computation failed".to_string());
+                }
+                Err(e) => {
+                    eprintln!("[model_manager] failed to download {filename}: {e}");
+                    last_error = Some(format!("{e}"));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "unknown error".to_string()))
+    }
+
     #[cfg(feature = "local-ml")]
     fn download_model(
         &mut self,
@@ -328,6 +402,7 @@ impl ModelManager {
         progress_cb: &dyn Fn(usize, usize),
     ) -> anyhow::Result<()> {
         use std::fs;
+        use std::sync::Mutex;
 
         self.statuses
             .insert(model_id.to_string(), ModelStatus::Downloading);
@@ -341,80 +416,83 @@ impl ModelManager {
         fs::create_dir_all(&manifests)?;
 
         // Resume from partial state if available
-        let mut partial =
-            self.load_partial_state(model_id)
-                .unwrap_or_else(|| PartialDownloadState {
-                    model_id: model_id.to_string(),
-                    hf_repo: hf_repo.to_string(),
-                    completed_digests: BTreeMap::new(),
-                });
-
-        let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.model(hf_repo.to_string());
+        let mut partial = self
+            .load_partial_state(model_id)
+            .unwrap_or_else(|| PartialDownloadState {
+                model_id: model_id.to_string(),
+                hf_repo: hf_repo.to_string(),
+                completed_digests: BTreeMap::new(),
+            });
 
         let mut manifest_files = partial.completed_digests.clone();
         let total = files.len();
-        for (i, filename) in files.iter().enumerate() {
-            progress_cb(i, total);
 
-            // Skip files already completed in a previous run
-            if partial.completed_digests.contains_key(*filename) {
-                continue;
-            }
+        // Identify files that still need downloading
+        let pending: Vec<&str> = files
+            .iter()
+            .filter(|f| !partial.completed_digests.contains_key(**f))
+            .copied()
+            .collect();
 
-            // Download with retry
-            let mut last_error = None;
-            for attempt in 0..MAX_DOWNLOAD_RETRIES {
-                if attempt > 0 {
-                    eprintln!(
-                        "[model_manager] retry {attempt}/{MAX_DOWNLOAD_RETRIES} for {filename}"
-                    );
-                }
+        // Report progress for already-completed files
+        let completed_so_far = total - pending.len();
+        if completed_so_far > 0 {
+            progress_cb(completed_so_far, total);
+        }
 
-                let result = repo.get(filename);
+        if !pending.is_empty() {
+            let api = hf_hub::api::sync::Api::new()?;
+            let repo = api.model(hf_repo.to_string());
 
-                match result {
-                    Ok(path) => {
-                        // Atomic copy: write to .partial temp, then rename
-                        let dest = model_path.join(filename);
-                        let partial_dest = model_path.join(format!("{filename}.partial"));
-                        if !dest.exists() {
-                            fs::copy(&path, &partial_dest)?;
-                            fs::rename(&partial_dest, &dest)?;
-                        }
-                        // Store as content-addressable blob
-                        if let Some(digest) = sha256_file(&dest) {
-                            let blob_path = blobs.join(format!("sha256-{digest}"));
-                            if !blob_path.exists() {
-                                let partial_blob = blobs.join(format!("sha256-{digest}.partial"));
-                                fs::copy(&dest, &partial_blob)?;
-                                fs::rename(&partial_blob, &blob_path)?;
+            // Parallel download using std::thread::scope.
+            // Each thread gets its own reference to the repo handle (Send+Sync).
+            type DownloadResult = Result<(String, String), (String, String)>;
+            let results: Mutex<Vec<DownloadResult>> = Mutex::new(Vec::new());
+
+            std::thread::scope(|s| {
+                for filename in &pending {
+                    let repo = &repo;
+                    let model_path = &model_path;
+                    let blobs = &blobs;
+                    let results = &results;
+
+                    s.spawn(move || {
+                        let outcome = Self::download_single_file(repo, filename, model_path, blobs);
+                        // Progress callback is not Sync, so we cannot call it from
+                        // parallel threads. We record results and report progress
+                        // after joining.
+                        match outcome {
+                            Ok(pair) => {
+                                results.lock().unwrap().push(Ok(pair));
                             }
-                            manifest_files.insert(filename.to_string(), digest.clone());
-                            partial
-                                .completed_digests
-                                .insert(filename.to_string(), digest);
+                            Err(e) => {
+                                results.lock().unwrap().push(Err((filename.to_string(), e)));
+                            }
                         }
-                        // Persist partial state after each file completes
+                    });
+                }
+            });
+
+            // Process results (single-threaded after thread::scope join)
+            let results = results.into_inner().unwrap();
+            for result in results {
+                match result {
+                    Ok((filename, digest)) => {
+                        manifest_files.insert(filename.clone(), digest.clone());
+                        partial.completed_digests.insert(filename, digest);
                         let _ = self.save_partial_state(&partial);
-                        last_error = None;
-                        break;
                     }
-                    Err(e) => {
-                        eprintln!("[model_manager] failed to download {filename}: {e}");
-                        last_error = Some(format!("{e}"));
+                    Err((filename, err)) => {
+                        self.statuses
+                            .insert(model_id.to_string(), ModelStatus::Error(err.clone()));
+                        anyhow::bail!(
+                            "model download incomplete: failed to download {filename} after {MAX_DOWNLOAD_RETRIES} retries: {err}"
+                        );
                     }
                 }
-            }
-
-            if let Some(err) = last_error {
-                self.statuses
-                    .insert(model_id.to_string(), ModelStatus::Error(err.clone()));
-                anyhow::bail!(
-                    "model download incomplete: failed to download {filename} after {MAX_DOWNLOAD_RETRIES} retries: {err}"
-                );
             }
         }
+
         progress_cb(total, total);
 
         // Write manifest
@@ -481,7 +559,7 @@ mod tests {
         // Initially not downloaded
         assert_eq!(mgr.status("test-model"), ModelStatus::NotDownloaded);
 
-        // Create the model directory with config.json → Ready (safetensors model)
+        // Create the model directory with config.json -> Ready (safetensors model)
         fs::create_dir_all(dir.path().join("test-model")).unwrap();
         fs::write(dir.path().join("test-model/config.json"), "{}").unwrap();
         assert_eq!(mgr.status("test-model"), ModelStatus::Ready);

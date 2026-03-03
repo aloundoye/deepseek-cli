@@ -11,6 +11,7 @@ pub(crate) fn is_read_only_api_name(name: &str) -> bool {
             | "git_status"
             | "git_diff"
             | "git_show"
+            | "git_log"
             | "web_search"
             | "web_fetch"
             | "notebook_read"

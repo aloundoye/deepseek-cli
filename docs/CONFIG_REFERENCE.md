@@ -20,7 +20,7 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 | `provider` | string | `"deepseek"` | LLM provider identifier |
 | `profile` | string | `"v3_2"` | Active model profile |
 | `context_window_tokens` | int | `128000` | Maximum context window (raise for long-context use) |
-| `temperature` | float | `0.2` | Sampling temperature |
+| `temperature` | float? | per-model | Sampling temperature (auto-tuned per model family: deepseek 0.0, qwen 0.55, gemini 1.0, default 0.2). User value overrides. |
 | `endpoint` | string | `"https://api.deepseek.com/chat/completions"` | API endpoint URL |
 | `api_key` | string? | `null` | API key (prefer `api_key_env` or env var) |
 | `api_key_env` | string | `"DEEPSEEK_API_KEY"` | Environment variable for API key |
@@ -226,6 +226,34 @@ Controls for automatic workspace context injection:
 | `window_size` | int | `512` | Chunk window size in tokens |
 | `overlap` | int | `64` | Overlap between adjacent chunks |
 | `max_file_size` | int | `200000` | Skip files larger than this |
+
+## `lsp` — Post-Edit Validation
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable post-edit diagnostics (runs language checks after `fs_edit`/`fs_write`) |
+| `languages` | object | `{}` | Per-language enable/disable. Keys: `"rust"`, `"typescript"`, `"python"`, `"go"`. Missing languages default to enabled. |
+
+Example — disable Python checks:
+
+```json
+{
+  "lsp": {
+    "enabled": true,
+    "languages": {
+      "python": false
+    }
+  }
+}
+```
+
+Supported checks:
+- **Rust**: `cargo check --message-format=json` (parsed JSON diagnostics)
+- **TypeScript**: `tsc --noEmit --pretty false` (parsed TSC output)
+- **Python**: `python3 -m py_compile` (syntax errors)
+- **Go**: `go vet` (vet errors)
+
+Gracefully skipped when the required toolchain is not installed.
 
 ## `experiments` — Feature Flags
 

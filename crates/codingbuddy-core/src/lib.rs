@@ -1353,6 +1353,38 @@ pub struct TokenUsage {
     pub reasoning_tokens: u64,
 }
 
+/// Execution phase for complex tasks.
+/// Enforces disciplined Explore->Plan->Execute->Verify workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPhase {
+    /// Read-only exploration of the codebase.
+    Explore,
+    /// Planning phase: model states its approach.
+    Plan,
+    /// Active implementation: all tools available.
+    Execute,
+    /// Post-implementation verification (tests, compilation).
+    Verify,
+}
+
+impl TaskPhase {
+    /// Display name for the phase.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskPhase::Explore => "explore",
+            TaskPhase::Plan => "plan",
+            TaskPhase::Execute => "execute",
+            TaskPhase::Verify => "verify",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single chunk emitted during streaming.
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
@@ -1420,6 +1452,10 @@ pub enum StreamChunk {
     },
     /// A recoverable or non-recoverable error occurred during processing.
     Error { message: String, recoverable: bool },
+    /// Phase transition in the explicit Explore->Plan->Execute->Verify loop.
+    PhaseTransition { from: String, to: String },
+    /// The active model was changed mid-session (via `/model` command).
+    ModelChanged { model: String },
     /// Streaming is done; the final assembled response follows.
     /// An optional reason string explains *why* the agent stopped
     /// (e.g. "max iterations reached", "plan dedup", content filter).
@@ -1537,6 +1573,15 @@ pub fn stream_chunk_to_event_json(chunk: &StreamChunk) -> serde_json::Value {
             "type": "error",
             "message": message,
             "recoverable": recoverable,
+        }),
+        StreamChunk::PhaseTransition { from, to } => serde_json::json!({
+            "type": "phase_transition",
+            "from": from,
+            "to": to,
+        }),
+        StreamChunk::ModelChanged { model } => serde_json::json!({
+            "type": "model_changed",
+            "model": model,
         }),
         StreamChunk::Done { reason } => {
             let mut obj = serde_json::json!({ "type": "done" });

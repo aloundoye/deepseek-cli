@@ -2236,6 +2236,8 @@ pub(crate) fn run_chat(
                         codingbuddy_core::StreamChunk::ClearStreamingText => "ClearStreamingText",
                         codingbuddy_core::StreamChunk::SnapshotRecorded { .. } => "SnapshotRecorded",
                         codingbuddy_core::StreamChunk::Error { .. } => "Error",
+                        codingbuddy_core::StreamChunk::PhaseTransition { .. } => "PhaseTransition",
+                        codingbuddy_core::StreamChunk::ModelChanged { .. } => "ModelChanged",
                         codingbuddy_core::StreamChunk::Done { .. } => "Done",
                     },
                     "payload": match &chunk {
@@ -2344,6 +2346,20 @@ pub(crate) fn run_chat(
                         let err = std::io::stderr();
                         let mut handle = err.lock();
                         let _ = writeln!(handle, "  \x1b[31m✗ Error:\x1b[0m {message}");
+                        let _ = handle.flush();
+                    }
+                    codingbuddy_core::StreamChunk::PhaseTransition { from, to } => {
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = writeln!(handle, "  \x1b[36m⟳ Phase:\x1b[0m {from} → {to}");
+                        let _ = handle.flush();
+                    }
+                    codingbuddy_core::StreamChunk::ModelChanged { model } => {
+                        use std::io::Write as _;
+                        let out = std::io::stdout();
+                        let mut handle = out.lock();
+                        let _ = writeln!(handle, "  \x1b[36m⟳ Model:\x1b[0m {model}");
                         let _ = handle.flush();
                     }
                     codingbuddy_core::StreamChunk::UsageUpdate { .. } => {}
@@ -3325,6 +3341,20 @@ pub(crate) fn run_chat_tui(
                 StreamChunk::Error { message, .. } => {
                     let _ = tx_stream.send(TuiStreamEvent::Error(message));
                 }
+                StreamChunk::PhaseTransition { from, to } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ModeTransition {
+                        from,
+                        to,
+                        reason: "phase".to_string(),
+                    });
+                }
+                StreamChunk::ModelChanged { model } => {
+                    let _ = tx_stream.send(TuiStreamEvent::ModeTransition {
+                        from: String::new(),
+                        to: model,
+                        reason: "model_switch".to_string(),
+                    });
+                }
                 StreamChunk::UsageUpdate { .. } => {}
                 StreamChunk::ClearStreamingText => {
                     let _ = tx_stream.send(TuiStreamEvent::ClearStreamingText);
@@ -3572,12 +3602,7 @@ fn login_payload(cwd: &Path) -> Result<serde_json::Value> {
 }
 
 fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
-    let cfg = AppConfig::ensure(cwd)?;
-    let env_key = if cfg.llm.api_key_env.trim().is_empty() {
-        "DEEPSEEK_API_KEY".to_string()
-    } else {
-        cfg.llm.api_key_env.clone()
-    };
+    let _cfg = AppConfig::ensure(cwd)?;
     let runtime_auth = runtime_dir(cwd).join("auth").join("session.json");
     let session_removed = if runtime_auth.exists() {
         std::fs::remove_file(&runtime_auth)?;
@@ -3600,15 +3625,17 @@ fn logout_payload(cwd: &Path) -> Result<serde_json::Value> {
         std::fs::write(&local_path, serde_json::to_vec_pretty(&root)?)?;
     }
 
-    // SAFETY: called on explicit user command from main thread.
-    unsafe { std::env::remove_var(env_key) };
+    // NOTE: We no longer mutate the process environment (unsafe data race).
+    // The ApiClient caches the key at construction, so clearing the env var
+    // would not affect the running session anyway. The settings file update
+    // above ensures the key is gone on next launch.
 
     Ok(json!({
         "schema": "deepseek.auth.v1",
         "logged_in": false,
         "session_removed": session_removed,
         "settings_updated": settings_updated,
-        "message": "Logged out. Session file removed and workspace API key unset.",
+        "message": "Logged out. Restart the session to complete logout.",
     }))
 }
 
@@ -4304,6 +4331,14 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                 }
                 StreamChunk::Error { message, .. } => {
                     let _ = writeln!(handle, "[error: {message}]");
+                    let _ = handle.flush();
+                }
+                StreamChunk::PhaseTransition { from, to } => {
+                    let _ = writeln!(handle, "[phase: {from} -> {to}]");
+                    let _ = handle.flush();
+                }
+                StreamChunk::ModelChanged { model } => {
+                    let _ = writeln!(handle, "[model changed: {model}]");
                     let _ = handle.flush();
                 }
                 StreamChunk::UsageUpdate { .. } => {}

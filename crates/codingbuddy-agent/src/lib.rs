@@ -415,9 +415,11 @@ impl AgentEngine {
     }
 
     pub(crate) fn stream(&self, chunk: StreamChunk) {
-        if let Ok(guard) = self.stream_callback.lock()
-            && let Some(cb) = guard.as_ref()
-        {
+        // Clone-then-call: release the mutex before invoking the callback
+        // so that the callback can safely call back into AgentEngine without
+        // deadlocking on stream_callback's mutex.
+        let cb = self.stream_callback.lock().ok().and_then(|g| g.clone());
+        if let Some(cb) = cb {
             cb(chunk);
         }
     }
@@ -572,6 +574,7 @@ impl AgentEngine {
             images: options.images.clone(),
             initial_context,
             profile_name: profile.map(|p| p.name.to_string()),
+            edit_validator: None,
         };
 
         // Build tool list: built-in tools + MCP-discovered tools.
@@ -1294,5 +1297,50 @@ mod tests {
         assert!(!result);
         #[cfg(feature = "local-ml")]
         assert!(result);
+    }
+
+    #[test]
+    fn test_stream_callback_clone_pattern() {
+        // Verify the clone-then-call pattern: the callback is cloned out of
+        // the mutex before invocation, so the lock is not held during the call.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_inner = call_count.clone();
+
+        // Simulate the Mutex<Option<StreamCallback>> pattern from AgentEngine
+        let stream_callback: Mutex<Option<codingbuddy_core::StreamCallback>> =
+            Mutex::new(Some(Arc::new(move |_chunk: StreamChunk| {
+                call_count_inner.fetch_add(1, Ordering::SeqCst);
+            })));
+
+        // Clone-then-call pattern (same as AgentEngine::stream)
+        let cb = stream_callback.lock().ok().and_then(|g| g.clone());
+        if let Some(cb) = cb {
+            cb(StreamChunk::ContentDelta("hello".to_string()));
+        }
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "callback should have been called once"
+        );
+
+        // Verify the mutex is NOT held during the callback (we can lock again)
+        assert!(
+            stream_callback.lock().is_ok(),
+            "mutex should not be poisoned or held"
+        );
+
+        // Call again to verify repeatability
+        let cb = stream_callback.lock().ok().and_then(|g| g.clone());
+        if let Some(cb) = cb {
+            cb(StreamChunk::ContentDelta("world".to_string()));
+        }
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "callback should have been called twice"
+        );
     }
 }

@@ -23,6 +23,7 @@ pub mod types;
 mod anti_hallucination;
 mod compaction;
 mod helpers;
+pub mod phases;
 mod safety;
 
 // Re-export public API from submodules
@@ -145,6 +146,12 @@ pub struct ToolUseLoop<'a> {
     workspace_path_str: String,
     /// Whether `cleanup_old_tool_outputs` has run this session (at most once).
     tool_output_cleanup_done: bool,
+    /// Current execution phase (None for Simple/Medium tasks).
+    phase: Option<codingbuddy_core::TaskPhase>,
+    /// Count of read-only tool calls since entering current phase.
+    phase_read_only_calls: usize,
+    /// Count of edit/write tool calls since entering Execute phase.
+    phase_edit_calls: usize,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -171,6 +178,13 @@ impl<'a> ToolUseLoop<'a> {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
 
+        // Phase loop: only for Complex tasks
+        let initial_phase = if config.complexity == crate::complexity::PromptComplexity::Complex {
+            Some(codingbuddy_core::TaskPhase::Explore)
+        } else {
+            None
+        };
+
         Self {
             llm,
             tool_host,
@@ -194,6 +208,9 @@ impl<'a> ToolUseLoop<'a> {
             pinned_directives: Vec::new(),
             workspace_path_str,
             tool_output_cleanup_done: false,
+            phase: initial_phase,
+            phase_read_only_calls: 0,
+            phase_edit_calls: 0,
         }
     }
 
@@ -1158,6 +1175,52 @@ impl<'a> ToolUseLoop<'a> {
                 }
             }
 
+            // Phase transition logic for Complex tasks
+            if let Some(current_phase) = self.phase {
+                // Count read-only vs write tool calls in this batch
+                let prev_edit_calls = self.phase_edit_calls;
+                for tc in &response.tool_calls {
+                    if helpers::is_read_only_api_name(&tc.name) {
+                        self.phase_read_only_calls += 1;
+                    } else {
+                        self.phase_edit_calls += 1;
+                    }
+                }
+                let used_write = self.phase_edit_calls > prev_edit_calls;
+                if let Some(new_phase) = phases::check_phase_transition(
+                    current_phase,
+                    self.phase_read_only_calls,
+                    false, // no text response (we had tool calls)
+                    false,
+                    used_write,
+                    self.phase_edit_calls,
+                ) {
+                    self.emit(StreamChunk::PhaseTransition {
+                        from: current_phase.as_str().to_string(),
+                        to: new_phase.as_str().to_string(),
+                    });
+                    // Inject transition guidance
+                    match new_phase {
+                        codingbuddy_core::TaskPhase::Plan => {
+                            self.messages.push(ChatMessage::System {
+                                content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
+                            });
+                        }
+                        codingbuddy_core::TaskPhase::Verify => {
+                            self.messages.push(ChatMessage::System {
+                                content: phases::VERIFY_TRANSITION_MESSAGE.to_string(),
+                            });
+                        }
+                        _ => {}
+                    }
+                    self.phase = Some(new_phase);
+                    self.phase_read_only_calls = 0;
+                    if new_phase == codingbuddy_core::TaskPhase::Execute {
+                        self.phase_edit_calls = 0;
+                    }
+                }
+            }
+
             // Mid-conversation reminder: every N tool calls, inject a brief
             // system-like nudge to keep the model focused.
             if !tool_calls_made.is_empty()
@@ -1903,6 +1966,16 @@ impl<'a> ToolUseLoop<'a> {
                 .collect()
         } else {
             self.tools.clone()
+        };
+
+        // Phase-based tool filtering for Complex tasks
+        let tools = if let Some(phase) = self.phase {
+            tools
+                .into_iter()
+                .filter(|t| phases::is_tool_allowed_in_phase(&t.function.name, phase))
+                .collect()
+        } else {
+            tools
         };
 
         // Force tool use on the first 2 LLM calls for each new question so the model

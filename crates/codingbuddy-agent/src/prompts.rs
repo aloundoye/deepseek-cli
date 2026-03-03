@@ -1,7 +1,10 @@
 //! System prompts for the tool-use agent loop.
 //!
-//! Two model-tier prompts: CHAT (action-biased, compensates for weaker reasoning)
-//! and REASONER (thinking-leveraging, grants more autonomy). Selected by model name.
+//! Four model-family prompts selected by model name:
+//! - CHAT (action-biased, compensates for weaker reasoning) — default / DeepSeek-Chat
+//! - REASONER (thinking-leveraging, grants more autonomy) — DeepSeek-Reasoner
+//! - QWEN (ultra-concise, token-efficient, aggressive tool use) — Qwen models
+//! - GEMINI (thorough, methodical, software-engineering focused) — Gemini models
 
 /// Default/fallback system prompt used by both tiers. Kept as compatibility alias.
 pub const TOOL_USE_SYSTEM_PROMPT: &str = CHAT_SYSTEM_PROMPT;
@@ -111,6 +114,84 @@ Use your thinking capability strategically:
 - Skip verification after changes.
 - Make changes beyond what was requested.
 - Output shell commands as text. Use tools (`fs_read`, `fs_grep`, `fs_glob`) instead of `cat`, `grep`, `find`, etc.
+"#;
+
+/// System prompt for Qwen models — ultra-concise, token-efficient, action-first.
+///
+/// Key principles:
+/// - Extreme brevity: 4 lines max unless showing code
+/// - Minimize output tokens above all else
+/// - Aggressive tool use, zero explanation
+/// - No preamble, no filler, no pleasantries
+pub const QWEN_SYSTEM_PROMPT: &str = r#"You are CodingBuddy, a terminal-based coding assistant. Be extremely concise.
+
+## RULES
+1. Use tools for everything. Never fabricate paths, content, or code.
+2. Read files before editing. Search before guessing.
+3. Respond in 1-4 lines max. No preamble. No explanations unless asked.
+4. After changes, verify with tests.
+5. Trust tool results over your own knowledge.
+
+## OUTPUT
+- Minimize tokens. Show results, not plans.
+- NEVER explain what you will do. Just do it.
+- Do not add comments, docstrings, or annotations unless asked.
+- Use tools (`fs_read`, `fs_grep`, `fs_glob`) instead of shell commands (`cat`, `grep`, `find`).
+- The project context injected at the start is for YOUR reference only. Never quote headers or metadata from it.
+"#;
+
+/// System prompt for Gemini models — thorough, methodical, software-engineering focused.
+///
+/// Key principles:
+/// - Detailed analysis before action
+/// - Methodical approach: explore, understand, then modify
+/// - Strong emphasis on testing and verification
+/// - Thoroughness over speed
+pub const GEMINI_SYSTEM_PROMPT: &str = r#"You are CodingBuddy, an expert software engineering assistant operating in a terminal.
+
+## CORE PRINCIPLES
+1. ALWAYS use tools to gather information. NEVER fabricate file contents, paths, or project structure.
+2. Read files before editing them. Search before guessing paths.
+3. Be thorough: understand the full context before making changes.
+4. After making changes, ALWAYS verify with tests or the build command.
+5. Mimic existing code style. Never assume a library is available without checking.
+
+## METHODOLOGY
+Follow a methodical approach for every task:
+
+### Explore First
+- Read ALL files relevant to the task before making any changes.
+- Use `fs_grep` to find all references to types, functions, or interfaces you plan to modify.
+- Understand the dependency graph: what depends on what.
+- Look at test files to understand expected behavior.
+
+### Analyze Before Acting
+- Consider edge cases and potential regressions.
+- If changing a public API, trace all callers.
+- If modifying a type, check serialization, display, and test usage.
+
+### Make Changes Carefully
+- Modify files in dependency order (dependencies first, dependents after).
+- Run tests after EACH file change, not just at the end.
+- If a test fails, analyze the error fully before attempting a fix.
+
+### Verify Thoroughly
+- Run the full test suite after all changes are complete.
+- Check that no unrelated tests broke.
+- Confirm the build succeeds cleanly.
+
+## OUTPUT RULES
+- Your response MUST be under 200 words unless you are showing code.
+- When you receive tool results, base your ENTIRE response on them. Trust tool results over expectations.
+- The project context injected at the start is for YOUR reference only. Never quote section headers or metadata from it.
+- When multiple independent lookups are needed, call multiple tools simultaneously.
+
+## DO NOT
+- Fabricate file paths or content.
+- Edit a file you haven't read in this session.
+- Skip verification after changes.
+- Make changes beyond what was requested.
+- Output shell commands as text. Use tools (`fs_read`, `fs_grep`, `fs_glob`, `fs_list`) instead of `cat`, `grep`, `find`, `ls`.
 "#;
 
 use crate::complexity::PromptComplexity;
@@ -270,8 +351,13 @@ Am I working on the right files? Have I read the files I'm about to edit?\n";
 
 /// Build system prompt with model-specific base prompt selection.
 ///
-/// Selects `CHAT_SYSTEM_PROMPT` or `REASONER_SYSTEM_PROMPT` by model name,
-/// then layers complexity and environment context on top.
+/// Selects the appropriate system prompt by model family:
+/// - Qwen models → `QWEN_SYSTEM_PROMPT`
+/// - Gemini models → `GEMINI_SYSTEM_PROMPT`
+/// - DeepSeek reasoner → `REASONER_SYSTEM_PROMPT`
+/// - Everything else → `CHAT_SYSTEM_PROMPT`
+///
+/// Then layers complexity and environment context on top.
 pub fn build_model_aware_system_prompt(
     project_memory: Option<&str>,
     system_prompt_override: Option<&str>,
@@ -293,9 +379,19 @@ pub fn build_model_aware_system_prompt(
         );
     }
 
-    // Select base prompt by model tier
+    // Select base prompt by model family, then by model tier.
+    // Non-DeepSeek model families are checked first so that e.g. "qwen-reasoner"
+    // still gets the Qwen prompt rather than the generic reasoner prompt.
+    let model_lower = model.to_ascii_lowercase();
+    let is_qwen = model_lower.contains("qwen");
+    let is_gemini = model_lower.contains("gemini");
     let is_reasoner = codingbuddy_core::is_reasoner_model(model);
-    let base_prompt = if is_reasoner {
+
+    let base_prompt = if is_qwen {
+        QWEN_SYSTEM_PROMPT
+    } else if is_gemini {
+        GEMINI_SYSTEM_PROMPT
+    } else if is_reasoner {
         REASONER_SYSTEM_PROMPT
     } else {
         CHAT_SYSTEM_PROMPT
@@ -311,8 +407,12 @@ pub fn build_model_aware_system_prompt(
         repo_map_summary,
     );
 
-    // Add model-tier-specific guidance on top
-    if is_reasoner {
+    // Add model-tier-specific guidance on top.
+    // Qwen and Gemini do not get additional tier-specific guidance —
+    // their base prompts are already self-contained.
+    if is_qwen || is_gemini {
+        base
+    } else if is_reasoner {
         format!("{base}{REASONER_GUIDANCE}")
     } else if complexity == PromptComplexity::Complex {
         format!("{base}{CHAT_PRESCRIPTIVE_GUIDANCE}")
@@ -894,6 +994,306 @@ mod tests {
             REASONER_SYSTEM_PROMPT.contains("fs_read")
                 && REASONER_SYSTEM_PROMPT.contains("fs_grep"),
             "reasoner should reference tool alternatives"
+        );
+    }
+
+    // ── Qwen and Gemini prompt selection tests ──
+
+    #[test]
+    fn qwen_prompt_is_concise_and_action_oriented() {
+        assert!(
+            QWEN_SYSTEM_PROMPT.contains("1-4 lines"),
+            "qwen should enforce brevity"
+        );
+        assert!(
+            QWEN_SYSTEM_PROMPT.contains("Minimize tokens"),
+            "qwen should minimize tokens"
+        );
+        assert!(
+            QWEN_SYSTEM_PROMPT.contains("Never fabricate"),
+            "qwen should have anti-hallucination"
+        );
+        assert!(
+            QWEN_SYSTEM_PROMPT.contains("Trust tool results"),
+            "qwen should trust tool results"
+        );
+        let qwen_lines = QWEN_SYSTEM_PROMPT.lines().count();
+        assert!(
+            qwen_lines < 25,
+            "qwen prompt should be short (< 25 lines), got {qwen_lines}"
+        );
+    }
+
+    #[test]
+    fn gemini_prompt_is_thorough_and_methodical() {
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("METHODOLOGY"),
+            "gemini should have methodology section"
+        );
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("Explore First"),
+            "gemini should emphasize exploration"
+        );
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("Analyze Before Acting"),
+            "gemini should emphasize analysis"
+        );
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("Verify Thoroughly"),
+            "gemini should emphasize verification"
+        );
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("NEVER fabricate"),
+            "gemini should have anti-hallucination"
+        );
+    }
+
+    #[test]
+    fn model_aware_selects_qwen_prompt() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "qwen-2.5-coder",
+        );
+        assert!(
+            prompt.contains("1-4 lines"),
+            "qwen model should use QWEN_SYSTEM_PROMPT"
+        );
+        assert!(
+            !prompt.contains("PRIME DIRECTIVE"),
+            "qwen should NOT get chat prompt"
+        );
+        assert!(
+            !prompt.contains("THINKING STRATEGY"),
+            "qwen should NOT get reasoner prompt"
+        );
+        assert!(
+            !prompt.contains("METHODOLOGY"),
+            "qwen should NOT get gemini prompt"
+        );
+    }
+
+    #[test]
+    fn model_aware_selects_gemini_prompt() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "gemini-2.0-flash",
+        );
+        assert!(
+            prompt.contains("METHODOLOGY"),
+            "gemini model should use GEMINI_SYSTEM_PROMPT"
+        );
+        assert!(
+            !prompt.contains("PRIME DIRECTIVE"),
+            "gemini should NOT get chat prompt"
+        );
+        assert!(
+            !prompt.contains("THINKING STRATEGY"),
+            "gemini should NOT get reasoner prompt"
+        );
+        assert!(
+            !prompt.contains("1-4 lines"),
+            "gemini should NOT get qwen prompt"
+        );
+    }
+
+    #[test]
+    fn model_aware_qwen_case_insensitive() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "Qwen-2.5-72B",
+        );
+        assert!(
+            prompt.contains("1-4 lines"),
+            "qwen matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn model_aware_gemini_case_insensitive() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "Gemini-Pro-1.5",
+        );
+        assert!(
+            prompt.contains("METHODOLOGY"),
+            "gemini matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn qwen_gets_complexity_injection() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "qwen-2.5-coder",
+        );
+        assert!(
+            prompt.contains("COMPLEX TASK"),
+            "qwen complex should get planning protocol"
+        );
+        // Qwen should NOT get the extra prescriptive guidance (that is chat-only)
+        assert!(
+            !prompt.contains("Verification Protocol"),
+            "qwen should not get chat prescriptive guidance"
+        );
+    }
+
+    #[test]
+    fn gemini_gets_complexity_injection() {
+        let prompt = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "gemini-2.0-flash",
+        );
+        assert!(
+            prompt.contains("COMPLEX TASK"),
+            "gemini complex should get planning protocol"
+        );
+        assert!(
+            !prompt.contains("Verification Protocol"),
+            "gemini should not get chat prescriptive guidance"
+        );
+    }
+
+    #[test]
+    fn qwen_no_extra_tier_guidance() {
+        // Qwen prompts should not get REASONER_GUIDANCE or CHAT_PRESCRIPTIVE_GUIDANCE
+        let simple = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "qwen-2.5-coder",
+        );
+        let complex = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Complex,
+            None,
+            "qwen-2.5-coder",
+        );
+        assert!(
+            !simple.contains("Model: DeepSeek-Reasoner"),
+            "qwen simple should not get reasoner guidance"
+        );
+        assert!(
+            !complex.contains("Explicit Verification Protocol"),
+            "qwen complex should not get chat prescriptive guidance"
+        );
+    }
+
+    #[test]
+    fn gemini_preserves_memory_and_context() {
+        let ctx = WorkspaceContext {
+            cwd: "/workspace".to_string(),
+            git_branch: Some("feature".to_string()),
+            os: "linux".to_string(),
+        };
+        let prompt = build_model_aware_system_prompt(
+            Some("Use 4 spaces."),
+            None,
+            Some("Check types."),
+            Some(&ctx),
+            PromptComplexity::Simple,
+            None,
+            "gemini-2.0-flash",
+        );
+        assert!(prompt.contains("Use 4 spaces."));
+        assert!(prompt.contains("Check types."));
+        assert!(prompt.contains("/workspace"));
+        assert!(prompt.contains("feature"));
+    }
+
+    #[test]
+    fn qwen_and_gemini_forbid_shell_commands() {
+        assert!(
+            QWEN_SYSTEM_PROMPT.contains("fs_read")
+                && QWEN_SYSTEM_PROMPT.contains("fs_grep")
+                && QWEN_SYSTEM_PROMPT.contains("fs_glob"),
+            "qwen should reference tool alternatives"
+        );
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("fs_read")
+                && GEMINI_SYSTEM_PROMPT.contains("fs_grep")
+                && GEMINI_SYSTEM_PROMPT.contains("fs_glob"),
+            "gemini should reference tool alternatives"
+        );
+    }
+
+    #[test]
+    fn qwen_and_gemini_have_anti_parrot() {
+        assert!(
+            QWEN_SYSTEM_PROMPT.contains("YOUR reference only"),
+            "qwen should prevent parroting context"
+        );
+        assert!(
+            GEMINI_SYSTEM_PROMPT.contains("YOUR reference only"),
+            "gemini should prevent parroting context"
+        );
+    }
+
+    #[test]
+    fn deepseek_models_unaffected_by_new_families() {
+        // Ensure deepseek-chat still gets CHAT_SYSTEM_PROMPT
+        let chat = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "deepseek-chat",
+        );
+        assert!(
+            chat.contains("PRIME DIRECTIVE"),
+            "deepseek-chat should still use CHAT_SYSTEM_PROMPT"
+        );
+
+        // Ensure deepseek-reasoner still gets REASONER_SYSTEM_PROMPT
+        let reasoner = build_model_aware_system_prompt(
+            None,
+            None,
+            None,
+            None,
+            PromptComplexity::Simple,
+            None,
+            "deepseek-reasoner",
+        );
+        assert!(
+            reasoner.contains("THINKING STRATEGY"),
+            "deepseek-reasoner should still use REASONER_SYSTEM_PROMPT"
         );
     }
 }

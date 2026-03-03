@@ -125,6 +125,8 @@ pub struct ToolLoopConfig {
     pub initial_context: Vec<ChatMessage>,
     /// Active agent profile name for logging (e.g. "build", "explore", "plan").
     pub profile_name: Option<String>,
+    /// Optional post-edit validator for LSP-like diagnostics (Phase 4).
+    pub edit_validator: Option<Arc<codingbuddy_lsp::EditValidator>>,
 }
 
 impl Default for ToolLoopConfig {
@@ -149,6 +151,7 @@ impl Default for ToolLoopConfig {
             images: vec![],
             initial_context: vec![],
             profile_name: None,
+            edit_validator: None,
         }
     }
 }
