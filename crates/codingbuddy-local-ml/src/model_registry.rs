@@ -48,6 +48,8 @@ pub struct ModelEntry {
     pub quality_tier: u8,
     /// GGUF weight filename for quantized completion models. `None` for SafeTensors models.
     pub gguf_filename: Option<&'static str>,
+    /// Estimated VRAM/RAM required in MB (Q4_K_M quantization).
+    pub estimated_vram_mb: u32,
 }
 
 /// Default files to download for SafeTensors (non-GGUF) models.
@@ -65,8 +67,19 @@ impl ModelEntry {
     }
 }
 
-/// Registry of supported completion models.
+/// Registry of supported completion models (ordered by quality tier descending).
 pub const COMPLETION_MODELS: &[ModelEntry] = &[
+    ModelEntry {
+        model_id: "qwen2.5-coder-7b",
+        hf_repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        display_name: "Qwen2.5 Coder 7B",
+        params_b: 7.0,
+        code_specialized: true,
+        context_tokens: 32768,
+        quality_tier: 3,
+        gguf_filename: Some("qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
+        estimated_vram_mb: 4800,
+    },
     ModelEntry {
         model_id: "qwen2.5-coder-3b",
         hf_repo: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
@@ -76,6 +89,7 @@ pub const COMPLETION_MODELS: &[ModelEntry] = &[
         context_tokens: 32768,
         quality_tier: 3,
         gguf_filename: Some("qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
+        estimated_vram_mb: 2200,
     },
     ModelEntry {
         model_id: "qwen2.5-coder-1.5b",
@@ -86,6 +100,7 @@ pub const COMPLETION_MODELS: &[ModelEntry] = &[
         context_tokens: 32768,
         quality_tier: 2,
         gguf_filename: Some("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"),
+        estimated_vram_mb: 1100,
     },
     ModelEntry {
         model_id: "phi-3-mini-4k",
@@ -96,6 +111,7 @@ pub const COMPLETION_MODELS: &[ModelEntry] = &[
         context_tokens: 4096,
         quality_tier: 3,
         gguf_filename: Some("Phi-3-mini-4k-instruct-q4.gguf"),
+        estimated_vram_mb: 2600,
     },
     ModelEntry {
         model_id: "tinyllama-1.1b-chat",
@@ -106,6 +122,7 @@ pub const COMPLETION_MODELS: &[ModelEntry] = &[
         context_tokens: 2048,
         quality_tier: 1,
         gguf_filename: Some("tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"),
+        estimated_vram_mb: 800,
     },
 ];
 
@@ -120,6 +137,7 @@ pub const EMBEDDING_MODELS: &[ModelEntry] = &[
         context_tokens: 512,
         quality_tier: 2,
         gguf_filename: None,
+        estimated_vram_mb: 100,
     },
     ModelEntry {
         model_id: "BAAI/bge-base-en-v1.5",
@@ -130,6 +148,7 @@ pub const EMBEDDING_MODELS: &[ModelEntry] = &[
         context_tokens: 512,
         quality_tier: 3,
         gguf_filename: None,
+        estimated_vram_mb: 450,
     },
     ModelEntry {
         model_id: "jinaai/jina-embeddings-v2-base-code",
@@ -140,6 +159,7 @@ pub const EMBEDDING_MODELS: &[ModelEntry] = &[
         context_tokens: 8192,
         quality_tier: 3,
         gguf_filename: None,
+        estimated_vram_mb: 550,
     },
 ];
 
@@ -161,8 +181,26 @@ pub fn default_embedding_model() -> &'static ModelEntry {
 
 /// Returns the recommended default completion model for local ghost text.
 pub fn default_completion_model() -> &'static ModelEntry {
-    // Qwen2.5 Coder 3B — best code quality at small size
-    &COMPLETION_MODELS[0]
+    find_completion_model("qwen2.5-coder-3b")
+        .expect("qwen2.5-coder-3b must exist in COMPLETION_MODELS")
+}
+
+/// Recommend the best completion model that fits within `available_mb` of RAM/VRAM.
+///
+/// Returns `None` if no model fits (caller should disable local completion).
+/// Prefers code-specialized models and higher quality tiers.
+pub fn recommend_completion_model(available_mb: u64) -> Option<&'static ModelEntry> {
+    // COMPLETION_MODELS is ordered by quality (best first), so the first
+    // code-specialized model that fits is the best choice.
+    COMPLETION_MODELS
+        .iter()
+        .find(|m| m.code_specialized && u64::from(m.estimated_vram_mb) <= available_mb)
+        .or_else(|| {
+            // Fall back to any model that fits
+            COMPLETION_MODELS
+                .iter()
+                .find(|m| u64::from(m.estimated_vram_mb) <= available_mb)
+        })
 }
 
 /// Detect the architecture from a model ID.
@@ -262,6 +300,65 @@ mod tests {
             model.code_specialized,
             "default completion should be code-specialized"
         );
-        assert!(model.model_id.contains("qwen"), "should be Qwen2.5 Coder");
+        assert_eq!(model.model_id, "qwen2.5-coder-3b");
+    }
+
+    #[test]
+    fn find_7b_model() {
+        let entry = find_completion_model("qwen2.5-coder-7b");
+        assert!(entry.is_some(), "7B model must exist in registry");
+        let e = entry.unwrap();
+        assert_eq!(e.params_b, 7.0);
+        assert_eq!(e.estimated_vram_mb, 4800);
+        assert!(e.code_specialized);
+    }
+
+    #[test]
+    fn recommend_selects_best_fitting_model() {
+        // Enough for 7B
+        let m = recommend_completion_model(5000).unwrap();
+        assert_eq!(m.model_id, "qwen2.5-coder-7b");
+
+        // Enough for 3B but not 7B
+        let m = recommend_completion_model(3000).unwrap();
+        assert_eq!(m.model_id, "qwen2.5-coder-3b");
+
+        // Enough for 1.5B but not 3B
+        let m = recommend_completion_model(1500).unwrap();
+        assert_eq!(m.model_id, "qwen2.5-coder-1.5b");
+    }
+
+    #[test]
+    fn recommend_returns_none_when_too_small() {
+        assert!(
+            recommend_completion_model(500).is_none(),
+            "should return None when no model fits"
+        );
+    }
+
+    #[test]
+    fn recommend_falls_back_to_non_code_model() {
+        // TinyLLaMA needs 800 MB — at exactly 800, it should fit
+        // but no code-specialized model fits at 800
+        let m = recommend_completion_model(800).unwrap();
+        assert_eq!(m.model_id, "tinyllama-1.1b-chat");
+    }
+
+    #[test]
+    fn all_models_have_vram_estimate() {
+        for m in COMPLETION_MODELS {
+            assert!(
+                m.estimated_vram_mb > 0,
+                "model {} missing VRAM estimate",
+                m.model_id
+            );
+        }
+        for m in EMBEDDING_MODELS {
+            assert!(
+                m.estimated_vram_mb > 0,
+                "model {} missing VRAM estimate",
+                m.model_id
+            );
+        }
     }
 }

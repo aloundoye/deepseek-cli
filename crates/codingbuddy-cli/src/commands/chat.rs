@@ -2516,33 +2516,63 @@ pub(crate) fn run_chat_tui(
         {
             let gen_slot = Arc::clone(&generator);
             let cache_dir = cfg.local_ml.cache_dir.clone();
-            let model_id = cfg.local_ml.autocomplete.model_id.clone();
+            let model_id_cfg = cfg.local_ml.autocomplete.model_id.clone();
             let device_str = cfg.local_ml.device.clone();
             std::thread::spawn(move || {
+                // Resolve "auto" device via hardware detection
+                let (device, detected) = codingbuddy_local_ml::resolve_device(&device_str);
+
+                // Resolve "auto" model_id via hardware-aware recommendation
+                let resolved_model_id = if model_id_cfg == "auto" {
+                    let hw = codingbuddy_local_ml::hardware::detect_hardware();
+                    match codingbuddy_local_ml::model_registry::recommend_completion_model(
+                        hw.available_for_models_mb,
+                    ) {
+                        Some(entry) => {
+                            eprintln!(
+                                "[codingbuddy] auto-selected model: {} ({:.1}B params, needs {} MB)",
+                                entry.display_name, entry.params_b, entry.estimated_vram_mb
+                            );
+                            entry.model_id.to_string()
+                        }
+                        None => {
+                            eprintln!(
+                                "[codingbuddy] insufficient RAM ({} MB available) for any local model, using mock",
+                                hw.available_for_models_mb
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    model_id_cfg
+                };
+
                 let mut mgr =
                     codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cache_dir));
                 // Look up registry entry to get HF repo and GGUF filename
                 let (entry, gguf_filename) =
-                    match codingbuddy_local_ml::model_registry::find_completion_model(&model_id) {
+                    match codingbuddy_local_ml::model_registry::find_completion_model(
+                        &resolved_model_id,
+                    ) {
                         Some(e) => match e.gguf_filename {
                             Some(name) => (e, name),
                             None => {
                                 eprintln!(
-                                    "[codingbuddy] model '{model_id}' has no GGUF file configured, using mock"
+                                    "[codingbuddy] model '{resolved_model_id}' has no GGUF file configured, using mock"
                                 );
                                 return;
                             }
                         },
                         None => {
                             eprintln!(
-                                "[codingbuddy] model '{model_id}' not found in registry, using mock"
+                                "[codingbuddy] model '{resolved_model_id}' not found in registry, using mock"
                             );
                             return;
                         }
                     };
                 let files = entry.download_files();
                 let model_path = match mgr.ensure_model_with_progress(
-                    &model_id,
+                    &resolved_model_id,
                     entry.hf_repo,
                     &files,
                     |current, total| {
@@ -2558,12 +2588,12 @@ pub(crate) fn run_chat_tui(
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!(
-                            "[codingbuddy] model '{model_id}' not available ({e}), using mock"
+                            "[codingbuddy] model '{resolved_model_id}' not available ({e}), using mock"
                         );
                         return;
                     }
                 };
-                let device = codingbuddy_local_ml::parse_device(&device_str);
+                eprintln!("[codingbuddy] loading {} on {detected}", entry.display_name);
                 match codingbuddy_local_ml::CandleCompletion::load(
                     &model_path.join(gguf_filename),
                     &model_path.join("tokenizer.json"),

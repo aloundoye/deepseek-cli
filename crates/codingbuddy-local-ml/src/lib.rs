@@ -1,6 +1,7 @@
 pub mod chunker;
 pub mod completion;
 pub mod embeddings;
+pub mod hardware;
 mod model_manager;
 pub mod model_registry;
 pub mod privacy;
@@ -36,6 +37,45 @@ pub fn parse_device(s: &str) -> candle_core::Device {
         "metal" => candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu),
         "cuda" => candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu),
         _ => candle_core::Device::Cpu,
+    }
+}
+
+/// Resolve a device string to a candle Device with logging.
+///
+/// Handles `"auto"` by detecting hardware, and logs fallbacks on init failure.
+#[cfg(feature = "local-ml")]
+pub fn resolve_device(requested: &str) -> (candle_core::Device, hardware::DetectedDevice) {
+    let target = if requested == "auto" {
+        let hw = hardware::detect_hardware();
+        eprintln!(
+            "[codingbuddy] auto-detected device: {}, RAM: {} MB (available for models: {} MB)",
+            hw.device, hw.total_ram_mb, hw.available_for_models_mb
+        );
+        hw.device
+    } else {
+        match requested {
+            "metal" => hardware::DetectedDevice::Metal,
+            "cuda" => hardware::DetectedDevice::Cuda,
+            _ => hardware::DetectedDevice::Cpu,
+        }
+    };
+
+    match target {
+        hardware::DetectedDevice::Metal => match candle_core::Device::new_metal(0) {
+            Ok(d) => (d, hardware::DetectedDevice::Metal),
+            Err(e) => {
+                eprintln!("[codingbuddy] Metal init failed ({e}), falling back to CPU");
+                (candle_core::Device::Cpu, hardware::DetectedDevice::Cpu)
+            }
+        },
+        hardware::DetectedDevice::Cuda => match candle_core::Device::new_cuda(0) {
+            Ok(d) => (d, hardware::DetectedDevice::Cuda),
+            Err(e) => {
+                eprintln!("[codingbuddy] CUDA init failed ({e}), falling back to CPU");
+                (candle_core::Device::Cpu, hardware::DetectedDevice::Cpu)
+            }
+        },
+        hardware::DetectedDevice::Cpu => (candle_core::Device::Cpu, hardware::DetectedDevice::Cpu),
     }
 }
 

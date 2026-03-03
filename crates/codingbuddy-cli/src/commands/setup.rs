@@ -127,6 +127,31 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
     println!("  - Ghost text: inline code completions in the TUI\n");
 
     let enable_ml = prompt_yes_no("  Enable local ML? [Y/n]: ")?;
+
+    // Detect hardware and recommend model when ML is enabled
+    let (detected_device, recommended_model) = if enable_ml {
+        let hw = codingbuddy_local_ml::hardware::detect_hardware();
+        let device_label = match hw.device {
+            codingbuddy_local_ml::hardware::DetectedDevice::Metal => "Apple Silicon (Metal)",
+            codingbuddy_local_ml::hardware::DetectedDevice::Cuda => "NVIDIA GPU (CUDA)",
+            codingbuddy_local_ml::hardware::DetectedDevice::Cpu => "CPU",
+        };
+        println!("\n  Detected: {device_label}, {} MB RAM", hw.total_ram_mb);
+        let model = codingbuddy_local_ml::model_registry::recommend_completion_model(
+            hw.available_for_models_mb,
+        );
+        if let Some(m) = model {
+            println!(
+                "  Selected model: {} ({:.1}B parameters)",
+                m.display_name, m.params_b
+            );
+        } else {
+            println!("  Warning: insufficient RAM for local models (ghost text disabled)");
+        }
+        (Some(hw.device.to_string()), model.map(|m| m.model_id))
+    } else {
+        (None, None)
+    };
     println!();
 
     // Step 4: Privacy Scanning
@@ -140,7 +165,13 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
 
     // Write config and download models
     if enable_ml || enable_privacy {
-        merge_local_ml_config(cwd, enable_ml, enable_privacy)?;
+        merge_local_ml_config(
+            cwd,
+            enable_ml,
+            enable_privacy,
+            detected_device.as_deref(),
+            recommended_model,
+        )?;
     }
     if enable_ml {
         download_required_models(cfg, false)?;
@@ -166,6 +197,7 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
     let api_key_set = has_api_key(&cfg);
     let models = model_download_status(&cfg);
     let provider = cfg.llm.active_provider();
+    let hw = codingbuddy_local_ml::hardware::detect_hardware();
 
     if json_mode {
         print_json(&json!({
@@ -174,10 +206,17 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
             "chat_model": provider.models.chat,
             "reasoner_model": provider.models.reasoner,
             "api_key": if api_key_set { "configured" } else { "missing" },
+            "hardware": {
+                "device": hw.device.to_string(),
+                "total_ram_mb": hw.total_ram_mb,
+                "available_for_models_mb": hw.available_for_models_mb,
+            },
             "local_ml": {
                 "enabled": cfg.local_ml.enabled,
+                "device": cfg.local_ml.device,
                 "privacy_enabled": cfg.local_ml.privacy.enabled,
                 "autocomplete_enabled": cfg.local_ml.autocomplete.enabled,
+                "autocomplete_model": cfg.local_ml.autocomplete.model_id,
                 "models": models,
             },
         }))?;
@@ -193,12 +232,17 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
             if api_key_set { "configured" } else { "missing" }
         );
         println!(
-            "local_ml: {}",
+            "hardware: {} ({} MB RAM, {} MB available for models)",
+            hw.device, hw.total_ram_mb, hw.available_for_models_mb
+        );
+        println!(
+            "local_ml: {} (device: {})",
             if cfg.local_ml.enabled {
                 "enabled"
             } else {
                 "disabled"
-            }
+            },
+            cfg.local_ml.device
         );
         println!(
             "privacy: {}",
@@ -208,6 +252,9 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
                 "disabled"
             }
         );
+        if cfg.local_ml.autocomplete.enabled {
+            println!("autocomplete_model: {}", cfg.local_ml.autocomplete.model_id);
+        }
         for (model_id, status) in &models {
             println!("model: {} ({})", model_id, status);
         }
@@ -219,7 +266,15 @@ fn run_status_display(cwd: &Path, json_mode: bool) -> Result<()> {
 fn run_local_ml_shortcut(cwd: &Path, json_mode: bool) -> Result<()> {
     let cfg = AppConfig::ensure(cwd)?;
 
-    merge_local_ml_config(cwd, true, true)?;
+    // Auto-detect hardware for device and model selection
+    let hw = codingbuddy_local_ml::hardware::detect_hardware();
+    let device = hw.device.to_string();
+    let model_id = codingbuddy_local_ml::model_registry::recommend_completion_model(
+        hw.available_for_models_mb,
+    )
+    .map(|m| m.model_id);
+
+    merge_local_ml_config(cwd, true, true, Some(&device), model_id)?;
 
     if !json_mode {
         println!("Local ML enabled.");
@@ -434,7 +489,16 @@ fn merge_provider_config(
 }
 
 /// Merge local_ml keys into `.codingbuddy/settings.json` without clobbering other settings.
-fn merge_local_ml_config(cwd: &Path, enabled: bool, privacy_enabled: bool) -> Result<()> {
+///
+/// `device` and `model_id` are optional — when `Some`, they're written to the config
+/// so the auto-detected values persist across sessions.
+fn merge_local_ml_config(
+    cwd: &Path,
+    enabled: bool,
+    privacy_enabled: bool,
+    device: Option<&str>,
+    model_id: Option<&str>,
+) -> Result<()> {
     let path = settings_path(cwd);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -461,6 +525,20 @@ fn merge_local_ml_config(cwd: &Path, enabled: bool, privacy_enabled: bool) -> Re
     }
     if let Some(ml) = local_ml.as_object_mut() {
         ml.insert("enabled".to_string(), json!(enabled));
+        if let Some(dev) = device {
+            ml.insert("device".to_string(), json!(dev));
+        }
+        if let Some(mid) = model_id {
+            let autocomplete = ml
+                .entry("autocomplete".to_string())
+                .or_insert_with(|| json!({}));
+            if !autocomplete.is_object() {
+                *autocomplete = json!({});
+            }
+            if let Some(ac) = autocomplete.as_object_mut() {
+                ac.insert("model_id".to_string(), json!(mid));
+            }
+        }
         let privacy = ml.entry("privacy".to_string()).or_insert_with(|| json!({}));
         if !privacy.is_object() {
             *privacy = json!({});
@@ -518,7 +596,7 @@ mod tests {
         .unwrap();
 
         // Merge local_ml config
-        merge_local_ml_config(cwd, true, true).unwrap();
+        merge_local_ml_config(cwd, true, true, Some("metal"), Some("qwen2.5-coder-7b")).unwrap();
 
         // Read back and verify
         let raw = fs::read_to_string(&path).unwrap();
@@ -531,6 +609,11 @@ mod tests {
         // New keys written
         assert_eq!(root["local_ml"]["enabled"], true);
         assert_eq!(root["local_ml"]["privacy"]["enabled"], true);
+        assert_eq!(root["local_ml"]["device"], "metal");
+        assert_eq!(
+            root["local_ml"]["autocomplete"]["model_id"],
+            "qwen2.5-coder-7b"
+        );
     }
 
     #[test]

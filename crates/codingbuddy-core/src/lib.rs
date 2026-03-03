@@ -2979,7 +2979,7 @@ impl Default for ThemeConfig {
 pub struct LocalMlConfig {
     /// Master switch for all local ML features.
     pub enabled: bool,
-    /// Compute device: "cpu", "cuda", "metal".
+    /// Compute device: "auto", "cpu", "cuda", "metal".
     pub device: String,
     /// Directory for cached model files.
     pub cache_dir: String,
@@ -2997,7 +2997,7 @@ impl Default for LocalMlConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            device: "cpu".to_string(),
+            device: "auto".to_string(),
             cache_dir: ".codingbuddy/models".to_string(),
             embeddings: EmbeddingsModelConfig::default(),
             index: VectorIndexConfig::default(),
@@ -3066,7 +3066,7 @@ impl Default for AutocompleteLocalConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model_id: "qwen2.5-coder-3b".to_string(),
+            model_id: "auto".to_string(),
             debounce_ms: 200,
             timeout_ms: 2000,
             max_tokens: 128,
@@ -3753,7 +3753,7 @@ mod tests {
     fn local_ml_config_defaults_correct() {
         let cfg = LocalMlConfig::default();
         assert!(!cfg.enabled, "local_ml must be disabled by default");
-        assert_eq!(cfg.device, "cpu");
+        assert_eq!(cfg.device, "auto");
         assert_eq!(cfg.cache_dir, ".codingbuddy/models");
         assert!(cfg.embeddings.enabled);
         assert!(!cfg.autocomplete.enabled);
