@@ -846,7 +846,9 @@ fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
     if text.len() <= max_chars {
         return text.to_string();
     }
-    let truncated = &text[..max_chars.min(text.len())];
+    // Use floor_char_boundary to avoid panicking on multi-byte UTF-8
+    let safe_end = text.floor_char_boundary(max_chars.min(text.len()));
+    let truncated = &text[..safe_end];
     if let Some(last_newline) = truncated.rfind('\n') {
         let remaining = text.len() - last_newline;
         format!(

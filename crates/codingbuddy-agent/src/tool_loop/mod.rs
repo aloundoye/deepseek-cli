@@ -654,40 +654,102 @@ impl<'a> ToolUseLoop<'a> {
             // Execute independent read-only tools in parallel using thread scope.
             // This avoids blocking on I/O-bound tools (file reads, greps) sequentially.
             if parallel_calls.len() > 1 {
-                // Execute the raw tool calls in parallel, collecting results
-                // Each thread captures its own duration for accurate timing.
+                // Pre-validate, check circuit breaker, and look up cache BEFORE entering
+                // thread scope (these require &mut self which is not Sync).
+                let mut pre_validated: Vec<(
+                    LlmToolCall,               // repaired call
+                    Option<serde_json::Value>, // cached result (Some = skip execution)
+                    Option<String>,            // validation/breaker error (Some = skip execution)
+                )> = Vec::with_capacity(parallel_calls.len());
+
+                for llm_call in &parallel_calls {
+                    let repaired = tool_bridge::repair_tool_name(&llm_call.name, &self.tools);
+                    let effective_name = repaired.unwrap_or_else(|| llm_call.name.clone());
+                    let effective_call = if effective_name != llm_call.name {
+                        LlmToolCall {
+                            id: llm_call.id.clone(),
+                            name: effective_name,
+                            arguments: llm_call.arguments.clone(),
+                        }
+                    } else {
+                        (*llm_call).clone()
+                    };
+                    let parsed_args: serde_json::Value =
+                        serde_json::from_str(&effective_call.arguments).unwrap_or_default();
+
+                    // Schema validation
+                    if let Err(e) = codingbuddy_tools::validate_tool_args_schema(
+                        &effective_call.name,
+                        &parsed_args,
+                        &self.tools,
+                    ) {
+                        pre_validated.push((
+                            effective_call,
+                            None,
+                            Some(format!("Validation error: {e}")),
+                        ));
+                        continue;
+                    }
+
+                    // Circuit breaker check
+                    if let Some(state) = self.circuit_breaker.get(&effective_call.name)
+                        && state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD
+                        && state.cooldown_remaining > 0
+                    {
+                        let err = format!(
+                            "Tool '{}' is temporarily disabled due to repeated failures. Try a different approach.",
+                            effective_call.name
+                        );
+                        pre_validated.push((effective_call, None, Some(err)));
+                        continue;
+                    }
+
+                    // Cache lookup
+                    let cached = self.cache_lookup(&effective_call.name, &parsed_args);
+                    pre_validated.push((effective_call, cached, None));
+                }
+
+                // Execute in parallel — only calls that passed pre-validation and aren't cached.
+                // Threads return (index, result, elapsed_ms) to avoid cloning effective_call.
                 let tool_host = &self.tool_host;
-                let tools = &self.tools;
                 let parallel_results: Vec<_> = std::thread::scope(|s| {
-                    let handles: Vec<_> = parallel_calls
+                    let handles: Vec<_> = pre_validated
                         .iter()
-                        .map(|llm_call| {
+                        .enumerate()
+                        .map(|(idx, (effective_call, cached, error))| {
                             s.spawn(move || {
+                                // Return pre-computed error
+                                if let Some(err_msg) = error {
+                                    let error_result = codingbuddy_core::ToolResult {
+                                        invocation_id: uuid::Uuid::nil(),
+                                        success: false,
+                                        output: serde_json::json!(err_msg),
+                                    };
+                                    return (idx, error_result, 0u64);
+                                }
+
+                                // Return cached result
+                                if let Some(cached_val) = cached {
+                                    let result = codingbuddy_core::ToolResult {
+                                        invocation_id: uuid::Uuid::nil(),
+                                        success: true,
+                                        output: cached_val.clone(),
+                                    };
+                                    return (idx, result, 0u64);
+                                }
+
+                                // Execute the tool
                                 let start = Instant::now();
-                                // Repair tool name
-                                let repaired = tool_bridge::repair_tool_name(&llm_call.name, tools);
-                                let effective_name =
-                                    repaired.unwrap_or_else(|| llm_call.name.clone());
-                                let effective_call = if effective_name != llm_call.name {
-                                    LlmToolCall {
-                                        id: llm_call.id.clone(),
-                                        name: effective_name,
-                                        arguments: llm_call.arguments.clone(),
-                                    }
-                                } else {
-                                    (*llm_call).clone()
-                                };
                                 let internal =
-                                    tool_bridge::llm_tool_call_to_internal(&effective_call);
+                                    tool_bridge::llm_tool_call_to_internal(effective_call);
                                 let proposal = tool_host.propose(internal);
-                                // Read-only tools are auto-approved
                                 let approved = ApprovedToolCall {
                                     invocation_id: proposal.invocation_id,
                                     call: proposal.call,
                                 };
                                 let result = tool_host.execute(approved);
                                 let elapsed = start.elapsed().as_millis() as u64;
-                                (effective_call, result, elapsed)
+                                (idx, result, elapsed)
                             })
                         })
                         .collect();
@@ -700,11 +762,6 @@ impl<'a> ToolUseLoop<'a> {
                                     .map(|s| s.as_str())
                                     .or_else(|| panic_payload.downcast_ref::<&str>().copied())
                                     .unwrap_or("unknown panic");
-                                let error_call = LlmToolCall {
-                                    id: String::new(),
-                                    name: "parallel_tool_panic".to_string(),
-                                    arguments: String::new(),
-                                };
                                 let error_result = codingbuddy_core::ToolResult {
                                     invocation_id: uuid::Uuid::nil(),
                                     success: false,
@@ -712,14 +769,26 @@ impl<'a> ToolUseLoop<'a> {
                                         "Internal error: parallel tool execution panicked: {panic_msg}"
                                     )),
                                 };
-                                (error_call, error_result, 0u64)
+                                // Use usize::MAX as sentinel for panicked threads
+                                (usize::MAX, error_result, 0u64)
                             })
                         })
                         .collect()
                 });
 
-                // Process results sequentially (updates messages, cache, events)
-                for (effective_call, result, par_duration) in &parallel_results {
+                // Process results sequentially (updates messages, cache, events).
+                // Look up effective_call from pre_validated by index.
+                for (idx, result, par_duration) in &parallel_results {
+                    let effective_call = if *idx < pre_validated.len() {
+                        &pre_validated[*idx].0
+                    } else {
+                        // Panicked thread — emit error with placeholder
+                        self.messages.push(ChatMessage::Tool {
+                            tool_call_id: String::new(),
+                            content: result.output.to_string(),
+                        });
+                        continue;
+                    };
                     let args: serde_json::Value = serde_json::from_str(&effective_call.arguments)
                         .unwrap_or_else(|e| {
                             eprintln!(
@@ -753,7 +822,6 @@ impl<'a> ToolUseLoop<'a> {
                     let msg = self.apply_privacy_to_message(msg);
 
                     // Cache store AFTER privacy filtering — cache only holds filtered data.
-                    // We extract the filtered content from the message we're about to push.
                     if result.success {
                         if let ChatMessage::Tool { ref content, .. } = msg {
                             self.cache_store(

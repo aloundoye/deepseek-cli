@@ -49,7 +49,6 @@ pub const PROFILE_EXPLORE: AgentProfile = AgentProfile {
         "fs_glob",
         "fs_grep",
         "fs_list",
-        "bash_run",
         "git_status",
         "git_diff",
         "git_show",
@@ -63,8 +62,7 @@ pub const PROFILE_EXPLORE: AgentProfile = AgentProfile {
     blocked_tools: &[],
     system_prompt_addendum: "\n## Agent Profile: Explore\n\
         Read and search only. Do NOT modify files. \
-        Gather information with fs_read, fs_grep, fs_glob. \
-        Use bash_run for read-only commands (git log, cargo check, etc.).\n",
+        Gather information with fs_read, fs_grep, fs_glob.\n",
     max_turns: None,
 };
 
@@ -299,7 +297,10 @@ mod tests {
         let names: Vec<_> = filtered.iter().map(|t| t.function.name.as_str()).collect();
         assert!(names.contains(&"fs_read"));
         assert!(names.contains(&"fs_glob"));
-        assert!(names.contains(&"bash_run"));
+        assert!(
+            !names.contains(&"bash_run"),
+            "bash_run should be blocked in explore (not read-only)"
+        );
         assert!(
             !names.contains(&"fs_edit"),
             "edit should be blocked in explore"

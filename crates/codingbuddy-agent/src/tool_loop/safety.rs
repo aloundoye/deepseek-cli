@@ -148,13 +148,17 @@ impl CostTracker {
         let input_tokens = self.total_input_tokens as f64;
         let cache_tokens = self.total_cache_hit_tokens as f64;
         let output_tokens = self.total_output_tokens as f64;
+        let reasoning_tokens = self.total_reasoning_tokens as f64;
 
-        // Cache-hit tokens are charged at a discount
-        let effective_input = (input_tokens - cache_tokens) + (cache_tokens * self.cache_discount);
+        // Cache-hit tokens are charged at a discount; floor at zero for safety
+        let effective_input =
+            ((input_tokens - cache_tokens) + (cache_tokens * self.cache_discount)).max(0.0);
         let input_cost = effective_input / 1_000_000.0 * self.cost_per_million_input;
         let output_cost = output_tokens / 1_000_000.0 * self.cost_per_million_output;
+        // Reasoning tokens are charged at the output token rate (DeepSeek pricing)
+        let reasoning_cost = reasoning_tokens / 1_000_000.0 * self.cost_per_million_output;
 
-        input_cost + output_cost
+        input_cost + output_cost + reasoning_cost
     }
 
     /// Whether the cost has exceeded the hard budget cap.

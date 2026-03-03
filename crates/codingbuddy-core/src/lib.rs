@@ -437,12 +437,8 @@ impl ToolName {
                 | Self::NotebookRead
                 | Self::DiagnosticsCheck
                 | Self::UserQuestion
-                | Self::TaskCreate
-                | Self::TaskUpdate
                 | Self::TaskGet
                 | Self::TaskList
-                | Self::SpawnTask
-                | Self::ExitPlanMode
         )
     }
 

@@ -215,8 +215,8 @@ impl MemoryManager {
             ));
         }
 
-        // 4. Project-local DEEPSEEK.local.md (gitignored).
-        let local_path = self.workspace.join("DEEPSEEK.local.md");
+        // 4. Project-local CODINGBUDDY.local.md (gitignored).
+        let local_path = self.workspace.join("CODINGBUDDY.local.md");
         if local_path.exists()
             && let Ok(text) = fs::read_to_string(&local_path)
         {
@@ -479,31 +479,64 @@ impl MemoryManager {
             ));
         }
 
-        for entry in WalkDir::new(&self.workspace)
+        // Check if this is a targeted checkpoint (only covers a subset of files).
+        // Targeted checkpoints must NOT delete files outside the snapshot — only
+        // restore the files that were originally captured.
+        // metadata.json lives in the checkpoint root (parent of snapshot_root/fs/).
+        let checkpoint_root = snapshot_root.parent().unwrap_or(snapshot_root.as_path());
+        let is_targeted = fs::read_to_string(checkpoint_root.join("metadata.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("targeted").and_then(|t| t.as_bool()))
+            .unwrap_or(false);
+
+        // Collect the relative paths present in the snapshot.
+        let snapshot_files: Vec<PathBuf> = WalkDir::new(&snapshot_root)
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| e.path().is_file())
-        {
-            let path = entry.path();
-            let rel = path.strip_prefix(&self.workspace)?;
-            if has_ignored_component(rel) {
-                continue;
+            .filter_map(|e| {
+                e.path()
+                    .strip_prefix(&snapshot_root)
+                    .ok()
+                    .map(PathBuf::from)
+            })
+            .filter(|rel| rel.to_str() != Some("metadata.json"))
+            .collect();
+
+        if is_targeted {
+            // Targeted: only delete + restore files that are IN the snapshot.
+            // Other workspace files are left untouched.
+            for rel in &snapshot_files {
+                let dest = self.workspace.join(rel);
+                if dest.exists() {
+                    fs::remove_file(&dest)?;
+                }
             }
-            fs::remove_file(path)?;
+        } else {
+            // Full checkpoint: delete all workspace files (original behavior).
+            for entry in WalkDir::new(&self.workspace)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+            {
+                let path = entry.path();
+                let rel = path.strip_prefix(&self.workspace)?;
+                if has_ignored_component(rel) {
+                    continue;
+                }
+                fs::remove_file(path)?;
+            }
         }
 
-        for entry in WalkDir::new(&snapshot_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_file())
-        {
-            let path = entry.path();
-            let rel = path.strip_prefix(&snapshot_root)?;
+        // Restore all files from the snapshot.
+        for rel in &snapshot_files {
+            let src = snapshot_root.join(rel);
             let dest = self.workspace.join(rel);
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(path, dest)?;
+            fs::copy(src, dest)?;
         }
 
         Ok(record)
@@ -612,7 +645,7 @@ impl MemoryManager {
         };
 
         // Create a commit object from the tree
-        let commit_msg = format!("deepseek shadow: {reason} [{commit_id}]");
+        let commit_msg = format!("codingbuddy shadow: {reason} [{commit_id}]");
         let commit_out = std::process::Command::new("git")
             .args(["commit-tree", &tree_sha, "-m", &commit_msg])
             .current_dir(workspace)
@@ -726,9 +759,9 @@ impl MemoryManager {
                 .unwrap_or("");
             let id = Uuid::parse_str(id_str).unwrap_or(Uuid::nil());
 
-            // Extract reason from subject: "deepseek shadow: <reason> [<id>]"
+            // Extract reason from subject: "codingbuddy shadow: <reason> [<id>]"
             let reason = subject
-                .strip_prefix("deepseek shadow: ")
+                .strip_prefix("codingbuddy shadow: ")
                 .and_then(|s| s.rsplit_once(" [").map(|(r, _)| r.to_string()))
                 .unwrap_or(subject);
 
@@ -1088,8 +1121,8 @@ pub fn load_hierarchical_memory(workspace: &Path) -> Vec<(PathBuf, String)> {
                 paths.push((codingbuddy_md, trimmed.to_string()));
             }
         }
-        // Also check DEEPSEEK.local.md (gitignored, machine-local).
-        let local_md = dir.join("DEEPSEEK.local.md");
+        // Also check CODINGBUDDY.local.md (gitignored, machine-local).
+        let local_md = dir.join("CODINGBUDDY.local.md");
         if local_md.exists()
             && let Ok(content) = fs::read_to_string(&local_md)
         {
