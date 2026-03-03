@@ -32,7 +32,6 @@ chrono.workspace = true
 regex.workspace = true
 notify.workspace = true
 strsim.workspace = true
-toml.workspace = true
 sha2.workspace = true
 glob.workspace = true
 

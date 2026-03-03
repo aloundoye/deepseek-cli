@@ -37,7 +37,7 @@ const DOT_ACCESS_PREFIXES: &[&str] = &[
 ];
 
 /// Tool names that represent read/search operations for path extraction.
-const READ_TOOL_NAMES: &[&str] = &[
+pub(crate) const READ_TOOL_NAMES: &[&str] = &[
     "fs_read", "fs.read", "fs_glob", "fs.glob", "fs_grep", "fs.grep", "fs_list", "fs.list",
 ];
 

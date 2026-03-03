@@ -67,6 +67,16 @@ pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
 /// Every N tool calls, inject a brief system reminder to keep the model on track.
 const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
 
+/// Return `Some(args_json)` only for read tools (needed for anti-hallucination
+/// path extraction). Write/agent tools don't need the raw JSON stored.
+fn args_json_for_record(tool_name: &str, raw_args: &str) -> Option<String> {
+    if anti_hallucination::READ_TOOL_NAMES.contains(&tool_name) {
+        Some(raw_args.to_string())
+    } else {
+        None
+    }
+}
+
 /// Brief reminder injected every `MID_CONVERSATION_REMINDER_INTERVAL` tool calls.
 const MID_CONVERSATION_REMINDER: &str =
     "Reminder: Verify changes with tests. Be concise. Use tools — do not guess.";
@@ -232,12 +242,14 @@ impl<'a> ToolUseLoop<'a> {
             return;
         }
         let (key, raw) = Self::cache_key_with_raw(tool_name, args);
-        self.tool_cache
-            .insert(key, CacheEntry {
+        self.tool_cache.insert(
+            key,
+            CacheEntry {
                 result: result.clone(),
                 timestamp: Instant::now(),
                 raw_key: raw,
-            });
+            },
+        );
 
         // Evict oldest entry if cache exceeds maximum size (single insert → at most 1 eviction)
         if self.tool_cache.len() > MAX_CACHE_ENTRIES
@@ -516,15 +528,14 @@ impl<'a> ToolUseLoop<'a> {
                 // Allows up to MAX_NUDGE_ATTEMPTS nudges per turn before letting through.
                 // NOTE: No `tool_calls_made.is_empty()` guard — the model can revert to
                 // hallucination at any point, even after using tools earlier.
-                let (has_unverified_refs, has_shell_cmd) =
-                    if nudge_count < MAX_NUDGE_ATTEMPTS {
-                        (
-                            has_unverified_file_references(&text, &tool_calls_made),
-                            contains_shell_command_pattern(&text),
-                        )
-                    } else {
-                        (false, false)
-                    };
+                let (has_unverified_refs, has_shell_cmd) = if nudge_count < MAX_NUDGE_ATTEMPTS {
+                    (
+                        has_unverified_file_references(&text, &tool_calls_made),
+                        contains_shell_command_pattern(&text),
+                    )
+                } else {
+                    (false, false)
+                };
                 let should_nudge = nudge_count < MAX_NUDGE_ATTEMPTS
                     && (text.len() > HALLUCINATION_NUDGE_THRESHOLD
                         || has_unverified_refs
@@ -776,7 +787,10 @@ impl<'a> ToolUseLoop<'a> {
                         args_summary,
                         success: result.success,
                         duration_ms: *par_duration,
-                        args_json: None,
+                        args_json: args_json_for_record(
+                            &effective_call.name,
+                            &effective_call.arguments,
+                        ),
                         result_preview: None,
                     };
                     if record.success {
@@ -1006,7 +1020,7 @@ impl<'a> ToolUseLoop<'a> {
                 args_summary: summarize_args(&tool_call.args),
                 success: false,
                 duration_ms: duration,
-                args_json: Some(llm_call.arguments.clone()),
+                args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
                 result_preview: None,
             });
             return Ok(records);
@@ -1048,7 +1062,7 @@ impl<'a> ToolUseLoop<'a> {
                     args_summary,
                     success: false,
                     duration_ms: duration,
-                    args_json: Some(llm_call.arguments.clone()),
+                    args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
                     result_preview: None,
                 });
                 return Ok(records);
@@ -1097,7 +1111,7 @@ impl<'a> ToolUseLoop<'a> {
                     args_summary,
                     success: false,
                     duration_ms: duration,
-                    args_json: Some(llm_call.arguments.clone()),
+                    args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
                     result_preview: None,
                 });
                 return Ok(records);
@@ -1139,7 +1153,7 @@ impl<'a> ToolUseLoop<'a> {
                 args_summary,
                 success: true,
                 duration_ms: duration,
-                args_json: Some(llm_call.arguments.clone()),
+                args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
                 result_preview: None,
             });
             return Ok(records);
@@ -1291,7 +1305,7 @@ impl<'a> ToolUseLoop<'a> {
             args_summary,
             success,
             duration_ms: duration,
-            args_json: Some(llm_call.arguments.clone()),
+            args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
             result_preview,
         });
 
@@ -1390,7 +1404,7 @@ impl<'a> ToolUseLoop<'a> {
             args_summary,
             success: true,
             duration_ms: duration,
-            args_json: Some(llm_call.arguments.clone()),
+            args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
             result_preview: None,
         }])
     }
@@ -1824,7 +1838,7 @@ impl<'a> ToolUseLoop<'a> {
 
             let group_tokens: u64 = self.messages[group_start..keep_from]
                 .iter()
-                .map(|m| estimate_message_tokens(std::slice::from_ref(m)) as u64)
+                .map(|m| estimate_message_tokens(std::slice::from_ref(m)))
                 .sum();
 
             if kept_tokens + group_tokens > target && keep_from < self.messages.len() {
@@ -1911,9 +1925,7 @@ impl<'a> ToolUseLoop<'a> {
 
         // P2.7: Post-compaction validation — ensure the result is structurally sound.
         // Must have at least 2 messages and start with a System message.
-        if new_messages.len() < 2
-            || !matches!(&new_messages[0], ChatMessage::System { .. })
-        {
+        if new_messages.len() < 2 || !matches!(&new_messages[0], ChatMessage::System { .. }) {
             eprintln!(
                 "[compact] post-compaction validation failed: {} messages, discarding",
                 new_messages.len()

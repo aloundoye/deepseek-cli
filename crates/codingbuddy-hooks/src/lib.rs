@@ -515,7 +515,7 @@ impl HookRuntime {
     /// Run a command hook handler: pipe JSON on stdin, parse stdout JSON for decisions.
     fn run_command_handler(&self, command: &str, input: &HookInput, timeout_secs: u64) -> HookRun {
         // P0.5: Reject commands with dangerous shell constructs before execution.
-        if contains_dangerous_shell_constructs(command) {
+        if codingbuddy_policy::shell_parse::contains_substitution_constructs(command) {
             return HookRun {
                 handler_description: format!("command: {command}"),
                 success: false,
@@ -700,16 +700,6 @@ pub fn merge_skill_hooks(
 /// Closes the current single-quote, inserts an escaped single-quote, and reopens.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Returns true if the command string contains dangerous shell constructs
-/// that could enable command injection: `$(`, backtick, `>(`, `<(`, `<<<`.
-fn contains_dangerous_shell_constructs(cmd: &str) -> bool {
-    cmd.contains("$(")
-        || cmd.contains('`')
-        || cmd.contains(">(")
-        || cmd.contains("<(")
-        || cmd.contains("<<<")
 }
 
 fn build_command(path: &Path) -> Command {

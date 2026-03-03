@@ -3105,6 +3105,140 @@ impl Default for PrivacyLocalConfig {
     }
 }
 
+// ── Workspace metadata detection ──
+
+/// Recognized build systems for workspace detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildSystem {
+    Cargo,
+    NpmYarn,
+    Go,
+}
+
+impl BuildSystem {
+    /// Human-readable name shown in bootstrap context.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cargo => "Cargo",
+            Self::NpmYarn => "npm/yarn",
+            Self::Go => "Go",
+        }
+    }
+
+    /// Collective noun for workspace members.
+    pub fn member_noun(self) -> &'static str {
+        match self {
+            Self::Cargo => "crates",
+            Self::NpmYarn => "packages",
+            Self::Go => "modules",
+        }
+    }
+
+    /// Manifest file name at the workspace root.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Cargo => "Cargo.toml",
+            Self::NpmYarn => "package.json",
+            Self::Go => "go.work",
+        }
+    }
+}
+
+impl std::fmt::Display for BuildSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Detected workspace metadata from a project root manifest.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMetadata {
+    /// The detected build system.
+    pub build_system: BuildSystem,
+    /// List of workspace member paths/globs.
+    pub members: Vec<String>,
+}
+
+/// Detect workspace metadata from a project root.
+///
+/// Tries, in order:
+/// 1. `Cargo.toml` — `[workspace] members` array
+/// 2. `package.json` — `"workspaces"` array
+/// 3. `go.work` — `use` directives
+///
+/// Returns `None` if no workspace is detected.
+pub fn detect_workspace(root: &Path) -> Option<WorkspaceMetadata> {
+    // Try Cargo.toml
+    if let Ok(content) = fs::read_to_string(root.join("Cargo.toml"))
+        && let Ok(parsed) = content.parse::<toml::Table>()
+        && let Some(members) = parsed
+            .get("workspace")
+            .and_then(|ws| ws.get("members"))
+            .and_then(|m| m.as_array())
+    {
+        let items: Vec<String> = members
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !items.is_empty() {
+            return Some(WorkspaceMetadata {
+                build_system: BuildSystem::Cargo,
+                members: items,
+            });
+        }
+    }
+
+    // Try package.json
+    if let Ok(content) = fs::read_to_string(root.join("package.json"))
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(workspaces) = parsed.get("workspaces").and_then(|w| w.as_array())
+    {
+        let items: Vec<String> = workspaces
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !items.is_empty() {
+            return Some(WorkspaceMetadata {
+                build_system: BuildSystem::NpmYarn,
+                members: items,
+            });
+        }
+    }
+
+    // Try go.work
+    if let Ok(content) = fs::read_to_string(root.join("go.work")) {
+        let mut modules = Vec::new();
+        let mut in_use_block = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("use (") || trimmed == "use (" {
+                in_use_block = true;
+                continue;
+            }
+            if in_use_block && trimmed == ")" {
+                in_use_block = false;
+                continue;
+            }
+            if in_use_block && !trimmed.is_empty() {
+                modules.push(trimmed.to_string());
+            } else if trimmed.starts_with("use ") && !trimmed.contains('(') {
+                let module = trimmed.trim_start_matches("use ").trim();
+                if !module.is_empty() {
+                    modules.push(module.to_string());
+                }
+            }
+        }
+        if !modules.is_empty() {
+            return Some(WorkspaceMetadata {
+                build_system: BuildSystem::Go,
+                members: modules,
+            });
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

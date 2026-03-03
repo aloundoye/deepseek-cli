@@ -676,20 +676,11 @@ pub fn expand_env_vars(input: &str) -> String {
     result
 }
 
-/// Check whether a string contains shell metacharacters that could enable injection.
-fn contains_shell_metacharacters(s: &str) -> bool {
-    s.contains(';')
-        || s.contains('|')
-        || s.contains('&')
-        || s.contains('$')
-        || s.contains('`')
-        || s.contains('(')
-        || s.contains(')')
-}
-
 /// Expand environment variables in all string fields of an MCP server config.
 /// Returns an error if any expanded value contains shell metacharacters.
 pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
+    use codingbuddy_policy::shell_parse::contains_shell_injection_chars;
+
     let expanded_id = expand_env_vars(&server.id);
     let expanded_name = expand_env_vars(&server.name);
     let expanded_cmd = server.command.as_ref().map(|cmd| expand_env_vars(cmd));
@@ -697,7 +688,7 @@ pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
     let expanded_url = server.url.as_ref().map(|url| expand_env_vars(url));
 
     if let Some(ref cmd) = expanded_cmd
-        && contains_shell_metacharacters(cmd)
+        && contains_shell_injection_chars(cmd)
     {
         return Err(anyhow!(
             "MCP server '{}': expanded command contains shell metacharacters: {cmd}",
@@ -705,7 +696,7 @@ pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
         ));
     }
     for arg in &expanded_args {
-        if contains_shell_metacharacters(arg) {
+        if contains_shell_injection_chars(arg) {
             return Err(anyhow!(
                 "MCP server '{}': expanded arg contains shell metacharacters: {arg}",
                 server.id

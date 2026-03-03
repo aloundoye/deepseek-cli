@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use toml::Table as TomlTable;
 
 const HEAVY_DIRS: &[&str] = &[
     ".git",
@@ -59,103 +58,21 @@ struct ManifestEntry {
 
 /// Extract workspace metadata (workspace members, build system) from the project root.
 ///
-/// Tries, in order:
-/// 1. `Cargo.toml` — looks for `[workspace] members` array
-/// 2. `package.json` — looks for `"workspaces"` array
-/// 3. `go.work` — looks for `use` directives
-///
-/// Returns a formatted string with workspace info, or `None` if no workspace is detected.
+/// Delegates to `codingbuddy_core::detect_workspace()` and formats the result as text.
 pub(crate) fn extract_workspace_metadata(workspace_root: &Path) -> Option<String> {
-    // Try Cargo.toml first
-    let cargo_path = workspace_root.join("Cargo.toml");
-    if let Ok(content) = fs::read_to_string(&cargo_path)
-        && let Ok(parsed) = content.parse::<TomlTable>()
-        && let Some(members) = parsed
-            .get("workspace")
-            .and_then(|ws| ws.get("members"))
-            .and_then(|m| m.as_array())
-    {
-        let member_paths: Vec<String> = members
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect();
-        if !member_paths.is_empty() {
-            let mut lines = Vec::new();
-            lines.push("Workspace metadata:".to_string());
-            lines.push("  Build system: Cargo".to_string());
-            lines.push(format!(
-                "  Workspace members: {} crates",
-                member_paths.len()
-            ));
-            for member in &member_paths {
-                lines.push(format!("  - {member}"));
-            }
-            return Some(lines.join("\n"));
-        }
+    let meta = codingbuddy_core::detect_workspace(workspace_root)?;
+    let mut lines = Vec::with_capacity(3 + meta.members.len());
+    lines.push("Workspace metadata:".to_string());
+    lines.push(format!("  Build system: {}", meta.build_system));
+    lines.push(format!(
+        "  Workspace members: {} {}",
+        meta.members.len(),
+        meta.build_system.member_noun(),
+    ));
+    for member in &meta.members {
+        lines.push(format!("  - {member}"));
     }
-
-    // Try package.json
-    let pkg_path = workspace_root.join("package.json");
-    if let Ok(content) = fs::read_to_string(&pkg_path)
-        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(workspaces) = parsed.get("workspaces").and_then(|w| w.as_array())
-    {
-        let workspace_paths: Vec<String> = workspaces
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect();
-        if !workspace_paths.is_empty() {
-            let mut lines = Vec::new();
-            lines.push("Workspace metadata:".to_string());
-            lines.push("  Build system: npm/yarn".to_string());
-            lines.push(format!(
-                "  Workspace members: {} packages",
-                workspace_paths.len()
-            ));
-            for member in &workspace_paths {
-                lines.push(format!("  - {member}"));
-            }
-            return Some(lines.join("\n"));
-        }
-    }
-
-    // Try go.work
-    let gowork_path = workspace_root.join("go.work");
-    if let Ok(content) = fs::read_to_string(&gowork_path) {
-        let mut modules = Vec::new();
-        let mut in_use_block = false;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("use (") || trimmed == "use (" {
-                in_use_block = true;
-                continue;
-            }
-            if in_use_block && trimmed == ")" {
-                in_use_block = false;
-                continue;
-            }
-            if in_use_block && !trimmed.is_empty() {
-                modules.push(trimmed.to_string());
-            } else if trimmed.starts_with("use ") && !trimmed.contains('(') {
-                let module = trimmed.trim_start_matches("use ").trim();
-                if !module.is_empty() {
-                    modules.push(module.to_string());
-                }
-            }
-        }
-        if !modules.is_empty() {
-            let mut lines = Vec::new();
-            lines.push("Workspace metadata:".to_string());
-            lines.push("  Build system: Go".to_string());
-            lines.push(format!("  Workspace members: {} modules", modules.len()));
-            for module in &modules {
-                lines.push(format!("  - {module}"));
-            }
-            return Some(lines.join("\n"));
-        }
-    }
-
-    None
+    Some(lines.join("\n"))
 }
 
 pub fn gather_for_prompt(

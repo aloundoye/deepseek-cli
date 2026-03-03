@@ -241,13 +241,14 @@ impl HybridRetriever {
             let mut file_cache: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
             for (_rank, chunk) in &mut bm25_only_chunks {
                 if chunk.content.is_empty() && chunk.start_line > 0 {
-                    let file_lines = file_cache
-                        .entry(chunk.file_path.clone())
-                        .or_insert_with(|| {
-                            std::fs::read_to_string(&chunk.file_path)
-                                .ok()
-                                .map(|c| c.lines().map(String::from).collect())
-                        });
+                    let file_lines =
+                        file_cache
+                            .entry(chunk.file_path.clone())
+                            .or_insert_with(|| {
+                                std::fs::read_to_string(&chunk.file_path)
+                                    .ok()
+                                    .map(|c| c.lines().map(String::from).collect())
+                            });
                     if let Some(lines) = file_lines.as_deref() {
                         let start = chunk.start_line.saturating_sub(1);
                         let end = chunk.end_line.min(lines.len());

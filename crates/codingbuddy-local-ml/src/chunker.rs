@@ -511,23 +511,32 @@ fn compute_chunk_id(file_path: &str, start_line: usize, content_hash: &str) -> S
 pub fn chunk_workspace_metadata(workspace_root: &Path) -> Vec<Chunk> {
     let mut chunks = Vec::new();
 
-    // 1. Parse Cargo.toml workspace members
-    let cargo_toml_path = workspace_root.join("Cargo.toml");
-    if cargo_toml_path.is_file() {
-        if let Some(chunk) = parse_cargo_workspace_members(&cargo_toml_path) {
-            chunks.push(chunk);
-        }
-    } else {
-        // 2. Fall back to package.json workspaces
-        let package_json_path = workspace_root.join("package.json");
-        if package_json_path.is_file()
-            && let Some(chunk) = parse_package_json_workspaces(&package_json_path)
-        {
-            chunks.push(chunk);
-        }
+    // 1. Workspace members via shared detect_workspace()
+    if let Some(meta) = codingbuddy_core::detect_workspace(workspace_root) {
+        let chunk_content = format!(
+            "This workspace has {} {}: {}",
+            meta.members.len(),
+            meta.build_system.member_noun(),
+            meta.members.join(", ")
+        );
+        // Use the manifest path that was detected for chunk identity
+        let manifest_name = meta.build_system.manifest_name();
+        let manifest_path = workspace_root.join(manifest_name);
+        let content_hash = compute_hash(&chunk_content);
+        let file_path_str = manifest_path.to_string_lossy().to_string();
+        let id = compute_chunk_id(&file_path_str, 0, &content_hash);
+        chunks.push(Chunk {
+            id,
+            file_path: manifest_path,
+            start_line: 0,
+            end_line: 0,
+            content: chunk_content,
+            content_hash,
+            language: "metadata".to_string(),
+        });
     }
 
-    // 3. Directory structure summary (first level only)
+    // 2. Directory structure summary (first level only)
     if let Ok(entries) = std::fs::read_dir(workspace_root) {
         let mut dirs: Vec<String> = Vec::new();
         for entry in entries.flatten() {
@@ -559,7 +568,7 @@ pub fn chunk_workspace_metadata(workspace_root: &Path) -> Vec<Chunk> {
         }
     }
 
-    // 4. README first 50 lines
+    // 3. README first 50 lines
     let readme_path = workspace_root.join("README.md");
     if readme_path.is_file()
         && let Ok(content) = std::fs::read_to_string(&readme_path)
@@ -582,73 +591,6 @@ pub fn chunk_workspace_metadata(workspace_root: &Path) -> Vec<Chunk> {
     }
 
     chunks
-}
-
-/// Parse `[workspace] members` from a Cargo.toml file into a metadata chunk.
-fn parse_cargo_workspace_members(cargo_toml_path: &Path) -> Option<Chunk> {
-    let content = std::fs::read_to_string(cargo_toml_path).ok()?;
-    let parsed: toml::Table = content.parse().ok()?;
-
-    let workspace = parsed.get("workspace")?.as_table()?;
-    let members = workspace.get("members")?.as_array()?;
-
-    let member_names: Vec<&str> = members.iter().filter_map(|v| v.as_str()).collect();
-
-    if member_names.is_empty() {
-        return None;
-    }
-
-    let chunk_content = format!(
-        "This workspace has {} crates: {}",
-        member_names.len(),
-        member_names.join(", ")
-    );
-    let content_hash = compute_hash(&chunk_content);
-    let file_path_str = cargo_toml_path.to_string_lossy().to_string();
-    let id = compute_chunk_id(&file_path_str, 0, &content_hash);
-
-    Some(Chunk {
-        id,
-        file_path: cargo_toml_path.to_path_buf(),
-        start_line: 0,
-        end_line: 0,
-        content: chunk_content,
-        content_hash,
-        language: "metadata".to_string(),
-    })
-}
-
-/// Parse `workspaces` from a package.json file into a metadata chunk.
-fn parse_package_json_workspaces(package_json_path: &Path) -> Option<Chunk> {
-    let content = std::fs::read_to_string(package_json_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    let workspaces = parsed.get("workspaces")?.as_array()?;
-
-    let workspace_names: Vec<&str> = workspaces.iter().filter_map(|v| v.as_str()).collect();
-
-    if workspace_names.is_empty() {
-        return None;
-    }
-
-    let chunk_content = format!(
-        "This workspace has {} packages: {}",
-        workspace_names.len(),
-        workspace_names.join(", ")
-    );
-    let content_hash = compute_hash(&chunk_content);
-    let file_path_str = package_json_path.to_string_lossy().to_string();
-    let id = compute_chunk_id(&file_path_str, 0, &content_hash);
-
-    Some(Chunk {
-        id,
-        file_path: package_json_path.to_path_buf(),
-        start_line: 0,
-        end_line: 0,
-        content: chunk_content,
-        content_hash,
-        language: "metadata".to_string(),
-    })
 }
 
 fn should_skip_path(path: &Path, config: &ChunkConfig) -> bool {

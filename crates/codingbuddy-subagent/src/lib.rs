@@ -507,11 +507,23 @@ impl SubagentConfig {
     }
 }
 
-/// Detect whether an error message represents a policy-engine denial rather
-/// than a generic OS permission error. Only policy-specific patterns trigger
-/// the read-only fallback; OS errors like "Permission denied: /etc/shadow"
-/// do not.
-fn is_policy_denial(error_msg: &str) -> bool {
+/// Detect whether an error represents a policy-engine denial rather than a
+/// generic OS permission error. Only policy-specific errors trigger the
+/// read-only fallback; OS errors like "Permission denied: /etc/shadow" do not.
+///
+/// Tries typed `PolicyError` downcast first, then falls back to string
+/// matching for non-typed denials (user denial, locked mode, hook blocking).
+fn is_policy_denial(err: &anyhow::Error) -> bool {
+    // Typed check: every PolicyError variant is a policy denial.
+    if err
+        .downcast_ref::<codingbuddy_policy::PolicyError>()
+        .is_some()
+    {
+        return true;
+    }
+
+    // String fallback for denials not expressed as PolicyError
+    // (user approval denied, locked mode, hook blocking).
     const POLICY_PATTERNS: &[&str] = &[
         "denied by policy",
         "blocked by policy",
@@ -521,10 +533,8 @@ fn is_policy_denial(error_msg: &str) -> bool {
         "locked mode",
         "policy blocked",
         "requires approval",
-        "command prefix is blocked by policy",
-        "path traversal denied",
     ];
-    let lower = error_msg.to_lowercase();
+    let lower = err.to_string().to_lowercase();
     POLICY_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
@@ -593,7 +603,7 @@ impl SubagentManager {
                                 // Detect policy denial errors and fall back to read-only.
                                 // Uses specific policy-engine patterns to avoid false positives
                                 // from OS-level permission errors (e.g. EACCES on /etc/shadow).
-                                if is_policy_denial(&err.to_string()) {
+                                if is_policy_denial(&err) {
                                     current_task.read_only_fallback = true;
                                 }
                                 continue;
@@ -1223,62 +1233,76 @@ mod tests {
     fn test_os_permission_error_not_treated_as_policy_denial() {
         // OS-level permission errors should NOT trigger read-only fallback
         assert!(
-            !is_policy_denial("Permission denied (os error 13)"),
+            !is_policy_denial(&anyhow::anyhow!("Permission denied (os error 13)")),
             "OS EACCES should not be treated as policy denial"
         );
         assert!(
-            !is_policy_denial("Permission not allowed: /etc/shadow"),
+            !is_policy_denial(&anyhow::anyhow!("Permission not allowed: /etc/shadow")),
             "OS-level 'not allowed' should not be treated as policy denial"
         );
         assert!(
-            !is_policy_denial("open('/etc/passwd'): permission denied"),
+            !is_policy_denial(&anyhow::anyhow!("open('/etc/passwd'): permission denied")),
             "file-system permission denied should not match"
         );
         assert!(
-            !is_policy_denial("connection refused"),
+            !is_policy_denial(&anyhow::anyhow!("connection refused")),
             "network errors should not match"
         );
         assert!(
-            !is_policy_denial("file not found: /tmp/missing.txt"),
+            !is_policy_denial(&anyhow::anyhow!("file not found: /tmp/missing.txt")),
             "not-found errors should not match"
         );
 
-        // Policy engine errors SHOULD trigger read-only fallback
+        // Policy engine errors SHOULD trigger read-only fallback (string fallback)
         assert!(
-            is_policy_denial("Permission denied by policy: fs_edit"),
+            is_policy_denial(&anyhow::anyhow!("Permission denied by policy: fs_edit")),
             "policy denial should match"
         );
         assert!(
-            is_policy_denial("command prefix is blocked by policy"),
-            "dangerous command policy should match"
-        );
-        assert!(
-            is_policy_denial("tool fs_write not in allowlist"),
+            is_policy_denial(&anyhow::anyhow!("tool fs_write not in allowlist")),
             "allowlist denial should match"
         );
         assert!(
-            is_policy_denial("Tool bash.run is not allowlisted"),
+            is_policy_denial(&anyhow::anyhow!("Tool bash.run is not allowlisted")),
             "not-allowlisted denial should match"
         );
         assert!(
-            is_policy_denial("approval denied by user"),
+            is_policy_denial(&anyhow::anyhow!("approval denied by user")),
             "user approval denial should match"
         );
         assert!(
-            is_policy_denial("locked mode blocks all non-read operations"),
+            is_policy_denial(&anyhow::anyhow!(
+                "locked mode blocks all non-read operations"
+            )),
             "locked mode should match"
         );
         assert!(
-            is_policy_denial("fs.write policy blocked"),
+            is_policy_denial(&anyhow::anyhow!("fs.write policy blocked")),
             "policy blocked should match"
         );
         assert!(
-            is_policy_denial("This operation requires approval"),
+            is_policy_denial(&anyhow::anyhow!("This operation requires approval")),
             "requires approval should match"
         );
+
+        // Typed PolicyError variants should match via downcast
         assert!(
-            is_policy_denial("path traversal denied"),
-            "path traversal should match"
+            is_policy_denial(&anyhow::anyhow!(
+                codingbuddy_policy::PolicyError::PathTraversal
+            )),
+            "typed PathTraversal should match"
+        );
+        assert!(
+            is_policy_denial(&anyhow::anyhow!(
+                codingbuddy_policy::PolicyError::CommandNotAllowed
+            )),
+            "typed CommandNotAllowed should match"
+        );
+        assert!(
+            is_policy_denial(&anyhow::anyhow!(
+                codingbuddy_policy::PolicyError::DangerousCommand
+            )),
+            "typed DangerousCommand should match"
         );
     }
 

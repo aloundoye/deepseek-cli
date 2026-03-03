@@ -185,6 +185,36 @@ fn contains_forbidden_constructs_regex(cmd: &str) -> bool {
     has_redirection_operator(trimmed)
 }
 
+/// Check whether a command contains shell constructs that evaluate or expand
+/// embedded content: command substitution (`$(…)`, backticks), process
+/// substitution (`>(…)`, `<(…)`), and here-strings (`<<<`).
+///
+/// Unlike [`contains_forbidden_constructs`], this does **not** reject basic
+/// chaining (`&&`, `||`, `;`) or redirection — those are safe when the entire
+/// command is user-authored (e.g., hook commands in config).
+pub fn contains_substitution_constructs(cmd: &str) -> bool {
+    cmd.contains("$(")
+        || cmd.contains('`')
+        || cmd.contains(">(")
+        || cmd.contains("<(")
+        || cmd.contains("<<<")
+}
+
+/// Check whether a string contains shell metacharacters that could enable
+/// injection when used as an expanded environment variable value.
+///
+/// This is a character-level check (not AST-based) because expanded values
+/// are data, not commands — tree-sitter parsing doesn't apply.
+pub fn contains_shell_injection_chars(s: &str) -> bool {
+    s.contains(';')
+        || s.contains('|')
+        || s.contains('&')
+        || s.contains('$')
+        || s.contains('`')
+        || s.contains('(')
+        || s.contains(')')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
