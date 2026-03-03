@@ -264,10 +264,14 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Invalidate cache entries for a given path (after a write tool modifies it).
+    /// Uses exact path match or path-prefix match to avoid over-invalidation
+    /// (e.g. modifying `/foo/test.rs` should not invalidate `/foo/other_test.rs`).
     fn cache_invalidate_path(&mut self, path: &str) {
         self.tool_cache.retain(|_key, entry| {
-            // Invalidate any cached entry whose original args contain this path
-            !entry.raw_key.contains(path)
+            // Check if the raw key contains the exact path as a JSON string value.
+            // JSON-encoded paths are wrapped in quotes: "path": "/foo/bar.rs"
+            let quoted = format!("\"{path}\"");
+            !entry.raw_key.contains(&quoted)
         });
     }
 
@@ -450,6 +454,10 @@ impl<'a> ToolUseLoop<'a> {
             // Build and send the LLM request
             turns += 1;
             let request = self.build_request();
+            // Images only need to be sent once — clear after first turn to save tokens.
+            if turns == 1 && !self.config.images.is_empty() {
+                self.config.images.clear();
+            }
 
             // Emit model routing event when the model changes (escalation/de-escalation)
             if request.model != last_model {
@@ -1109,7 +1117,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: None,
                 prompt: None,
                 session_type: None,
-                workspace: self.workspace_str(),
+                workspace: self.workspace_str().to_string(),
             };
             let hook_result = hooks.fire(HookEvent::PreToolUse, &input);
             if hook_result.blocked {
@@ -1307,7 +1315,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(result.output.clone()),
                 prompt: None,
                 session_type: None,
-                workspace: self.workspace_str(),
+                workspace: self.workspace_str().to_string(),
             };
             Self::fire_hook_logged(hooks, HookEvent::PostToolUse, &input);
         }
@@ -1558,7 +1566,7 @@ impl<'a> ToolUseLoop<'a> {
                     tool_result: None,
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self.workspace_str(),
+                    workspace: self.workspace_str().to_string(),
                 };
                 Self::fire_hook_logged(hooks, HookEvent::SubagentStart, &input);
             }
@@ -1580,7 +1588,7 @@ impl<'a> ToolUseLoop<'a> {
                         .map(|r| serde_json::Value::String(r.clone())),
                     prompt: Some(prompt.to_string()),
                     session_type: None,
-                    workspace: self.workspace_str(),
+                    workspace: self.workspace_str().to_string(),
                 };
                 Self::fire_hook_logged(hooks, HookEvent::SubagentStop, &input);
             }
@@ -1945,7 +1953,7 @@ impl<'a> ToolUseLoop<'a> {
                 tool_result: Some(serde_json::Value::String(summary.clone())),
                 prompt: None,
                 session_type: None,
-                workspace: self.workspace_str(),
+                workspace: self.workspace_str().to_string(),
             };
             Self::fire_hook_logged(hooks, HookEvent::PreCompact, &input);
         }
@@ -2129,8 +2137,8 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Get the workspace path as a string for hook inputs (pre-computed in `new()`).
-    fn workspace_str(&self) -> String {
-        self.workspace_path_str.clone()
+    fn workspace_str(&self) -> &str {
+        &self.workspace_path_str
     }
 
     /// Emit a stream chunk to the callback.
@@ -3308,8 +3316,11 @@ mod tests {
 
         let result = loop_.run("what's in this image?").unwrap();
         assert_eq!(result.response, "I see the image.");
-        // The images are included in the config, which is used in build_request
-        assert!(!loop_.config.images.is_empty());
+        // Images are cleared after the first turn to avoid re-sending them every turn
+        assert!(
+            loop_.config.images.is_empty(),
+            "images should be cleared after first turn"
+        );
     }
 
     #[test]

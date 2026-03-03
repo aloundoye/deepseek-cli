@@ -91,7 +91,7 @@ pub struct AgentEngine {
     stream_callback: Mutex<Option<codingbuddy_core::StreamCallback>>,
     max_turns: Option<u64>,
     max_budget_usd: Option<f64>,
-    approval_handler: Mutex<Option<ApprovalHandler>>,
+    approval_handler: Mutex<Option<Arc<Mutex<ApprovalHandler>>>>,
     user_question_handler: Mutex<Option<UserQuestionHandler>>,
     subagent_worker: Mutex<Option<SubagentWorkerFn>>,
     pub(crate) hooks: HookRuntime,
@@ -289,7 +289,7 @@ impl AgentEngine {
 
     pub fn set_approval_handler(&self, handler: ApprovalHandler) {
         if let Ok(mut guard) = self.approval_handler.lock() {
-            *guard = Some(handler);
+            *guard = Some(Arc::new(Mutex::new(handler)));
         }
     }
 
@@ -620,11 +620,11 @@ impl AgentEngine {
             loop_.set_stream_callback(cb.clone());
         }
 
-        // Wire approval handler (bridge FnMut → Fn via Mutex)
-        if let Ok(mut guard) = self.approval_handler.lock()
-            && let Some(handler) = guard.take()
+        // Wire approval handler (clone Arc — engine stays reusable across run() calls)
+        if let Ok(guard) = self.approval_handler.lock()
+            && let Some(ref handler) = *guard
         {
-            let handler = Arc::new(Mutex::new(handler));
+            let handler = handler.clone();
             loop_.set_approval_callback(Arc::new(move |call| {
                 let mut h = handler
                     .lock()
@@ -633,11 +633,11 @@ impl AgentEngine {
             }));
         }
 
-        // Wire user question handler
-        if let Ok(mut guard) = self.user_question_handler.lock()
-            && let Some(handler) = guard.take()
+        // Wire user question handler (clone Arc — already Arc<dyn Fn>)
+        if let Ok(guard) = self.user_question_handler.lock()
+            && let Some(ref handler) = *guard
         {
-            loop_.set_user_question_callback(handler);
+            loop_.set_user_question_callback(handler.clone());
         }
 
         // Wire hooks — create a new runtime with the same config for the loop
@@ -815,10 +815,13 @@ impl AgentEngine {
     }
 
     pub(crate) fn request_approval(&self, call: &ToolCall) -> Result<bool> {
-        if let Ok(mut guard) = self.approval_handler.lock()
-            && let Some(handler) = guard.as_mut()
+        if let Ok(guard) = self.approval_handler.lock()
+            && let Some(ref handler) = *guard
         {
-            return handler(call);
+            let mut h = handler
+                .lock()
+                .map_err(|_| anyhow!("approval handler mutex poisoned"))?;
+            return h(call);
         }
         Ok(false)
     }

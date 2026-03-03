@@ -322,7 +322,11 @@ impl ContextManager {
         }
 
         // Sort by score descending
-        suggestions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        suggestions.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Take top N
         suggestions.truncate(limit);
