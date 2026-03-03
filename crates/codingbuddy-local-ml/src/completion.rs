@@ -68,5 +68,7 @@ impl LocalGenBackend for MockGenerator {
     }
 }
 
+pub mod kv_cache;
+
 #[cfg(feature = "local-ml")]
 pub mod candle_backend;

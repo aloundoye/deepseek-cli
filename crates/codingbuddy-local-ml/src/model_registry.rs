@@ -203,6 +203,27 @@ pub fn recommend_completion_model(available_mb: u64) -> Option<&'static ModelEnt
         })
 }
 
+/// Check if a model fits within the available memory before loading.
+///
+/// Returns `Ok(())` if the model fits, or `Err` with a suggestion if it doesn't.
+pub fn check_model_fits(model_id: &str, available_mb: u64) -> Result<(), String> {
+    let Some(entry) = find_completion_model(model_id) else {
+        // Unknown model — can't check, let it proceed
+        return Ok(());
+    };
+    let required = u64::from(entry.estimated_vram_mb);
+    if required <= available_mb {
+        return Ok(());
+    }
+    let suggestion = recommend_completion_model(available_mb)
+        .map(|m| format!(" Try '{}' instead.", m.model_id))
+        .unwrap_or_default();
+    Err(format!(
+        "model '{}' requires ~{} MB but only {} MB available.{}",
+        model_id, required, available_mb, suggestion
+    ))
+}
+
 /// Detect the architecture from a model ID.
 #[cfg(any(test, feature = "local-ml"))]
 pub fn detect_completion_architecture(model_id: &str) -> CompletionArchitecture {
@@ -342,6 +363,29 @@ mod tests {
         // but no code-specialized model fits at 800
         let m = recommend_completion_model(800).unwrap();
         assert_eq!(m.model_id, "tinyllama-1.1b-chat");
+    }
+
+    #[test]
+    fn check_model_fits_passes_when_enough_ram() {
+        assert!(check_model_fits("qwen2.5-coder-3b", 5000).is_ok());
+    }
+
+    #[test]
+    fn check_model_fits_fails_with_suggestion() {
+        let err = check_model_fits("qwen2.5-coder-7b", 3000).unwrap_err();
+        assert!(err.contains("4800 MB"), "should mention required RAM");
+        assert!(
+            err.contains("qwen2.5-coder-3b"),
+            "should suggest smaller model"
+        );
+    }
+
+    #[test]
+    fn check_model_fits_unknown_model_passes() {
+        assert!(
+            check_model_fits("unknown-model-xyz", 1000).is_ok(),
+            "unknown models should pass (can't check)"
+        );
     }
 
     #[test]

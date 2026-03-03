@@ -2593,6 +2593,15 @@ pub(crate) fn run_chat_tui(
                         return;
                     }
                 };
+                // Pre-load memory check (detect_hardware is OnceLock-cached)
+                let hw = codingbuddy_local_ml::hardware::detect_hardware();
+                if let Err(msg) = codingbuddy_local_ml::model_registry::check_model_fits(
+                    &resolved_model_id,
+                    hw.available_for_models_mb,
+                ) {
+                    eprintln!("[codingbuddy] {msg} Using mock.");
+                    return;
+                }
                 eprintln!("[codingbuddy] loading {} on {detected}", entry.display_name);
                 match codingbuddy_local_ml::CandleCompletion::load(
                     &model_path.join(gguf_filename),
