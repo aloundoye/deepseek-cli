@@ -325,6 +325,13 @@ impl McpManager {
             .split_once(':')
             .ok_or_else(|| anyhow!("invalid resource reference: {reference}"))?;
 
+        // Validate URI to prevent path traversal and abuse
+        if contains_path_traversal(uri) || uri.len() > 1024 {
+            return Err(anyhow!(
+                "invalid resource URI: path traversal or excessive length"
+            ));
+        }
+
         let server = self
             .get_server(server_id)?
             .ok_or_else(|| anyhow!("MCP server not found: {server_id}"))?;
@@ -676,6 +683,20 @@ pub fn expand_env_vars(input: &str) -> String {
     result
 }
 
+/// Check if a string contains `..` as a path component (i.e. `../`, `/..',
+/// or standalone `..`). Avoids false positives on version strings, Rust ranges, etc.
+fn contains_path_traversal(s: &str) -> bool {
+    s == ".."
+        || s.starts_with("../")
+        || s.ends_with("/..")
+        || s.contains("/../")
+        || s.starts_with("..\\")
+        || s.ends_with("\\..")
+        || s.contains("\\..\\")
+        || s.contains("\\../")
+        || s.contains("/..\\")
+}
+
 /// Expand environment variables in all string fields of an MCP server config.
 /// Returns an error if any expanded value contains shell metacharacters.
 pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
@@ -686,6 +707,32 @@ pub fn expand_server_env_vars(server: &mut McpServer) -> Result<()> {
     let expanded_cmd = server.command.as_ref().map(|cmd| expand_env_vars(cmd));
     let expanded_args: Vec<String> = server.args.iter().map(|a| expand_env_vars(a)).collect();
     let expanded_url = server.url.as_ref().map(|url| expand_env_vars(url));
+
+    // Validate expanded values don't contain path traversal
+    if let Some(ref cmd) = expanded_cmd
+        && contains_path_traversal(cmd)
+    {
+        return Err(anyhow!(
+            "MCP server '{}': expanded command contains path traversal: {cmd}",
+            server.id
+        ));
+    }
+    if let Some(ref url) = expanded_url
+        && contains_path_traversal(url)
+    {
+        return Err(anyhow!(
+            "MCP server '{}': expanded url contains path traversal: {url}",
+            server.id
+        ));
+    }
+    for (i, arg) in expanded_args.iter().enumerate() {
+        if contains_path_traversal(arg) {
+            return Err(anyhow!(
+                "MCP server '{}': expanded arg[{i}] contains path traversal: {arg}",
+                server.id
+            ));
+        }
+    }
 
     if let Some(ref cmd) = expanded_cmd
         && contains_shell_injection_chars(cmd)

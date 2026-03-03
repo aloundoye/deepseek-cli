@@ -3348,9 +3348,15 @@ pub(crate) fn run_chat_tui(
                     Ok(Err(e)) => {
                         let _ = tx_done.send(TuiStreamEvent::Error(e.to_string()));
                     }
-                    Err(_) => {
-                        let _ = tx_done
-                            .send(TuiStreamEvent::Error("agent thread panicked".to_string()));
+                    Err(panic_payload) => {
+                        let msg = panic_payload
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic");
+                        let _ = tx_done.send(TuiStreamEvent::Error(format!(
+                            "agent thread panicked: {msg}"
+                        )));
                     }
                 }
             });

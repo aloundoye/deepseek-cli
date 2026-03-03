@@ -27,6 +27,7 @@ codingbuddy-hooks = { path = "../codingbuddy-hooks" }
 jsonschema.workspace = true
 codingbuddy-memory = { path = "../codingbuddy-memory" }
 codingbuddy-chrome = { path = "../codingbuddy-chrome" }
+strsim.workspace = true
 base64.workspace = true
 pdf-extract.workspace = true
 scraper.workspace = true

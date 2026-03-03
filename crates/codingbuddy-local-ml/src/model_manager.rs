@@ -21,6 +21,20 @@ pub struct ModelInfo {
     pub cache_path: PathBuf,
 }
 
+/// Partial download state persisted to disk for resume support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "local-ml")]
+struct PartialDownloadState {
+    model_id: String,
+    hf_repo: String,
+    /// SHA-256 digests of completed files (filename → digest).
+    completed_digests: BTreeMap<String, String>,
+}
+
+/// Maximum number of retries per file download.
+#[cfg(feature = "local-ml")]
+const MAX_DOWNLOAD_RETRIES: usize = 6;
+
 /// Manifest for a content-addressable model cache entry.
 ///
 /// Maps logical filenames to SHA-256 digests stored in the `blobs/` directory.
@@ -277,6 +291,34 @@ impl ModelManager {
         }
     }
 
+    /// Path to the partial download state file for a model.
+    #[cfg(feature = "local-ml")]
+    fn partial_state_path(&self, model_id: &str) -> PathBuf {
+        self.cache_dir.join(format!("{model_id}.partial"))
+    }
+
+    /// Load partial download state, if any.
+    #[cfg(feature = "local-ml")]
+    fn load_partial_state(&self, model_id: &str) -> Option<PartialDownloadState> {
+        let path = self.partial_state_path(model_id);
+        let data = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Save partial download state.
+    #[cfg(feature = "local-ml")]
+    fn save_partial_state(&self, state: &PartialDownloadState) -> anyhow::Result<()> {
+        let path = self.partial_state_path(&state.model_id);
+        std::fs::write(&path, serde_json::to_string(state)?)?;
+        Ok(())
+    }
+
+    /// Remove partial download state (called on completion).
+    #[cfg(feature = "local-ml")]
+    fn remove_partial_state(&self, model_id: &str) {
+        let _ = std::fs::remove_file(self.partial_state_path(model_id));
+    }
+
     #[cfg(feature = "local-ml")]
     fn download_model(
         &mut self,
@@ -298,30 +340,79 @@ impl ModelManager {
         fs::create_dir_all(&blobs)?;
         fs::create_dir_all(&manifests)?;
 
+        // Resume from partial state if available
+        let mut partial =
+            self.load_partial_state(model_id)
+                .unwrap_or_else(|| PartialDownloadState {
+                    model_id: model_id.to_string(),
+                    hf_repo: hf_repo.to_string(),
+                    completed_digests: BTreeMap::new(),
+                });
+
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(hf_repo.to_string());
 
-        let mut manifest_files = BTreeMap::new();
+        let mut manifest_files = partial.completed_digests.clone();
         let total = files.len();
         for (i, filename) in files.iter().enumerate() {
             progress_cb(i, total);
-            match repo.get(filename) {
-                Ok(path) => {
-                    // Store in legacy layout for backward compatibility
-                    let dest = model_path.join(filename);
-                    if !dest.exists() {
-                        fs::copy(&path, &dest)?;
-                    }
-                    // Also store as content-addressable blob
-                    if let Some(digest) = sha256_file(&dest) {
-                        let blob_path = blobs.join(format!("sha256-{digest}"));
-                        if !blob_path.exists() {
-                            fs::copy(&dest, &blob_path)?;
+
+            // Skip files already completed in a previous run
+            if partial.completed_digests.contains_key(*filename) {
+                continue;
+            }
+
+            // Download with retry
+            let mut last_error = None;
+            for attempt in 0..MAX_DOWNLOAD_RETRIES {
+                if attempt > 0 {
+                    eprintln!(
+                        "[model_manager] retry {attempt}/{MAX_DOWNLOAD_RETRIES} for {filename}"
+                    );
+                }
+
+                let result = repo.get(filename);
+
+                match result {
+                    Ok(path) => {
+                        // Atomic copy: write to .partial temp, then rename
+                        let dest = model_path.join(filename);
+                        let partial_dest = model_path.join(format!("{filename}.partial"));
+                        if !dest.exists() {
+                            fs::copy(&path, &partial_dest)?;
+                            fs::rename(&partial_dest, &dest)?;
                         }
-                        manifest_files.insert(filename.to_string(), digest);
+                        // Store as content-addressable blob
+                        if let Some(digest) = sha256_file(&dest) {
+                            let blob_path = blobs.join(format!("sha256-{digest}"));
+                            if !blob_path.exists() {
+                                let partial_blob = blobs.join(format!("sha256-{digest}.partial"));
+                                fs::copy(&dest, &partial_blob)?;
+                                fs::rename(&partial_blob, &blob_path)?;
+                            }
+                            manifest_files.insert(filename.to_string(), digest.clone());
+                            partial
+                                .completed_digests
+                                .insert(filename.to_string(), digest);
+                        }
+                        // Persist partial state after each file completes
+                        let _ = self.save_partial_state(&partial);
+                        last_error = None;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[model_manager] failed to download {filename}: {e}");
+                        last_error = Some(format!("{e}"));
                     }
                 }
-                Err(_) => continue,
+            }
+
+            if let Some(err) = last_error {
+                self.statuses
+                    .insert(model_id.to_string(), ModelStatus::Error(err.clone()));
+                anyhow::bail!(
+                    "model download incomplete: failed to download {filename} after {MAX_DOWNLOAD_RETRIES} retries: {err}"
+                );
             }
         }
         progress_cb(total, total);
@@ -335,6 +426,9 @@ impl ModelManager {
             let manifest_path = manifests.join(format!("{model_id}.json"));
             fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
         }
+
+        // Clean up partial state on success
+        self.remove_partial_state(model_id);
 
         self.statuses
             .insert(model_id.to_string(), ModelStatus::Ready);

@@ -33,6 +33,9 @@ pub struct HardwareInfo {
     pub total_ram_mb: u64,
     /// RAM available for model loading (total minus 4 GB OS reserve).
     pub available_for_models_mb: u64,
+    /// GPU/accelerator memory in MB (e.g. Metal unified memory on macOS, VRAM on CUDA).
+    /// `None` if no GPU detected or memory query failed.
+    pub gpu_memory_mb: Option<u64>,
 }
 
 const OS_RESERVE_MB: u64 = 4096;
@@ -50,13 +53,76 @@ pub fn detect_hardware() -> HardwareInfo {
         .get_or_init(|| {
             let (device, total_ram_mb) = detect_platform();
             let available_for_models_mb = total_ram_mb.saturating_sub(OS_RESERVE_MB);
+            let gpu_memory_mb = detect_gpu_memory(device, total_ram_mb);
             HardwareInfo {
                 device,
                 total_ram_mb,
                 available_for_models_mb,
+                gpu_memory_mb,
             }
         })
         .clone()
+}
+
+/// Detect GPU memory in MB.
+///
+/// - macOS Metal (Apple Silicon): uses unified memory, reports ~75% of total RAM
+///   as available for Metal (the OS reserves the rest). Queries `sysctl iogpu.wired_limit_mb`
+///   if available, otherwise estimates.
+/// - Linux CUDA: queries `nvidia-smi` for total GPU memory.
+/// - CPU-only: returns None.
+fn detect_gpu_memory(device: DetectedDevice, total_ram_mb: u64) -> Option<u64> {
+    match device {
+        DetectedDevice::Metal => {
+            // Try IOKit query via system_profiler
+            if let Some(mb) = macos_metal_memory_mb() {
+                return Some(mb);
+            }
+            // Fallback: Apple Silicon uses unified memory, ~75% available for GPU
+            Some(total_ram_mb * 3 / 4)
+        }
+        #[cfg(target_os = "linux")]
+        DetectedDevice::Cuda => nvidia_gpu_memory_mb(),
+        #[cfg(not(target_os = "linux"))]
+        DetectedDevice::Cuda => None,
+        DetectedDevice::Cpu => None,
+    }
+}
+
+/// Query Metal GPU memory on macOS via `sysctl iogpu.wired_limit_mb`.
+#[cfg(target_os = "macos")]
+fn macos_metal_memory_mb() -> Option<u64> {
+    let output = Command::new("sysctl")
+        .args(["-n", "iogpu.wired_limit_mb"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let mb: u64 = s.trim().parse().ok()?;
+    // Treat 0 as unavailable — fall back to estimation
+    if mb > 0 { Some(mb) } else { None }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_metal_memory_mb() -> Option<u64> {
+    None
+}
+
+/// Query NVIDIA GPU total memory via `nvidia-smi`.
+#[cfg(target_os = "linux")]
+fn nvidia_gpu_memory_mb() -> Option<u64> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    // Take the first GPU's memory
+    s.lines().next()?.trim().parse().ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -167,6 +233,26 @@ mod tests {
         let hw = detect_hardware();
         if cfg!(target_arch = "aarch64") {
             assert_eq!(hw.device, DetectedDevice::Metal);
+        }
+    }
+
+    #[test]
+    fn gpu_memory_detected_on_gpu_platforms() {
+        let hw = detect_hardware();
+        match hw.device {
+            DetectedDevice::Metal | DetectedDevice::Cuda => {
+                assert!(
+                    hw.gpu_memory_mb.is_some(),
+                    "GPU memory should be detected for {:?}",
+                    hw.device
+                );
+                let gpu_mb = hw.gpu_memory_mb.unwrap();
+                assert!(gpu_mb > 0, "GPU memory should be > 0");
+            }
+            DetectedDevice::Cpu => {
+                // GPU memory is None for CPU-only systems
+                assert!(hw.gpu_memory_mb.is_none());
+            }
         }
     }
 }

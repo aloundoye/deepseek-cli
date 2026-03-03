@@ -223,7 +223,9 @@ fn redact_line(line: &str, regex: &Regex) -> String {
 fn build_builtin_secret_patterns() -> Vec<(String, Regex)> {
     let patterns = vec![
         ("api_key_sk", r"sk-[a-zA-Z0-9]{20,}"),
+        ("anthropic_key", r"sk-ant-[a-zA-Z0-9\-]{20,}"),
         ("aws_key", r"AKIA[0-9A-Z]{16}"),
+        ("google_api_key", r"AIza[a-zA-Z0-9_\-]{35}"),
         ("github_token", r"ghp_[a-zA-Z0-9]{36}"),
         ("gitlab_token", r"glpat-[a-zA-Z0-9\-]{20,}"),
         ("private_key", r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----"),
@@ -237,6 +239,14 @@ fn build_builtin_secret_patterns() -> Vec<(String, Regex)> {
             r#"mongodb(\+srv)?://[^\s'"]+:[^\s'"]+@[^\s'"]+"#,
         ),
         ("redis_conn", r#"redis://[^\s'"]+:[^\s'"]+@[^\s'"]+"#),
+        (
+            "azure_env_var",
+            r"(?i)AZURE_[A-Z_]*(?:KEY|SECRET|TOKEN|PASSWORD)\s*[:=]\s*\S+",
+        ),
+        (
+            "hex_secret_assign",
+            r#"(?i)(?:secret|token|key|password)\s*[:=]\s*['"]?[a-f0-9]{40,}['"]?"#,
+        ),
         (
             "generic_secret_assign",
             r#"(?i)(api[_-]?key|secret[_-]?key|auth[_-]?token|password)\s*[:=]\s*['"]?[a-zA-Z0-9_\-/+=]{16,}['"]?"#,

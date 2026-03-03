@@ -59,7 +59,56 @@ impl FileSnapshot {
             workspace.join(file_path)
         };
 
-        match fs::read_to_string(&abs_path) {
+        // Check file size via metadata BEFORE reading to prevent OOM on huge files
+        let file_size = fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+
+        // For files larger than the snapshot limit, only read a preview portion
+        let read_result = if file_size > SNAPSHOT_FULL_CONTENT_LIMIT as u64 {
+            // Read only the first portion for preview + hash the file in chunks
+            use std::io::Read;
+            let mut file = match std::fs::File::open(&abs_path) {
+                Ok(f) => f,
+                Err(_) => {
+                    return Self {
+                        path: file_path.to_string(),
+                        content_hash: String::new(),
+                        preview: String::new(),
+                        full_content: None,
+                        exists: false,
+                    };
+                }
+            };
+            // Read a small portion for preview
+            let mut preview_buf = vec![0u8; 8192.min(file_size as usize)];
+            let n = file.read(&mut preview_buf).unwrap_or(0);
+            let preview_str = String::from_utf8_lossy(&preview_buf[..n]);
+            let preview: String = preview_str.lines().take(50).collect::<Vec<_>>().join("\n");
+            // Hash the full file without loading it all into memory
+            let mut hasher = Sha256::new();
+            // Reset file position
+            use std::io::Seek;
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = file.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let hash = format!("{:x}", hasher.finalize());
+            return Self {
+                path: file_path.to_string(),
+                content_hash: hash,
+                preview,
+                full_content: None,
+                exists: true,
+            };
+        } else {
+            fs::read_to_string(&abs_path)
+        };
+
+        match read_result {
             Ok(content) => {
                 let mut hasher = Sha256::new();
                 hasher.update(content.as_bytes());
@@ -493,6 +542,18 @@ impl MemoryManager {
             ));
         }
 
+        // Validate snapshot_root is within the runtime directory to prevent path traversal
+        let expected_root = std::fs::canonicalize(runtime_dir(&self.workspace))
+            .unwrap_or_else(|_| runtime_dir(&self.workspace));
+        if let Ok(canonical) = std::fs::canonicalize(&snapshot_root)
+            && !canonical.starts_with(&expected_root)
+        {
+            return Err(anyhow!(
+                "checkpoint path outside runtime directory: {}",
+                snapshot_root.display()
+            ));
+        }
+
         // Check if this is a targeted checkpoint (only covers a subset of files).
         // Targeted checkpoints must NOT delete files outside the snapshot — only
         // restore the files that were originally captured.
@@ -771,7 +832,13 @@ impl MemoryManager {
             let id_str = ref_name
                 .strip_prefix("refs/codingbuddy-shadow/")
                 .unwrap_or("");
-            let id = Uuid::parse_str(id_str).unwrap_or(Uuid::nil());
+            let id = match Uuid::parse_str(id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("[memory] warning: invalid UUID in ref {ref_name}: {e}");
+                    continue;
+                }
+            };
 
             // Extract reason from subject: "codingbuddy shadow: <reason> [<id>]"
             let reason = subject

@@ -16,6 +16,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Represents a file suggestion with relevance score
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,12 +26,46 @@ pub struct FileSuggestion {
     pub reasons: Vec<String>,
 }
 
+/// Lazily compiled import patterns shared across all `ContextManager` instances.
+static IMPORT_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(build_import_patterns);
+
+/// Build regex patterns for detecting imports in different languages.
+fn build_import_patterns() -> HashMap<String, Regex> {
+    let mut patterns = HashMap::new();
+
+    let rust =
+        Regex::new(r#"^\s*(?:pub\s+)?(?:use|crate|mod|extern\s+crate)\s+([\w_:]+)"#).unwrap();
+    patterns.insert("rs".to_string(), rust);
+
+    let javascript =
+        Regex::new(r#"^\s*(?:import|export|require)\s*(?:\(|\{)?\s*['\"]([^'\"]+)['\"]"#).unwrap();
+    patterns.insert("js".to_string(), javascript.clone());
+    patterns.insert("ts".to_string(), javascript.clone());
+    patterns.insert("jsx".to_string(), javascript.clone());
+    patterns.insert("tsx".to_string(), javascript);
+
+    let python = Regex::new(r#"^\s*(?:import|from)\s+([\w\.]+)"#).unwrap();
+    patterns.insert("py".to_string(), python);
+
+    let java = Regex::new(r#"^\s*(?:import|package)\s+([\w\.]+)"#).unwrap();
+    patterns.insert("java".to_string(), java);
+
+    // Matches both:
+    // import "fmt"
+    // import (
+    //   "fmt"
+    // )
+    let go = Regex::new(r#"^\s*(?:import\s+)?(?:[\w\.]+\s+)?["`]([^"`]+)["`]\s*$"#).unwrap();
+    patterns.insert("go".to_string(), go);
+
+    patterns
+}
+
 /// Context manager for intelligent file selection
 pub struct ContextManager {
     workspace_root: PathBuf,
     file_graph: DiGraph<PathBuf, ()>,
     node_indices: HashMap<PathBuf, NodeIndex>,
-    import_patterns: HashMap<String, Regex>,
     recent_files: Vec<PathBuf>,
     max_recent_files: usize,
 }
@@ -40,49 +75,13 @@ impl ContextManager {
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self> {
         let workspace_root = workspace_root.as_ref().to_path_buf();
 
-        let import_patterns = Self::build_import_patterns();
-
         Ok(Self {
             workspace_root,
             file_graph: DiGraph::new(),
             node_indices: HashMap::new(),
-            import_patterns,
             recent_files: Vec::new(),
             max_recent_files: 50,
         })
-    }
-
-    /// Build regex patterns for detecting imports in different languages
-    fn build_import_patterns() -> HashMap<String, Regex> {
-        let mut patterns = HashMap::new();
-
-        let rust =
-            Regex::new(r#"^\s*(?:pub\s+)?(?:use|crate|mod|extern\s+crate)\s+([\w_:]+)"#).unwrap();
-        patterns.insert("rs".to_string(), rust);
-
-        let javascript =
-            Regex::new(r#"^\s*(?:import|export|require)\s*(?:\(|\{)?\s*['\"]([^'\"]+)['\"]"#)
-                .unwrap();
-        patterns.insert("js".to_string(), javascript.clone());
-        patterns.insert("ts".to_string(), javascript.clone());
-        patterns.insert("jsx".to_string(), javascript.clone());
-        patterns.insert("tsx".to_string(), javascript);
-
-        let python = Regex::new(r#"^\s*(?:import|from)\s+([\w\.]+)"#).unwrap();
-        patterns.insert("py".to_string(), python);
-
-        let java = Regex::new(r#"^\s*(?:import|package)\s+([\w\.]+)"#).unwrap();
-        patterns.insert("java".to_string(), java);
-
-        // Matches both:
-        // import "fmt"
-        // import (
-        //   "fmt"
-        // )
-        let go = Regex::new(r#"^\s*(?:import\s+)?(?:[\w\.]+\s+)?["`]([^"`]+)["`]\s*$"#).unwrap();
-        patterns.insert("go".to_string(), go);
-
-        patterns
     }
 
     /// Analyze the workspace and build dependency graph
@@ -153,7 +152,7 @@ impl ContextManager {
         let mut imports = Vec::new();
 
         for line in content.lines() {
-            if let Some(pattern) = self.import_patterns.get(ext.as_str())
+            if let Some(pattern) = IMPORT_PATTERNS.get(ext.as_str())
                 && let Some(caps) = pattern.captures(line)
                 && let Some(import) = caps.get(1)
             {
@@ -644,7 +643,7 @@ mod tests {
 
     #[test]
     fn rust_import_pattern_matches() {
-        let patterns = ContextManager::build_import_patterns();
+        let patterns = &*IMPORT_PATTERNS;
         let rs = patterns.get("rs").unwrap();
         assert!(rs.is_match("use crate::utils;"));
         assert!(rs.is_match("pub use crate::models::User;"));
@@ -654,7 +653,7 @@ mod tests {
 
     #[test]
     fn python_import_pattern_matches() {
-        let patterns = ContextManager::build_import_patterns();
+        let patterns = &*IMPORT_PATTERNS;
         let py = patterns.get("py").unwrap();
         assert!(py.is_match("import os"));
         assert!(py.is_match("from pathlib import Path"));
@@ -663,7 +662,7 @@ mod tests {
 
     #[test]
     fn js_import_pattern_matches() {
-        let patterns = ContextManager::build_import_patterns();
+        let patterns = &*IMPORT_PATTERNS;
         let js = patterns.get("js").unwrap();
         // Direct string imports and require() calls
         assert!(js.is_match(r#"import 'react'"#));

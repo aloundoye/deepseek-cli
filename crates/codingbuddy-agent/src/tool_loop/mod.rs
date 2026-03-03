@@ -31,7 +31,7 @@ pub use types::*;
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
     ApprovedToolCall, ChatMessage, ChatRequest, EventKind, LlmToolCall, StreamCallback,
-    StreamChunk, TokenUsage, ToolChoice, ToolDefinition, ToolHost, UserQuestion,
+    StreamChunk, TokenUsage, ToolCall, ToolChoice, ToolDefinition, ToolHost, UserQuestion,
     estimate_message_tokens, strip_prior_reasoning_content,
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
@@ -143,6 +143,8 @@ pub struct ToolUseLoop<'a> {
     pinned_directives: Vec<String>,
     /// Pre-computed workspace path string for hook inputs (avoids repeated allocation).
     workspace_path_str: String,
+    /// Whether `cleanup_old_tool_outputs` has run this session (at most once).
+    tool_output_cleanup_done: bool,
 }
 
 impl<'a> ToolUseLoop<'a> {
@@ -191,6 +193,7 @@ impl<'a> ToolUseLoop<'a> {
             doom_loop_tracker: DoomLoopTracker::default(),
             pinned_directives: Vec::new(),
             workspace_path_str,
+            tool_output_cleanup_done: false,
         }
     }
 
@@ -264,24 +267,61 @@ impl<'a> ToolUseLoop<'a> {
     }
 
     /// Invalidate cache entries for a given path (after a write tool modifies it).
-    /// Uses exact path match or path-prefix match to avoid over-invalidation
-    /// (e.g. modifying `/foo/test.rs` should not invalidate `/foo/other_test.rs`).
+    /// Also invalidates entries referencing the parent directory (e.g., `fs_list` results).
     fn cache_invalidate_path(&mut self, path: &str) {
+        let quoted = format!("\"{path}\"");
+        // Also invalidate parent directory entries (e.g. fs_list caches)
+        let parent_quoted = path
+            .rsplit_once('/')
+            .map(|(parent, _)| format!("\"{parent}\""));
+
         self.tool_cache.retain(|_key, entry| {
-            // Check if the raw key contains the exact path as a JSON string value.
-            // JSON-encoded paths are wrapped in quotes: "path": "/foo/bar.rs"
-            let quoted = format!("\"{path}\"");
-            !entry.raw_key.contains(&quoted)
+            if entry.raw_key.contains(&quoted) {
+                return false;
+            }
+            if let Some(ref pq) = parent_quoted
+                && entry.raw_key.contains(pq.as_str())
+            {
+                return false;
+            }
+            true
         });
+    }
+
+    /// Clean up old tool output files (>7 days). Runs at most once per session.
+    fn cleanup_old_tool_outputs(&mut self) {
+        if self.tool_output_cleanup_done {
+            return;
+        }
+        self.tool_output_cleanup_done = true;
+        let output_dir = std::path::Path::new(&self.workspace_path_str)
+            .join(".codingbuddy")
+            .join("tool_outputs");
+        let Ok(entries) = std::fs::read_dir(&output_dir) else {
+            return;
+        };
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                let modified = metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     /// Persist a large tool output to disk and return a hint for the truncated message.
     /// Writes to `.codingbuddy/tool_outputs/<hash>.txt` so the model can re-read it.
     const LARGE_OUTPUT_THRESHOLD: usize = 50_000; // 50KB
-    fn persist_large_output(&self, tool_name: &str, raw_output: &str) -> Option<String> {
+    fn persist_large_output(&mut self, tool_name: &str, raw_output: &str) -> Option<String> {
         if raw_output.len() < Self::LARGE_OUTPUT_THRESHOLD {
             return None;
         }
+        // Opportunistic cleanup of old files
+        self.cleanup_old_tool_outputs();
         let output_dir = std::path::Path::new(&self.workspace_path_str)
             .join(".codingbuddy")
             .join("tool_outputs");
@@ -295,8 +335,13 @@ impl<'a> ToolUseLoop<'a> {
         let filename = format!("{tool_name}_{hash:016x}.txt");
         let path = output_dir.join(&filename);
         if std::fs::write(&path, raw_output).is_ok() {
+            let line_count = raw_output.lines().count();
             Some(format!(
-                "\n[Full output saved to .codingbuddy/tool_outputs/{filename} — use fs_read to view]"
+                "\n[Full output ({line_count} lines, {} bytes) saved to \
+                 .codingbuddy/tool_outputs/{filename}. \
+                 Use fs_read with start_line/end_line to view specific sections, \
+                 or fs_grep to search within it.]",
+                raw_output.len()
             ))
         } else {
             None
@@ -374,6 +419,9 @@ impl<'a> ToolUseLoop<'a> {
         if is_continuation {
             strip_prior_reasoning_content(&mut self.messages);
         }
+
+        // Reset per-question state so previous errors don't leak across turns
+        self.recovery_injected = false;
 
         self.messages.push(ChatMessage::User {
             content: user_message.to_string(),
@@ -498,6 +546,17 @@ impl<'a> ToolUseLoop<'a> {
                                 messages_after: self.messages.len() as u64,
                             });
                         }
+
+                        // Auto-continue: inject a synthetic user message to prompt
+                        // continuation after compaction. DeepSeek often gets confused
+                        // about what to do next after context is compacted.
+                        self.messages.push(ChatMessage::User {
+                            content: "Context was compacted. Continue with your current task. \
+                                      If you were in the middle of something, resume from where \
+                                      you left off. If you're unsure what to do next, summarize \
+                                      what's been accomplished and ask for clarification."
+                                .to_string(),
+                        });
                     }
                     if !compacted {
                         self.emit(StreamChunk::Done {
@@ -785,11 +844,12 @@ impl<'a> ToolUseLoop<'a> {
                 // Threads return (index, result, elapsed_ms) to avoid cloning effective_call.
                 let tool_host = &self.tool_host;
                 let parallel_results: Vec<_> = std::thread::scope(|s| {
-                    let handles: Vec<_> = pre_validated
+                    // Collect (idx, handle) pairs so idx is available even if the thread panics
+                    let indexed_handles: Vec<_> = pre_validated
                         .iter()
                         .enumerate()
                         .map(|(idx, (effective_call, cached, error))| {
-                            s.spawn(move || {
+                            let handle = s.spawn(move || {
                                 // Return pre-computed error
                                 if let Some(err_msg) = error {
                                     let error_result = codingbuddy_core::ToolResult {
@@ -822,12 +882,13 @@ impl<'a> ToolUseLoop<'a> {
                                 let result = tool_host.execute(approved);
                                 let elapsed = start.elapsed().as_millis() as u64;
                                 (idx, result, elapsed)
-                            })
+                            });
+                            (idx, handle)
                         })
                         .collect();
-                    handles
+                    indexed_handles
                         .into_iter()
-                        .map(|h| {
+                        .map(|(original_idx, h)| {
                             h.join().unwrap_or_else(|panic_payload| {
                                 let panic_msg = panic_payload
                                     .downcast_ref::<String>()
@@ -841,8 +902,8 @@ impl<'a> ToolUseLoop<'a> {
                                         "Internal error: parallel tool execution panicked: {panic_msg}"
                                     )),
                                 };
-                                // Use usize::MAX as sentinel for panicked threads
-                                (usize::MAX, error_result, 0u64)
+                                // Use the original index so the caller can look up the tool_call_id
+                                (original_idx, error_result, 0u64)
                             })
                         })
                         .collect()
@@ -854,7 +915,8 @@ impl<'a> ToolUseLoop<'a> {
                     let effective_call = if *idx < pre_validated.len() {
                         &pre_validated[*idx].0
                     } else {
-                        // Panicked thread — emit error with placeholder
+                        // Should not happen now that we preserve original_idx,
+                        // but keep as safety fallback
                         self.messages.push(ChatMessage::Tool {
                             tool_call_id: String::new(),
                             content: result.output.to_string(),
@@ -1028,34 +1090,59 @@ impl<'a> ToolUseLoop<'a> {
             if doom_loop_detected {
                 if let Some(ref cb) = self.event_cb {
                     cb(EventKind::DoomLoopDetected {
-                        tool_name: doom_loop_tool,
+                        tool_name: doom_loop_tool.clone(),
                         repeat_count: DOOM_LOOP_THRESHOLD as u64,
                     });
                 }
                 self.emit(StreamChunk::SecurityWarning {
                     message: format!(
                         "Doom loop detected: model repeated identical tool calls {}+ times. \
-                         Stopping to prevent infinite loop. Send a new message to continue.",
+                         The tool '{doom_loop_tool}' has been called with the same arguments repeatedly.",
                         DOOM_LOOP_THRESHOLD
                     ),
                 });
-                self.messages.push(ChatMessage::System {
-                    content: DOOM_LOOP_GUIDANCE.to_string(),
-                });
-                self.doom_loop_tracker.mark_warned();
-                // Terminate the tool loop — this is a blocking gate.
-                // The model cannot continue; the user must send a new message.
-                self.emit(StreamChunk::Done {
-                    reason: Some(FINISH_REASON_DOOM_LOOP.to_string()),
-                });
-                return Ok(ToolLoopResult {
-                    response: response.text.clone(),
-                    tool_calls_made,
-                    finish_reason: FINISH_REASON_DOOM_LOOP.to_string(),
-                    usage: total_usage,
-                    turns,
-                    messages: self.messages.clone(),
-                });
+
+                // Try to get user decision via approval callback
+                let user_wants_continue = if let Some(ref cb) = self.approval_cb {
+                    // Present as a "doom loop" approval — user sees the warning and decides
+                    let dummy_call = ToolCall {
+                        name: format!("__doom_loop_continue__{doom_loop_tool}"),
+                        args: serde_json::json!({
+                            "reason": "doom_loop_detected",
+                            "repeated_tool": doom_loop_tool,
+                            "message": "The model is repeating the same action. Continue, abort, or redirect?"
+                        }),
+                        requires_approval: true,
+                    };
+                    cb(&dummy_call).unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if user_wants_continue {
+                    // User chose to continue — reset doom loop tracker and proceed
+                    self.doom_loop_tracker.reset();
+                    self.messages.push(ChatMessage::System {
+                        content: DOOM_LOOP_GUIDANCE.to_string(),
+                    });
+                } else {
+                    // User chose to abort (or no approval callback) — stop the loop
+                    self.messages.push(ChatMessage::System {
+                        content: DOOM_LOOP_GUIDANCE.to_string(),
+                    });
+                    self.doom_loop_tracker.mark_warned();
+                    self.emit(StreamChunk::Done {
+                        reason: Some(FINISH_REASON_DOOM_LOOP.to_string()),
+                    });
+                    return Ok(ToolLoopResult {
+                        response: response.text.clone(),
+                        tool_calls_made,
+                        finish_reason: FINISH_REASON_DOOM_LOOP.to_string(),
+                        usage: total_usage,
+                        turns,
+                        messages: self.messages.clone(),
+                    });
+                }
             }
 
             // Mid-conversation reminder: every N tool calls, inject a brief
@@ -1814,12 +1901,12 @@ impl<'a> ToolUseLoop<'a> {
             .iter()
             .rposition(|m| matches!(m, ChatMessage::User { .. }))
             .unwrap_or(0);
-        let tool_call_count_this_turn = self.messages[last_user_idx..]
+        let llm_turns_this_question = self.messages[last_user_idx..]
             .iter()
-            .filter(|m| matches!(m, ChatMessage::Tool { .. }))
+            .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
             .count();
-        // Require tool use for the first 2 LLM rounds per user question (Code mode only)
-        let tool_choice = if tool_call_count_this_turn < 2 && !self.config.read_only {
+        // Require tool use for the first LLM round per user question (Code mode only)
+        let tool_choice = if llm_turns_this_question < 1 && !self.config.read_only {
             ToolChoice::required()
         } else {
             ToolChoice::auto()
@@ -1986,8 +2073,7 @@ impl<'a> ToolUseLoop<'a> {
         // A group starts at a User message and includes everything until the next User message.
         let mut keep_from = self.messages.len();
         let mut kept_tokens: u64 = 0;
-        let target = target_tokens
-            .min((self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64);
+        let target = target_tokens;
 
         while keep_from > 1 {
             // Find the start of this group (previous User message)
@@ -2822,6 +2908,8 @@ mod tests {
 
     #[test]
     fn subsequent_turns_use_auto_tool_choice() {
+        // After 1+ Assistant turns since last User message, tool_choice should be auto.
+        // The threshold is based on Assistant messages, not Tool messages.
         let llm = ScriptedLlm::new(vec![]);
         let tool_host = Arc::new(MockToolHost::new(vec![], true));
         let config = ToolLoopConfig::default();
@@ -2833,24 +2921,29 @@ mod tests {
             default_tools(),
         );
 
-        // Add 2 tool result messages — after 2 tool calls, should switch to auto
+        // Simulate: User asked → Assistant responded (1 turn) → tool result
+        loop_.messages.push(ChatMessage::Assistant {
+            content: Some("I'll read the file.".to_string()),
+            tool_calls: vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+            }],
+            reasoning_content: None,
+        });
         loop_.messages.push(ChatMessage::Tool {
             tool_call_id: "call_1".to_string(),
             content: "file content".to_string(),
-        });
-        loop_.messages.push(ChatMessage::Tool {
-            tool_call_id: "call_2".to_string(),
-            content: "another file".to_string(),
         });
 
         let request = loop_.build_request();
         assert_eq!(
             request.tool_choice,
             ToolChoice::auto(),
-            "after 2+ tool results should use tool_choice=auto"
+            "after 1+ Assistant turns should use tool_choice=auto"
         );
 
-        // With only 1 tool result, should still force required (strengthened forcing)
+        // With no Assistant messages (only Tool results), should still force required
         let llm2 = ScriptedLlm::new(vec![]);
         let tool_host2 = Arc::new(MockToolHost::new(vec![], true));
         let mut loop2 = ToolUseLoop::new(
@@ -2868,7 +2961,7 @@ mod tests {
         assert_eq!(
             request2.tool_choice,
             ToolChoice::required(),
-            "with only 1 tool result, should still force required"
+            "with no Assistant turns, should still force required"
         );
     }
 
@@ -4748,6 +4841,43 @@ mod tests {
         assert!(
             has_doom_guidance,
             "doom loop guidance should be in messages for context if user continues"
+        );
+    }
+
+    #[test]
+    fn doom_loop_reset_clears_all_state() {
+        let mut tracker = DoomLoopTracker::default();
+        let args = r#"{"file_path":"/main.rs"}"#;
+
+        // Build up to doom loop detection
+        tracker.record("fs_read", args);
+        tracker.record("fs_read", args);
+        assert!(tracker.record("fs_read", args), "doom loop detected");
+        tracker.mark_warned();
+
+        // Reset clears everything
+        tracker.reset();
+        assert!(
+            tracker.recent_calls.is_empty(),
+            "history should be empty after reset"
+        );
+        assert!(
+            !tracker.warning_injected,
+            "warning flag should be cleared after reset"
+        );
+
+        // Same calls after reset need full threshold again
+        assert!(
+            !tracker.record("fs_read", args),
+            "1st call after reset: no doom loop"
+        );
+        assert!(
+            !tracker.record("fs_read", args),
+            "2nd call after reset: no doom loop"
+        );
+        assert!(
+            tracker.record("fs_read", args),
+            "3rd call after reset: doom loop re-detected"
         );
     }
 

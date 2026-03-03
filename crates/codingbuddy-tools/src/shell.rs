@@ -62,11 +62,21 @@ impl ShellRunner for PlatformShellRunner {
 }
 
 fn spawn_command(cmd: &str, cwd: &Path) -> Result<Child> {
-    let cwd = if cwd.exists() {
-        std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
-    } else {
+    // Always attempt canonicalization to resolve symlinks and prevent path traversal.
+    // For non-existent paths, try canonicalizing the nearest existing parent.
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| {
+        // Fallback: canonicalize the parent chain to resolve what we can
+        let mut path = cwd.to_path_buf();
+        while let Some(parent) = path.parent() {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent)
+                && let Ok(remainder) = path.strip_prefix(parent)
+            {
+                return canonical_parent.join(remainder);
+            }
+            path = parent.to_path_buf();
+        }
         cwd.to_path_buf()
-    };
+    });
     let mut errors = Vec::new();
     for mut command in candidate_commands(cmd) {
         command.current_dir(&cwd);

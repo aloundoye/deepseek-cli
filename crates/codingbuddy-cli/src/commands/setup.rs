@@ -69,11 +69,17 @@ fn run_wizard_steps(cwd: &Path, cfg: &AppConfig) -> Result<()> {
     let provider_choice = prompt_choice("  Select [1-2]: ", 1, 2)?;
 
     if provider_choice == 2 {
-        print!("  API base URL: ");
-        std::io::stdout().flush()?;
-        let mut base_url = String::new();
-        std::io::stdin().read_line(&mut base_url)?;
-        let base_url = base_url.trim().to_string();
+        let base_url = loop {
+            print!("  API base URL: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let url = input.trim().to_string();
+            if url.starts_with("http://") || url.starts_with("https://") {
+                break url;
+            }
+            println!("  Invalid URL — must start with http:// or https://");
+        };
 
         print!("  Model name: ");
         std::io::stdout().flush()?;

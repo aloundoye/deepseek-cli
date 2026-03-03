@@ -514,6 +514,23 @@ impl HookRuntime {
 
     /// Run a command hook handler: pipe JSON on stdin, parse stdout JSON for decisions.
     fn run_command_handler(&self, command: &str, input: &HookInput, timeout_secs: u64) -> HookRun {
+        // Reject commands with embedded newlines (command injection vector)
+        if command.contains('\n') || command.contains('\r') {
+            return HookRun {
+                handler_description: format!("command: {command}"),
+                success: false,
+                timed_out: false,
+                exit_code: None,
+                output: HookOutput {
+                    additional_context: Some(
+                        "Hook command rejected: contains newline characters".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                blocked: true,
+            };
+        }
+
         // P0.5: Reject commands with dangerous shell constructs before execution.
         if codingbuddy_policy::shell_parse::contains_substitution_constructs(command) {
             return HookRun {

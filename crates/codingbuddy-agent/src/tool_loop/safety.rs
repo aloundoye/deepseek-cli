@@ -76,6 +76,13 @@ impl DoomLoopTracker {
     pub(crate) fn mark_warned(&mut self) {
         self.warning_injected = true;
     }
+
+    /// Reset the tracker, clearing all history and warning state.
+    /// Used when the user explicitly allows continuing past a doom loop.
+    pub(crate) fn reset(&mut self) {
+        self.recent_calls.clear();
+        self.warning_injected = false;
+    }
 }
 
 // ── Circuit breaker ──

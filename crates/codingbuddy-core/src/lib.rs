@@ -232,6 +232,7 @@ pub enum ToolName {
     ExitPlanMode,
     Skill,
     KillShell,
+    Batch,
 }
 
 impl ToolName {
@@ -278,6 +279,7 @@ impl ToolName {
             "exit_plan_mode" => Self::ExitPlanMode,
             "skill" => Self::Skill,
             "kill_shell" => Self::KillShell,
+            "batch" => Self::Batch,
             _ => return None,
         })
     }
@@ -325,6 +327,7 @@ impl ToolName {
             "exit_plan_mode" => Self::ExitPlanMode,
             "skill" => Self::Skill,
             "kill_shell" => Self::KillShell,
+            "batch" => Self::Batch,
             _ => return None,
         })
     }
@@ -371,6 +374,7 @@ impl ToolName {
             Self::ExitPlanMode => "exit_plan_mode",
             Self::Skill => "skill",
             Self::KillShell => "kill_shell",
+            Self::Batch => "batch",
         }
     }
 
@@ -416,6 +420,7 @@ impl ToolName {
             Self::ExitPlanMode => "exit_plan_mode",
             Self::Skill => "skill",
             Self::KillShell => "kill_shell",
+            Self::Batch => "batch",
         }
     }
 
@@ -428,6 +433,7 @@ impl ToolName {
                 | Self::FsList
                 | Self::FsGlob
                 | Self::FsGrep
+                | Self::Batch
                 | Self::GitStatus
                 | Self::GitDiff
                 | Self::GitShow
@@ -2840,6 +2846,14 @@ impl Default for UiConfig {
 #[serde(default)]
 pub struct ToolsConfig {
     pub chrome: ChromeToolsConfig,
+    /// Automatically run language-specific diagnostics after file edits.
+    /// Feeds compilation errors back to the LLM for self-correction.
+    #[serde(default = "default_true")]
+    pub diagnostics_after_edit: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

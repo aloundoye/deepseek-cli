@@ -63,6 +63,7 @@ pub struct LocalToolHost {
     visual_verification_enabled: bool,
     chrome_allow_stub_fallback: bool,
     lint_after_edit: Option<String>,
+    diagnostics_after_edit: bool,
     review_mode: bool,
     mcp_executor: Option<McpExecutor>,
 }
@@ -105,6 +106,7 @@ impl LocalToolHost {
             visual_verification_enabled: cfg.experiments.visual_verification,
             chrome_allow_stub_fallback: cfg.tools.chrome.allow_stub_fallback,
             lint_after_edit,
+            diagnostics_after_edit: cfg.tools.diagnostics_after_edit,
             review_mode: false,
             mcp_executor: None,
         })
@@ -469,6 +471,15 @@ impl LocalToolHost {
                 if let Some(lint) = lint_output {
                     result["lint"] = lint;
                 }
+                // Auto-diagnostics after edit
+                if self.diagnostics_after_edit {
+                    maybe_run_auto_diagnostics(
+                        self.runner.as_ref(),
+                        &self.workspace,
+                        Some(path),
+                        &mut result,
+                    );
+                }
                 Ok(result)
             }
             "fs.search_rg" => {
@@ -573,20 +584,30 @@ impl LocalToolHost {
                     .ok_or_else(|| anyhow!("unified_diff missing"))?;
                 let patch = self.patches.stage(diff, &[])?;
                 let (applied, conflicts) = self.patches.apply(&self.workspace, patch.patch_id)?;
-                if applied {
-                    Ok(json!({
+                let mut result = if applied {
+                    json!({
                         "applied": true,
                         "patch_id": patch.patch_id.to_string(),
                         "files": patch.target_files,
-                    }))
+                    })
                 } else {
-                    Ok(json!({
+                    json!({
                         "applied": false,
                         "patch_id": patch.patch_id.to_string(),
                         "conflicts": conflicts,
                         "files": patch.target_files,
-                    }))
+                    })
+                };
+                // Auto-diagnostics after patch application
+                if applied && self.diagnostics_after_edit {
+                    maybe_run_auto_diagnostics(
+                        self.runner.as_ref(),
+                        &self.workspace,
+                        None,
+                        &mut result,
+                    );
                 }
+                Ok(result)
             }
             "fs.write" => {
                 let path = call
@@ -1111,6 +1132,15 @@ impl LocalToolHost {
                 if let Some(lint) = lint_output {
                     result["lint"] = lint;
                 }
+                // Auto-diagnostics after multi_edit
+                if self.diagnostics_after_edit {
+                    maybe_run_auto_diagnostics(
+                        self.runner.as_ref(),
+                        &self.workspace,
+                        None,
+                        &mut result,
+                    );
+                }
                 Ok(result)
             }
             "diagnostics.check" => {
@@ -1139,6 +1169,81 @@ impl LocalToolHost {
                         "MCP tool '{name}' called but no MCP executor configured"
                     )),
                 }
+            }
+            "batch" => {
+                let tool_calls = call
+                    .args
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow!("tool_calls array missing"))?;
+                if tool_calls.len() > 25 {
+                    return Err(anyhow!(
+                        "batch limited to 25 tool calls, got {}",
+                        tool_calls.len()
+                    ));
+                }
+
+                // Only allow read-only tools in batch (no writes, no nested batch)
+                let read_only_tools = [
+                    "fs.read",
+                    "fs.list",
+                    "fs.glob",
+                    "fs.grep",
+                    "fs.search_rg",
+                    "git.status",
+                    "git.diff",
+                    "git.show",
+                    "web.fetch",
+                    "web.search",
+                    "notebook.read",
+                    "index.query",
+                    "diagnostics.check",
+                ];
+                for tc in tool_calls {
+                    let tool_name = tc.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                    if tool_name == "batch" {
+                        return Err(anyhow!("cannot nest batch inside batch"));
+                    }
+                    if !read_only_tools.contains(&tool_name) {
+                        return Err(anyhow!(
+                            "batch only allows read-only tools, got '{tool_name}'. \
+                             Use individual tool calls for write operations."
+                        ));
+                    }
+                }
+
+                // Execute each sub-call sequentially (reusing existing handlers)
+                let mut results = Vec::with_capacity(tool_calls.len());
+                let mut successes = 0usize;
+                for tc in tool_calls {
+                    let tool_name = tc.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let params = tc.get("parameters").cloned().unwrap_or(json!({}));
+                    let sub_call = ToolCall {
+                        name: tool_name.to_string(),
+                        args: params,
+                        requires_approval: false,
+                    };
+                    let approved = ApprovedToolCall {
+                        invocation_id: Uuid::now_v7(),
+                        call: sub_call,
+                    };
+                    let sub_result = self.execute(approved);
+                    if sub_result.success {
+                        successes += 1;
+                    }
+                    results.push(json!({
+                        "tool": tool_name,
+                        "success": sub_result.success,
+                        "output": sub_result.output,
+                    }));
+                }
+                let total = results.len();
+                Ok(json!({
+                    "results": results,
+                    "total": total,
+                    "succeeded": successes,
+                    "failed": total - successes,
+                }))
             }
             _ => Err(anyhow!("unknown tool: {}", call.name)),
         }
@@ -1946,6 +2051,50 @@ where a unified diff is more natural.".to_string(),
                 }),
             },
         },
+        // ── Batch tool ────────────────────────────────────────────────────
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "batch".to_string(),
+                description: "Execute multiple read-only tool calls in a single request. \
+Use this when you need to perform several independent read operations (reading multiple files, \
+searching in parallel, checking git status and diff together). \
+\n\nRules:\n\
+- Only read-only tools allowed: fs_read, fs_list, fs_glob, fs_grep, git_status, git_diff, \
+git_show, web_fetch, web_search, notebook_read, index_query, diagnostics_check\n\
+- Cannot nest batch inside batch\n\
+- Cannot batch write tools (fs_edit, fs_write, bash_run) — use individual calls for those\n\
+- Maximum 25 tool calls per batch\n\
+\nReturns an array of results with per-tool success/error status.".to_string(),
+            strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "tool_calls": {
+                            "type": "array",
+                            "description": "Array of tool calls to execute",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {
+                                        "type": "string",
+                                        "description": "Name of the tool to call (e.g. 'fs.read', 'fs.grep')"
+                                    },
+                                    "parameters": {
+                                        "type": "object",
+                                        "description": "Parameters to pass to the tool"
+                                    }
+                                },
+                                "required": ["tool", "parameters"]
+                            },
+                            "minItems": 1,
+                            "maxItems": 25
+                        }
+                    },
+                    "required": ["tool_calls"]
+                }),
+            },
+        },
         // ── Chrome browser automation tools ─────────────────────────────────
         ToolDefinition {
             tool_type: "function".to_string(),
@@ -2427,6 +2576,7 @@ pub const PLAN_MODE_TOOLS: &[&str] = &[
     "index_query",
     "notebook_read",
     "diagnostics_check",
+    "batch",
     "user_question",
     "task_create",
     "task_update",
@@ -3412,16 +3562,50 @@ fn generate_unified_diff(path: &str, before: &str, after: &str) -> String {
     out
 }
 
+/// Run auto-diagnostics after an edit and inject results into the tool result JSON.
+fn maybe_run_auto_diagnostics(
+    runner: &dyn ShellRunner,
+    workspace: &Path,
+    target: Option<&str>,
+    result: &mut serde_json::Value,
+) {
+    let Ok((cmd, source)) = detect_diagnostics_command(workspace, target) else {
+        return;
+    };
+    let Ok(diag_result) = runner.run(&cmd, workspace, Duration::from_secs(30)) else {
+        return;
+    };
+    let diagnostics = parse_diagnostics(&diag_result.stdout, &diag_result.stderr, source);
+    if diagnostics.is_empty() {
+        return;
+    }
+    result["diagnostics"] = json!(diagnostics);
+    let msg: Vec<String> = diagnostics
+        .iter()
+        .map(|d| {
+            let file = d.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+            let line = d.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+            let text = d.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("  {file}:{line}: {text}")
+        })
+        .take(10)
+        .collect();
+    result["diagnostics_message"] = json!(format!(
+        "Errors detected after edit — please fix:\n{}",
+        msg.join("\n")
+    ));
+}
+
 fn detect_diagnostics_command(
     workspace: &Path,
     target: Option<&str>,
 ) -> Result<(String, &'static str)> {
     if workspace.join("Cargo.toml").exists() {
-        let cmd = match target {
-            Some(_) => "cargo check --message-format=json 2>&1".to_string(),
-            None => "cargo check --message-format=json 2>&1".to_string(),
-        };
-        return Ok((cmd, "rustc"));
+        // cargo check always checks the whole workspace; target is unused for Rust.
+        return Ok((
+            "cargo check --message-format=json 2>&1".to_string(),
+            "rustc",
+        ));
     }
     if workspace.join("tsconfig.json").exists() {
         return Ok(("npx tsc --noEmit --pretty false 2>&1".to_string(), "tsc"));
@@ -3541,6 +3725,423 @@ fn parse_ruff_json(output: &str) -> Vec<serde_json::Value> {
     diagnostics
 }
 
+/// Compute Levenshtein edit distance between two strings.
+/// Normalized similarity between two strings (0.0 = completely different, 1.0 = identical).
+fn levenshtein_similarity(a: &str, b: &str) -> f64 {
+    strsim::normalized_levenshtein(a, b)
+}
+
+/// Result of a fuzzy match: byte offsets and the strategy name.
+#[cfg_attr(not(test), allow(dead_code))]
+struct FuzzyMatch {
+    start: usize,
+    end: usize,
+    strategy: &'static str,
+}
+
+/// Try 7 fuzzy matching strategies in order when exact match fails.
+/// Returns the first unambiguous match found.
+fn fuzzy_match_search(content: &str, search: &str) -> Option<FuzzyMatch> {
+    // Strategy 1: LineTrimmedReplacer — match lines ignoring leading/trailing whitespace per line
+    if let Some(m) = fuzzy_line_trimmed(content, search) {
+        return Some(m);
+    }
+    // Strategy 2: BlockAnchorReplacer — first+last lines as anchors, fuzzy middle
+    if let Some(m) = fuzzy_block_anchor(content, search) {
+        return Some(m);
+    }
+    // Strategy 3: WhitespaceNormalizedReplacer — collapse all whitespace to single spaces
+    if let Some(m) = fuzzy_whitespace_normalized(content, search) {
+        return Some(m);
+    }
+    // Strategy 4: IndentationFlexibleReplacer — strip common indentation prefix
+    if let Some(m) = fuzzy_indentation_flexible(content, search) {
+        return Some(m);
+    }
+    // Strategy 5: EscapeNormalizedReplacer — unescape \n, \t, \" before matching
+    if let Some(m) = fuzzy_escape_normalized(content, search) {
+        return Some(m);
+    }
+    // Strategy 6: TrimmedBoundaryReplacer — trim leading/trailing blank lines from search
+    if let Some(m) = fuzzy_trimmed_boundary(content, search) {
+        return Some(m);
+    }
+    // Strategy 7: ContextAwareReplacer — anchors + ≥50% middle line match rate
+    if let Some(m) = fuzzy_context_aware(content, search) {
+        return Some(m);
+    }
+    None
+}
+
+/// Convert a line-index range to byte offsets in the original content.
+/// `line_idx` is the starting line, `line_count` is how many lines the match spans.
+/// Each line's byte length includes the `\n` separator; the trailing newline of
+/// the last matched line is excluded.
+fn lines_to_byte_range(
+    content_lines: &[&str],
+    content_len: usize,
+    line_idx: usize,
+    line_count: usize,
+) -> (usize, usize) {
+    let start: usize = content_lines[..line_idx].iter().map(|l| l.len() + 1).sum();
+    let end = start
+        + content_lines[line_idx..line_idx + line_count]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+        - 1;
+    (start, end.min(content_len))
+}
+
+/// Strategy 1: Match lines ignoring per-line leading/trailing whitespace.
+fn fuzzy_line_trimmed(content: &str, search: &str) -> Option<FuzzyMatch> {
+    let search_lines: Vec<&str> = search.lines().collect();
+    if search_lines.is_empty() {
+        return None;
+    }
+    let content_lines: Vec<&str> = content.lines().collect();
+    if content_lines.len() < search_lines.len() {
+        return None;
+    }
+    let trimmed_search: Vec<&str> = search_lines.iter().map(|l| l.trim()).collect();
+
+    let mut matches = Vec::new();
+    for i in 0..=content_lines.len() - search_lines.len() {
+        let all_match =
+            (0..search_lines.len()).all(|j| content_lines[i + j].trim() == trimmed_search[j]);
+        if all_match {
+            matches.push(i);
+        }
+    }
+
+    if matches.len() != 1 {
+        return None; // Ambiguous or no match
+    }
+
+    let line_idx = matches[0];
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
+
+    Some(FuzzyMatch {
+        start,
+        end,
+        strategy: "line_trimmed",
+    })
+}
+
+/// Strategy 2: First+last lines as anchors, fuzzy-match middle (Levenshtein ≥ 0.3).
+fn fuzzy_block_anchor(content: &str, search: &str) -> Option<FuzzyMatch> {
+    let search_lines: Vec<&str> = search.lines().collect();
+    if search_lines.len() < 3 {
+        return None; // Need at least 3 lines for anchor strategy
+    }
+    let content_lines: Vec<&str> = content.lines().collect();
+    if content_lines.len() < search_lines.len() {
+        return None;
+    }
+
+    let first_trimmed = search_lines[0].trim();
+    let last_trimmed = search_lines[search_lines.len() - 1].trim();
+    if first_trimmed.is_empty() || last_trimmed.is_empty() {
+        return None;
+    }
+
+    let mut matches = Vec::new();
+    for i in 0..=content_lines.len() - search_lines.len() {
+        let end_idx = i + search_lines.len() - 1;
+        if content_lines[i].trim() != first_trimmed {
+            continue;
+        }
+        if content_lines[end_idx].trim() != last_trimmed {
+            continue;
+        }
+        // Check middle lines with Levenshtein similarity ≥ 0.3
+        let middle_ok = (1..search_lines.len() - 1).all(|j| {
+            levenshtein_similarity(content_lines[i + j].trim(), search_lines[j].trim()) >= 0.3
+        });
+        if middle_ok {
+            matches.push(i);
+        }
+    }
+
+    if matches.len() != 1 {
+        return None;
+    }
+
+    let line_idx = matches[0];
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
+
+    Some(FuzzyMatch {
+        start,
+        end,
+        strategy: "block_anchor",
+    })
+}
+
+/// Strategy 3: Collapse all whitespace to single spaces, then match.
+fn fuzzy_whitespace_normalized(content: &str, search: &str) -> Option<FuzzyMatch> {
+    let normalize = |s: &str| -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut prev_ws = false;
+        for ch in s.chars() {
+            if ch.is_whitespace() {
+                if !prev_ws {
+                    result.push(' ');
+                    prev_ws = true;
+                }
+            } else {
+                result.push(ch);
+                prev_ws = false;
+            }
+        }
+        result
+    };
+
+    let norm_search = normalize(search);
+    if norm_search.is_empty() {
+        return None;
+    }
+    let norm_content = normalize(content);
+
+    // Find all occurrences in normalized content
+    let mut norm_matches = Vec::new();
+    let mut start = 0;
+    while let Some(pos) = norm_content[start..].find(&norm_search) {
+        norm_matches.push(start + pos);
+        start += pos + 1;
+    }
+
+    if norm_matches.len() != 1 {
+        return None; // Ambiguous or no match
+    }
+
+    // Map normalized position back to original content position
+    // Walk both strings in lockstep
+    let norm_start = norm_matches[0];
+    let norm_end = norm_start + norm_search.len();
+
+    let mut norm_pos = 0;
+    let mut orig_start = 0;
+    let mut orig_end = 0;
+    let mut prev_ws = false;
+
+    for (i, ch) in content.char_indices() {
+        if norm_pos == norm_start {
+            orig_start = i;
+        }
+        if ch.is_whitespace() {
+            if !prev_ws {
+                norm_pos += 1; // One normalized space
+                prev_ws = true;
+            }
+        } else {
+            norm_pos += ch.len_utf8();
+            prev_ws = false;
+        }
+        if norm_pos >= norm_end {
+            orig_end = i + ch.len_utf8();
+            break;
+        }
+    }
+    if orig_end == 0 {
+        orig_end = content.len();
+    }
+
+    Some(FuzzyMatch {
+        start: orig_start,
+        end: orig_end,
+        strategy: "whitespace_normalized",
+    })
+}
+
+/// Strategy 4: Strip common indentation prefix, match de-indented.
+fn fuzzy_indentation_flexible(content: &str, search: &str) -> Option<FuzzyMatch> {
+    let search_lines: Vec<&str> = search.lines().collect();
+    if search_lines.is_empty() {
+        return None;
+    }
+
+    // Find minimum indentation in search (ignoring empty lines)
+    let search_indent = search_lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    let stripped_search: Vec<String> = search_lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else if l.len() >= search_indent {
+                l[search_indent..].to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    if content_lines.len() < search_lines.len() {
+        return None;
+    }
+
+    let mut matches = Vec::new();
+    for i in 0..=content_lines.len() - search_lines.len() {
+        // Find the actual indentation of this content block
+        let block_indent = content_lines[i..i + search_lines.len()]
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.len() - l.trim_start().len())
+            .min()
+            .unwrap_or(0);
+
+        let all_match = (0..search_lines.len()).all(|j| {
+            let cl = content_lines[i + j];
+            let sl = &stripped_search[j];
+            if cl.trim().is_empty() && sl.is_empty() {
+                return true;
+            }
+            let cl_stripped = if cl.len() >= block_indent {
+                &cl[block_indent..]
+            } else {
+                cl
+            };
+            cl_stripped == sl.as_str()
+        });
+
+        if all_match {
+            matches.push(i);
+        }
+    }
+
+    if matches.len() != 1 {
+        return None;
+    }
+
+    let line_idx = matches[0];
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
+
+    Some(FuzzyMatch {
+        start,
+        end,
+        strategy: "indentation_flexible",
+    })
+}
+
+/// Strategy 5: Unescape \n, \t, \" etc. before matching.
+fn fuzzy_escape_normalized(content: &str, search: &str) -> Option<FuzzyMatch> {
+    // Only apply if search actually contains escape sequences
+    if !search.contains('\\') {
+        return None;
+    }
+
+    let unescaped = search
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\'", "'")
+        .replace("\\\\", "\\");
+
+    if unescaped == search {
+        return None; // No change after unescaping
+    }
+
+    // Try exact match with unescaped search
+    let count = content.matches(&unescaped).count();
+    if count != 1 {
+        return None;
+    }
+
+    let pos = content.find(&unescaped)?;
+    Some(FuzzyMatch {
+        start: pos,
+        end: pos + unescaped.len(),
+        strategy: "escape_normalized",
+    })
+}
+
+/// Strategy 6: Trim leading/trailing blank lines from search string.
+fn fuzzy_trimmed_boundary(content: &str, search: &str) -> Option<FuzzyMatch> {
+    let trimmed = search
+        .trim_start_matches('\n')
+        .trim_start_matches("\r\n")
+        .trim_end_matches('\n')
+        .trim_end_matches("\r\n");
+
+    if trimmed == search || trimmed.is_empty() {
+        return None; // No change after trimming, or empty
+    }
+
+    let count = content.matches(trimmed).count();
+    if count != 1 {
+        return None;
+    }
+
+    let pos = content.find(trimmed)?;
+    Some(FuzzyMatch {
+        start: pos,
+        end: pos + trimmed.len(),
+        strategy: "trimmed_boundary",
+    })
+}
+
+/// Strategy 7: First+last lines as anchors, ≥50% middle line match rate.
+fn fuzzy_context_aware(content: &str, search: &str) -> Option<FuzzyMatch> {
+    let search_lines: Vec<&str> = search.lines().collect();
+    if search_lines.len() < 3 {
+        return None;
+    }
+    let content_lines: Vec<&str> = content.lines().collect();
+    if content_lines.len() < search_lines.len() {
+        return None;
+    }
+
+    let first_trimmed = search_lines[0].trim();
+    let last_trimmed = search_lines[search_lines.len() - 1].trim();
+    if first_trimmed.is_empty() || last_trimmed.is_empty() {
+        return None;
+    }
+
+    let middle_count = search_lines.len() - 2;
+    let required_matches = middle_count.div_ceil(2); // ≥50%
+
+    let mut matches = Vec::new();
+    for i in 0..=content_lines.len() - search_lines.len() {
+        let end_idx = i + search_lines.len() - 1;
+        if content_lines[i].trim() != first_trimmed {
+            continue;
+        }
+        if content_lines[end_idx].trim() != last_trimmed {
+            continue;
+        }
+        // Count middle lines that match (trimmed equality)
+        let matched_middle = (1..search_lines.len() - 1)
+            .filter(|&j| content_lines[i + j].trim() == search_lines[j].trim())
+            .count();
+        if matched_middle >= required_matches {
+            matches.push(i);
+        }
+    }
+
+    if matches.len() != 1 {
+        return None;
+    }
+
+    let line_idx = matches[0];
+    let (start, end) =
+        lines_to_byte_range(&content_lines, content.len(), line_idx, search_lines.len());
+
+    Some(FuzzyMatch {
+        start,
+        end,
+        strategy: "context_aware",
+    })
+}
+
 fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<usize> {
     if let (Some(search), Some(replace)) = (
         edit.get("search").and_then(|v| v.as_str()),
@@ -3550,6 +4151,11 @@ fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<u
         if replace_all {
             let count = content.matches(search).count();
             if count == 0 {
+                // Fuzzy fallback for replace_all — try to find at least one match
+                if let Some(fm) = fuzzy_match_search(content, search) {
+                    content.replace_range(fm.start..fm.end, replace);
+                    return Ok(1);
+                }
                 return Err(anyhow!("search pattern not found: {search}"));
             }
             *content = content.replace(search, replace);
@@ -3557,6 +4163,11 @@ fn apply_single_edit(content: &mut String, edit: &serde_json::Value) -> Result<u
         }
         if let Some(pos) = content.find(search) {
             content.replace_range(pos..pos + search.len(), replace);
+            return Ok(1);
+        }
+        // Fuzzy fallback chain for single replacement
+        if let Some(fm) = fuzzy_match_search(content, search) {
+            content.replace_range(fm.start..fm.end, replace);
             return Ok(1);
         }
         return Err(anyhow!("search pattern not found: {search}"));
@@ -4691,6 +5302,7 @@ mod tests {
             "patch_apply",
             "patch_direct",
             "diagnostics_check",
+            "batch",
         ] {
             assert!(
                 names.contains(&expected),
@@ -5147,5 +5759,110 @@ mod tests {
             "error should mention invalid name: {err}"
         );
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    // ── Fuzzy edit matching tests ────────────────────────────────────────
+
+    #[test]
+    fn fuzzy_line_trimmed_matches_with_different_indentation() {
+        let content = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let search = "  let x = 1;\n  let y = 2;";
+        let result = fuzzy_line_trimmed(content, search);
+        assert!(result.is_some(), "should match with different indentation");
+        let m = result.unwrap();
+        assert_eq!(m.strategy, "line_trimmed");
+        assert_eq!(&content[m.start..m.end], "    let x = 1;\n    let y = 2;");
+    }
+
+    #[test]
+    fn fuzzy_line_trimmed_rejects_ambiguous() {
+        let content = "let x = 1;\nlet y = 2;\nlet x = 1;\nlet y = 2;\n";
+        let search = "let x = 1;\nlet y = 2;";
+        let result = fuzzy_line_trimmed(content, search);
+        assert!(result.is_none(), "should reject ambiguous matches");
+    }
+
+    #[test]
+    fn fuzzy_block_anchor_matches() {
+        let content = "fn foo() {\n    // comment\n    let x = 1;\n    return x;\n}\n";
+        // Search with slightly different middle line
+        let search = "fn foo() {\n    // different comment\n    let x = 1;\n    return x;\n}";
+        let result = fuzzy_block_anchor(content, search);
+        assert!(result.is_some(), "should match with fuzzy middle");
+        assert_eq!(result.unwrap().strategy, "block_anchor");
+    }
+
+    #[test]
+    fn fuzzy_whitespace_normalized_matches() {
+        let content = "let   x   =   1;";
+        let search = "let x = 1;";
+        let result = fuzzy_whitespace_normalized(content, search);
+        assert!(result.is_some(), "should match with normalized whitespace");
+        let m = result.unwrap();
+        assert_eq!(m.strategy, "whitespace_normalized");
+    }
+
+    #[test]
+    fn fuzzy_indentation_flexible_matches() {
+        let content = "    fn foo() {\n        let x = 1;\n    }\n";
+        let search = "fn foo() {\n    let x = 1;\n}";
+        let result = fuzzy_indentation_flexible(content, search);
+        assert!(result.is_some(), "should match with flexible indentation");
+        assert_eq!(result.unwrap().strategy, "indentation_flexible");
+    }
+
+    #[test]
+    fn fuzzy_escape_normalized_matches() {
+        let content = "hello\nworld";
+        let search = "hello\\nworld";
+        let result = fuzzy_escape_normalized(content, search);
+        assert!(result.is_some(), "should match after unescape");
+        assert_eq!(result.unwrap().strategy, "escape_normalized");
+    }
+
+    #[test]
+    fn fuzzy_trimmed_boundary_matches() {
+        let content = "fn foo() {\n    let x = 1;\n}\n";
+        let search = "\nfn foo() {\n    let x = 1;\n}\n\n";
+        let result = fuzzy_trimmed_boundary(content, search);
+        assert!(result.is_some(), "should match after trimming blank lines");
+        assert_eq!(result.unwrap().strategy, "trimmed_boundary");
+    }
+
+    #[test]
+    fn fuzzy_context_aware_matches_with_50pct_middle() {
+        let content =
+            "fn foo() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n}\n";
+        // First and last lines match exactly, 2 of 4 middle lines match (50%)
+        let search = "fn foo() {\n    let a = 1;\n    let DIFFERENT = 99;\n    let c = 3;\n    let ALSO_DIFFERENT = 99;\n}";
+        let result = fuzzy_context_aware(content, search);
+        assert!(result.is_some(), "should match with ≥50% middle line match");
+        assert_eq!(result.unwrap().strategy, "context_aware");
+    }
+
+    #[test]
+    fn apply_single_edit_uses_fuzzy_fallback() {
+        let mut content = "    fn main() {\n        println!(\"hello\");\n    }\n".to_string();
+        let edit = json!({
+            "search": "fn main() {\n    println!(\"hello\");\n}",
+            "replace": "fn main() {\n    println!(\"world\");\n}",
+            "all": false
+        });
+        let result = apply_single_edit(&mut content, &edit);
+        assert!(result.is_ok(), "fuzzy fallback should succeed: {result:?}");
+        assert!(content.contains("world"), "replacement should be applied");
+    }
+
+    #[test]
+    fn apply_single_edit_exact_match_preferred_over_fuzzy() {
+        let mut content = "let x = 1;\nlet y = 2;\n".to_string();
+        let edit = json!({
+            "search": "let x = 1;",
+            "replace": "let x = 42;",
+            "all": false
+        });
+        let result = apply_single_edit(&mut content, &edit);
+        assert!(result.is_ok());
+        assert_eq!(content, "let x = 42;\nlet y = 2;\n");
     }
 }

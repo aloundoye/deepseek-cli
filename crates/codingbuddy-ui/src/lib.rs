@@ -225,7 +225,8 @@ impl SlashCommand {
         if !line.starts_with('/') {
             return None;
         }
-        let mut parts = line[1..].split_whitespace();
+        let tokens = shell_words::split(&line[1..]).unwrap_or_default();
+        let mut parts = tokens.iter().map(String::as_str);
         let name = parts.next()?.to_ascii_lowercase();
         let args = parts.map(ToString::to_string).collect::<Vec<_>>();
 
@@ -2562,13 +2563,19 @@ impl GhostTextState {
     }
 
     /// Accept one word from the ghost text suggestion.
+    ///
+    /// Uses word boundary detection that treats alphanumeric and underscore
+    /// characters as part of a word (matching identifier conventions).
     pub fn accept_word(&mut self) -> Option<String> {
         if let Some(ref text) = self.suggestion {
             let trimmed = text.trim_start();
-            let word_end = trimmed
-                .find(|c: char| c.is_whitespace())
-                .map(|i| i + (text.len() - trimmed.len()))
-                .unwrap_or(text.len());
+            let leading_ws = text.len() - trimmed.len();
+            // Find end of the word: alphanumeric or underscore characters
+            let word_len = trimmed
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(trimmed.len());
+            // If we're at a non-word char, take at least one character
+            let word_end = leading_ws + word_len.max(1).min(trimmed.len());
             if word_end == 0 {
                 return self.accept_full();
             }
@@ -5612,11 +5619,20 @@ mod tests {
             SlashCommand::parse("/background list"),
             Some(SlashCommand::Background(vec!["list".to_string()]))
         );
+        // Quoted args: shell-style tokenizer strips quotes
         assert_eq!(
             SlashCommand::parse("/commit -m \"checkpoint\""),
             Some(SlashCommand::Commit(vec![
                 "-m".to_string(),
-                "\"checkpoint\"".to_string()
+                "checkpoint".to_string()
+            ]))
+        );
+        // Multi-word quoted arg preserved as single token
+        assert_eq!(
+            SlashCommand::parse("/commit -m \"fix login bug\""),
+            Some(SlashCommand::Commit(vec![
+                "-m".to_string(),
+                "fix login bug".to_string()
             ]))
         );
         assert_eq!(

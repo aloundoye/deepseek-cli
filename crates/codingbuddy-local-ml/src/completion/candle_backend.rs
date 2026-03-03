@@ -87,10 +87,10 @@ impl CandleCompletion {
             None, // top_p
         );
 
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|e| anyhow!("model lock poisoned: {}", e))?;
+        let mut model = self.model.lock().unwrap_or_else(|e| {
+            eprintln!("[local-ml] recovering from poisoned model lock");
+            e.into_inner()
+        });
 
         let mut all_tokens = input_ids.clone();
         let mut generated = String::new();

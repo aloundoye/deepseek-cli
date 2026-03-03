@@ -103,7 +103,8 @@ impl ApiClient {
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
                         let parsed = if self.cfg.stream {
@@ -364,7 +365,8 @@ impl ApiClient {
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
                         return parse_non_streaming_payload(&body);
@@ -411,7 +413,8 @@ impl ApiClient {
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
                         return parse_fim_non_streaming_payload(&body);
@@ -470,7 +473,8 @@ impl ApiClient {
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
+                    let retry_after = parse_retry_after(resp.headers());
 
                     if status.is_success() {
                         let mut content_out = String::new();
@@ -595,7 +599,8 @@ impl ApiClient {
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
+                    let retry_after = parse_retry_after(resp.headers());
 
                     if status.is_success() {
                         let mut content_out = String::new();
@@ -848,7 +853,8 @@ impl ApiClient {
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = parse_retry_after_seconds(resp.headers().get(RETRY_AFTER));
+                    // Check retry-after-ms first (milliseconds), fall back to Retry-After (seconds)
+                    let retry_after = parse_retry_after(resp.headers());
 
                     if status.is_success() {
                         // Read SSE line-by-line, invoking callback for each delta
@@ -1254,6 +1260,21 @@ fn should_retry_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
 
+/// Parse `retry-after-ms` (milliseconds) header, returns value in seconds for
+/// consistency with `parse_retry_after_seconds`. Sub-second precision is preserved
+/// by rounding up to the nearest second.
+fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get("retry-after-ms")?.to_str().ok()?.trim();
+    let ms = value.parse::<f64>().ok()?;
+    // Convert ms to seconds, rounding up (at least 1s for any positive value)
+    Some(((ms / 1000.0).ceil() as u64).max(1))
+}
+
+/// Combined retry-after parser: tries `retry-after-ms` first, then `Retry-After`.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    parse_retry_after_ms(headers).or_else(|| parse_retry_after_seconds(headers.get(RETRY_AFTER)))
+}
+
 fn parse_retry_after_seconds(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
     let value = header?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
@@ -1275,13 +1296,20 @@ fn parse_retry_after_http_date(value: &str) -> Option<u64> {
     Some(delta.max(0) as u64)
 }
 
+/// Compute retry delay with jitter.
+/// Priority: `retry-after-ms` header > `Retry-After` header > exponential backoff.
+/// Backoff is capped at 30s; header values are respected as-is.
 fn retry_delay_ms(base_ms: u64, attempt: u8, retry_after_seconds: Option<u64>) -> Duration {
     if let Some(seconds) = retry_after_seconds {
         return Duration::from_millis(seconds.saturating_mul(1000));
     }
+    // Exponential backoff with jitter: base * 2^attempt * (0.5..1.5)
     let exponent = u32::from(attempt);
-    let exponential = base_ms.saturating_mul(2_u64.saturating_pow(exponent));
-    Duration::from_millis(exponential.max(base_ms.max(100)))
+    let base = base_ms as f64 * 2f64.powi(exponent as i32);
+    // Simple deterministic jitter based on attempt number (avoids rand dependency)
+    let jitter_factor = 0.5 + (((attempt as f64 * 1.618).fract()) * 1.0); // 0.5..1.5 range
+    let delay_ms = (base * jitter_factor).min(30_000.0);
+    Duration::from_millis(delay_ms.max(base_ms as f64) as u64)
 }
 
 fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
@@ -2206,14 +2234,27 @@ mod tests {
 
     #[test]
     fn network_retry_base_uses_one_second_delays() {
-        // Verify the constant matches the spec: 1s, 2s, 4s
+        // Verify the constant matches the spec: base ~1s, ~2s, ~4s (with jitter)
         assert_eq!(NETWORK_RETRY_BASE_MS, 1000);
         let d0 = retry_delay_ms(NETWORK_RETRY_BASE_MS, 0, None);
         let d1 = retry_delay_ms(NETWORK_RETRY_BASE_MS, 1, None);
         let d2 = retry_delay_ms(NETWORK_RETRY_BASE_MS, 2, None);
-        assert_eq!(d0, Duration::from_millis(1000));
-        assert_eq!(d1, Duration::from_millis(2000));
-        assert_eq!(d2, Duration::from_millis(4000));
+        // Jitter range: base * 2^attempt * [0.5, 1.5], capped at 30s
+        let ms0 = d0.as_millis();
+        let ms1 = d1.as_millis();
+        let ms2 = d2.as_millis();
+        assert!(
+            (500..=1500).contains(&ms0),
+            "attempt 0 should be ~1s (got {ms0}ms)"
+        );
+        assert!(
+            (1000..=3000).contains(&ms1),
+            "attempt 1 should be ~2s (got {ms1}ms)"
+        );
+        assert!(
+            (2000..=6000).contains(&ms2),
+            "attempt 2 should be ~4s (got {ms2}ms)"
+        );
     }
 
     #[test]
