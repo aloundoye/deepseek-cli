@@ -284,14 +284,29 @@ Every prompt is automatically classified:
 
 - **Simple** (e.g., "fix the typo in README") → Fast response, minimal thinking
 - **Medium** (e.g., "add input validation to the form") → Reads files first, tests after
-- **Complex** (e.g., "refactor the database layer to use connection pooling") → Full planning protocol: explore codebase, create a plan, implement file by file, test after each change
+- **Complex** (e.g., "refactor the database layer to use connection pooling") → Full planning protocol with explicit phase loop: Explore (read-only) → Plan (state approach) → Execute (implement) → Verify (test). Tools are filtered per phase — e.g., write tools are unavailable during Explore. Phase transitions happen automatically based on read-only call count, plan keywords, and edit count.
+
+### Post-Edit Validation
+
+After every file edit (`fs_edit` or `fs_write`), CodingBuddy runs language-specific checks and feeds errors back to the LLM:
+
+- **Rust** (`.rs`) → `cargo check --message-format=json`
+- **TypeScript** (`.ts`, `.tsx`) → `tsc --noEmit --pretty false`
+- **Python** (`.py`) → `python3 -m py_compile`
+- **Go** (`.go`) → `go vet`
+
+If the toolchain isn't installed, the check is silently skipped. Per-language checks can be disabled in configuration.
 
 ### Automatic Model Routing
 
 - Simple and medium tasks use `deepseek-chat` (fast, efficient)
 - Complex tasks that hit errors automatically escalate to `deepseek-reasoner` (deeper thinking, up to 64K output)
 - After 3 consecutive successes, it de-escalates back to `deepseek-chat`
-- Each model gets its own optimized system prompt — `deepseek-chat` gets action-biased instructions ("just do it"), `deepseek-reasoner` gets thinking-leveraging instructions ("use your thinking for planning")
+- Each model family gets its own optimized system prompt:
+  - `deepseek-chat` → action-biased ("just do it, don't ask permission")
+  - `deepseek-reasoner` → thinking-leveraging ("use your thinking for planning")
+  - Qwen models → concise output emphasis ("1-4 lines, minimize tokens")
+  - Gemini models → methodical software engineering ("Explore First, Analyze Before Acting, Verify Thoroughly")
 
 ### Doom Loop Detection
 
@@ -345,8 +360,24 @@ Every tool call that modifies files captures a before/after snapshot:
 | `auto` | Auto-approves commands matching the allowlist |
 | `plan` | Shows what it would do without executing |
 | `locked` | Blocks all write operations |
+| `bypassPermissions` | Skips all approval checks (must be set explicitly, not reachable via cycling) |
 
-Cycle modes with **Shift+Tab** in the TUI, or:
+Cycle modes with **Shift+Tab** in the TUI (cycles ask → auto → plan → locked), or:
+
+### Default Deny Rules
+
+CodingBuddy ships with built-in safety rules that are always active (prepended before user rules):
+
+| Pattern | Action | Rationale |
+|---------|--------|-----------|
+| `rm -rf *` | Deny | Prevent recursive deletion |
+| `git push --force*` | Ask | Force push can destroy remote history |
+| `.env` edits | Ask | May contain secrets |
+| `node_modules/*` edits | Deny | Should not modify dependencies |
+| `DROP TABLE` | Ask | Destructive database operation |
+| `git reset --hard` | Ask | Discards uncommitted changes |
+| `chmod 777` | Ask | Overly permissive file permissions |
+| `curl * \| sh` | Ask | Remote code execution risk |
 
 ```bash
 deepseek --permission-mode auto chat

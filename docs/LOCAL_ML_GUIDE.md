@@ -207,6 +207,23 @@ Models are stored in `~/.cache/deepseek/<model_id>/`. Set `local_ml.cache_dir` t
 
 The vector index is stored in `.codingbuddy/vector_index.sqlite` in your project directory.
 
+### Memory-Aware Loading
+
+When `local-ml` is enabled, the model loader checks available system memory before loading and selects a strategy:
+
+| Strategy | Condition | Behavior |
+|----------|-----------|----------|
+| **Full** | Available >= 2x model size | Load at full context window |
+| **ReducedContext** | Available >= 1x model size | Load with halved context window |
+| **CpuOnly** | Available >= 0.5x model size | Force CPU-only (no GPU layers) |
+| **Skip** | Available < 0.5x model size | Skip loading, fall back to mock with warning |
+
+This prevents OOM crashes on memory-constrained machines. The check uses `sysctl` on macOS and `/proc/meminfo` on Linux.
+
+### Parallel Downloads
+
+Model files are downloaded concurrently using thread-scoped parallelism. A 60-second stall detection timer automatically retries individual files that stop making progress. Downloads resume from partial state if interrupted.
+
 ---
 
 ## Build Variants

@@ -4,9 +4,11 @@ CodingBuddy is a terminal-native coding agent written in Rust. It combines chat,
 
 ## Highlights
 - **Agent intelligence**: Adaptive complexity (Simple/Medium/Complex), planning protocols, error recovery, stuck detection
+- **Explicit phase loop**: Complex tasks follow Explore→Plan→Execute→Verify with per-phase tool filtering
+- **Post-edit validation**: LSP-like diagnostics (`cargo check`, `tsc`, `py_compile`, `go vet`) fed back to the LLM for self-correction
+- **Per-model system prompts**: Optimized prompts for DeepSeek chat/reasoner, Qwen (concise), and Gemini (methodical)
 - **Agent profiles**: Task-specialized tool filtering (build/explore/plan) — reduces decision space for weaker models
 - **Doom loop detection**: Detects and breaks repeated identical tool calls with corrective guidance
-- **Model-tier prompts**: Separate system prompts optimized for `deepseek-chat` (action-biased) vs `deepseek-reasoner` (thinking-leveraging)
 - **Bootstrap context**: Automatic project awareness (file tree, git status, repo map, dependency analysis) on first turn
 - **Per-turn retrieval**: Vector + BM25 code search with RRF fusion — fires every turn, not just the first
 - **Privacy scanning**: 3-layer secret detection (path/content/builtin patterns) with redaction on tool outputs
@@ -14,14 +16,15 @@ CodingBuddy is a terminal-native coding agent written in Rust. It combines chat,
 - **Multi-provider**: DeepSeek default, any OpenAI-compatible endpoint (GLM-5, Qwen, Ollama, OpenRouter, etc.) via setup wizard or `--model` flag
 - **Model routing**: Automatically routes complex tasks to `deepseek-reasoner`, simple tasks to `deepseek-chat`
 - **Step snapshots**: Per-tool-call file snapshots with content hashing for fine-grained undo
+- **Default deny rules**: Built-in safety rules block dangerous operations (`rm -rf`, `git push --force`, `.env` edits)
 - **14 lifecycle hooks**: SessionStart through TaskCompleted — extend behavior at every stage
 - **Interactive TUI**: Vim mode, @file autocomplete, !bash prefix, syntax highlighting, keyboard shortcuts
 - **Skills & subagents**: Forked execution, worktree isolation, custom agent definitions
 - **MCP integration**: JSON-RPC stdio/http transports, prompts as slash commands
-- **Permission engine**: 7 modes, glob allowlist/denylist, team-managed policy overlays
+- **Permission engine**: 7 modes, glob allowlist/denylist, team-managed policy overlays, bypass mode
 - **Session persistence**: JSONL event log + SQLite projections, deterministic replay
 - **LLM compaction**: Structured LLM-based conversation compaction preserving goals, progress, and findings
-- **Local ML (opt-in)**: Candle-powered embeddings and code completion, HNSW vector index — runs fully offline
+- **Local ML (opt-in)**: Candle-powered embeddings and code completion, HNSW vector index, memory-aware loading — runs fully offline
 
 ## Architecture
 
@@ -30,13 +33,14 @@ CodingBuddy is a Rust workspace organized into focused crates:
 | Crate | Role |
 |-------|------|
 | `codingbuddy-cli` | CLI dispatch, argument parsing, 24 subcommand handlers |
-| `codingbuddy-agent` | Agent engine, tool-use loop, complexity classifier, prompt construction, team mode |
-| `codingbuddy-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `EventEnvelope`), config loading, multi-provider config |
-| `codingbuddy-llm` | LLM client (`LlmClient` trait), streaming, prompt cache |
+| `codingbuddy-agent` | Agent engine, tool-use loop, complexity classifier, prompt construction, phase loop, team mode |
+| `codingbuddy-core` | Shared types (`AppConfig`, `ChatRequest`, `StreamChunk`, `TaskPhase`, `EventEnvelope`), config loading, multi-provider config |
+| `codingbuddy-llm` | LLM client (`LlmClient` trait), streaming, prompt cache, cached API key resolution |
 | `codingbuddy-tools` | Tool definitions (enriched descriptions), plugin manager, shell runner, sandbox wrapping |
-| `codingbuddy-policy` | Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings` |
+| `codingbuddy-policy` | Permission engine (denylist/allowlist), approval gates, output scanner, `ManagedSettings`, default deny rules |
 | `codingbuddy-hooks` | 14 lifecycle events, `HookRuntime`, once/disabled fields, `PermissionDecision` |
-| `codingbuddy-local-ml` | Local ML via Candle: embeddings, completion, chunking, vector index, hybrid retrieval, privacy router |
+| `codingbuddy-lsp` | Post-edit validation: `cargo check`, `tsc`, `py_compile`, `go vet` diagnostics fed back to LLM |
+| `codingbuddy-local-ml` | Local ML via Candle: embeddings, completion, chunking, vector index, hybrid retrieval, privacy router, memory-aware loading |
 | `codingbuddy-store` | Session persistence (JSONL event log + SQLite projections) |
 | `codingbuddy-memory` | Long-term memory, shadow commits, checkpoints, step snapshots |
 | `codingbuddy-index` | Full-text code index (Tantivy), RAG retrieval with citations |
@@ -64,15 +68,18 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 - The loop continues until the LLM responds without tool calls (task complete)
 - Thinking mode (`deepseek-reasoner`) can be enabled for complex reasoning
 - Adaptive complexity: Simple/Medium/Complex classification with thinking budget escalation (8K→64K)
+- Explicit phase loop: Complex tasks follow Explore→Plan→Execute→Verify with per-phase tool filtering
+- Post-edit validation: LSP-like diagnostics after file edits, fed back to LLM for immediate self-correction
 - Agent profiles: task-type tool filtering (build/explore/plan) reduces the model's decision space
 - Doom loop detection: rolling hash window detects 3+ identical tool calls and injects corrective guidance
-- Model-tier prompts: `deepseek-chat` gets action-biased instructions, `deepseek-reasoner` gets thinking-leveraging
+- Per-model system prompts: optimized for DeepSeek chat/reasoner, Qwen (concise), Gemini (methodical)
 - Bootstrap context: automatic project awareness (tree, git status, repo map, manifests) on first turn
 - Per-turn retrieval: vector + BM25 search with RRF, fires every turn with remaining-budget awareness
 - LLM compaction: structured LLM-based summary (Goal/Completed/In Progress/Key Facts/Findings/Modified Files) with code-based fallback
 - Step snapshots: before/after file state captured per tool call with SHA-256 hashing and revert support
 - Error recovery: automatic guidance injection on failures, stuck detection after repeated errors
 - Model routing: Complex+escalated tasks route to `deepseek-reasoner` automatically
+- Default deny rules: built-in safety rules for dangerous operations (rm -rf, force push, .env edits)
 
 ## Install
 
@@ -250,7 +257,7 @@ See `docs/LOCAL_ML_GUIDE.md` for the full guide.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets    # 974 tests
+cargo test --workspace --all-targets    # 1,228 tests
 cargo build --release --bin codingbuddy
 ```
 
