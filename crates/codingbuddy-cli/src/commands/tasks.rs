@@ -182,7 +182,7 @@ pub(crate) fn mission_control_payload(
     }))
 }
 
-pub(crate) fn render_mission_control_payload(payload: &Value) -> String {
+pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
     let tasks = payload
         .get("tasks")
         .and_then(Value::as_array)
@@ -313,7 +313,11 @@ pub(crate) fn render_mission_control_payload(payload: &Value) -> String {
         }
     }
     lines.push("Use /tasks show <task_id> for one task, /tasks output <task_id> for full output, or /tasks resume <task_id> to switch into a child session.".to_string());
-    lines.join("\n")
+    lines
+}
+
+pub(crate) fn render_mission_control_payload(payload: &Value) -> String {
+    render_mission_control_lines(payload).join("\n")
 }
 
 pub(crate) fn task_detail_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {

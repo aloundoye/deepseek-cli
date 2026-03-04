@@ -372,10 +372,46 @@ pub struct UiStatus {
     /// Current agent execution mode label.
     #[serde(default)]
     pub agent_mode: String,
+    #[serde(default)]
+    pub mission_control_snapshot: Vec<String>,
 }
 
 fn default_context_max() -> u64 {
     128_000
+}
+
+fn render_mission_control_panel(status: &UiStatus, shell: &ChatShell) -> String {
+    let mut lines = if status.mission_control_snapshot.is_empty() {
+        vec![
+            "Mission Control".to_string(),
+            "No persisted task snapshot is available for this session yet.".to_string(),
+        ]
+    } else {
+        status.mission_control_snapshot.clone()
+    };
+    let recent_events: Vec<String> = shell
+        .mission_control_lines
+        .iter()
+        .rev()
+        .take(6)
+        .cloned()
+        .collect();
+    if !recent_events.is_empty() {
+        lines.push(String::new());
+        lines.push("Recent activity:".to_string());
+        for event in recent_events.iter().rev() {
+            lines.push(format!("  - {event}"));
+        }
+    }
+    lines.push(String::new());
+    if status.plan_state == "awaiting_approval" {
+        lines.push(
+            "Ctrl+Y approves the current plan. Alt+Y opens a rejection prompt with feedback."
+                .to_string(),
+        );
+    }
+    lines.push("Ctrl+T hides mission control.".to_string());
+    lines.join("\n")
 }
 
 pub fn render_statusline(status: &UiStatus) -> String {
@@ -2792,6 +2828,8 @@ pub struct KeyBindings {
     pub toggle_thinking: KeyEvent,
     pub kill_background: KeyEvent,
     pub open_editor: KeyEvent,
+    pub approve_plan: KeyEvent,
+    pub reject_plan: KeyEvent,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2819,6 +2857,8 @@ struct KeyBindingsFile {
     toggle_thinking: Option<String>,
     kill_background: Option<String>,
     open_editor: Option<String>,
+    approve_plan: Option<String>,
+    reject_plan: Option<String>,
 }
 
 impl Default for KeyBindings {
@@ -2846,6 +2886,8 @@ impl Default for KeyBindings {
             toggle_thinking: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
             kill_background: KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
             open_editor: KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            approve_plan: KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            reject_plan: KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
         }
     }
 }
@@ -2917,6 +2959,12 @@ impl KeyBindings {
         }
         if let Some(value) = raw.open_editor {
             self.open_editor = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.approve_plan {
+            self.approve_plan = parse_key_event(&value)?;
+        }
+        if let Some(value) = raw.reject_plan {
+            self.reject_plan = parse_key_event(&value)?;
         }
         Ok(self)
     }
@@ -3192,6 +3240,7 @@ where
     let mut active_phase: Option<(u64, String)> = None;
     let mut last_phase_event_at = Instant::now();
     let mut last_phase_heartbeat_at = Instant::now();
+    let mut last_mission_refresh_at = Instant::now();
     let mut model_picker: Option<ModelPickerState> = None;
     let mut pending_images: Vec<PathBuf> = Vec::new();
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
@@ -3222,6 +3271,14 @@ where
                 "iteration {iteration}: {phase} in progress (heartbeat)"
             ));
             last_phase_heartbeat_at = Instant::now();
+        }
+        if mission_control_visible
+            && last_mission_refresh_at.elapsed() >= Duration::from_millis(1500)
+        {
+            if let Some(new_status) = refresh_status() {
+                status = new_status;
+            }
+            last_mission_refresh_at = Instant::now();
         }
 
         // Print any new transcript entries above the inline viewport
@@ -3374,6 +3431,12 @@ where
                     ]))
                     .wrap(Wrap { trim: false })
                     .scroll((scroll_y, 0)),
+                    stream_area,
+                );
+            } else if mission_control_visible {
+                let panel = render_mission_control_panel(&status, &shell);
+                frame.render_widget(
+                    Paragraph::new(panel).wrap(Wrap { trim: false }),
                     stream_area,
                 );
             } else {
@@ -3558,6 +3621,62 @@ where
                     .bg(mode_color)
                     .add_modifier(Modifier::BOLD),
             ));
+            if status.active_tasks > 0 {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" {} TASKS ", status.active_tasks),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !status.workflow_phase.is_empty() && status.workflow_phase != "idle" {
+                let phase_color = match status.workflow_phase.as_str() {
+                    "explore" => Color::Cyan,
+                    "plan" => Color::Blue,
+                    "approval" => Color::Yellow,
+                    "execute" => Color::Green,
+                    "verify" => Color::Magenta,
+                    "completed" => Color::Green,
+                    "failed" => Color::Red,
+                    "paused" => Color::Gray,
+                    _ => Color::White,
+                };
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" {} ", status.workflow_phase.to_ascii_uppercase()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(phase_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if status.plan_state != "none" {
+                let plan_bg = if status.plan_state == "awaiting_approval" {
+                    Color::LightYellow
+                } else {
+                    Color::Blue
+                };
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" PLAN:{} ", status.plan_state.to_ascii_uppercase()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(plan_bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if status.background_jobs > 0 {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" {} JOBS ", status.background_jobs),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             if let Some(review) = status.pr_review_status.as_deref() {
                 let (label, bg) = review_badge(review);
                 status_spans.push(Span::raw(" "));
@@ -4625,18 +4744,11 @@ where
         if key == bindings.toggle_mission_control {
             mission_control_visible = !mission_control_visible;
             info_line = if mission_control_visible {
-                let lines = if shell.mission_control_lines.is_empty() {
-                    vec![
-                        "Mission control enabled.".to_string(),
-                        "No mission-control events in this session yet.".to_string(),
-                    ]
-                } else {
-                    shell.mission_control_lines.clone()
-                };
-                for line in lines.into_iter().take(12) {
-                    shell.push_system(format!("[mission] {line}"));
+                if let Some(new_status) = refresh_status() {
+                    status = new_status;
                 }
-                "mission control enabled".to_string()
+                last_mission_refresh_at = Instant::now();
+                format!("mission control visible ({})", status.workflow_phase)
             } else {
                 "mission control hidden".to_string()
             };
@@ -4662,6 +4774,37 @@ where
             } else {
                 "plan collapse disabled".to_string()
             };
+            continue;
+        }
+        if key == bindings.approve_plan {
+            if status.plan_state != "awaiting_approval" {
+                info_line = "no plan is awaiting approval".to_string();
+                continue;
+            }
+            if is_processing {
+                info_line = "plan approval is already in progress".to_string();
+                continue;
+            }
+            let plan_cmd = "/plan approve".to_string();
+            shell.push_user(&plan_cmd);
+            is_processing = true;
+            cancelled = false;
+            active_phase = None;
+            last_phase_event_at = Instant::now();
+            last_phase_heartbeat_at = Instant::now();
+            shell.active_tool = Some("plan review".to_string());
+            info_line = "approving current plan".to_string();
+            on_submit(&plan_cmd);
+            continue;
+        }
+        if key == bindings.reject_plan {
+            if status.plan_state != "awaiting_approval" {
+                info_line = "no plan is awaiting approval".to_string();
+                continue;
+            }
+            input = "/plan reject ".to_string();
+            cursor_pos = input.len();
+            info_line = "plan reject: add feedback and press Enter".to_string();
             continue;
         }
         if key == bindings.background {
@@ -6032,6 +6175,40 @@ mod tests {
     }
 
     #[test]
+    fn mission_control_panel_renders_snapshot_and_recent_events() {
+        let status = UiStatus {
+            mission_control_snapshot: vec![
+                "Mission Control: session=abc phase=execute".to_string(),
+                "- Tasks:".to_string(),
+                "  - implement drawer [running]".to_string(),
+            ],
+            ..Default::default()
+        };
+        let mut shell = ChatShell::default();
+        shell.push_mission_control("[background] task completed: audit".to_string());
+        shell.push_mission_control("[plan] approved; workflow moved to execute".to_string());
+
+        let panel = render_mission_control_panel(&status, &shell);
+        assert!(panel.contains("Mission Control: session=abc phase=execute"));
+        assert!(panel.contains("implement drawer [running]"));
+        assert!(panel.contains("Recent activity:"));
+        assert!(panel.contains("[background] task completed: audit"));
+        assert!(panel.contains("Ctrl+T hides mission control."));
+    }
+
+    #[test]
+    fn mission_control_panel_shows_plan_review_shortcuts() {
+        let status = UiStatus {
+            plan_state: "awaiting_approval".to_string(),
+            mission_control_snapshot: vec!["Mission Control".to_string()],
+            ..Default::default()
+        };
+        let panel = render_mission_control_panel(&status, &ChatShell::default());
+        assert!(panel.contains("Ctrl+Y approves the current plan"));
+        assert!(panel.contains("Alt+Y opens a rejection prompt"));
+    }
+
+    #[test]
     fn spinner_cycles_through_frames() {
         let mut shell = ChatShell::default();
         let mut frames = Vec::new();
@@ -7032,6 +7209,10 @@ mod tests {
         assert_eq!(bindings.open_editor.code, KeyCode::Char('g'));
         assert_eq!(bindings.kill_background.code, KeyCode::Char('f'));
         assert_eq!(bindings.toggle_thinking.code, KeyCode::Char('t'));
+        assert_eq!(bindings.approve_plan.code, KeyCode::Char('y'));
+        assert_eq!(bindings.approve_plan.modifiers, KeyModifiers::CONTROL);
+        assert_eq!(bindings.reject_plan.code, KeyCode::Char('y'));
+        assert_eq!(bindings.reject_plan.modifiers, KeyModifiers::ALT);
     }
 
     // ── P1-01: rewind picker state machine tests ────────────────────────

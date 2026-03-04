@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::UsageArgs;
 use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
+use crate::commands::tasks::{mission_control_payload, render_mission_control_lines};
 use crate::output::*;
 use crate::util::*;
 
@@ -69,6 +70,13 @@ pub(crate) fn current_ui_status(
         let transcript_chars: u64 = projection.transcript.iter().map(|t| t.len() as u64).sum();
         transcript_chars / 4
     };
+    let mission_control_snapshot = if let Some(session) = session.as_ref() {
+        mission_control_payload(cwd, Some(session.session_id), 8)
+            .map(|payload| render_mission_control_lines(&payload))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     Ok(UiStatus {
         model: if force_max_think {
@@ -97,6 +105,7 @@ pub(crate) fn current_ui_status(
         pr_review_status,
         pr_url: None,
         agent_mode: String::new(),
+        mission_control_snapshot,
     })
 }
 
