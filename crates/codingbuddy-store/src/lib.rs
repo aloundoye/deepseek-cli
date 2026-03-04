@@ -1892,6 +1892,33 @@ impl Store {
         Ok(None)
     }
 
+    pub fn load_background_job_by_reference(
+        &self,
+        reference: &str,
+    ) -> Result<Option<BackgroundJobRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, kind, reference, status, metadata_json, started_at, updated_at
+             FROM background_jobs
+             WHERE reference = ?1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([reference])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(BackgroundJobRecord {
+                job_id: Uuid::parse_str(row.get::<_, String>(0)?.as_str())?,
+                kind: row.get(1)?,
+                reference: row.get(2)?,
+                status: row.get(3)?,
+                metadata_json: row.get(4)?,
+                started_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn list_background_jobs(&self) -> Result<Vec<BackgroundJobRecord>> {
         let conn = self.db()?;
         let mut stmt = conn.prepare(

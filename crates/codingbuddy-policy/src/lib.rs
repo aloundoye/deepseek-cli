@@ -858,23 +858,8 @@ fn is_edit_tool(name: &str) -> bool {
 
 /// Returns true if the tool is read-only (never modifies state).
 fn is_read_only_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "fs.read"
-            | "fs.list"
-            | "fs.glob"
-            | "fs.grep"
-            | "fs.search_rg"
-            | "index.query"
-            | "git.status"
-            | "git.diff"
-            | "git.show"
-            | "git.log"
-            | "web.fetch"
-            | "web.search"
-            | "notebook.read"
-            | "diagnostics.check"
-    )
+    matches!(name, "fs.search_rg" | "git.log")
+        || codingbuddy_core::is_internal_tool_name_read_only(name)
 }
 
 impl Default for PolicyEngine {

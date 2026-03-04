@@ -47,7 +47,10 @@ use commands::skills::run_skills;
 use commands::status::{run_context, run_status, run_usage};
 use commands::tasks::run_tasks;
 use commands::update::run_update;
-use context::{apply_cli_flags, chat_options_from_cli, ensure_llm_ready, wire_subagent_worker};
+use context::{
+    apply_cli_flags, chat_options_from_cli, ensure_llm_ready, finalize_background_subagent_run,
+    wire_subagent_worker,
+};
 use output::print_json;
 
 #[derive(Parser)]
@@ -436,6 +439,10 @@ struct AskArgs {
         default_missing_value = "true"
     )]
     tools: bool,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long, default_value = "ask")]
+    mode: String,
 }
 
 #[derive(Args, Default)]
@@ -1414,8 +1421,35 @@ fn run() -> Result<()> {
             let mut engine = AgentEngine::new(&cwd)?;
             apply_cli_flags(&mut engine, &cli);
             wire_subagent_worker(&engine, &cwd);
-            let options = chat_options_from_cli(&cli, args.tools, ChatMode::Ask);
-            let output = engine.chat_with_options(&args.prompt, options)?;
+            let mode = match args.mode.trim().to_ascii_lowercase().as_str() {
+                "ask" => ChatMode::Ask,
+                "code" | "plan" => ChatMode::Code,
+                "context" => ChatMode::Context,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "invalid --mode '{}': expected ask, code, or context",
+                        other
+                    ));
+                }
+            };
+            let mut options = chat_options_from_cli(&cli, args.tools, mode);
+            options.session_id = args
+                .session_id
+                .as_deref()
+                .map(uuid::Uuid::parse_str)
+                .transpose()?;
+            let output = engine.chat_with_options(&args.prompt, options);
+            let finalize_result = match output.as_ref() {
+                Ok(text) => finalize_background_subagent_run(&cwd, Ok(text.as_str())),
+                Err(err) => {
+                    let err_text = err.to_string();
+                    finalize_background_subagent_run(&cwd, Err(err_text.as_str()))
+                }
+            };
+            if let Err(err) = finalize_result {
+                eprintln!("warning: failed to finalize background subagent run: {err}");
+            }
+            let output = output?;
             if cli.json {
                 print_json(&json!({"output": output}))?;
             } else {

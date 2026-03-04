@@ -400,6 +400,7 @@ mod tests {
         assert!(is_agent_level_tool("spawn_task"));
         assert!(is_agent_level_tool("skill"));
         assert!(is_agent_level_tool("enter_plan_mode"));
+        assert!(is_agent_level_tool("tool_search"));
         assert!(!is_agent_level_tool("fs_read"));
         assert!(!is_agent_level_tool("bash_run"));
         assert!(!is_agent_level_tool("mcp__something"));

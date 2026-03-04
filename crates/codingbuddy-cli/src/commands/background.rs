@@ -268,10 +268,27 @@ pub(crate) fn spawn_background_process(
     kind: &str,
     reference: String,
     metadata: serde_json::Value,
+    command: Command,
+) -> Result<serde_json::Value> {
+    spawn_background_process_for_session(cwd, None, kind, reference, metadata, command)
+}
+
+pub(crate) fn spawn_background_process_for_session(
+    cwd: &Path,
+    session_id: Option<Uuid>,
+    kind: &str,
+    reference: String,
+    metadata: serde_json::Value,
     mut command: Command,
 ) -> Result<serde_json::Value> {
     let store = Store::new(cwd)?;
-    let session = ensure_session_record(cwd, &store)?;
+    let session = if let Some(session_id) = session_id {
+        store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?
+    } else {
+        ensure_session_record(cwd, &store)?
+    };
     let job_id = Uuid::now_v7();
     let started_at = Utc::now().to_rfc3339();
     let log_dir = runtime_dir(cwd).join("background").join(kind);

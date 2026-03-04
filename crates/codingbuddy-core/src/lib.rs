@@ -4,6 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod tool_metadata;
+pub use tool_metadata::{
+    ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier, is_api_tool_name_read_only,
+    is_internal_tool_name_read_only,
+};
+
 pub type Result<T> = anyhow::Result<T>;
 
 // DeepSeek API model constants.
@@ -220,6 +226,8 @@ pub enum ToolName {
     ChromeScreenshot,
     ChromeReadConsole,
     ChromeEvaluate,
+    ExtendedThinking,
+    ToolSearch,
     UserQuestion,
     TaskCreate,
     TaskUpdate,
@@ -267,6 +275,8 @@ impl ToolName {
             "chrome_screenshot" => Self::ChromeScreenshot,
             "chrome_read_console" => Self::ChromeReadConsole,
             "chrome_evaluate" => Self::ChromeEvaluate,
+            "extended_thinking" | "think_deeply" => Self::ExtendedThinking,
+            "tool_search" => Self::ToolSearch,
             "user_question" => Self::UserQuestion,
             "task_create" => Self::TaskCreate,
             "task_update" => Self::TaskUpdate,
@@ -315,6 +325,8 @@ impl ToolName {
             "chrome.screenshot" => Self::ChromeScreenshot,
             "chrome.read_console" => Self::ChromeReadConsole,
             "chrome.evaluate" => Self::ChromeEvaluate,
+            "extended_thinking" | "think_deeply" => Self::ExtendedThinking,
+            "tool_search" => Self::ToolSearch,
             "user_question" => Self::UserQuestion,
             "task_create" => Self::TaskCreate,
             "task_update" => Self::TaskUpdate,
@@ -362,6 +374,8 @@ impl ToolName {
             Self::ChromeScreenshot => "chrome.screenshot",
             Self::ChromeReadConsole => "chrome.read_console",
             Self::ChromeEvaluate => "chrome.evaluate",
+            Self::ExtendedThinking => "extended_thinking",
+            Self::ToolSearch => "tool_search",
             Self::UserQuestion => "user_question",
             Self::TaskCreate => "task_create",
             Self::TaskUpdate => "task_update",
@@ -408,6 +422,8 @@ impl ToolName {
             Self::ChromeScreenshot => "chrome_screenshot",
             Self::ChromeReadConsole => "chrome_read_console",
             Self::ChromeEvaluate => "chrome_evaluate",
+            Self::ExtendedThinking => "extended_thinking",
+            Self::ToolSearch => "tool_search",
             Self::UserQuestion => "user_question",
             Self::TaskCreate => "task_create",
             Self::TaskUpdate => "task_update",
@@ -427,62 +443,19 @@ impl ToolName {
     /// Whether this tool is read-only (allowed in plan/explore mode).
     #[must_use]
     pub fn is_read_only(&self) -> bool {
-        matches!(
-            self,
-            Self::FsRead
-                | Self::FsList
-                | Self::FsGlob
-                | Self::FsGrep
-                | Self::Batch
-                | Self::GitStatus
-                | Self::GitDiff
-                | Self::GitShow
-                | Self::WebFetch
-                | Self::WebSearch
-                | Self::IndexQuery
-                | Self::NotebookRead
-                | Self::DiagnosticsCheck
-                | Self::UserQuestion
-                | Self::TaskGet
-                | Self::TaskList
-                | Self::TaskOutput
-        )
+        self.metadata().read_only
     }
 
     /// Whether this tool is handled by AgentEngine, not LocalToolHost.
     #[must_use]
     pub fn is_agent_level(&self) -> bool {
-        matches!(
-            self,
-            Self::UserQuestion
-                | Self::TaskCreate
-                | Self::TaskUpdate
-                | Self::TaskGet
-                | Self::TaskList
-                | Self::SpawnTask
-                | Self::TaskOutput
-                | Self::TaskStop
-                | Self::EnterPlanMode
-                | Self::ExitPlanMode
-                | Self::Skill
-                | Self::KillShell
-        )
+        self.metadata().agent_level
     }
 
     /// Whether this tool is blocked during review mode.
     #[must_use]
     pub fn is_review_blocked(&self) -> bool {
-        matches!(
-            self,
-            Self::FsWrite
-                | Self::FsEdit
-                | Self::MultiEdit
-                | Self::PatchStage
-                | Self::PatchApply
-                | Self::PatchDirect
-                | Self::BashRun
-                | Self::NotebookEdit
-        )
+        self.metadata().review_blocked
     }
 
     /// All built-in tool name variants.
@@ -513,6 +486,8 @@ impl ToolName {
         Self::ChromeScreenshot,
         Self::ChromeReadConsole,
         Self::ChromeEvaluate,
+        Self::ExtendedThinking,
+        Self::ToolSearch,
         Self::UserQuestion,
         Self::TaskCreate,
         Self::TaskUpdate,
@@ -2571,28 +2546,7 @@ pub enum ReviewMode {
 impl ReviewMode {
     /// Returns true if this tool name is read-only and allowed in strict mode.
     pub fn is_read_only_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "fs_read"
-                | "fs_glob"
-                | "fs_grep"
-                | "fs_list"
-                | "git_status"
-                | "git_diff"
-                | "git_show"
-                | "git_log"
-                | "web_search"
-                | "web_fetch"
-                | "notebook_read"
-                | "index_query"
-                | "extended_thinking"
-                | "think_deeply"
-                | "spawn_task"
-                | "task_output"
-                | "task_list"
-                | "task_get"
-                | "user_question"
-        )
+        name == "git_log" || is_api_tool_name_read_only(name)
     }
 }
 
@@ -3501,13 +3455,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_is_read_only_matches_plan_mode() {
-        let read_only: Vec<&str> = ToolName::ALL
-            .iter()
-            .filter(|t| t.is_read_only())
-            .map(|t| t.as_api_name())
-            .collect();
-        // Plan mode tools must be a subset of read-only tools
+    fn tool_phase_access_reflects_runtime_contract() {
         for name in &[
             "fs_read",
             "fs_list",
@@ -3521,13 +3469,44 @@ mod tests {
             "index_query",
             "notebook_read",
             "diagnostics_check",
+            "extended_thinking",
+            "tool_search",
         ] {
-            assert!(read_only.contains(name), "{name} should be read-only");
+            let tool = ToolName::from_api_name(name).expect("known tool");
+            assert!(tool.is_read_only(), "{name} should be read-only");
+            assert!(
+                tool.is_allowed_in_phase(TaskPhase::Explore),
+                "{name} should be available in Explore"
+            );
+            assert!(
+                tool.is_allowed_in_phase(TaskPhase::Plan),
+                "{name} should be available in Plan"
+            );
         }
-        // Write tools must not be read-only
+
         for name in &["fs_write", "fs_edit", "bash_run", "notebook_edit"] {
-            assert!(!read_only.contains(name), "{name} should not be read-only");
+            let tool = ToolName::from_api_name(name).expect("known tool");
+            assert!(!tool.is_read_only(), "{name} should not be read-only");
+            assert!(
+                !tool.is_allowed_in_phase(TaskPhase::Explore),
+                "{name} should be blocked in Explore"
+            );
         }
+
+        for name in &["task_create", "task_update", "spawn_task", "exit_plan_mode"] {
+            let tool = ToolName::from_api_name(name).expect("known tool");
+            assert!(
+                tool.is_allowed_in_phase(TaskPhase::Plan),
+                "{name} should be available in Plan"
+            );
+        }
+
+        let enter_plan = ToolName::from_api_name("enter_plan_mode").expect("enter_plan_mode");
+        assert!(enter_plan.is_allowed_in_phase(TaskPhase::Explore));
+        assert!(!enter_plan.is_allowed_in_phase(TaskPhase::Plan));
+        let exit_plan = ToolName::from_api_name("exit_plan_mode").expect("exit_plan_mode");
+        assert!(!exit_plan.is_allowed_in_phase(TaskPhase::Explore));
+        assert!(exit_plan.is_allowed_in_phase(TaskPhase::Plan));
     }
 
     #[test]

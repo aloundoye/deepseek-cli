@@ -615,9 +615,9 @@ impl AgentEngine {
                     self.append_event_best_effort_for_session(
                         Some(session.session_id),
                         EventKind::SessionStateChanged {
-                        from: session.status.clone(),
-                        to: SessionState::ExecutingStep,
-                    },
+                            from: session.status.clone(),
+                            to: SessionState::ExecutingStep,
+                        },
                     );
                     Some(TaskPhase::Execute)
                 } else {
@@ -657,10 +657,7 @@ impl AgentEngine {
         // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
         let builtin_tools = tool_definitions();
         let signals = detect_signals(prompt, &self.workspace);
-        let (mut tools, extended_tools) = tiered_tool_definitions(builtin_tools, &signals);
-        if !extended_tools.is_empty() {
-            tools.push(tool_search_definition());
-        }
+        let (mut tools, mut discoverable_tools) = tiered_tool_definitions(builtin_tools, &signals);
         if let Some(ref mcp) = self.mcp
             && let Ok(mcp_tools) = mcp.discover_tools()
         {
@@ -688,6 +685,11 @@ impl AgentEngine {
         // Apply agent profile tool filtering
         if let Some(p) = profile {
             tools = agent_profiles::filter_by_profile(tools, p);
+            discoverable_tools = agent_profiles::filter_by_profile(discoverable_tools, p);
+        }
+
+        if !discoverable_tools.is_empty() {
+            tools.push(tool_search_definition());
         }
 
         let mut loop_ = tool_loop::ToolUseLoop::new(
@@ -697,6 +699,7 @@ impl AgentEngine {
             system_prompt,
             tools,
         );
+        loop_.set_discoverable_tools(discoverable_tools);
 
         // Wire stream callback
         {
@@ -866,8 +869,7 @@ impl AgentEngine {
         options.session_id = Some(session.session_id);
 
         // Load chat history from the store if possible
-        if let Ok(projection) = self.store.rebuild_from_events(session.session_id)
-        {
+        if let Ok(projection) = self.store.rebuild_from_events(session.session_id) {
             options.chat_history = projection.chat_messages;
         }
 
@@ -875,10 +877,10 @@ impl AgentEngine {
         self.append_event_best_effort_for_session(
             Some(session.session_id),
             EventKind::ChatTurn {
-            message: ChatMessage::User {
-                content: prompt_enriched.clone(),
+                message: ChatMessage::User {
+                    content: prompt_enriched.clone(),
+                },
             },
-        },
         );
 
         let result = if !options.tools {
@@ -895,12 +897,12 @@ impl AgentEngine {
             self.append_event_best_effort_for_session(
                 Some(session.session_id),
                 EventKind::ChatTurn {
-                message: ChatMessage::Assistant {
-                    content: Some(text.clone()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
+                    message: ChatMessage::Assistant {
+                        content: Some(text.clone()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                    },
                 },
-            },
             );
         }
 

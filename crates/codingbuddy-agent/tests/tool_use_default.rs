@@ -10,7 +10,7 @@ use codingbuddy_core::{
     SessionState, StreamCallback, TokenUsage,
 };
 use codingbuddy_llm::LlmClient;
-use codingbuddy_store::{Store, SubagentRunRecord, TaskQueueRecord};
+use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord, TaskQueueRecord};
 use codingbuddy_testkit::ScriptedLlm;
 use std::collections::VecDeque;
 use std::fs;
@@ -648,6 +648,102 @@ fn context_mode_uses_read_only_tools() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn code_mode_build_profile_uses_smaller_tool_surface() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![text_response("Scoped tool set ready.")]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Fix the bug in src/main.rs",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    let tool_names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert!(
+        tool_names.contains(&"fs_edit"),
+        "build profile should keep fs_edit"
+    );
+    assert!(
+        tool_names.contains(&"bash_run"),
+        "build profile should keep bash_run"
+    );
+    assert!(
+        tool_names.contains(&"tool_search"),
+        "tool_search should appear when discoverable tools exist"
+    );
+    assert!(
+        !tool_names.contains(&"web_search"),
+        "build profile should not expose web_search by default"
+    );
+    assert!(
+        !tool_names.contains(&"chrome_navigate"),
+        "chrome tools should stay hidden without chrome-specific signals"
+    );
+    Ok(())
+}
+
+#[test]
+fn tool_search_enables_matching_tools_for_followup_turns() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![("call_1", "tool_search", r#"{"query":"plan mode"}"#)]),
+        tool_call_response(vec![("call_2", "enter_plan_mode", "{}")]),
+        text_response("Planning mode entered."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let output = engine.chat_with_options(
+        "Inspect this repository",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Planning mode entered"));
+    let requests = captured.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected at least two captured requests"
+    );
+    let first_tools: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    let second_tools: Vec<&str> = requests[1]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert!(first_tools.contains(&"tool_search"));
+    assert!(
+        !first_tools.contains(&"enter_plan_mode"),
+        "enter_plan_mode should be hidden until discovered"
+    );
+    assert!(
+        second_tools.contains(&"enter_plan_mode"),
+        "tool_search should promote matching tools into the next request"
+    );
+    Ok(())
+}
+
 /// When tools=false, the analysis path is used (no tools in request).
 #[test]
 fn tools_false_uses_analysis_path() -> Result<()> {
@@ -962,6 +1058,56 @@ fn spawn_task_persists_child_session_and_run_metadata() -> Result<()> {
 }
 
 #[test]
+fn spawn_task_background_keeps_task_running() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let job_id = Uuid::now_v7();
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "spawn_task",
+                &format!(
+                    r#"{{"prompt":"analyze the project","description":"explore project","subagent_type":"explore","run_in_background":true,"max_turns":5,"model":"deepseek-chat"}}"#
+                ),
+            )]),
+            text_response("Delegated task queued."),
+        ],
+    )?;
+
+    let worker: codingbuddy_agent::SubagentWorkerFn = Arc::new(move |_task| {
+        Ok(serde_json::json!({
+            "job_id": job_id,
+            "status": "running",
+        })
+        .to_string())
+    });
+    engine.set_subagent_worker(worker);
+
+    let output = engine.chat_with_options(
+        "Analyze this project in background",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Delegated task queued"));
+    let store = Store::new(temp.path())?;
+    let tasks = store.list_tasks(None)?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].status, "in_progress");
+    let run = store
+        .load_subagent_run_for_task(tasks[0].task_id)?
+        .expect("subagent run");
+    assert_eq!(run.status, "running");
+    assert_eq!(run.background_job_id, Some(job_id));
+    Ok(())
+}
+
+#[test]
 fn task_output_tool_surfaces_persisted_run_payload() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
@@ -1048,6 +1194,95 @@ fn task_output_tool_surfaces_persisted_run_payload() -> Result<()> {
 }
 
 #[test]
+fn task_stop_cancels_background_run() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let store = Store::new(temp.path())?;
+    let session = Session {
+        session_id: Uuid::now_v7(),
+        workspace_root: temp.path().to_string_lossy().to_string(),
+        baseline_commit: None,
+        status: SessionState::Idle,
+        budgets: SessionBudgets {
+            per_turn_seconds: 30,
+            max_think_tokens: 1024,
+        },
+        active_plan_id: None,
+    };
+    store.save_session(&session)?;
+
+    let task_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+    let job_id = Uuid::now_v7();
+    let now = chrono::Utc::now().to_rfc3339();
+    store.insert_task(&TaskQueueRecord {
+        task_id,
+        session_id: session.session_id,
+        title: "Background task".to_string(),
+        description: None,
+        priority: 1,
+        status: "in_progress".to_string(),
+        outcome: None,
+        artifact_path: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    })?;
+    store.upsert_subagent_run(&SubagentRunRecord {
+        run_id,
+        session_id: Some(session.session_id),
+        task_id: Some(task_id),
+        child_session_id: None,
+        background_job_id: Some(job_id),
+        name: "bg".to_string(),
+        goal: "work".to_string(),
+        status: "running".to_string(),
+        output: None,
+        error: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    })?;
+    store.upsert_background_job(&BackgroundJobRecord {
+        job_id,
+        kind: "subagent".to_string(),
+        reference: format!("subagent:{run_id}"),
+        status: "running".to_string(),
+        metadata_json: serde_json::json!({}).to_string(),
+        started_at: now.clone(),
+        updated_at: now,
+    })?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![(
+                "call_1",
+                "task_stop",
+                &format!(r#"{{"task_id":"{task_id}"}}"#),
+            )]),
+            text_response("Stopped the task."),
+        ],
+    )?;
+
+    let output = engine.chat_with_options(
+        "Stop the background task",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Stopped the task"));
+    let task = store.load_task(task_id)?.expect("task");
+    assert_eq!(task.status, "cancelled");
+    let run = store.load_subagent_run(run_id)?.expect("run");
+    assert_eq!(run.status, "stopped");
+    let job = store.load_background_job(job_id)?.expect("job");
+    assert_eq!(job.status, "stopped");
+    Ok(())
+}
+
+#[test]
 fn task_create_persists_to_store() -> Result<()> {
     let temp = tempfile::tempdir()?;
     init_workspace(temp.path())?;
@@ -1077,7 +1312,10 @@ fn task_create_persists_to_store() -> Result<()> {
     let tasks = store.list_tasks(None)?;
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].title, "Audit parser");
-    assert_eq!(tasks[0].description.as_deref(), Some("Inspect parser edge cases"));
+    assert_eq!(
+        tasks[0].description.as_deref(),
+        Some("Inspect parser edge cases")
+    );
     assert_eq!(tasks[0].priority, 2);
     Ok(())
 }
@@ -1110,7 +1348,10 @@ fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
     assert!(output.contains("Plan saved"));
     let store = Store::new(temp.path())?;
     let session = store.load_latest_session()?.expect("session");
-    assert_eq!(session.status, codingbuddy_core::SessionState::AwaitingApproval);
+    assert_eq!(
+        session.status,
+        codingbuddy_core::SessionState::AwaitingApproval
+    );
     let plan_id = session.active_plan_id.expect("active plan");
     let plan = store.load_plan(plan_id)?.expect("plan");
     assert_eq!(plan.version, 2);

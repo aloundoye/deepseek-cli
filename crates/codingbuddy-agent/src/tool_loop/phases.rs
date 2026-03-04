@@ -4,9 +4,6 @@
 //! per phase. Simple/Medium tasks bypass phases entirely.
 
 use codingbuddy_core::{TaskPhase, ToolName};
-use codingbuddy_tools::PLAN_MODE_TOOLS;
-
-use super::helpers::is_read_only_api_name;
 
 fn is_mcp_tool(tool_name: &str) -> bool {
     tool_name.starts_with("mcp__")
@@ -19,14 +16,9 @@ pub fn is_tool_allowed_in_phase(tool_name: &str, phase: TaskPhase) -> bool {
         return true;
     }
 
-    match phase {
-        TaskPhase::Explore => is_read_only_api_name(tool_name),
-        TaskPhase::Plan => PLAN_MODE_TOOLS.contains(&tool_name),
-        TaskPhase::Verify => {
-            tool_name == ToolName::BashRun.as_api_name() || is_read_only_api_name(tool_name)
-        }
-        TaskPhase::Execute => true,
-    }
+    ToolName::from_api_name(tool_name)
+        .map(|tool| tool.is_allowed_in_phase(phase))
+        .unwrap_or(phase == TaskPhase::Execute)
 }
 
 /// Determine if a phase transition should occur based on the current state.
@@ -130,6 +122,18 @@ mod tests {
     fn explore_allows_mcp() {
         assert!(is_tool_allowed_in_phase(
             "mcp__server__tool",
+            TaskPhase::Explore
+        ));
+    }
+
+    #[test]
+    fn explore_allows_enter_plan_mode() {
+        assert!(is_tool_allowed_in_phase(
+            "enter_plan_mode",
+            TaskPhase::Explore
+        ));
+        assert!(!is_tool_allowed_in_phase(
+            "exit_plan_mode",
             TaskPhase::Explore
         ));
     }

@@ -10,50 +10,14 @@
 //! - **Extended**: Available on-demand via the `tool_search` meta-tool.
 //!   The model discovers these when it needs capabilities beyond the core set.
 
-use codingbuddy_core::{FunctionDefinition, ToolDefinition};
+use codingbuddy_core::{FunctionDefinition, ToolDefinition, ToolName, ToolTier};
 use serde_json::json;
-
-/// Classification of a tool into a loading tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolTier {
-    /// Always included in every API call.
-    Core,
-    /// Included when contextually relevant.
-    Contextual,
-    /// Available on-demand via `tool_search`.
-    Extended,
-}
 
 /// Classify a tool by its API name into a tier.
 pub fn tool_tier(api_name: &str) -> ToolTier {
-    match api_name {
-        // Core: fundamental tools always available
-        "fs_read" | "fs_write" | "fs_edit" | "fs_glob" | "fs_grep" | "fs_list" | "bash_run"
-        | "multi_edit" => ToolTier::Core,
-
-        // Core: agent-level tools always available
-        "user_question" | "spawn_task" | "extended_thinking" | "think_deeply" => ToolTier::Core,
-
-        // Contextual: git tools (included in git repos)
-        "git_status" | "git_diff" | "git_show" => ToolTier::Contextual,
-
-        // Contextual: diagnostics (included when build system detected)
-        "diagnostics_check" => ToolTier::Contextual,
-
-        // Contextual: web tools (included when prompt mentions URLs/docs)
-        "web_fetch" | "web_search" => ToolTier::Contextual,
-
-        // Contextual: index (included for large codebases)
-        "index_query" => ToolTier::Contextual,
-
-        // Contextual: task management (included when multi-step work detected)
-        "task_create" | "task_update" | "task_get" | "task_list" | "task_output" => {
-            ToolTier::Contextual
-        }
-
-        // Everything else: notebooks, chrome, patches, plan mode, skills
-        _ => ToolTier::Extended,
-    }
+    ToolName::from_api_name(api_name)
+        .map(|tool| tool.tier())
+        .unwrap_or(ToolTier::Extended)
 }
 
 /// Signals used to decide which contextual tools to include.
@@ -84,16 +48,21 @@ pub fn contextual_tool_names(signals: &ToolContextSignals) -> Vec<&'static str> 
     if signals.prompt_mentions_web {
         tools.extend_from_slice(&["web_fetch", "web_search"]);
     }
-    if signals.codebase_file_count > 500 {
+    if signals.codebase_file_count > 500 || signals.prompt_is_complex {
         tools.push("index_query");
     }
     if signals.prompt_is_complex {
         tools.extend_from_slice(&[
+            "extended_thinking",
             "task_create",
             "task_update",
             "task_get",
             "task_list",
             "task_output",
+            "task_stop",
+            "spawn_task",
+            "enter_plan_mode",
+            "exit_plan_mode",
         ]);
     }
     tools
@@ -127,6 +96,10 @@ pub fn detect_signals(prompt: &str, workspace: &std::path::Path) -> ToolContextS
             || prompt_lower.contains("migrate")
             || prompt_lower.contains("restructure")
             || prompt_lower.contains("implement")
+            || prompt_lower.contains("plan")
+            || prompt_lower.contains("review")
+            || prompt_lower.contains("audit")
+            || prompt_lower.contains("analyze")
             || prompt_lower.contains("build a")
             || prompt_lower.contains("create a"),
     }
@@ -207,8 +180,8 @@ pub fn tool_search_definition() -> ToolDefinition {
                           need capabilities like: notebooks (notebook_read, notebook_edit), \
                           browser automation (chrome_navigate, chrome_click, chrome_screenshot), \
                           patch management (patch_stage, patch_apply), skills, or plan mode. \
-                          Returns matching tool names and descriptions that you can then use \
-                          directly."
+                          Returns matching tool names and descriptions and makes those matches \
+                          available in subsequent turns."
                 .to_string(),
             strict: None,
             parameters: json!({
@@ -272,9 +245,7 @@ mod tests {
         assert_eq!(tool_tier("bash_run"), ToolTier::Core);
         assert_eq!(tool_tier("multi_edit"), ToolTier::Core);
         assert_eq!(tool_tier("user_question"), ToolTier::Core);
-        assert_eq!(tool_tier("spawn_task"), ToolTier::Core);
-        assert_eq!(tool_tier("extended_thinking"), ToolTier::Core);
-        assert_eq!(tool_tier("think_deeply"), ToolTier::Core); // alias
+        assert_eq!(tool_tier("tool_search"), ToolTier::Core);
     }
 
     #[test]
@@ -296,9 +267,8 @@ mod tests {
 
     #[test]
     fn think_deeply_alias_accepted() {
-        // Both names should resolve to Core tier
-        assert_eq!(tool_tier("extended_thinking"), ToolTier::Core);
-        assert_eq!(tool_tier("think_deeply"), ToolTier::Core);
+        assert_eq!(tool_tier("extended_thinking"), ToolTier::Contextual);
+        assert_eq!(tool_tier("think_deeply"), ToolTier::Contextual);
     }
 
     #[test]
@@ -307,6 +277,9 @@ mod tests {
         assert_eq!(tool_tier("web_fetch"), ToolTier::Contextual);
         assert_eq!(tool_tier("index_query"), ToolTier::Contextual);
         assert_eq!(tool_tier("diagnostics_check"), ToolTier::Contextual);
+        assert_eq!(tool_tier("spawn_task"), ToolTier::Contextual);
+        assert_eq!(tool_tier("enter_plan_mode"), ToolTier::Contextual);
+        assert_eq!(tool_tier("extended_thinking"), ToolTier::Contextual);
     }
 
     #[test]
@@ -314,7 +287,7 @@ mod tests {
         assert_eq!(tool_tier("notebook_read"), ToolTier::Extended);
         assert_eq!(tool_tier("chrome_navigate"), ToolTier::Extended);
         assert_eq!(tool_tier("patch_stage"), ToolTier::Extended);
-        assert_eq!(tool_tier("enter_plan_mode"), ToolTier::Extended);
+        assert_eq!(tool_tier("skill"), ToolTier::Extended);
     }
 
     #[test]
