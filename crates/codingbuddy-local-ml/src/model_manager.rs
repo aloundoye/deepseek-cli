@@ -416,13 +416,13 @@ impl ModelManager {
         fs::create_dir_all(&manifests)?;
 
         // Resume from partial state if available
-        let mut partial = self
-            .load_partial_state(model_id)
-            .unwrap_or_else(|| PartialDownloadState {
-                model_id: model_id.to_string(),
-                hf_repo: hf_repo.to_string(),
-                completed_digests: BTreeMap::new(),
-            });
+        let mut partial =
+            self.load_partial_state(model_id)
+                .unwrap_or_else(|| PartialDownloadState {
+                    model_id: model_id.to_string(),
+                    hf_repo: hf_repo.to_string(),
+                    completed_digests: BTreeMap::new(),
+                });
 
         let mut manifest_files = partial.completed_digests.clone();
         let total = files.len();

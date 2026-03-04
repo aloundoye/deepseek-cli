@@ -2373,7 +2373,10 @@ impl Store {
 
     pub fn delete_task(&self, task_id: Uuid) -> Result<()> {
         let conn = self.db()?;
-        conn.execute("DELETE FROM task_queue WHERE task_id = ?1", [task_id.to_string()])?;
+        conn.execute(
+            "DELETE FROM task_queue WHERE task_id = ?1",
+            [task_id.to_string()],
+        )?;
         Ok(())
     }
 

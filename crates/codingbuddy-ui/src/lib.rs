@@ -103,6 +103,8 @@ pub enum TuiStreamEvent {
         name: String,
         error: String,
     },
+    /// A persisted system/background notice arrived outside the active turn.
+    SystemNotice { line: String, error: bool },
     /// Watch mode auto-triggered because comment digest changed.
     WatchTriggered { digest: u64, comment_count: usize },
     /// Display an inline image in the terminal (raw bytes).
@@ -3738,6 +3740,17 @@ where
                     ));
                     shell.push_error(format!("[subagent] failed {name}: {error_compact}"));
                     info_line = format!("subagent failed: {name}");
+                }
+                TuiStreamEvent::SystemNotice { line, error } => {
+                    if line.starts_with("[background]") || line.starts_with("[task]") {
+                        shell.push_mission_control(line.clone());
+                    }
+                    if error {
+                        shell.push_error(line.clone());
+                    } else {
+                        shell.push_system(line.clone());
+                    }
+                    info_line = truncate_inline(&line, 96);
                 }
                 TuiStreamEvent::WatchTriggered { comment_count, .. } => {
                     shell.push_system(format!(
