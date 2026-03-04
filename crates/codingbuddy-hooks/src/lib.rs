@@ -609,17 +609,23 @@ impl HookRuntime {
         // Exit code 2 = block.
         let blocked_by_exit = exit_code == Some(2);
 
-        // Try to parse stdout as JSON for decisions.
-        let stdout_output = child
-            .stdout
-            .and_then(|mut out| {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut out, &mut buf).ok()?;
-                Some(buf)
-            })
-            .unwrap_or_default();
-
-        let output: HookOutput = serde_json::from_str(&stdout_output).unwrap_or_default();
+        // Only parse stdout when the process exited normally. On timeout, descendants
+        // may still hold stdout fds open after killing the shell wrapper, which can make
+        // a blocking read hang until those descendants exit.
+        let output = if !timed_out && status.is_some() {
+            let stdout_output = child
+                .stdout
+                .take()
+                .and_then(|mut out| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut out, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            serde_json::from_str(&stdout_output).unwrap_or_default()
+        } else {
+            HookOutput::default()
+        };
 
         let blocked = blocked_by_exit || output.decision.as_deref() == Some("block");
 
