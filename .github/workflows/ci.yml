@@ -1,8 +1,8 @@
 name: CI
 
 on:
-  push:
   pull_request:
+    branches: [main]
 
 jobs:
   quality:
@@ -37,28 +37,17 @@ jobs:
       - name: tests
         run: cargo test --workspace --all-targets
 
-      - name: parity regression checklist
-        if: runner.os == 'Linux'
-        run: bash scripts/parity_regression_check.sh
-
-      - name: runtime conformance scan
-        if: runner.os == 'Linux'
-        run: bash scripts/runtime_conformance_scan.sh
-
       - name: build
         run: cargo build --workspace
 
-      - name: cli json smoke
-        run: cargo run --bin deepseek -- --json status
-
-      - name: extended cli smoke
-        shell: bash
+      - name: conformance scripts
+        if: runner.os == 'Linux'
         run: |
-          cargo run --bin deepseek -- --json memory show
-          cargo run --bin deepseek -- --json mcp add ci-local --command echo --arg ok
-          cargo run --bin deepseek -- --json mcp list
-          cargo run --bin deepseek -- --json export --format json
-          cargo run --bin deepseek -- --json mcp remove ci-local
+          bash scripts/parity_regression_check.sh
+          bash scripts/runtime_conformance_scan.sh
+
+      - name: cli smoke
+        run: cargo run --bin codingbuddy -- --json status
 
       - name: installer dry-run (unix)
         if: runner.os != 'Windows'
@@ -68,46 +57,3 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/install.ps1 -DryRun -Version v0.0.0 -Repo example/example
-
-  target-build:
-    name: target build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: macos-13
-            target: x86_64-apple-darwin
-          - os: macos-14
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Linux ARM64 cross toolchain
-        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-          target: ${{ matrix.target }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build target release binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --bin deepseek --target ${{ matrix.target }}

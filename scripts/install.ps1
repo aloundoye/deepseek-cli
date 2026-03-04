@@ -1,7 +1,7 @@
 param(
   [string]$Version = "latest",
-  [string]$Repo = "aloutndoye/deepseek-cli",
-  [string]$InstallDir = "$env:LOCALAPPDATA\\Programs\\deepseek\\bin",
+  [string]$Repo = "aloundoye/codingbuddy",
+  [string]$InstallDir = "$env:LOCALAPPDATA\Programs\codingbuddy\bin",
   [string]$Target = "",
   [switch]$DryRun
 )
@@ -18,7 +18,7 @@ if ([string]::IsNullOrWhiteSpace($Target)) {
     throw "unsupported architecture for prebuilt binaries: $arch"
   }
 }
-$asset = "deepseek-$Target.zip"
+$asset = "codingbuddy-$Target.zip"
 
 if ($Version -eq "latest") {
   $baseUrl = "https://github.com/$Repo/releases/latest/download"
@@ -39,7 +39,7 @@ if ($DryRun) {
   exit 0
 }
 
-$tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("deepseek-install-" + [guid]::NewGuid().ToString())
+$tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codingbuddy-install-" + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Path $tmpRoot | Out-Null
 
 $assetPath = Join-Path $tmpRoot $asset
@@ -64,15 +64,26 @@ if (Test-Path $checksumsPath) {
 }
 
 Expand-Archive -Path $assetPath -DestinationPath $tmpRoot -Force
-$binary = Get-ChildItem -Path $tmpRoot -Recurse -Filter "deepseek.exe" | Select-Object -First 1
+$binary = Get-ChildItem -Path $tmpRoot -Recurse -Filter "codingbuddy.exe" | Select-Object -First 1
 if (-not $binary) {
-  throw "unable to locate extracted deepseek.exe"
+  throw "unable to locate extracted codingbuddy.exe"
 }
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-$destination = Join-Path $InstallDir "deepseek.exe"
+$destination = Join-Path $InstallDir "codingbuddy.exe"
 Copy-Item -Path $binary.FullName -Destination $destination -Force
 
-Write-Host "Installed deepseek to $destination"
-Write-Host "If needed, add to PATH: $InstallDir"
-Write-Host "Uninstall: Remove-Item $destination"
+# Auto-add to user PATH
+$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($currentPath -notlike "*$InstallDir*") {
+  [Environment]::SetEnvironmentVariable("Path", "$InstallDir;$currentPath", "User")
+  Write-Host "Added $InstallDir to user PATH."
+}
+
+# Cleanup
+Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
+
+Write-Host ""
+Write-Host "CodingBuddy installed! Run: codingbuddy"
+Write-Host "Location: $destination"
+Write-Host "Uninstall: Remove-Item `"$destination`""

@@ -2,12 +2,39 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: extract
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.extract.outputs.version }}" >/dev/null 2>&1; then
+            echo "Release v${{ steps.extract.outputs.version }} already exists, skipping."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build (${{ matrix.target }})
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,7 +72,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -53,80 +80,71 @@ jobs:
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --bin deepseek --target ${{ matrix.target }}
+        run: cargo build --release --bin codingbuddy --target ${{ matrix.target }}
 
       - name: Package artifact (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/deepseek dist/deepseek
-          tar -C dist -czf dist/deepseek-${{ matrix.target }}.tar.gz deepseek
-          rm dist/deepseek
+          cp target/${{ matrix.target }}/release/codingbuddy dist/codingbuddy
+          tar -C dist -czf dist/codingbuddy-${{ matrix.target }}.tar.gz codingbuddy
+          rm dist/codingbuddy
 
       - name: Package artifact (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/deepseek.exe dist/deepseek.exe
-          Compress-Archive -Path dist/deepseek.exe -DestinationPath dist/deepseek-${{ matrix.target }}.zip -Force
-          Remove-Item dist/deepseek.exe
+          Copy-Item target/${{ matrix.target }}/release/codingbuddy.exe dist/codingbuddy.exe
+          Compress-Archive -Path dist/codingbuddy.exe -DestinationPath dist/codingbuddy-${{ matrix.target }}.zip -Force
+          Remove-Item dist/codingbuddy.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deepseek-${{ matrix.target }}
-          path: dist/deepseek-${{ matrix.target }}.${{ matrix.archive_ext }}
+          name: codingbuddy-${{ matrix.target }}
+          path: dist/codingbuddy-${{ matrix.target }}.${{ matrix.archive_ext }}
 
   publish:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
     permissions:
       contents: write
-      id-token: write
-      attestations: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
 
       - name: Flatten artifacts
         run: |
-          find dist -mindepth 2 -type f -name 'deepseek-*' -exec cp {} dist/ \;
+          find dist -mindepth 2 -type f -name 'codingbuddy-*' -exec cp {} dist/ \;
 
       - name: Generate checksums
         run: |
           cd dist
           shopt -s nullglob
-          files=(deepseek-*.tar.gz deepseek-*.zip)
+          files=(codingbuddy-*.tar.gz codingbuddy-*.zip)
           if [ ${#files[@]} -eq 0 ]; then
             echo "no release artifacts found" >&2
             exit 1
           fi
           sha256sum "${files[@]}" > checksums.txt
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          path: .
-          format: spdx-json
-          output-file: dist/sbom.spdx.json
-
-      - name: Generate provenance attestation
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: |
-            dist/deepseek-*.tar.gz
-            dist/deepseek-*.zip
-            dist/checksums.txt
-            dist/sbom.spdx.json
+      - name: Create tag
+        run: |
+          git tag "v${{ needs.check-version.outputs.version }}"
+          git push origin "v${{ needs.check-version.outputs.version }}"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          generate_release_notes: true
           files: |
-            dist/deepseek-*.tar.gz
-            dist/deepseek-*.zip
+            dist/codingbuddy-*.tar.gz
+            dist/codingbuddy-*.zip
             dist/checksums.txt
-            dist/sbom.spdx.json

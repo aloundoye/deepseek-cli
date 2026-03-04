@@ -2,16 +2,16 @@
 set -euo pipefail
 
 VERSION="latest"
-REPO="${DEEPSEEK_REPO:-aloutndoye/deepseek-cli}"
-INSTALL_DIR="${DEEPSEEK_INSTALL_DIR:-}"
-TARGET="${DEEPSEEK_TARGET:-}"
+REPO="${CODINGBUDDY_REPO:-aloundoye/codingbuddy}"
+INSTALL_DIR="${CODINGBUDDY_INSTALL_DIR:-}"
+TARGET="${CODINGBUDDY_TARGET:-}"
 DRY_RUN=0
 
 usage() {
   cat <<USAGE
-Install DeepSeek CLI from GitHub releases.
+Install CodingBuddy from GitHub releases.
 
-Usage: scripts/install.sh [--version <tag|latest>] [--repo <owner/repo>] [--install-dir <dir>] [--target <triple>] [--dry-run]
+Usage: install.sh [--version <tag|latest>] [--repo <owner/repo>] [--install-dir <dir>] [--target <triple>] [--dry-run]
 USAGE
 }
 
@@ -97,7 +97,7 @@ if [[ -z "$TARGET" ]]; then
   esac
 fi
 
-asset="deepseek-${TARGET}.tar.gz"
+asset="codingbuddy-${TARGET}.tar.gz"
 if [[ "$VERSION" == "latest" ]]; then
   base_url="https://github.com/${REPO}/releases/latest/download"
 else
@@ -142,18 +142,48 @@ fi
 
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir"
 
-bin_path="$tmp_dir/deepseek"
+bin_path="$tmp_dir/codingbuddy"
 if [[ ! -f "$bin_path" ]]; then
-  bin_path="$(find "$tmp_dir" -type f -name deepseek | head -n 1)"
+  bin_path="$(find "$tmp_dir" -type f -name codingbuddy | head -n 1)"
 fi
 if [[ -z "$bin_path" || ! -f "$bin_path" ]]; then
-  echo "unable to locate extracted deepseek binary" >&2
+  echo "unable to locate extracted codingbuddy binary" >&2
   exit 1
 fi
 
 mkdir -p "$INSTALL_DIR"
-install -m 0755 "$bin_path" "$INSTALL_DIR/deepseek"
+install -m 0755 "$bin_path" "$INSTALL_DIR/codingbuddy"
 
-echo "Installed deepseek to $INSTALL_DIR/deepseek"
-echo "If needed, add to PATH: export PATH=\"$INSTALL_DIR:\$PATH\""
-echo "Uninstall: rm \"$INSTALL_DIR/deepseek\""
+# Auto-add to PATH if installing to ~/.local/bin and it's not already on PATH
+if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]]; then
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+      export_line='export PATH="$HOME/.local/bin:$PATH"'
+      shell_name="$(basename "$SHELL")"
+      profile=""
+      case "$shell_name" in
+        zsh)  profile="$HOME/.zshrc" ;;
+        bash)
+          if [[ -f "$HOME/.bashrc" ]]; then
+            profile="$HOME/.bashrc"
+          else
+            profile="$HOME/.profile"
+          fi
+          ;;
+        *)    profile="$HOME/.profile" ;;
+      esac
+      if [[ -n "$profile" ]] && ! grep -qF '.local/bin' "$profile" 2>/dev/null; then
+        echo "" >> "$profile"
+        echo "# Added by CodingBuddy installer" >> "$profile"
+        echo "$export_line" >> "$profile"
+        echo "Added $INSTALL_DIR to PATH in $profile"
+      fi
+      ;;
+  esac
+fi
+
+echo ""
+echo "CodingBuddy installed! Run: codingbuddy"
+echo "Location: $INSTALL_DIR/codingbuddy"
+echo "Uninstall: rm \"$INSTALL_DIR/codingbuddy\""

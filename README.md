@@ -88,15 +88,15 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 macOS/Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main/scripts/install.sh | bash -s -- --version latest
+curl -fsSL https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```powershell
-$script = Join-Path $env:TEMP "deepseek-install.ps1"
-Invoke-WebRequest https://raw.githubusercontent.com/aloutndoye/deepseek-cli/main/scripts/install.ps1 -OutFile $script
-& $script -Version latest
+$script = Join-Path $env:TEMP "codingbuddy-install.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/aloundoye/codingbuddy/main/scripts/install.ps1 -OutFile $script
+& $script
 ```
 
 ### Option 2: Build from source
