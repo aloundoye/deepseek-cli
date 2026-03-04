@@ -19,15 +19,19 @@ use syntect::highlighting::{Theme as SyntectTheme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 mod keybindings;
+mod panels;
 mod statusline;
+mod theme;
 
 #[cfg(test)]
 use keybindings::KeyBindingsFile;
 pub use keybindings::{KeyBindings, load_keybindings};
+use panels::{load_artifact_lines, render_mission_control_panel};
 #[cfg(test)]
 use statusline::render_statusline_spans;
 use statusline::review_badge;
 pub use statusline::{UiStatus, render_statusline};
+pub use theme::TuiTheme;
 
 /// Lazy-initialized syntect highlighting assets.
 struct SyntectAssets {
@@ -352,40 +356,6 @@ pub fn render_prompt_suggestions(is_empty_input: bool) -> Vec<Span<'static>> {
         ));
     }
     spans
-}
-
-fn render_mission_control_panel(status: &UiStatus, shell: &ChatShell) -> String {
-    let mut lines = if status.mission_control_snapshot.is_empty() {
-        vec![
-            "Mission Control".to_string(),
-            "No persisted task snapshot is available for this session yet.".to_string(),
-        ]
-    } else {
-        status.mission_control_snapshot.clone()
-    };
-    let recent_events: Vec<String> = shell
-        .mission_control_lines
-        .iter()
-        .rev()
-        .take(6)
-        .cloned()
-        .collect();
-    if !recent_events.is_empty() {
-        lines.push(String::new());
-        lines.push("Recent activity:".to_string());
-        for event in recent_events.iter().rev() {
-            lines.push(format!("  - {event}"));
-        }
-    }
-    lines.push(String::new());
-    if status.plan_state == "awaiting_approval" {
-        lines.push(
-            "Ctrl+Y approves the current plan. Alt+Y opens a rejection prompt with feedback."
-                .to_string(),
-        );
-    }
-    lines.push("Ctrl+T hides mission control.".to_string());
-    lines.join("\n")
 }
 
 /// Check if a word is a keyword in common programming languages.
@@ -2475,109 +2445,6 @@ fn autocomplete_at_suggestions(prefix: &str, workspace: &Path) -> Vec<String> {
     matches
 }
 
-fn parse_theme_color(name: &str) -> Color {
-    match name.to_ascii_lowercase().as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "white" => Color::White,
-        "gray" | "grey" => Color::Gray,
-        "darkgray" | "darkgrey" => Color::DarkGray,
-        "lightred" => Color::LightRed,
-        "lightgreen" => Color::LightGreen,
-        "lightyellow" => Color::LightYellow,
-        "lightblue" => Color::LightBlue,
-        "lightmagenta" => Color::LightMagenta,
-        "lightcyan" => Color::LightCyan,
-        _ => Color::Cyan,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TuiTheme {
-    pub primary: Color,
-    pub secondary: Color,
-    pub error: Color,
-}
-
-impl Default for TuiTheme {
-    fn default() -> Self {
-        Self {
-            primary: Color::Cyan,
-            secondary: Color::Yellow,
-            error: Color::Red,
-        }
-    }
-}
-
-impl TuiTheme {
-    pub fn from_config(primary: &str, secondary: &str, error: &str) -> Self {
-        Self {
-            primary: parse_theme_color(primary),
-            secondary: parse_theme_color(secondary),
-            error: parse_theme_color(error),
-        }
-    }
-}
-
-pub fn load_artifact_lines(workspace: &Path) -> Vec<String> {
-    let artifacts_dir = workspace.join(".codingbuddy").join("artifacts");
-    let mut lines = Vec::new();
-    if !artifacts_dir.exists() {
-        lines.push("No artifacts found.".to_string());
-        lines.push(format!("Directory: {}", artifacts_dir.display()));
-        return lines;
-    }
-    let mut entries: Vec<_> = fs::read_dir(&artifacts_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    if entries.is_empty() {
-        lines.push("No task artifacts found.".to_string());
-        return lines;
-    }
-    for entry in entries {
-        let task_dir = entry.path();
-        let task_id = entry.file_name().to_string_lossy().to_string();
-        lines.push(format!("## Task: {task_id}"));
-        for name in &["plan.md", "diff.patch", "verification.md"] {
-            let file_path = task_dir.join(name);
-            if file_path.exists() {
-                let size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-                lines.push(format!("  {name} ({size} bytes)"));
-                // Show first few lines as preview
-                if let Ok(content) = fs::read_to_string(&file_path) {
-                    for (i, line) in content.lines().take(5).enumerate() {
-                        lines.push(format!("    {}", line));
-                        if i == 4 {
-                            lines.push("    ...".to_string());
-                        }
-                    }
-                }
-            }
-        }
-        // Also show any other files in the task directory
-        if let Ok(files) = fs::read_dir(&task_dir) {
-            for file in files.filter_map(|f| f.ok()) {
-                let fname = file.file_name().to_string_lossy().to_string();
-                if !["plan.md", "diff.patch", "verification.md"].contains(&fname.as_str()) {
-                    let size = fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-                    lines.push(format!("  {fname} ({size} bytes)"));
-                }
-            }
-        }
-        lines.push(String::new());
-    }
-    lines
-}
-
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<String>,
@@ -2933,7 +2800,7 @@ where
                     stream_area,
                 );
             } else if mission_control_visible {
-                let panel = render_mission_control_panel(&status, &shell);
+                let panel = render_mission_control_panel(&status, &shell.mission_control_lines);
                 frame.render_widget(
                     Paragraph::new(panel).wrap(Wrap { trim: false }),
                     stream_area,
@@ -5647,7 +5514,7 @@ mod tests {
         shell.push_mission_control("[background] task completed: audit".to_string());
         shell.push_mission_control("[plan] approved; workflow moved to execute".to_string());
 
-        let panel = render_mission_control_panel(&status, &shell);
+        let panel = render_mission_control_panel(&status, &shell.mission_control_lines);
         assert!(panel.contains("Mission Control: session=abc phase=execute"));
         assert!(panel.contains("implement drawer [running]"));
         assert!(panel.contains("Recent activity:"));
@@ -5662,7 +5529,7 @@ mod tests {
             mission_control_snapshot: vec!["Mission Control".to_string()],
             ..Default::default()
         };
-        let panel = render_mission_control_panel(&status, &ChatShell::default());
+        let panel = render_mission_control_panel(&status, &[]);
         assert!(panel.contains("Ctrl+Y approves the current plan"));
         assert!(panel.contains("Alt+Y opens a rejection prompt"));
     }
