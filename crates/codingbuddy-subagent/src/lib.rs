@@ -415,12 +415,16 @@ fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
 ///
 /// Memory is stored per-project, per-agent:
 /// `~/.codingbuddy/projects/<hash>/agents/<name>/MEMORY.md`
+fn user_home_or_temp_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 pub fn agent_memory_path(workspace: &Path, agent_name: &str) -> PathBuf {
     let hash = project_hash(workspace);
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
+    user_home_or_temp_dir()
         .join(".codingbuddy/projects")
         .join(&hash)
         .join("agents")
@@ -458,10 +462,7 @@ fn project_hash(workspace: &Path) -> String {
 /// Path to a subagent's transcript file.
 pub fn transcript_path(workspace: &Path, agent_id: Uuid) -> PathBuf {
     let hash = project_hash(workspace);
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
+    user_home_or_temp_dir()
         .join(".codingbuddy/projects")
         .join(&hash)
         .join("subagents")

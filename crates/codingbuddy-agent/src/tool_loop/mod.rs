@@ -3448,6 +3448,7 @@ mod tests {
             }
         }
 
+        #[cfg(not(target_os = "windows"))]
         fn executed_count(&self) -> usize {
             self.execute_count
                 .load(std::sync::atomic::Ordering::Relaxed)
