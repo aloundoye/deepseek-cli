@@ -19,12 +19,13 @@ use codingbuddy_ui::{
     run_tui_shell_with_bindings,
 };
 use serde_json::json;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 
 // Shared helpers
@@ -53,9 +54,11 @@ use crate::commands::git::{
 };
 use crate::commands::mcp::run_mcp;
 use crate::commands::memory::{run_export, run_memory};
+use crate::commands::plan::{current_plan_payload, handle_plan_slash, render_plan_notice_lines};
 use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
-use crate::commands::status::{current_ui_status, run_context, run_status, run_usage};
+use crate::commands::status::{current_ui_status, run_context, run_usage};
+use crate::commands::tasks::handle_tasks_slash;
 
 pub(crate) fn is_max_think_selection(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
@@ -840,35 +843,6 @@ fn agents_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
     }))
 }
 
-fn mission_control_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
-    let store = Store::new(cwd)?;
-    let session_id = store
-        .load_latest_session()?
-        .map(|session| session.session_id);
-    let tasks = store.list_tasks(session_id)?;
-    let subagents = store.list_subagent_runs(session_id, limit)?;
-    let running_subagents = subagents
-        .iter()
-        .filter(|run| run.status.eq_ignore_ascii_case("running"))
-        .count();
-    let failed_subagents = subagents
-        .iter()
-        .filter(|run| run.status.eq_ignore_ascii_case("failed"))
-        .count();
-    Ok(json!({
-        "schema": "deepseek.chat.mission_control.v1",
-        "session_id": session_id.map(|id| id.to_string()),
-        "tasks": tasks,
-        "subagents": subagents,
-        "summary": {
-            "task_count": tasks.len(),
-            "subagent_count": subagents.len(),
-            "running_subagents": running_subagents,
-            "failed_subagents": failed_subagents,
-        }
-    }))
-}
-
 fn render_agents_payload(payload: &serde_json::Value) -> String {
     let runs = payload
         .get("agents")
@@ -902,60 +876,237 @@ fn render_agents_payload(payload: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
-fn render_mission_control_payload(payload: &serde_json::Value) -> String {
-    let tasks = payload
-        .get("tasks")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let subagents = payload
-        .get("subagents")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut lines = vec![format!(
-        "Mission Control: {} task(s), {} subagent run(s)",
-        tasks.len(),
-        subagents.len()
-    )];
-    if tasks.is_empty() {
-        lines.push("- Tasks: none".to_string());
-    } else {
-        lines.push("- Tasks:".to_string());
-        for task in tasks.iter().take(10) {
-            let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("task");
-            let status = task
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let priority = task
-                .get("priority")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default();
-            lines.push(format!("  - {title} [{status}] priority={priority}"));
-        }
-    }
-    if subagents.is_empty() {
-        lines.push("- Subagents: none".to_string());
-    } else {
-        lines.push("- Subagents:".to_string());
-        for run in subagents.iter().take(10) {
-            let name = run
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("subagent");
-            let status = run
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let run_id = run
-                .get("run_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            lines.push(format!("  - {name} [{status}] {run_id}"));
+fn render_todos_payload(payload: &serde_json::Value) -> String {
+    let count = payload
+        .get("count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let mut lines = vec![
+        format!("Workspace comment scan: {count} result(s)"),
+        "This is not the agent task queue. Use /tasks for delegated work, subagents, and background jobs.".to_string(),
+    ];
+    if let Some(rows) = payload.get("items").and_then(|value| value.as_array()) {
+        for row in rows.iter().take(20) {
+            lines.push(format!(
+                "- {}:{} {}",
+                row["path"].as_str().unwrap_or_default(),
+                row["line"].as_u64().unwrap_or(0),
+                row["text"].as_str().unwrap_or_default()
+            ));
         }
     }
     lines.join("\n")
+}
+
+fn session_focus_payload(cwd: &Path, session_id: Uuid) -> Result<serde_json::Value> {
+    let store = Store::new(cwd)?;
+    let session = store
+        .load_session(session_id)?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+    let projection = store.rebuild_from_events(session.session_id)?;
+    Ok(json!({
+        "schema": "deepseek.chat.resume.v1",
+        "session_id": session.session_id.to_string(),
+        "state": format!("{:?}", session.status),
+        "turns": projection.transcript.len(),
+        "steps": projection.step_status.len(),
+        "message": format!(
+            "switched active chat session to {} ({} turns, state={:?})",
+            session.session_id,
+            projection.transcript.len(),
+            session.status
+        ),
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct SessionLifecycleNotice {
+    line: String,
+    is_error: bool,
+}
+
+fn active_session_id_for_notices(
+    cwd: &Path,
+    session_override: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    if let Some(session_id) = session_override {
+        return Ok(Some(session_id));
+    }
+    Ok(Store::new(cwd)?
+        .load_latest_session()?
+        .map(|session| session.session_id))
+}
+
+fn latest_session_event_seq(cwd: &Path, session_id: Uuid) -> Result<u64> {
+    Ok(read_session_events(cwd, session_id)?
+        .last()
+        .map(|event| event.seq_no)
+        .unwrap_or(0))
+}
+
+fn background_task_notice(
+    store: &Store,
+    task_id: &str,
+    status: &str,
+) -> Result<Option<SessionLifecycleNotice>> {
+    let Ok(task_id) = Uuid::parse_str(task_id) else {
+        return Ok(None);
+    };
+    let Some(run) = store.load_subagent_run_for_task(task_id)? else {
+        return Ok(None);
+    };
+    if run.background_job_id.is_none() {
+        return Ok(None);
+    }
+    let Some(task) = store.load_task(task_id)? else {
+        return Ok(None);
+    };
+    let subject = if task.title.trim().is_empty() {
+        run.name.clone()
+    } else {
+        task.title.clone()
+    };
+    let detail = task
+        .outcome
+        .as_deref()
+        .or(run.output.as_deref())
+        .or(run.error.as_deref())
+        .unwrap_or_default();
+    let detail = truncate_inline(&detail.replace('\n', " "), 120);
+    let is_error = matches!(status, "failed" | "cancelled");
+    let line = match status {
+        "completed" if detail.is_empty() => format!("[background] task completed: {subject}"),
+        "completed" => format!("[background] task completed: {subject} — {detail}"),
+        "failed" if detail.is_empty() => format!("[background] task failed: {subject}"),
+        "failed" => format!("[background] task failed: {subject} — {detail}"),
+        "cancelled" if detail.is_empty() => format!("[background] task cancelled: {subject}"),
+        "cancelled" => format!("[background] task cancelled: {subject} — {detail}"),
+        _ => return Ok(None),
+    };
+    Ok(Some(SessionLifecycleNotice { line, is_error }))
+}
+
+fn background_job_notice(
+    store: &Store,
+    job_id: Uuid,
+    reason: &str,
+) -> Result<Option<SessionLifecycleNotice>> {
+    let Some(job) = store.load_background_job(job_id)? else {
+        return Ok(None);
+    };
+    if job.kind == "subagent" {
+        return Ok(None);
+    }
+    let reason_lower = reason.to_ascii_lowercase();
+    let subject = if job.reference.trim().is_empty() {
+        format!("{} {}", job.kind, job.job_id)
+    } else {
+        format!("{} {}", job.kind, job.reference)
+    };
+    let is_error = reason_lower.contains("fail");
+    let line = match reason_lower.as_str() {
+        "manual_stop" => format!("[background] stopped: {subject}"),
+        "completed" => format!("[background] completed: {subject}"),
+        _ if is_error => format!("[background] failed: {subject} — {reason}"),
+        _ => format!("[background] update: {subject} — {reason}"),
+    };
+    Ok(Some(SessionLifecycleNotice { line, is_error }))
+}
+
+fn plan_notices(store: &Store, session_id: Uuid) -> Result<Vec<SessionLifecycleNotice>> {
+    let Some(session) = store.load_session(session_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(payload) = current_plan_payload(store, Some(&session))? else {
+        return Ok(Vec::new());
+    };
+    Ok(render_plan_notice_lines(&payload)
+        .into_iter()
+        .map(|line| SessionLifecycleNotice {
+            line,
+            is_error: false,
+        })
+        .collect())
+}
+
+fn plan_state_transition_notice(
+    from: &codingbuddy_core::SessionState,
+    to: &codingbuddy_core::SessionState,
+) -> Option<SessionLifecycleNotice> {
+    let line = match (from, to) {
+        (
+            codingbuddy_core::SessionState::AwaitingApproval,
+            codingbuddy_core::SessionState::ExecutingStep,
+        ) => "[plan] approved; workflow moved to execute".to_string(),
+        (
+            codingbuddy_core::SessionState::AwaitingApproval,
+            codingbuddy_core::SessionState::Planning,
+        ) => "[plan] returned to drafting for revision".to_string(),
+        _ => return None,
+    };
+    Some(SessionLifecycleNotice {
+        line,
+        is_error: false,
+    })
+}
+
+fn poll_session_lifecycle_notices(
+    cwd: &Path,
+    session_override: Option<Uuid>,
+    watermarks: &mut HashMap<Uuid, u64>,
+) -> Result<Vec<SessionLifecycleNotice>> {
+    let Some(session_id) = active_session_id_for_notices(cwd, session_override)? else {
+        return Ok(Vec::new());
+    };
+    let store = Store::new(cwd)?;
+    let baseline = if let Some(seq) = watermarks.get(&session_id).copied() {
+        seq
+    } else {
+        let latest = latest_session_event_seq(cwd, session_id)?;
+        watermarks.insert(session_id, latest);
+        if let Some(session) = store.load_session(session_id)?
+            && matches!(
+                session.status,
+                codingbuddy_core::SessionState::AwaitingApproval
+            )
+            && session.active_plan_id.is_some()
+        {
+            return plan_notices(&store, session_id);
+        }
+        return Ok(Vec::new());
+    };
+    let mut next_seq = baseline;
+    let mut notices = Vec::new();
+    for event in read_session_events(cwd, session_id)? {
+        if event.seq_no <= baseline {
+            continue;
+        }
+        next_seq = next_seq.max(event.seq_no);
+        let event_notices = match event.kind {
+            EventKind::TaskUpdated { task_id, status } => {
+                background_task_notice(&store, &task_id, &status)?
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            }
+            EventKind::BackgroundJobStopped { job_id, reason } => {
+                background_job_notice(&store, job_id, &reason)?
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            }
+            EventKind::PlanCreated { .. } | EventKind::PlanRevised { .. } => {
+                plan_notices(&store, session_id)?
+            }
+            EventKind::SessionStateChanged { from, to } => plan_state_transition_notice(&from, &to)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        for notice in event_notices {
+            notices.push(notice);
+        }
+    }
+    watermarks.insert(session_id, next_seq);
+    Ok(notices)
 }
 
 pub(crate) fn run_chat(
@@ -965,6 +1116,7 @@ pub(crate) fn run_chat(
     allow_tools: bool,
     tui: bool,
     cli: Option<&crate::Cli>,
+    initial_session_id: Option<Uuid>,
 ) -> Result<()> {
     use std::io::{IsTerminal, Write, stdin, stdout};
 
@@ -1013,6 +1165,7 @@ pub(crate) fn run_chat(
             debug_context,
             detect_urls,
             watch_files_enabled,
+            initial_session_id,
         );
     }
     if tui && !interactive_tty {
@@ -1024,11 +1177,13 @@ pub(crate) fn run_chat(
     let mut active_chat_mode = ChatMode::Code;
     let mut last_watch_digest: Option<u64> = None;
     let mut pending_images: Vec<codingbuddy_core::ImageContent> = vec![];
+    let mut selected_session_id = initial_session_id;
+    let mut lifecycle_notice_watermarks = HashMap::<Uuid, u64>::new();
     if !json_mode {
         println!("deepseek chat (type 'exit' to quit)");
         println!(
             "model: {} thinking=auto approvals: bash={} edits={} tools={}",
-            cfg.llm.base_model,
+            cfg.llm.active_base_model(),
             cfg.policy.approve_bash,
             cfg.policy.approve_edits,
             if allow_tools {
@@ -1043,6 +1198,13 @@ pub(crate) fn run_chat(
     }
     loop {
         if !json_mode {
+            for notice in poll_session_lifecycle_notices(
+                cwd,
+                selected_session_id,
+                &mut lifecycle_notice_watermarks,
+            )? {
+                println!("{}", notice.line);
+            }
             print!("> ");
             stdout().flush()?;
         }
@@ -1252,15 +1414,22 @@ pub(crate) fn run_chat(
                     if json_mode {
                         print_json(&json!({
                             "force_max_think": force_max_think,
-                            "model": cfg.llm.base_model,
+                            "model": if force_max_think {
+                                cfg.llm.active_reasoner_model()
+                            } else {
+                                cfg.llm.active_base_model()
+                            },
                             "thinking_enabled": force_max_think,
                         }))?;
                     } else if force_max_think {
-                        println!("model mode: thinking-enabled ({})", cfg.llm.base_model);
+                        println!(
+                            "model mode: thinking-enabled ({})",
+                            cfg.llm.active_reasoner_model()
+                        );
                     } else {
                         println!(
                             "model mode: auto ({} thinking=on-demand)",
-                            cfg.llm.base_model
+                            cfg.llm.active_base_model()
                         );
                     }
                 }
@@ -1455,14 +1624,45 @@ pub(crate) fn run_chat(
                         json_mode,
                     )?;
                 }
-                SlashCommand::Plan => {
-                    force_max_think = true;
-                    if json_mode {
-                        print_json(&json!({"plan_mode": true, "thinking_enabled": true}))?;
+                SlashCommand::Plan(args) => {
+                    if args.is_empty() {
+                        let store = Store::new(cwd)?;
+                        let session = if let Some(session_id) = selected_session_id {
+                            store.load_session(session_id)?
+                        } else {
+                            store.load_latest_session()?
+                        };
+                        if current_plan_payload(&store, session.as_ref())?.is_some() {
+                            let response =
+                                handle_plan_slash(cwd, &["show".to_string()], selected_session_id)?;
+                            if let Some(session_id) = response.session_switch {
+                                selected_session_id = Some(session_id);
+                            }
+                            if json_mode {
+                                print_json(&response.payload)?;
+                            } else {
+                                println!("{}", response.text);
+                            }
+                        } else {
+                            force_max_think = true;
+                            if json_mode {
+                                print_json(&json!({"plan_mode": true, "thinking_enabled": true}))?;
+                            } else {
+                                println!(
+                                    "plan mode active; prompts will prefer structured planning with thinking enabled. Use /plan show|approve|reject <feedback> for the persisted review flow."
+                                );
+                            }
+                        }
                     } else {
-                        println!(
-                            "plan mode active; prompts will prefer structured planning with thinking enabled."
-                        );
+                        let response = handle_plan_slash(cwd, &args, selected_session_id)?;
+                        if let Some(session_id) = response.session_switch {
+                            selected_session_id = Some(session_id);
+                        }
+                        if json_mode {
+                            print_json(&response.payload)?;
+                        } else {
+                            println!("{}", response.text);
+                        }
                     }
                 }
                 SlashCommand::Add(args) => {
@@ -1610,7 +1810,15 @@ pub(crate) fn run_chat(
                         println!("{output}");
                     }
                 }
-                SlashCommand::Status => run_status(cwd, json_mode)?,
+                SlashCommand::Status => {
+                    let status =
+                        current_ui_status(cwd, &cfg, force_max_think, selected_session_id)?;
+                    if json_mode {
+                        print_json(&serde_json::to_value(&status)?)?;
+                    } else {
+                        println!("{}", render_statusline(&status));
+                    }
+                }
                 SlashCommand::Effort(level) => {
                     let level = level.unwrap_or_else(|| "medium".to_string());
                     let normalized = level.to_ascii_lowercase();
@@ -1703,12 +1911,15 @@ pub(crate) fn run_chat(
                         println!("{}", render_agents_payload(&payload));
                     }
                 }
-                SlashCommand::Tasks(_args) => {
-                    let payload = mission_control_payload(cwd, 20)?;
+                SlashCommand::Tasks(args) => {
+                    let response = handle_tasks_slash(cwd, &args, selected_session_id)?;
+                    if let Some(session_id) = response.session_switch {
+                        selected_session_id = Some(session_id);
+                    }
                     if json_mode {
-                        print_json(&payload)?;
+                        print_json(&response.payload)?;
                     } else {
-                        println!("{}", render_mission_control_payload(&payload));
+                        println!("{}", response.text);
                     }
                 }
                 SlashCommand::Review(args) => {
@@ -1953,9 +2164,35 @@ pub(crate) fn run_chat(
                 }
                 SlashCommand::Resume(session_id) => {
                     if let Some(id) = session_id {
-                        println!("Use 'deepseek --resume {id}' to resume a session.");
+                        let session_id = Uuid::parse_str(&id)
+                            .map_err(|_| anyhow!("invalid session ID: {id}"))?;
+                        let payload = session_focus_payload(cwd, session_id)?;
+                        selected_session_id = Some(session_id);
+                        if json_mode {
+                            print_json(&payload)?;
+                        } else {
+                            println!(
+                                "{}",
+                                payload["message"]
+                                    .as_str()
+                                    .unwrap_or("active chat session updated")
+                            );
+                        }
                     } else {
-                        println!("Use 'deepseek --continue' or 'deepseek --resume <id>'.");
+                        let message = selected_session_id
+                            .map(|id| format!("current chat session: {id}"))
+                            .unwrap_or_else(|| {
+                                "Use 'codingbuddy --continue' or 'codingbuddy --resume <id>'."
+                                    .to_string()
+                            });
+                        if json_mode {
+                            print_json(&json!({
+                                "session_id": selected_session_id.map(|id| id.to_string()),
+                                "message": message,
+                            }))?;
+                        } else {
+                            println!("{message}");
+                        }
                     }
                 }
                 SlashCommand::Stats => {
@@ -2145,20 +2382,7 @@ pub(crate) fn run_chat(
                     if json_mode {
                         print_json(&payload)?;
                     } else {
-                        println!(
-                            "TODO scan: {} result(s)",
-                            payload["count"].as_u64().unwrap_or(0)
-                        );
-                        if let Some(rows) = payload["items"].as_array() {
-                            for row in rows.iter().take(20) {
-                                println!(
-                                    "- {}:{} {}",
-                                    row["path"].as_str().unwrap_or_default(),
-                                    row["line"].as_u64().unwrap_or(0),
-                                    row["text"].as_str().unwrap_or_default()
-                                );
-                            }
-                        }
+                        println!("{}", render_todos_payload(&payload));
                     }
                 }
                 SlashCommand::Chrome(args) => {
@@ -2195,6 +2419,7 @@ pub(crate) fn run_chat(
                                     teammate_mode: teammate_mode.clone(),
                                     detect_urls,
                                     watch_files: watch_files_enabled,
+                                    session_id: selected_session_id,
                                     ..Default::default()
                                 },
                             )?;
@@ -2377,7 +2602,7 @@ pub(crate) fn run_chat(
 
         let images_for_turn = std::mem::take(&mut pending_images);
         if !json_mode && !json_events {
-            crate::md_render::print_role_header("assistant", &cfg.llm.base_model);
+            crate::md_render::print_role_header("assistant", &cfg.llm.active_base_model());
         }
         let output = engine.chat_with_options(
             prompt,
@@ -2392,14 +2617,20 @@ pub(crate) fn run_chat(
                 detect_urls,
                 watch_files: watch_files_enabled,
                 images: images_for_turn,
+                session_id: selected_session_id,
                 ..Default::default()
             },
         )?;
+        if selected_session_id.is_none() {
+            selected_session_id = Store::new(cwd)?
+                .load_latest_session()?
+                .map(|session| session.session_id);
+        }
         last_assistant_response = Some(output.clone());
         if !json_mode && !json_events {
             crate::md_render::print_role_footer();
         }
-        let ui_status = current_ui_status(cwd, &cfg, force_max_think)?;
+        let ui_status = current_ui_status(cwd, &cfg, force_max_think, selected_session_id)?;
         if json_mode {
             let suggestions = generate_prompt_suggestions(&output);
             print_json(
@@ -2411,6 +2642,13 @@ pub(crate) fn run_chat(
             let suggestions = generate_prompt_suggestions(&output);
             if !suggestions.is_empty() {
                 println!("\x1b[2m  suggestions: {}\x1b[0m", suggestions.join(" | "));
+            }
+            for notice in poll_session_lifecycle_notices(
+                cwd,
+                selected_session_id,
+                &mut lifecycle_notice_watermarks,
+            )? {
+                println!("{}", notice.line);
             }
         }
 
@@ -2450,6 +2688,7 @@ pub(crate) fn run_chat(
                             teammate_mode: teammate_mode.clone(),
                             detect_urls,
                             watch_files: true,
+                            session_id: selected_session_id,
                             ..Default::default()
                         },
                     )?;
@@ -2474,6 +2713,7 @@ pub(crate) fn run_chat_tui(
     debug_context: bool,
     detect_urls: bool,
     watch_files_enabled: bool,
+    initial_session_id: Option<Uuid>,
 ) -> Result<()> {
     let debug = std::env::var("CODINGBUDDY_DEBUG").is_ok();
     if debug {
@@ -2489,6 +2729,7 @@ pub(crate) fn run_chat_tui(
     let read_only_mode = Arc::new(AtomicBool::new(false));
     let active_chat_mode = Arc::new(std::sync::Mutex::new(ChatMode::Code));
     let last_watch_digest = Arc::new(std::sync::Mutex::new(None::<u64>));
+    let active_session_id = Arc::new(std::sync::Mutex::new(initial_session_id));
     let pending_images = Arc::new(std::sync::Mutex::new(
         Vec::<codingbuddy_core::ImageContent>::new(),
     ));
@@ -2515,7 +2756,12 @@ pub(crate) fn run_chat_tui(
         }));
     }
 
-    let status = current_ui_status(cwd, cfg, force_max_think.load(Ordering::Relaxed))?;
+    let status = current_ui_status(
+        cwd,
+        cfg,
+        force_max_think.load(Ordering::Relaxed),
+        initial_session_id,
+    )?;
     let bindings = load_tui_keybindings(cwd, cfg);
     let theme = TuiTheme::from_config(&cfg.theme.primary, &cfg.theme.secondary, &cfg.theme.error);
     let fmt_refresh = Arc::clone(&force_max_think);
@@ -2523,6 +2769,40 @@ pub(crate) fn run_chat_tui(
     let read_only_for_closure = Arc::clone(&read_only_mode);
     let active_mode_for_closure = Arc::clone(&active_chat_mode);
     let watch_digest_for_closure = Arc::clone(&last_watch_digest);
+    let active_session_for_closure = Arc::clone(&active_session_id);
+
+    {
+        let tx_notices = tx.clone();
+        let cwd_for_notices = cwd.to_path_buf();
+        let active_session_for_notices = Arc::clone(&active_session_id);
+        thread::spawn(move || {
+            let mut watermarks = HashMap::<Uuid, u64>::new();
+            loop {
+                let session_override = active_session_for_notices
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or(None);
+                if let Ok(notices) = poll_session_lifecycle_notices(
+                    &cwd_for_notices,
+                    session_override,
+                    &mut watermarks,
+                ) {
+                    for notice in notices {
+                        if tx_notices
+                            .send(TuiStreamEvent::SystemNotice {
+                                line: notice.line,
+                                error: notice.is_error,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(400));
+            }
+        });
+    }
 
     // Build ML completion callback for ghost text (if local_ml + autocomplete enabled).
     // Model loading runs in a background thread to avoid blocking TUI startup.
@@ -2786,12 +3066,12 @@ pub(crate) fn run_chat_tui(
                     if force_max_think.load(Ordering::Relaxed) {
                         format!(
                             "model mode: thinking-enabled ({})",
-                            cfg.llm.base_model
+                            cfg.llm.active_reasoner_model()
                         )
                     } else {
                         format!(
                             "model mode: auto ({} thinking=on-demand)",
-                            cfg.llm.base_model
+                            cfg.llm.active_base_model()
                         )
                     }
                 }
@@ -2860,9 +3140,44 @@ pub(crate) fn run_chat_tui(
                     )?;
                     format!("exported transcript {}", record.output_path)
                 }
-                SlashCommand::Plan => {
-                    force_max_think.store(true, Ordering::Relaxed);
-                    "plan mode enabled (thinking enabled)".to_string()
+                SlashCommand::Plan(args) => {
+                    if args.is_empty() {
+                        let store = Store::new(cwd)?;
+                        let session_override = active_session_for_closure
+                            .lock()
+                            .map_err(|_| anyhow!("failed to access active session state"))?
+                            .to_owned();
+                        let session = if let Some(session_id) = session_override {
+                            store.load_session(session_id)?
+                        } else {
+                            store.load_latest_session()?
+                        };
+                        if current_plan_payload(&store, session.as_ref())?.is_some() {
+                            let response =
+                                handle_plan_slash(cwd, &["show".to_string()], session_override)?;
+                            if let Some(session_id) = response.session_switch
+                                && let Ok(mut guard) = active_session_for_closure.lock()
+                            {
+                                *guard = Some(session_id);
+                            }
+                            response.text
+                        } else {
+                            force_max_think.store(true, Ordering::Relaxed);
+                            "plan mode enabled (thinking enabled). Use /plan show|approve|reject <feedback> for the persisted review flow.".to_string()
+                        }
+                    } else {
+                        let session_override = active_session_for_closure
+                            .lock()
+                            .map_err(|_| anyhow!("failed to access active session state"))?
+                            .to_owned();
+                        let response = handle_plan_slash(cwd, &args, session_override)?;
+                        if let Some(session_id) = response.session_switch
+                            && let Ok(mut guard) = active_session_for_closure.lock()
+                        {
+                            *guard = Some(session_id);
+                        }
+                        response.text
+                    }
                 }
                 SlashCommand::Add(args) => {
                     let mut guard = additional_dirs_for_closure
@@ -2945,7 +3260,16 @@ pub(crate) fn run_chat_tui(
                     format!("Reverted 1 conversation turn. {checkpoint_msg}")
                 }
                 SlashCommand::Status => {
-                    let status = current_ui_status(cwd, cfg, force_max_think.load(Ordering::Relaxed))?;
+                    let session_override = active_session_for_closure
+                        .lock()
+                        .map(|guard| *guard)
+                        .unwrap_or(None);
+                    let status = current_ui_status(
+                        cwd,
+                        cfg,
+                        force_max_think.load(Ordering::Relaxed),
+                        session_override,
+                    )?;
                     render_statusline(&status)
                 }
                 SlashCommand::Effort(level) => {
@@ -3081,9 +3405,18 @@ pub(crate) fn run_chat_tui(
                     let payload = agents_payload(cwd, 20)?;
                     render_agents_payload(&payload)
                 }
-                SlashCommand::Tasks(_) => {
-                    let payload = mission_control_payload(cwd, 20)?;
-                    render_mission_control_payload(&payload)
+                SlashCommand::Tasks(args) => {
+                    let session_override = active_session_for_closure
+                        .lock()
+                        .map(|guard| *guard)
+                        .unwrap_or(None);
+                    let response = handle_tasks_slash(cwd, &args, session_override)?;
+                    if let Some(session_id) = response.session_switch
+                        && let Ok(mut guard) = active_session_for_closure.lock()
+                    {
+                        *guard = Some(session_id);
+                    }
+                    response.text
                 }
                 SlashCommand::Review(_) => "Use 'deepseek review' subcommand for code review.".to_string(),
                 SlashCommand::Search(args) => {
@@ -3151,7 +3484,26 @@ pub(crate) fn run_chat_tui(
                     if let Some(n) = name { format!("Session renamed to: {n}") } else { "Usage: /rename <name>".to_string() }
                 }
                 SlashCommand::Resume(id) => {
-                    if let Some(id) = id { format!("Use 'deepseek --resume {id}' to resume.") } else { "Usage: /resume <session-id>".to_string() }
+                    if let Some(id) = id {
+                        let session_id =
+                            Uuid::parse_str(&id).map_err(|_| anyhow!("invalid session ID: {id}"))?;
+                        let payload = session_focus_payload(cwd, session_id)?;
+                        if let Ok(mut guard) = active_session_for_closure.lock() {
+                            *guard = Some(session_id);
+                        }
+                        payload["message"]
+                            .as_str()
+                            .unwrap_or("active chat session updated")
+                            .to_string()
+                    } else {
+                        let current = active_session_for_closure
+                            .lock()
+                            .map(|guard| *guard)
+                            .unwrap_or(None);
+                        current
+                            .map(|session_id| format!("current chat session: {session_id}"))
+                            .unwrap_or_else(|| "Usage: /resume <session-id>".to_string())
+                    }
                 }
                 SlashCommand::Stats => {
                     let store = Store::new(cwd)?;
@@ -3205,7 +3557,7 @@ pub(crate) fn run_chat_tui(
                 }
                 SlashCommand::Todos(args) => {
                     let payload = todos_payload(cwd, &args)?;
-                    serde_json::to_string_pretty(&payload)?
+                    render_todos_payload(&payload)
                 }
                 SlashCommand::Chrome(args) => {
                     let payload = chrome_payload(cwd, &args)?;
@@ -3265,6 +3617,10 @@ pub(crate) fn run_chat_tui(
                 .map(|mut imgs| std::mem::take(&mut *imgs))
                 .unwrap_or_default();
             let teammate_mode_for_turn = teammate_mode.clone();
+            let session_id_for_turn = active_session_for_closure
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or(None);
 
             engine.set_stream_callback(std::sync::Arc::new(move |chunk| match chunk {
                 StreamChunk::ContentDelta(s) => {
@@ -3379,6 +3735,7 @@ pub(crate) fn run_chat_tui(
                             detect_urls,
                             watch_files: watch_files_enabled,
                             images: images_for_turn,
+                            session_id: session_id_for_turn,
                             ..Default::default()
                         },
                     )
@@ -3403,7 +3760,16 @@ pub(crate) fn run_chat_tui(
                 }
             });
         },
-        move || current_ui_status(cwd, cfg, fmt_refresh.load(Ordering::Relaxed)).ok(),
+        move || {
+            let session_override = active_session_id.lock().map(|guard| *guard).unwrap_or(None);
+            current_ui_status(
+                cwd,
+                cfg,
+                fmt_refresh.load(Ordering::Relaxed),
+                session_override,
+            )
+            .ok()
+        },
         ml_completion_cb,
     )
 }
@@ -4367,7 +4733,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
             print_json(&json!({
                 "output": output,
                 "session_id": session_id,
-                "model": AppConfig::load(cwd).unwrap_or_default().llm.base_model,
+                "model": AppConfig::load(cwd)
+                    .unwrap_or_default()
+                    .llm
+                    .active_base_model(),
             }))?;
         }
         "stream-json" => {
@@ -4382,7 +4751,10 @@ pub(crate) fn run_print_mode(cwd: &Path, cli: &Cli) -> Result<()> {
                     "type": "result",
                     "output": output,
                     "session_id": session_id,
-                    "model": AppConfig::load(cwd).unwrap_or_default().llm.base_model,
+                    "model": AppConfig::load(cwd)
+                        .unwrap_or_default()
+                        .llm
+                        .active_base_model(),
                 }))?
             );
         }
@@ -4413,7 +4785,15 @@ pub(crate) fn run_continue_session(
         );
     }
     // Enter chat mode with the continued session context
-    run_chat(cwd, json_mode, false, true, false, None)
+    run_chat(
+        cwd,
+        json_mode,
+        false,
+        true,
+        false,
+        None,
+        Some(session.session_id),
+    )
 }
 
 pub(crate) fn run_resume_specific(
@@ -4437,12 +4817,22 @@ pub(crate) fn run_resume_specific(
             session.status
         );
     }
-    run_chat(cwd, json_mode, false, true, false, None)
+    run_chat(
+        cwd,
+        json_mode,
+        false,
+        true,
+        false,
+        None,
+        Some(session.session_id),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codingbuddy_core::{EventEnvelope, Plan, PlanStep, Session, SessionBudgets, SessionState};
+    use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
     use std::fs;
     use tempfile::tempdir;
 
@@ -4513,6 +4903,254 @@ mod tests {
         assert!(rendered.contains("1. CodingBuddy docs"));
         assert!(rendered.contains("## Extract (https://example.com/docs)"));
         assert!(rendered.contains("CodingBuddy is terminal-native."));
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_reports_background_task_completion() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session)?;
+        let task_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        store.insert_task(&TaskQueueRecord {
+            task_id,
+            session_id: session.session_id,
+            title: "Background audit".to_string(),
+            description: None,
+            priority: 1,
+            status: "completed".to_string(),
+            outcome: Some("done".to_string()),
+            artifact_path: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_subagent_run(&SubagentRunRecord {
+            run_id,
+            session_id: Some(session.session_id),
+            task_id: Some(task_id),
+            child_session_id: None,
+            background_job_id: Some(job_id),
+            name: "explore".to_string(),
+            goal: "inspect".to_string(),
+            status: "completed".to_string(),
+            output: Some("done".to_string()),
+            error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_background_job(&BackgroundJobRecord {
+            job_id,
+            kind: "subagent".to_string(),
+            reference: format!("subagent:{run_id}"),
+            status: "completed".to_string(),
+            metadata_json: json!({"reason":"completed"}).to_string(),
+            started_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::TaskUpdated {
+                task_id: task_id.to_string(),
+                status: "completed".to_string(),
+            },
+        })?;
+
+        let mut watermarks = HashMap::from([(session.session_id, 0_u64)]);
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].line.contains("Background audit"));
+        assert!(notices[0].line.contains("done"));
+        assert!(!notices[0].is_error);
+        Ok(())
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_reports_background_job_stop() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session)?;
+        let job_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        store.upsert_background_job(&BackgroundJobRecord {
+            job_id,
+            kind: "shell".to_string(),
+            reference: "shell:abc123".to_string(),
+            status: "stopped".to_string(),
+            metadata_json: json!({"reason":"manual_stop"}).to_string(),
+            started_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::BackgroundJobStopped {
+                job_id,
+                reason: "manual_stop".to_string(),
+            },
+        })?;
+
+        let mut watermarks = HashMap::from([(session.session_id, 0_u64)]);
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].line.contains("stopped"));
+        assert!(notices[0].line.contains("shell"));
+        assert!(!notices[0].is_error);
+        Ok(())
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_reports_plan_review_summary() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let plan_id = Uuid::now_v7();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::AwaitingApproval,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session)?;
+        let plan = Plan {
+            plan_id,
+            version: 2,
+            goal: "Fix the login race".to_string(),
+            assumptions: vec![],
+            steps: vec![
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Inspect login handler".to_string(),
+                    intent: "Read the current flow".to_string(),
+                    tools: vec![],
+                    files: vec!["src/login.rs".to_string()],
+                    done: false,
+                },
+                PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Patch state transition".to_string(),
+                    intent: "Remove the race".to_string(),
+                    tools: vec![],
+                    files: vec!["src/state.rs".to_string()],
+                    done: false,
+                },
+            ],
+            verification: vec!["cargo test -p codingbuddy-cli".to_string()],
+            risk_notes: vec![],
+        };
+        store.save_plan(session.session_id, &plan)?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::PlanRevised { plan: plan.clone() },
+        })?;
+        store.append_event(&EventEnvelope {
+            seq_no: store.next_seq_no(session.session_id)?,
+            at: Utc::now(),
+            session_id: session.session_id,
+            kind: EventKind::ExitPlanMode {
+                session_id: session.session_id,
+            },
+        })?;
+
+        let mut watermarks = HashMap::from([(session.session_id, 0_u64)]);
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.line.contains("awaiting approval"))
+        );
+        assert!(notices.iter().any(|notice| notice.line.contains("steps:")));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.line.contains("/plan approve"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_session_lifecycle_notices_surfaces_pending_plan_on_first_attach() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let plan_id = Uuid::now_v7();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::AwaitingApproval,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session)?;
+        store.save_plan(
+            session.session_id,
+            &Plan {
+                plan_id,
+                version: 1,
+                goal: "Audit approval UX".to_string(),
+                assumptions: vec![],
+                steps: vec![PlanStep {
+                    step_id: Uuid::now_v7(),
+                    title: "Review transcript notices".to_string(),
+                    intent: "Surface the plan".to_string(),
+                    tools: vec![],
+                    files: vec!["src/chat.rs".to_string()],
+                    done: false,
+                }],
+                verification: vec![],
+                risk_notes: vec![],
+            },
+        )?;
+
+        let mut watermarks = HashMap::new();
+        let notices =
+            poll_session_lifecycle_notices(temp.path(), Some(session.session_id), &mut watermarks)?;
+        assert!(!notices.is_empty());
+        assert!(notices[0].line.contains("[plan]"));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.line.contains("awaiting approval"))
+        );
+        Ok(())
     }
 
     #[test]

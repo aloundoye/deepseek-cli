@@ -9,6 +9,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::UsageArgs;
+use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
+use crate::commands::tasks::{mission_control_payload, render_mission_control_lines};
 use crate::output::*;
 use crate::util::*;
 
@@ -16,9 +18,18 @@ pub(crate) fn current_ui_status(
     cwd: &Path,
     cfg: &AppConfig,
     force_max_think: bool,
+    session_override: Option<Uuid>,
 ) -> Result<UiStatus> {
     let store = Store::new(cwd)?;
-    let session = store.load_latest_session()?;
+    let session = if let Some(session_id) = session_override {
+        Some(
+            store
+                .load_session(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?,
+        )
+    } else {
+        store.load_latest_session()?
+    };
     let projection = if let Some(session) = &session {
         store.rebuild_from_events(session.session_id)?
     } else {
@@ -59,12 +70,19 @@ pub(crate) fn current_ui_status(
         let transcript_chars: u64 = projection.transcript.iter().map(|t| t.len() as u64).sum();
         transcript_chars / 4
     };
+    let mission_control_snapshot = if let Some(session) = session.as_ref() {
+        mission_control_payload(cwd, Some(session.session_id), 8)
+            .map(|payload| render_mission_control_lines(&payload))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     Ok(UiStatus {
         model: if force_max_think {
-            cfg.llm.max_think_model.clone()
+            cfg.llm.active_reasoner_model()
         } else {
-            cfg.llm.base_model.clone()
+            cfg.llm.active_base_model()
         },
         pending_approvals,
         estimated_cost_usd,
@@ -75,6 +93,11 @@ pub(crate) fn current_ui_status(
             .clone()
             .unwrap_or_else(|| cfg.policy.permission_mode.to_string()),
         active_tasks: projection.task_ids.len(),
+        workflow_phase: session
+            .as_ref()
+            .map(|record| workflow_phase_label(&record.status).to_string())
+            .unwrap_or_default(),
+        plan_state: plan_state_label(session.as_ref()).to_string(),
         context_used_tokens: estimated_context_tokens,
         context_max_tokens: cfg.llm.context_window_tokens,
         session_turns: projection.transcript.len(),
@@ -82,6 +105,7 @@ pub(crate) fn current_ui_status(
         pr_review_status,
         pr_url: None,
         agent_mode: String::new(),
+        mission_control_snapshot,
     })
 }
 
@@ -147,6 +171,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         let max_tokens = session.budgets.max_think_tokens.max(1) as f64;
         let context_usage_pct =
             (((usage.input_tokens + usage.output_tokens) as f64 / max_tokens) * 100.0).min(100.0);
+        let active_plan = current_plan_payload(&store, Some(&session))?;
         let pending_approvals = projection
             .tool_invocations
             .len()
@@ -155,11 +180,14 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         json!({
             "session_id": session.session_id,
             "state": session.status,
+            "workflow_phase": workflow_phase_label(&session.status),
+            "plan_state": plan_state_label(Some(&session)),
             "active_plan_id": session.active_plan_id,
+            "plan": active_plan.unwrap_or(serde_json::Value::Null),
             "model": {
                 "profile": cfg.llm.profile,
-                "base": cfg.llm.base_model,
-                "max_think": cfg.llm.base_model,
+                "base": cfg.llm.active_base_model(),
+                "max_think": cfg.llm.active_reasoner_model(),
                 "thinking_mode": "auto",
             },
             "context_usage_percent": context_usage_pct,
@@ -186,10 +214,13 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         json!({
             "session_id": null,
             "state": "none",
+            "workflow_phase": "idle",
+            "plan_state": "none",
+            "plan": null,
             "model": {
                 "profile": cfg.llm.profile,
-                "base": cfg.llm.base_model,
-                "max_think": cfg.llm.base_model,
+                "base": cfg.llm.active_base_model(),
+                "max_think": cfg.llm.active_reasoner_model(),
                 "thinking_mode": "auto",
             },
             "context_usage_percent": 0.0,
@@ -213,9 +244,11 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         print_json(&payload)?;
     } else {
         println!(
-            "session={} state={} model={}/{}/{} context={:.1}% pending_approvals={} plugins={}/{}",
+            "session={} state={} phase={} plan={} model={}/{}/{} context={:.1}% pending_approvals={} plugins={}/{}",
             payload["session_id"].as_str().unwrap_or("none"),
             payload["state"].as_str().unwrap_or("unknown"),
+            payload["workflow_phase"].as_str().unwrap_or("idle"),
+            payload["plan_state"].as_str().unwrap_or("none"),
             payload["model"]["profile"].as_str().unwrap_or_default(),
             payload["model"]["base"].as_str().unwrap_or_default(),
             payload["model"]["max_think"].as_str().unwrap_or_default(),
@@ -243,6 +276,19 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 .as_u64()
                 .unwrap_or(0),
         );
+        if let Some(plan) = payload.get("plan").filter(|value| !value.is_null()) {
+            println!(
+                "plan id={} state={} version={} steps={} goal={}",
+                plan["plan_id"].as_str().unwrap_or_default(),
+                payload["plan_state"].as_str().unwrap_or("none"),
+                plan["version"].as_u64().unwrap_or(0),
+                plan["steps_count"].as_u64().unwrap_or(0),
+                plan["goal_preview"].as_str().unwrap_or_default(),
+            );
+            if payload["plan_state"].as_str() == Some("awaiting_approval") {
+                println!("next: /plan show | /plan approve | /plan reject <feedback>");
+            }
+        }
         if !payload["autopilot"].is_null() {
             println!(
                 "autopilot run={} status={} completed={} failed={}",

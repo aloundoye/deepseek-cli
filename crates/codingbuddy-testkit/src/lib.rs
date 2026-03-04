@@ -200,6 +200,9 @@ pub fn start_mock_llm_server() -> MockLlmServer {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                     let scenario = scenario_rx.try_recv().ok();
                     let _ = handle_mock_llm_connection(&mut stream, scenario.as_ref());
                 }

@@ -36,7 +36,7 @@ use codingbuddy_core::{
     ToolHost, UserQuestion, estimate_message_tokens, strip_prior_reasoning_content,
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
-use codingbuddy_llm::LlmClient;
+use codingbuddy_llm::{LlmClient, max_output_tokens_for_model};
 use codingbuddy_store::{Store, TaskQueueRecord};
 use codingbuddy_tools::{format_tool_search_results, search_extended_tools};
 use std::collections::{HashMap, VecDeque};
@@ -53,7 +53,7 @@ use anti_hallucination::{
 };
 use compaction::{
     COMPACTION_TARGET_PCT, PRUNE_AGE_TURNS, build_compaction_summary,
-    build_compaction_summary_with_llm, extract_tool_path,
+    build_compaction_summary_with_llm, extract_tool_path, truncate_line,
 };
 use helpers::{is_read_only_api_name, summarize_args};
 use safety::{
@@ -67,6 +67,12 @@ pub const PRUNE_THRESHOLD_PCT: f64 = 0.80;
 
 /// Context window usage percentage that triggers full compaction (Phase 2).
 pub const COMPACTION_THRESHOLD_PCT: f64 = 0.95;
+
+/// Minimum usable input budget during compaction to avoid zero-token edge cases.
+const MIN_COMPACTION_INPUT_BUDGET_TOKENS: u64 = 1024;
+
+/// Extra fixed overhead beyond tool definition size (system + control messages).
+const COMPACTION_EXTRA_OVERHEAD_TOKENS: u64 = 512;
 
 /// Every N tool calls, inject a brief system reminder to keep the model on track.
 const MID_CONVERSATION_REMINDER_INTERVAL: usize = 10;
@@ -276,6 +282,256 @@ impl<'a> ToolUseLoop<'a> {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    fn next_request_route(&self) -> (String, Option<codingbuddy_core::ThinkingConfig>, u32) {
+        // Model routing: use reasoner for Complex+escalated tasks
+        let use_reasoner = self.config.complexity == crate::complexity::PromptComplexity::Complex
+            && self.escalation.should_escalate();
+
+        if use_reasoner {
+            (
+                self.config.extended_thinking_model.clone(),
+                None, // Reasoner thinks natively
+                codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS,
+            )
+        } else {
+            let thinking = self.config.thinking.as_ref().map(|base| {
+                if self.escalation.should_escalate() {
+                    codingbuddy_core::ThinkingConfig::enabled(self.escalation.budget())
+                } else {
+                    base.clone()
+                }
+            });
+            (self.config.model.clone(), thinking, self.config.max_tokens)
+        }
+    }
+
+    fn compaction_budget_for_next_turn(&self, tool_def_tokens: u64) -> (u64, u64, u64) {
+        let (route_model, route_thinking, route_max_tokens) = self.next_request_route();
+        let thinking_enabled = route_thinking
+            .as_ref()
+            .is_some_and(|cfg| cfg.thinking_type.eq_ignore_ascii_case("enabled"));
+        let model_max_output =
+            max_output_tokens_for_model(self.config.provider_kind, &route_model, thinking_enabled);
+        let reserved_output_tokens = u64::from(route_max_tokens.min(model_max_output))
+            .max(self.config.response_budget_tokens);
+        let reserved_overhead_tokens = self
+            .config
+            .reserved_overhead_tokens
+            .max(tool_def_tokens.saturating_add(COMPACTION_EXTRA_OVERHEAD_TOKENS));
+        let usable_input_budget = self
+            .config
+            .context_window_tokens
+            .saturating_sub(reserved_overhead_tokens)
+            .saturating_sub(reserved_output_tokens)
+            .max(MIN_COMPACTION_INPUT_BUDGET_TOKENS);
+        let prune_threshold = ((usable_input_budget as f64) * PRUNE_THRESHOLD_PCT) as u64;
+        let compact_threshold = ((usable_input_budget as f64) * COMPACTION_THRESHOLD_PCT) as u64;
+        let compact_target = ((usable_input_budget as f64) * COMPACTION_TARGET_PCT) as u64;
+        (
+            prune_threshold.max(1),
+            compact_threshold.max(1),
+            compact_target.max(1),
+        )
+    }
+
+    fn is_active_task_status(status: &str) -> bool {
+        !matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled"
+        )
+    }
+
+    fn compaction_work_state_message(&self) -> Option<String> {
+        let store = self.workspace_store().ok()?;
+        let session = self.current_session(&store).ok()?;
+        let mut lines = Vec::new();
+
+        if let Some(phase) = self.phase {
+            lines.push(format!("- phase: {}", phase.as_str()));
+        }
+
+        let session_state = serde_json::to_string(&session.status)
+            .ok()
+            .map(|value| value.trim_matches('"').to_string())
+            .unwrap_or_else(|| format!("{:?}", session.status));
+        lines.push(format!("- session_state: {session_state}"));
+
+        if let Some(plan_id) = session.active_plan_id
+            && let Ok(Some(plan)) = store.load_plan(plan_id)
+        {
+            let done_steps = plan.steps.iter().filter(|step| step.done).count();
+            let total_steps = plan.steps.len();
+            lines.push(format!(
+                "- active_plan_goal: {}",
+                truncate_line(&plan.goal, 160)
+            ));
+            lines.push(format!(
+                "- active_plan_progress: {done_steps}/{total_steps} step(s) done"
+            ));
+            if let Some(next_step) = plan.steps.iter().find(|step| !step.done) {
+                lines.push(format!(
+                    "- active_plan_next_step: {}",
+                    truncate_line(&next_step.title, 120)
+                ));
+            }
+        }
+
+        if let Ok(tasks) = store.list_tasks(Some(session.session_id)) {
+            let active_tasks = tasks
+                .into_iter()
+                .filter(|task| Self::is_active_task_status(&task.status))
+                .take(5)
+                .collect::<Vec<_>>();
+            if !active_tasks.is_empty() {
+                lines.push("- active_tasks:".to_string());
+                for task in active_tasks {
+                    let mut task_line =
+                        format!("  - [{}] {}", task.status, truncate_line(&task.title, 80));
+                    if let Some(artifact_path) = task
+                        .artifact_path
+                        .as_ref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        task_line
+                            .push_str(&format!(" artifact={}", truncate_line(artifact_path, 80)));
+                    }
+                    if let Ok(Some(run)) = store.load_subagent_run_for_task(task.task_id)
+                        && let Some(child_session_id) = run.child_session_id
+                    {
+                        task_line.push_str(&format!(" child_session={child_session_id}"));
+                    }
+                    lines.push(task_line);
+                }
+            }
+        }
+
+        let has_plan = lines.iter().any(|line| line.starts_with("- active_plan_"));
+        let has_tasks = lines.iter().any(|line| line.starts_with("- active_tasks:"));
+        if !has_plan && !has_tasks && self.phase.is_none() {
+            return None;
+        }
+
+        Some(format!(
+            "ACTIVE_WORK_STATE (preserve after compaction):\n{}",
+            lines.join("\n")
+        ))
+    }
+
+    fn is_compaction_control_prompt(content: &str) -> bool {
+        let trimmed = content.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("conversation_history (compacted") {
+            return true;
+        }
+        if lower.starts_with("context was compacted.") {
+            return true;
+        }
+        if lower.starts_with("continue with your next steps if any remain") {
+            return true;
+        }
+        if lower.starts_with("your response is too verbose") {
+            return true;
+        }
+        trimmed == HALLUCINATION_NUDGE
+    }
+
+    fn replayable_user_prompt(messages: &[ChatMessage]) -> Option<String> {
+        messages.iter().rev().find_map(|msg| match msg {
+            ChatMessage::User { content } => {
+                let trimmed = content.trim();
+                if trimmed.is_empty() || Self::is_compaction_control_prompt(trimmed) {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            _ => None,
+        })
+    }
+
+    fn append_compaction_followup(
+        &self,
+        new_messages: &mut Vec<ChatMessage>,
+        compacted_msgs: &[ChatMessage],
+        compacted_count: usize,
+    ) {
+        if compacted_count < 5 {
+            return;
+        }
+        if new_messages
+            .last()
+            .is_some_and(|msg| matches!(msg, ChatMessage::User { .. }))
+        {
+            return;
+        }
+
+        let content = if let Some(replay) = Self::replayable_user_prompt(compacted_msgs) {
+            format!(
+                "Context was compacted. Resume the current task using this prior user request as the anchor:\n\n{}\n\nContinue with the next concrete step. If blocked, ask one focused clarification question.",
+                truncate_line(&replay, 700)
+            )
+        } else {
+            "Context was compacted. Continue with your next steps if any remain, or summarize what was accomplished.".to_string()
+        };
+        new_messages.push(ChatMessage::User { content });
+    }
+
+    fn persist_phase_state_best_effort(&self, new_phase: codingbuddy_core::TaskPhase) {
+        let Some(session_id) = self.config.session_id else {
+            return;
+        };
+        if self.config.workspace.is_none() {
+            return;
+        }
+
+        let Ok(store) = self.workspace_store() else {
+            return;
+        };
+        let Ok(Some(mut session)) = store.load_session(session_id) else {
+            return;
+        };
+
+        let target_status = match new_phase {
+            codingbuddy_core::TaskPhase::Explore => return,
+            codingbuddy_core::TaskPhase::Plan => SessionState::Planning,
+            codingbuddy_core::TaskPhase::Execute => SessionState::ExecutingStep,
+            codingbuddy_core::TaskPhase::Verify => SessionState::Verifying,
+        };
+
+        if new_phase == codingbuddy_core::TaskPhase::Plan && session.active_plan_id.is_none() {
+            let plan_id = Uuid::now_v7();
+            let plan = Plan {
+                plan_id,
+                version: 1,
+                goal: self.latest_user_prompt(),
+                assumptions: Vec::new(),
+                steps: Vec::new(),
+                verification: Vec::new(),
+                risk_notes: Vec::new(),
+            };
+            if store.save_plan(session.session_id, &plan).is_ok() {
+                session.active_plan_id = Some(plan_id);
+                self.emit_event_if_present(EventKind::PlanCreated { plan });
+            }
+        }
+
+        if session.status == target_status {
+            if session.active_plan_id.is_some() {
+                let _ = store.save_session(&session);
+            }
+            return;
+        }
+
+        let previous = session.status.clone();
+        session.status = target_status.clone();
+        if store.save_session(&session).is_ok() {
+            self.emit_event_if_present(EventKind::SessionStateChanged {
+                from: previous,
+                to: target_status,
+            });
+        }
     }
 
     fn emit_event_if_present(&self, kind: EventKind) {
@@ -617,17 +873,6 @@ impl<'a> ToolUseLoop<'a> {
         let mut nudge_count: usize = 0;
         let mut last_model = self.config.model.clone();
 
-        // Pre-compute immutable values used inside the loop
-        let tool_def_tokens: u64 = self
-            .tools
-            .iter()
-            .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
-            .sum();
-        let prune_threshold =
-            (self.config.context_window_tokens as f64 * PRUNE_THRESHOLD_PCT) as u64;
-        let compact_threshold =
-            (self.config.context_window_tokens as f64 * COMPACTION_THRESHOLD_PCT) as u64;
-
         let mut verbosity_nudge_count: usize = 0;
 
         loop {
@@ -685,8 +930,15 @@ impl<'a> ToolUseLoop<'a> {
             // Two-phase context management:
             // Phase 1 (80%): Prune old tool outputs to free space without losing structure
             // Phase 2 (95%): Full compaction with structured summary
+            let tool_def_tokens: u64 = self
+                .tools
+                .iter()
+                .map(|t| (serde_json::to_string(t).unwrap_or_default().len() as u64) / 4)
+                .sum();
             let message_tokens = estimate_message_tokens(&self.messages);
             let estimated_tokens = message_tokens + tool_def_tokens;
+            let (prune_threshold, compact_threshold, compact_target) =
+                self.compaction_budget_for_next_turn(tool_def_tokens);
 
             if estimated_tokens > prune_threshold {
                 // Phase 1: Lightweight pruning — trim old tool outputs
@@ -697,10 +949,8 @@ impl<'a> ToolUseLoop<'a> {
 
                 if post_prune_tokens > compact_threshold {
                     // Phase 2: Full compaction with structured summary
-                    let target =
-                        (self.config.context_window_tokens as f64 * COMPACTION_TARGET_PCT) as u64;
                     let pre_msg_count = self.messages.len() as u64;
-                    let compacted = self.compact_messages(target);
+                    let compacted = self.compact_messages(compact_target);
                     if compacted {
                         let post_tokens = estimate_message_tokens(&self.messages) + tool_def_tokens;
                         if let Some(ref cb) = self.event_cb {
@@ -712,17 +962,6 @@ impl<'a> ToolUseLoop<'a> {
                                 messages_after: self.messages.len() as u64,
                             });
                         }
-
-                        // Auto-continue: inject a synthetic user message to prompt
-                        // continuation after compaction. DeepSeek often gets confused
-                        // about what to do next after context is compacted.
-                        self.messages.push(ChatMessage::User {
-                            content: "Context was compacted. Continue with your current task. \
-                                      If you were in the middle of something, resume from where \
-                                      you left off. If you're unsure what to do next, summarize \
-                                      what's been accomplished and ask for clarification."
-                                .to_string(),
-                        });
                     }
                     if !compacted {
                         self.emit(StreamChunk::Done {
@@ -907,6 +1146,27 @@ impl<'a> ToolUseLoop<'a> {
                     },
                     tool_calls: vec![],
                 });
+
+                if let Some(current_phase) = self.phase {
+                    let should_allow_text_transition =
+                        current_phase != codingbuddy_core::TaskPhase::Plan;
+                    let text_has_plan_keywords =
+                        should_allow_text_transition && phases::text_has_plan_keywords(&text);
+                    if should_allow_text_transition
+                        && let Some(new_phase) = phases::check_phase_transition(
+                            current_phase,
+                            self.phase_read_only_calls,
+                            true,
+                            text_has_plan_keywords,
+                            false,
+                            self.phase_edit_calls,
+                        )
+                    {
+                        self.apply_phase_transition(new_phase);
+                        strip_prior_reasoning_content(&mut self.messages);
+                        continue;
+                    }
+                }
 
                 self.emit(StreamChunk::Done { reason: None });
                 return Ok(ToolLoopResult {
@@ -1332,29 +1592,7 @@ impl<'a> ToolUseLoop<'a> {
                     used_write,
                     self.phase_edit_calls,
                 ) {
-                    self.emit(StreamChunk::PhaseTransition {
-                        from: current_phase.as_str().to_string(),
-                        to: new_phase.as_str().to_string(),
-                    });
-                    // Inject transition guidance
-                    match new_phase {
-                        codingbuddy_core::TaskPhase::Plan => {
-                            self.messages.push(ChatMessage::System {
-                                content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
-                            });
-                        }
-                        codingbuddy_core::TaskPhase::Verify => {
-                            self.messages.push(ChatMessage::System {
-                                content: phases::VERIFY_TRANSITION_MESSAGE.to_string(),
-                            });
-                        }
-                        _ => {}
-                    }
-                    self.phase = Some(new_phase);
-                    self.phase_read_only_calls = 0;
-                    if new_phase == codingbuddy_core::TaskPhase::Execute {
-                        self.phase_edit_calls = 0;
-                    }
+                    self.apply_phase_transition(new_phase);
                 }
             }
 
@@ -2473,6 +2711,41 @@ impl<'a> ToolUseLoop<'a> {
         }
     }
 
+    fn apply_phase_transition(&mut self, new_phase: codingbuddy_core::TaskPhase) {
+        if self.phase == Some(new_phase) {
+            self.phase_read_only_calls = 0;
+            self.phase_edit_calls = 0;
+            return;
+        }
+
+        self.persist_phase_state_best_effort(new_phase);
+
+        if let Some(current_phase) = self.phase {
+            self.emit(StreamChunk::PhaseTransition {
+                from: current_phase.as_str().to_string(),
+                to: new_phase.as_str().to_string(),
+            });
+        }
+
+        match new_phase {
+            codingbuddy_core::TaskPhase::Plan => {
+                self.messages.push(ChatMessage::System {
+                    content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
+                });
+            }
+            codingbuddy_core::TaskPhase::Verify => {
+                self.messages.push(ChatMessage::System {
+                    content: phases::VERIFY_TRANSITION_MESSAGE.to_string(),
+                });
+            }
+            _ => {}
+        }
+
+        self.phase = Some(new_phase);
+        self.phase_read_only_calls = 0;
+        self.phase_edit_calls = 0;
+    }
+
     fn handle_enter_plan_mode(&mut self) -> Result<String> {
         let store = self.workspace_store()?;
         let mut session = self.current_session(&store)?;
@@ -2492,17 +2765,12 @@ impl<'a> ToolUseLoop<'a> {
         session.active_plan_id = Some(plan_id);
         store.save_session(&session)?;
         store.save_plan(session.session_id, &plan)?;
-        self.phase = Some(codingbuddy_core::TaskPhase::Plan);
-        self.phase_read_only_calls = 0;
-        self.phase_edit_calls = 0;
+        self.apply_phase_transition(codingbuddy_core::TaskPhase::Plan);
 
         self.emit_event_if_present(EventKind::EnterPlanMode {
             session_id: session.session_id,
         });
         self.emit_event_if_present(EventKind::PlanCreated { plan });
-        self.messages.push(ChatMessage::System {
-            content: phases::PLAN_TRANSITION_MESSAGE.to_string(),
-        });
 
         Ok("Plan mode entered. Explore and write the implementation plan before executing changes."
             .to_string())
@@ -2694,28 +2962,7 @@ impl<'a> ToolUseLoop<'a> {
             ToolChoice::auto()
         };
 
-        // Model routing: use reasoner for Complex+escalated tasks
-        let use_reasoner = self.config.complexity == crate::complexity::PromptComplexity::Complex
-            && self.escalation.should_escalate();
-
-        let (model, thinking, max_tokens) = if use_reasoner {
-            // Route to deepseek-reasoner: native thinking, no ThinkingConfig needed
-            (
-                self.config.extended_thinking_model.clone(),
-                None, // Reasoner thinks natively
-                codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS,
-            )
-        } else {
-            // Standard deepseek-chat with thinking budget
-            let thinking = self.config.thinking.as_ref().map(|base| {
-                if self.escalation.should_escalate() {
-                    codingbuddy_core::ThinkingConfig::enabled(self.escalation.budget())
-                } else {
-                    base.clone()
-                }
-            });
-            (self.config.model.clone(), thinking, self.config.max_tokens)
-        };
+        let (model, thinking, max_tokens) = self.next_request_route();
 
         // Strip sampling parameters and tool_choice for reasoner model (incompatible)
         let is_reasoner = codingbuddy_core::is_reasoner_model(&model);
@@ -2940,6 +3187,12 @@ impl<'a> ToolUseLoop<'a> {
 
         let mut new_messages = vec![system, summary_msg];
 
+        if let Some(work_state_message) = self.compaction_work_state_message() {
+            new_messages.push(ChatMessage::System {
+                content: work_state_message,
+            });
+        }
+
         // Re-inject pinned user directives so they survive compaction.
         // Placed as a System message right after the summary so the model
         // always sees them regardless of how many compaction rounds occur.
@@ -2958,6 +3211,7 @@ impl<'a> ToolUseLoop<'a> {
         }
 
         new_messages.extend(self.messages[keep_from..].to_vec());
+        self.append_compaction_followup(&mut new_messages, compacted_msgs, middle_count);
 
         // P2.7: Post-compaction validation — ensure the result is structurally sound.
         // Must have at least 2 messages and start with a System message.
@@ -2969,23 +3223,7 @@ impl<'a> ToolUseLoop<'a> {
             return false;
         }
 
-        let compacted_count = middle_count;
         self.messages = new_messages;
-
-        // Inject synthetic continuation to prevent model confusion after compaction.
-        // Only add when significant compaction occurred (5+ messages removed) and
-        // the last message is not already a User message.
-        if compacted_count >= 5 {
-            let last_is_user = self
-                .messages
-                .last()
-                .is_some_and(|m| matches!(m, ChatMessage::User { .. }));
-            if !last_is_user {
-                self.messages.push(ChatMessage::User {
-                    content: "Continue with your next steps if any remain, or summarize what was accomplished.".to_string(),
-                });
-            }
-        }
 
         true
     }
@@ -3134,7 +3372,11 @@ mod tests {
     use super::compaction::COMPACTION_TEMPLATE;
     use super::safety::DOOM_LOOP_HISTORY_SIZE;
     use super::*;
-    use codingbuddy_core::{LlmResponse, ToolCall, ToolProposal, ToolResult};
+    use codingbuddy_core::{
+        LlmResponse, Plan, PlanStep, Session, SessionBudgets, SessionState, TaskPhase, ToolCall,
+        ToolProposal, ToolResult,
+    };
+    use codingbuddy_store::TaskQueueRecord;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -3206,6 +3448,7 @@ mod tests {
             }
         }
 
+        #[cfg(not(target_os = "windows"))]
         fn executed_count(&self) -> usize {
             self.execute_count
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -4283,6 +4526,272 @@ mod tests {
         assert!(
             matches!(&loop_.messages[1], ChatMessage::User { content } if content.contains("compacted"))
         );
+    }
+
+    #[test]
+    fn compaction_budget_is_provider_and_model_aware() {
+        let llm = ScriptedLlm::new(vec![]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+
+        let mut deepseek_loop = ToolUseLoop::new(
+            &llm,
+            tool_host.clone(),
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+        deepseek_loop.config.provider_kind = codingbuddy_core::ProviderKind::Deepseek;
+        deepseek_loop.config.model = "deepseek-chat".to_string();
+        deepseek_loop.config.context_window_tokens = 128_000;
+        deepseek_loop.config.max_tokens = 32_768;
+        deepseek_loop.config.response_budget_tokens = 8_192;
+        deepseek_loop.config.reserved_overhead_tokens = 4_000;
+
+        let mut openai_loop = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+        openai_loop.config.provider_kind = codingbuddy_core::ProviderKind::OpenAiCompatible;
+        openai_loop.config.model = "gpt-4o-mini".to_string();
+        openai_loop.config.context_window_tokens = 128_000;
+        openai_loop.config.max_tokens = 32_768;
+        openai_loop.config.response_budget_tokens = 8_192;
+        openai_loop.config.reserved_overhead_tokens = 4_000;
+
+        let (deep_prune, _, _) = deepseek_loop.compaction_budget_for_next_turn(2_000);
+        let (openai_prune, _, _) = openai_loop.compaction_budget_for_next_turn(2_000);
+        assert!(
+            deep_prune < openai_prune,
+            "deepseek thinking budget should reserve more output than openai-compatible chat"
+        );
+    }
+
+    #[test]
+    fn compaction_appends_at_most_one_followup_user_prompt() {
+        let llm = ScriptedLlm::new(vec![make_text_response(
+            "## Goal\nPreserve context\n## Completed\nCompaction summary retained with files and findings.",
+        )]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        loop_.messages.push(ChatMessage::User {
+            content: "Please inspect auth, implement the fix, and run tests.".to_string(),
+        });
+        for i in 0..4 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("assistant-{i}: {}", "x".repeat(220))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+        loop_.messages.push(ChatMessage::User {
+            content: "Keep going with implementation details.".to_string(),
+        });
+        for i in 4..10 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("assistant-{i}: {}", "x".repeat(220))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+
+        let compacted = loop_.compact_messages(240);
+        assert!(compacted);
+
+        let followup_count = loop_
+            .messages
+            .iter()
+            .filter(|msg| matches!(msg, ChatMessage::User { content } if content.starts_with("Context was compacted.")))
+            .count();
+        assert_eq!(
+            followup_count, 1,
+            "compaction should emit exactly one followup user prompt"
+        );
+    }
+
+    #[test]
+    fn compaction_followup_replays_last_actionable_user_prompt() {
+        let llm = ScriptedLlm::new(vec![make_text_response(
+            "## Goal\nContinue task\n## Completed\nHistory compacted with actionable replay anchor.",
+        )]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig::default(),
+            "system".to_string(),
+            default_tools(),
+        );
+
+        loop_.messages.push(ChatMessage::User {
+            content: "Implement authentication middleware and run the integration tests."
+                .to_string(),
+        });
+        for i in 0..4 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("step-{i}: {}", "y".repeat(180))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+        loop_.messages.push(ChatMessage::User {
+            content: "Proceed with the remaining execution steps.".to_string(),
+        });
+        for i in 4..12 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("step-{i}: {}", "y".repeat(180))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+
+        let compacted = loop_.compact_messages(220);
+        assert!(compacted);
+
+        let replay = loop_
+            .messages
+            .iter()
+            .rev()
+            .find_map(|msg| match msg {
+                ChatMessage::User { content } if content.starts_with("Context was compacted.") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .expect("expected followup replay user message");
+        assert!(
+            replay.contains("Implement authentication middleware"),
+            "followup should replay the last actionable user request"
+        );
+    }
+
+    #[test]
+    fn compaction_injects_active_work_state_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(temp.path()).expect("store");
+
+        let session_id = Uuid::now_v7();
+        let plan_id = Uuid::now_v7();
+        let session = Session {
+            session_id,
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: SessionBudgets {
+                per_turn_seconds: 180,
+                max_think_tokens: 32_768,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session).expect("save session");
+        store
+            .save_plan(
+                session_id,
+                &Plan {
+                    plan_id,
+                    version: 1,
+                    goal: "Harden authentication middleware and validate with tests".to_string(),
+                    assumptions: vec![],
+                    steps: vec![
+                        PlanStep {
+                            step_id: Uuid::now_v7(),
+                            title: "Inspect middleware entrypoints".to_string(),
+                            intent: "Find all auth checks".to_string(),
+                            tools: vec!["fs_read".to_string()],
+                            files: vec!["src/auth/middleware.rs".to_string()],
+                            done: true,
+                        },
+                        PlanStep {
+                            step_id: Uuid::now_v7(),
+                            title: "Implement missing guard".to_string(),
+                            intent: "Enforce token validation".to_string(),
+                            tools: vec!["fs_edit".to_string()],
+                            files: vec!["src/auth/middleware.rs".to_string()],
+                            done: false,
+                        },
+                    ],
+                    verification: vec!["cargo test".to_string()],
+                    risk_notes: vec![],
+                },
+            )
+            .expect("save plan");
+        store
+            .insert_task(&TaskQueueRecord {
+                task_id: Uuid::now_v7(),
+                session_id,
+                title: "Patch auth middleware".to_string(),
+                description: Some("Ensure missing token guard is enforced".to_string()),
+                priority: 1,
+                status: "in_progress".to_string(),
+                outcome: None,
+                artifact_path: Some("session://child-auth".to_string()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .expect("insert task");
+
+        let llm = ScriptedLlm::new(vec![make_text_response(
+            "## Goal\nKeep active plan/task state\n## Completed\nCompaction retained active work snapshot.",
+        )]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            ToolLoopConfig {
+                workspace: Some(temp.path().to_path_buf()),
+                session_id: Some(session_id),
+                initial_phase: Some(TaskPhase::Execute),
+                ..Default::default()
+            },
+            "system".to_string(),
+            default_tools(),
+        );
+
+        loop_.messages.push(ChatMessage::User {
+            content: "Continue implementing the auth fix".to_string(),
+        });
+        for i in 0..4 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("work-{i}: {}", "z".repeat(200))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+        loop_.messages.push(ChatMessage::User {
+            content: "Carry on with the next execution step.".to_string(),
+        });
+        for i in 4..12 {
+            loop_.messages.push(ChatMessage::Assistant {
+                content: Some(format!("work-{i}: {}", "z".repeat(200))),
+                reasoning_content: None,
+                tool_calls: vec![],
+            });
+        }
+
+        let compacted = loop_.compact_messages(240);
+        assert!(compacted);
+
+        let snapshot = loop_
+            .messages
+            .iter()
+            .find_map(|msg| match msg {
+                ChatMessage::System { content } if content.starts_with("ACTIVE_WORK_STATE") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .expect("expected active work snapshot message");
+        assert!(snapshot.contains("Harden authentication middleware"));
+        assert!(snapshot.contains("Patch auth middleware"));
     }
 
     #[test]

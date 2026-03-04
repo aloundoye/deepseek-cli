@@ -1297,6 +1297,27 @@ impl LocalToolHost {
         if let Some(wrapped) = auto_isolated_wrapper_command(&workspace, cmd) {
             return self.run_cmd(&wrapped, timeout_secs);
         }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows doesn't have a built-in wrapper path today. Fall back to direct
+            // execution with strict logical isolation checks.
+            if command_references_outside_workspace(cmd, &workspace) {
+                return Err(anyhow!(
+                    "sandbox_mode={} blocked path outside workspace: {}",
+                    self.sandbox_mode,
+                    cmd
+                ));
+            }
+            if command_has_network_egress_intent(cmd) {
+                return Err(anyhow!(
+                    "sandbox_mode={} blocked network command: {}",
+                    self.sandbox_mode,
+                    cmd
+                ));
+            }
+            self.run_cmd(cmd, timeout_secs)
+        }
+        #[cfg(not(target_os = "windows"))]
         Err(anyhow!(
             "sandbox_mode={} requires an OS-level wrapper (set policy.sandbox_wrapper or CODINGBUDDY_SANDBOX_WRAPPER) or install bwrap/firejail/sandbox-exec",
             self.sandbox_mode
@@ -2919,8 +2940,8 @@ fn render_wrapper_template(template: &str, workspace: &Path, cmd: &str) -> Resul
             "sandbox wrapper template must include {{cmd}} placeholder"
         ));
     }
-    let workspace_q = shell_quote(workspace.to_string_lossy().as_ref());
-    let cmd_q = shell_quote(cmd);
+    let workspace_q = platform_shell_quote(workspace.to_string_lossy().as_ref());
+    let cmd_q = platform_shell_quote(cmd);
     Ok(template
         .replace("{workspace}", &workspace_q)
         .replace("{cmd}", &cmd_q))
@@ -2988,6 +3009,34 @@ fn command_in_path(command: &str) -> bool {
 fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     format!("'{escaped}'")
+}
+
+#[cfg(target_os = "windows")]
+fn platform_shell_quote(value: &str) -> String {
+    windows_shell_quote(value)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_shell_quote(value: &str) -> String {
+    shell_quote(value)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_quote(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
+        match ch {
+            // Keep arguments stable when the wrapper is executed via cmd /C.
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            '^' | '&' | '|' | '<' | '>' => {
+                escaped.push('^');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    format!("\"{escaped}\"")
 }
 
 fn shell_tokens(cmd: &str) -> Vec<String> {
@@ -3142,6 +3191,15 @@ fn token_to_absolute_path(token: &str) -> Option<PathBuf> {
     if candidate.is_absolute() {
         return Some(candidate);
     }
+    #[cfg(target_os = "windows")]
+    {
+        if token.starts_with("~\\") {
+            let home = std::env::var("USERPROFILE")
+                .ok()
+                .or_else(|| std::env::var("HOME").ok())?;
+            return Some(PathBuf::from(home).join(token.trim_start_matches("~\\")));
+        }
+    }
     None
 }
 
@@ -3158,6 +3216,9 @@ fn command_references_outside_workspace(cmd: &str, workspace: &Path) -> bool {
             || token.starts_with("../")
             || token.contains("/../")
             || token.ends_with("/..")
+            || token.starts_with("..\\")
+            || token.contains("\\..\\")
+            || token.ends_with("\\..")
         {
             return true;
         }
@@ -4808,6 +4869,38 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_sandbox_blocks_windows_parent_path_tokens() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-tools-ww-win-path-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec!["type *".to_string()];
+        cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::WorkspaceWrite;
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+        let result = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"type ..\\secret.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!result.success);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sandbox_mode=workspace-write")
+        );
+        assert!(runner.captured().is_empty());
+    }
+
+    #[test]
     fn workspace_write_sandbox_allows_workspace_relative_paths() {
         let workspace =
             std::env::temp_dir().join(format!("codingbuddy-tools-ww-allow-{}", Uuid::now_v7()));
@@ -4900,6 +4993,71 @@ mod tests {
         )
         .expect("render");
         assert_eq!(runner.captured(), vec![expected]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn isolated_sandbox_windows_falls_back_with_logical_checks() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-tools-iso-win-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("note.txt"), "hello").expect("note");
+
+        let mut cfg = AppConfig::default();
+        cfg.policy.allowlist = vec![
+            "type *".to_string(),
+            "curl *".to_string(),
+            "cat *".to_string(),
+        ];
+        cfg.policy.sandbox_mode = codingbuddy_core::SandboxMode::Isolated;
+        cfg.save(&workspace).expect("save config");
+        let policy = PolicyEngine::from_app_config(&cfg.policy);
+        let runner = RecordingRunner::default();
+        let host = LocalToolHost::with_runner(&workspace, policy, Arc::new(runner.clone()))
+            .expect("tool host");
+
+        let allowed = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"type note.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(allowed.success);
+
+        let blocked_path = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"type ..\\secret.txt"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!blocked_path.success);
+        assert!(
+            blocked_path.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blocked path outside workspace")
+        );
+
+        let blocked_network = host.execute(ApprovedToolCall {
+            invocation_id: Uuid::now_v7(),
+            call: ToolCall {
+                name: "bash.run".to_string(),
+                args: json!({"cmd":"curl https://example.com"}),
+                requires_approval: false,
+            },
+        });
+        assert!(!blocked_network.success);
+        assert!(
+            blocked_network.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blocked network command")
+        );
+        assert_eq!(runner.captured(), vec!["type note.txt".to_string()]);
     }
 
     #[test]

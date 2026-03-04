@@ -1937,6 +1937,26 @@ fn build_serve_tool_list(_workspace: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
+fn spawn_serve_shell(command: &str, workspace: &Path) -> std::io::Result<std::process::Output> {
+    Command::new("cmd")
+        .args(["/C", command])
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_serve_shell(command: &str, workspace: &Path) -> std::io::Result<std::process::Output> {
+    Command::new("sh")
+        .args(["-c", command])
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+}
+
 /// Execute a tool in MCP serve mode (simplified execution without full agent).
 fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json::Value) -> String {
     match tool_name {
@@ -1998,26 +2018,17 @@ fn execute_serve_tool(workspace: &Path, tool_name: &str, arguments: &serde_json:
                 .get("timeout")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30);
-            match Command::new("sh")
-                .args(["-c", cmd])
-                .current_dir(workspace)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => match child.wait_with_output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        format!(
-                            "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
-                            output.status.code().unwrap_or(-1),
-                            stdout,
-                            stderr
-                        )
-                    }
-                    Err(e) => format!("Command wait error: {e}"),
-                },
+            match spawn_serve_shell(cmd, workspace) {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    format!(
+                        "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+                        output.status.code().unwrap_or(-1),
+                        stdout,
+                        stderr
+                    )
+                }
                 Err(e) => format!("Command spawn error: {e}"),
             }
         }
@@ -2414,6 +2425,27 @@ mod tests {
         assert!(names.contains(&"fs_read"));
         assert!(names.contains(&"bash_run"));
         assert!(names.contains(&"git_status"));
+    }
+
+    #[test]
+    fn serve_bash_run_executes_on_current_platform() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-mcp-serve-run-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let out = execute_serve_tool(
+            &workspace,
+            "bash_run",
+            &json!({ "command": "echo mcp_serve_ok" }),
+        );
+        assert!(
+            out.contains("exit_code: 0"),
+            "expected successful shell execution, got: {out}"
+        );
+        assert!(
+            out.to_ascii_lowercase().contains("mcp_serve_ok"),
+            "expected shell output marker, got: {out}"
+        );
     }
 
     // ── MCP integration tests (Phase 16.6) ──────────────────────────────

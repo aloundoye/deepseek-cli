@@ -11,6 +11,7 @@ mod shared;
 mod team;
 pub mod tool_bridge;
 pub mod tool_loop;
+mod tool_surface;
 mod verify;
 pub mod watch;
 
@@ -41,6 +42,7 @@ use codingbuddy_tools::{
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tool_surface::shape_tool_surface;
 use uuid::Uuid;
 
 /// Handler for spawn_task subagent workers. Retained for API compatibility,
@@ -234,8 +236,10 @@ impl AgentEngine {
     }
 
     pub fn validate_api_key(&self) -> Result<()> {
+        let provider = self.cfg.llm.active_provider();
+        let model = self.cfg.llm.active_base_model();
         let test_request = ChatRequest {
-            model: self.cfg.llm.base_model.clone(),
+            model: model.clone(),
             messages: vec![ChatMessage::User {
                 content: "hi".to_string(),
             }],
@@ -263,7 +267,8 @@ impl AgentEngine {
                     || err_str.contains("authentication")
                 {
                     Err(anyhow!(
-                        "Invalid or missing API key.\n\nSet your API key using one of:\n• export DEEPSEEK_API_KEY=your-key-here\n• Add \"api_key\" to ~/.codingbuddy/settings.json under the \"llm\" section\n\nGet an API key at: https://platform.deepseek.com/api_keys"
+                        "Invalid or missing API key.\n\nSet your API key using one of:\n• export {}=your-key-here\n• Add \"api_key\" to ~/.codingbuddy/settings.json under the \"llm\" section",
+                        provider.api_key_env
                     ))
                 } else {
                     self.observer.warn_log(&format!(
@@ -311,6 +316,17 @@ impl AgentEngine {
         }
     }
 
+    fn emit_stream_chunk_best_effort(&self, chunk: StreamChunk) {
+        match self.stream_callback.lock() {
+            Ok(guard) => {
+                if let Some(ref cb) = *guard {
+                    cb(chunk);
+                }
+            }
+            Err(_) => eprintln!("[agent] stream callback mutex poisoned; chunk not emitted"),
+        }
+    }
+
     pub fn set_user_question_handler(&self, handler: UserQuestionHandler) {
         match self.user_question_handler.lock() {
             Ok(mut guard) => {
@@ -333,6 +349,60 @@ impl AgentEngine {
 
     pub fn subagent_worker(&self) -> Option<SubagentWorkerFn> {
         self.subagent_worker.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn active_plan_prompt_addendum(&self, session: &Session) -> Result<Option<String>> {
+        if !matches!(
+            session.status,
+            SessionState::ExecutingStep | SessionState::Verifying
+        ) {
+            return Ok(None);
+        }
+        let Some(plan_id) = session.active_plan_id else {
+            return Ok(None);
+        };
+        let Some(plan) = self.store.load_plan(plan_id)? else {
+            return Ok(None);
+        };
+
+        let mut lines = vec![
+            "## Active Approved Plan".to_string(),
+            format!("Goal: {}", plan.goal),
+        ];
+        if !plan.steps.is_empty() {
+            lines.push("Execution steps:".to_string());
+            for (idx, step) in plan.steps.iter().enumerate().take(8) {
+                let file_suffix = if step.files.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [files: {}]", step.files.join(", "))
+                };
+                lines.push(format!(
+                    "{}. {} - {}{}",
+                    idx + 1,
+                    step.title,
+                    step.intent,
+                    file_suffix
+                ));
+            }
+        }
+        if !plan.verification.is_empty() {
+            lines.push("Verification goals:".to_string());
+            for item in plan.verification.iter().take(6) {
+                lines.push(format!("- {item}"));
+            }
+        }
+        if !plan.risk_notes.is_empty() {
+            lines.push("Risk notes:".to_string());
+            for note in plan.risk_notes.iter().take(4) {
+                lines.push(format!("- {note}"));
+            }
+        }
+        lines.push(
+            "Treat this approved plan as the execution baseline and verify changes against it."
+                .to_string(),
+        );
+        Ok(Some(lines.join("\n")))
     }
 
     /// Build a subagent worker closure from the installed worker, if any.
@@ -579,14 +649,38 @@ impl AgentEngine {
         // Select agent profile based on mode and prompt content
         let profile = agent_profiles::select_profile(options.mode, prompt, complexity);
 
-        let mut system_prompt = prompts::build_tool_use_system_prompt_with_complexity(
+        let active_base_model = self.cfg.llm.active_base_model();
+        let active_reasoner_model = self.cfg.llm.active_reasoner_model();
+        let mut session = self.ensure_session_record_for(options.session_id)?;
+        if session.status == SessionState::AwaitingApproval && prompt_grants_plan_approval(prompt) {
+            session.status = SessionState::ExecutingStep;
+            self.store.save_session(&session)?;
+            self.append_event_best_effort_for_session(
+                Some(session.session_id),
+                EventKind::SessionStateChanged {
+                    from: SessionState::AwaitingApproval,
+                    to: SessionState::ExecutingStep,
+                },
+            );
+            self.emit_stream_chunk_best_effort(StreamChunk::PhaseTransition {
+                from: TaskPhase::Plan.as_str().to_string(),
+                to: TaskPhase::Execute.as_str().to_string(),
+            });
+        }
+
+        let mut system_prompt = prompts::build_model_aware_system_prompt(
             project_memory.as_deref(),
             options.system_prompt_override.as_deref(),
             options.system_prompt_append.as_deref(),
             Some(&ws_context),
             complexity,
             repo_map_summary.as_deref(),
+            &active_base_model,
         );
+        if let Some(plan_addendum) = self.active_plan_prompt_addendum(&session)? {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&plan_addendum);
+        }
 
         // Append profile-specific system prompt addendum
         if let Some(p) = profile {
@@ -607,39 +701,31 @@ impl AgentEngine {
         // Budget: ~15% of context window to leave room for conversation.
         let initial_context =
             self.build_bootstrap_context(prompt, options, self.cfg.llm.context_window_tokens);
-
-        let session = self.ensure_session_record_for(options.session_id)?;
         let initial_phase = match session.status {
-            SessionState::Planning | SessionState::AwaitingApproval => {
-                if prompt_grants_plan_approval(prompt) {
-                    self.append_event_best_effort_for_session(
-                        Some(session.session_id),
-                        EventKind::SessionStateChanged {
-                            from: session.status.clone(),
-                            to: SessionState::ExecutingStep,
-                        },
-                    );
-                    Some(TaskPhase::Execute)
-                } else {
-                    Some(TaskPhase::Plan)
-                }
-            }
+            SessionState::Planning | SessionState::AwaitingApproval => Some(TaskPhase::Plan),
             SessionState::ExecutingStep => Some(TaskPhase::Execute),
             SessionState::Verifying => Some(TaskPhase::Verify),
             _ => None,
         };
 
         let config = tool_loop::ToolLoopConfig {
-            model: self.cfg.llm.base_model.clone(), // Always deepseek-chat
+            model: active_base_model.clone(),
             max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
+            provider_kind: self
+                .cfg
+                .llm
+                .active_provider_kind()
+                .unwrap_or(codingbuddy_core::ProviderKind::Deepseek),
             temperature: None, // Incompatible with thinking mode
             context_window_tokens: self.cfg.llm.context_window_tokens,
+            reserved_overhead_tokens: self.cfg.context.reserved_overhead_tokens,
+            response_budget_tokens: self.cfg.context.response_budget_tokens,
             max_turns: self
                 .max_turns
                 .unwrap_or(self.cfg.agent_loop.tool_loop_max_turns) as usize,
             read_only,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(think_budget)),
-            extended_thinking_model: self.cfg.llm.max_think_model.clone(),
+            extended_thinking_model: active_reasoner_model,
             complexity,
             subagent_worker: self.build_subagent_worker(),
             skill_runner: self.build_skill_runner(),
@@ -686,6 +772,10 @@ impl AgentEngine {
         if let Some(p) = profile {
             tools = agent_profiles::filter_by_profile(tools, p);
             discoverable_tools = agent_profiles::filter_by_profile(discoverable_tools, p);
+        }
+        if let Some(capabilities) = self.cfg.llm.capabilities_for_model(&active_base_model) {
+            (tools, discoverable_tools) =
+                shape_tool_surface(tools, discoverable_tools, capabilities);
         }
 
         if !discoverable_tools.is_empty() {
@@ -1075,8 +1165,9 @@ fn build_retriever_callback(
         ..Default::default()
     };
 
-    // Build hybrid retriever: use UsearchBackend (HNSW) with local-ml, BruteForce without.
-    #[cfg(feature = "local-ml")]
+    // Build hybrid retriever: use UsearchBackend only when explicitly enabled;
+    // otherwise stick to the built-in brute-force backend for portability.
+    #[cfg(all(feature = "local-ml-usearch", not(target_os = "windows")))]
     let retriever = match codingbuddy_local_ml::UsearchBackend::new(embeddings.dimension()) {
         Ok(backend) => codingbuddy_local_ml::HybridRetriever::new_with_backend(
             &index_path,
@@ -1094,6 +1185,17 @@ fn build_retriever_callback(
             chunk_config,
         ),
     };
+    #[cfg(all(
+        feature = "local-ml",
+        any(not(feature = "local-ml-usearch"), target_os = "windows")
+    ))]
+    let retriever = codingbuddy_local_ml::HybridRetriever::new(
+        &index_path,
+        embeddings,
+        None,
+        0.7,
+        chunk_config,
+    );
     #[cfg(not(feature = "local-ml"))]
     let retriever = codingbuddy_local_ml::HybridRetriever::new(
         &index_path,

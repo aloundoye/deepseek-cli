@@ -415,12 +415,16 @@ fn git_stdout(workspace: &Path, args: &[&str]) -> Result<String> {
 ///
 /// Memory is stored per-project, per-agent:
 /// `~/.codingbuddy/projects/<hash>/agents/<name>/MEMORY.md`
+fn user_home_or_temp_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 pub fn agent_memory_path(workspace: &Path, agent_name: &str) -> PathBuf {
     let hash = project_hash(workspace);
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
+    user_home_or_temp_dir()
         .join(".codingbuddy/projects")
         .join(&hash)
         .join("agents")
@@ -458,10 +462,7 @@ fn project_hash(workspace: &Path) -> String {
 /// Path to a subagent's transcript file.
 pub fn transcript_path(workspace: &Path, agent_id: Uuid) -> PathBuf {
     let hash = project_hash(workspace);
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
+    user_home_or_temp_dir()
         .join(".codingbuddy/projects")
         .join(&hash)
         .join("subagents")
@@ -808,6 +809,51 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    fn run_git(repo: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("failed to spawn git command")
+    }
+
+    fn init_repo_with_initial_commit(repo: &Path, file_name: &str, file_content: &str) {
+        let init = run_git(repo, &["init", "-q"]);
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        // CI runners may not have global identity configured.
+        let name = run_git(repo, &["config", "user.name", "CodingBuddy Test"]);
+        assert!(
+            name.status.success(),
+            "git config user.name failed: {}",
+            String::from_utf8_lossy(&name.stderr)
+        );
+        let email = run_git(repo, &["config", "user.email", "codingbuddy@example.test"]);
+        assert!(
+            email.status.success(),
+            "git config user.email failed: {}",
+            String::from_utf8_lossy(&email.stderr)
+        );
+
+        std::fs::write(repo.join(file_name), file_content).expect("failed to write seed file");
+        let add = run_git(repo, &["add", "."]);
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let commit = run_git(repo, &["commit", "-m", "initial", "--allow-empty", "-q"]);
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
     #[test]
     fn runs_tasks_in_bounded_batches() {
         let manager = SubagentManager::new(2);
@@ -1066,26 +1112,7 @@ mod tests {
     #[test]
     fn worktree_creates_and_cleans() {
         let temp = tempfile::tempdir().unwrap();
-        // Initialize a git repo
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
-        assert!(init.status.success(), "git init failed");
-
-        // Need at least one commit for worktree
-        std::fs::write(temp.path().join("test.txt"), "hello\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["commit", "-m", "initial", "--allow-empty"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
+        init_repo_with_initial_commit(temp.path(), "test.txt", "hello\n");
 
         let mut wt = WorktreeIsolation::create(temp.path(), "test-agent").unwrap();
         assert!(wt.path().exists(), "worktree should exist");
@@ -1097,22 +1124,7 @@ mod tests {
     #[test]
     fn worktree_diff_collected() {
         let temp = tempfile::tempdir().unwrap();
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
-        assert!(init.status.success());
-
-        std::fs::write(temp.path().join("file.txt"), "original\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(temp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(temp.path())
-            .output();
+        init_repo_with_initial_commit(temp.path(), "file.txt", "original\n");
 
         let mut wt = WorktreeIsolation::create(temp.path(), "diff-test").unwrap();
 

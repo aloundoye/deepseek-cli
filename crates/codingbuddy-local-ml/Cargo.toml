@@ -9,11 +9,12 @@ license.workspace = true
 default = []
 local-ml = [
     "candle-core", "candle-nn", "candle-transformers",
-    "tokenizers", "hf-hub", "usearch",
+    "tokenizers", "hf-hub",
     "tree-sitter", "tree-sitter-rust", "tree-sitter-python",
     "tree-sitter-javascript", "tree-sitter-typescript",
     "tree-sitter-go", "tree-sitter-java",
 ]
+usearch-backend = ["dep:usearch"]
 
 [dependencies]
 anyhow.workspace = true
@@ -34,7 +35,6 @@ candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.4", optional = true }
-usearch = { version = "2.21", optional = true }
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
@@ -42,6 +42,9 @@ tree-sitter-javascript = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-go = { workspace = true, optional = true }
 tree-sitter-java = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+usearch = { version = "2.21", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

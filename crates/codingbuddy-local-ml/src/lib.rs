@@ -27,7 +27,11 @@ pub use completion::candle_backend::CandleCompletion;
 pub use embeddings::candle_backend::CandleEmbeddings;
 #[cfg(feature = "local-ml")]
 pub use reranker::candle_backend::CandleReranker;
-#[cfg(feature = "local-ml")]
+#[cfg(all(
+    feature = "local-ml",
+    feature = "usearch-backend",
+    not(target_os = "windows")
+))]
 pub use vector_index::UsearchBackend;
 
 /// Strategy for loading a model based on available system memory.

@@ -4,7 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod llm_capabilities;
 mod tool_metadata;
+pub use llm_capabilities::{
+    ModelCapabilities, ModelFamily, PreferredEditTool, ProviderKind, detect_model_family,
+    model_capabilities, normalize_provider_kind,
+};
 pub use tool_metadata::{
     ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier, is_api_tool_name_read_only,
     is_internal_tool_name_read_only,
@@ -2144,8 +2149,12 @@ pub enum CacheStrategy {
 /// Configuration for a single provider endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default)]
+    pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
+    #[serde(default)]
+    pub openai_compat_prefix: bool,
     pub models: ProviderModels,
 }
 
@@ -2195,13 +2204,43 @@ impl LlmConfig {
         }
         // Fallback: build from legacy top-level fields
         ProviderConfig {
+            kind: self.provider.clone(),
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
+            openai_compat_prefix: self.openai_compat_prefix,
             models: ProviderModels {
                 chat: self.base_model.clone(),
                 reasoner: Some(self.max_think_model.clone()),
             },
         }
+    }
+
+    #[must_use]
+    pub fn active_provider_kind(&self) -> Option<ProviderKind> {
+        let provider = self.active_provider();
+        let kind = if provider.kind.trim().is_empty() {
+            self.provider.as_str()
+        } else {
+            provider.kind.as_str()
+        };
+        normalize_provider_kind(kind)
+    }
+
+    #[must_use]
+    pub fn active_base_model(&self) -> String {
+        self.active_provider().models.chat
+    }
+
+    #[must_use]
+    pub fn active_reasoner_model(&self) -> String {
+        let provider = self.active_provider();
+        provider.models.reasoner.unwrap_or(provider.models.chat)
+    }
+
+    #[must_use]
+    pub fn capabilities_for_model(&self, model: &str) -> Option<ModelCapabilities> {
+        self.active_provider_kind()
+            .map(|provider| model_capabilities(provider, model))
     }
 }
 
@@ -2237,11 +2276,39 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
     map.insert(
         "deepseek".to_string(),
         ProviderConfig {
+            kind: "deepseek".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
+            openai_compat_prefix: false,
             models: ProviderModels {
                 chat: CODINGBUDDY_V32_CHAT_MODEL.to_string(),
                 reasoner: Some(CODINGBUDDY_V32_REASONER_MODEL.to_string()),
+            },
+        },
+    );
+    map.insert(
+        "openai-compatible".to_string(),
+        ProviderConfig {
+            kind: "openai-compatible".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            openai_compat_prefix: true,
+            models: ProviderModels {
+                chat: "gpt-4o-mini".to_string(),
+                reasoner: Some("o4-mini".to_string()),
+            },
+        },
+    );
+    map.insert(
+        "ollama".to_string(),
+        ProviderConfig {
+            kind: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            api_key_env: String::new(),
+            openai_compat_prefix: true,
+            models: ProviderModels {
+                chat: "qwen2.5-coder:7b".to_string(),
+                reasoner: None,
             },
         },
     );
@@ -4025,8 +4092,10 @@ mod tests {
         providers.insert(
             "openai-compat".to_string(),
             ProviderConfig {
+                kind: "openai-compatible".to_string(),
                 base_url: "http://localhost:11434/v1".to_string(),
                 api_key_env: "OLLAMA_KEY".to_string(),
+                openai_compat_prefix: true,
                 models: ProviderModels {
                     chat: "llama3".to_string(),
                     reasoner: None,
@@ -4049,9 +4118,62 @@ mod tests {
     fn default_providers_includes_deepseek() {
         let providers = default_providers();
         assert!(providers.contains_key("deepseek"));
+        assert!(providers.contains_key("openai-compatible"));
+        assert!(providers.contains_key("ollama"));
         let ds = &providers["deepseek"];
         assert_eq!(ds.base_url, "https://api.deepseek.com");
         assert_eq!(ds.models.chat, "deepseek-chat");
+    }
+
+    #[test]
+    fn provider_kind_aliases_resolve() {
+        assert_eq!(
+            normalize_provider_kind("openai-compat"),
+            Some(ProviderKind::OpenAiCompatible)
+        );
+        assert_eq!(
+            normalize_provider_kind("custom"),
+            Some(ProviderKind::OpenAiCompatible)
+        );
+        assert_eq!(
+            normalize_provider_kind("ollama"),
+            Some(ProviderKind::Ollama)
+        );
+        assert_eq!(
+            normalize_provider_kind("deepseek"),
+            Some(ProviderKind::Deepseek)
+        );
+        assert_eq!(normalize_provider_kind("made-up"), None);
+    }
+
+    #[test]
+    fn active_models_follow_provider_map() {
+        let cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(cfg.active_base_model(), "qwen2.5-coder:7b");
+        assert_eq!(cfg.active_reasoner_model(), "qwen2.5-coder:7b");
+        assert_eq!(cfg.active_provider_kind(), Some(ProviderKind::Ollama));
+    }
+
+    #[test]
+    fn capabilities_reflect_provider_and_model() {
+        let cfg = LlmConfig::default();
+        let deepseek = cfg
+            .capabilities_for_model("deepseek-reasoner")
+            .expect("deepseek caps");
+        assert!(deepseek.supports_reasoning_mode);
+        assert!(!deepseek.supports_tool_choice);
+        let ollama_cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        let ollama = ollama_cfg
+            .capabilities_for_model("qwen2.5-coder:7b")
+            .expect("ollama caps");
+        assert!(!ollama.supports_thinking_config);
+        assert_eq!(ollama.family, ModelFamily::Qwen);
     }
 
     // ── Phase 3 EventKind variant tests ──

@@ -1,7 +1,7 @@
 //! Public types, configuration, and callback signatures for the tool-use loop.
 
 use anyhow::Result;
-use codingbuddy_core::{ChatMessage, EventKind, TokenUsage, UserQuestion};
+use codingbuddy_core::{ChatMessage, EventKind, ProviderKind, TokenUsage, UserQuestion};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -101,8 +101,14 @@ pub struct SubagentRequest {
 pub struct ToolLoopConfig {
     pub model: String,
     pub max_tokens: u32,
+    /// Active provider kind for capability-aware budgeting decisions.
+    pub provider_kind: ProviderKind,
     pub temperature: Option<f32>,
     pub context_window_tokens: u64,
+    /// Tokens reserved for system/tool overhead during context budgeting.
+    pub reserved_overhead_tokens: u64,
+    /// Minimum tokens reserved for the model response during context budgeting.
+    pub response_budget_tokens: u64,
     pub max_turns: usize,
     /// When true, use read-only tools only (Ask/Context mode).
     pub read_only: bool,
@@ -143,8 +149,11 @@ impl Default for ToolLoopConfig {
         Self {
             model: codingbuddy_core::CODINGBUDDY_V32_CHAT_MODEL.to_string(),
             max_tokens: codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS,
+            provider_kind: ProviderKind::Deepseek,
             temperature: None,
             context_window_tokens: 128_000,
+            reserved_overhead_tokens: 4_000,
+            response_budget_tokens: 8_192,
             max_turns: DEFAULT_MAX_TURNS,
             read_only: false,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(

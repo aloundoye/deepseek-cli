@@ -347,7 +347,7 @@ fn validate_lane_patch_artifact(patch: &str) -> Result<()> {
 fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>> {
     let system = "You are a planning assistant. Given a user request, list the workspace-relative file paths that need to be modified or created. Return ONLY one file path per line, no other text.";
     let req = ChatRequest {
-        model: engine.cfg.llm.base_model.clone(),
+        model: engine.cfg.llm.active_base_model(),
         messages: vec![
             ChatMessage::System {
                 content: system.to_string(),

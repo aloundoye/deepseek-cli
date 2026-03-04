@@ -13,3 +13,6 @@ chrono.workspace = true
 uuid.workspace = true
 wait-timeout = "0.2"
 codingbuddy-policy = { path = "../codingbuddy-policy" }
+
+[dev-dependencies]
+tempfile.workspace = true

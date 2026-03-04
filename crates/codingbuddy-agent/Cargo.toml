@@ -38,6 +38,7 @@ glob.workspace = true
 
 [features]
 local-ml = ["codingbuddy-local-ml/local-ml"]
+local-ml-usearch = ["local-ml", "codingbuddy-local-ml/usearch-backend"]
 
 [dev-dependencies]
 tempfile.workspace = true

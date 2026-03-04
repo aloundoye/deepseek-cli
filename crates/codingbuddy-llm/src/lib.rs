@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
     CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse,
-    LlmToolCall, StreamCallback, StreamChunk, normalize_codingbuddy_model,
+    LlmToolCall, ProviderKind, StreamCallback, StreamChunk, normalize_codingbuddy_model,
     normalize_codingbuddy_profile,
 };
 use reqwest::StatusCode;
@@ -54,16 +54,22 @@ pub struct ApiClient {
 
 /// Resolve an API key from env var then config fallback.
 fn resolve_key_from_config(cfg: &LlmConfig) -> Option<String> {
-    std::env::var(&cfg.api_key_env)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            cfg.api_key
-                .as_ref()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        })
+    let provider = cfg.active_provider();
+    let env_key = provider.api_key_env.trim();
+    let env_value = if env_key.is_empty() {
+        None
+    } else {
+        std::env::var(env_key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    env_value.or_else(|| {
+        cfg.api_key
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 impl ApiClient {
@@ -91,37 +97,90 @@ impl ApiClient {
         self.cancel_token = Some(token);
     }
 
+    fn provider_kind(&self) -> Result<ProviderKind> {
+        self.cfg.active_provider_kind().ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                self.cfg.provider
+            )
+        })
+    }
+
+    fn provider_config(&self) -> codingbuddy_core::ProviderConfig {
+        self.cfg.active_provider()
+    }
+
+    fn apply_auth(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+        api_key: Option<&str>,
+    ) -> reqwest::blocking::RequestBuilder {
+        match api_key {
+            Some(key) if !key.trim().is_empty() => builder.bearer_auth(key),
+            _ => builder,
+        }
+    }
+
+    fn resolve_request_api_key(&self) -> Result<Option<String>> {
+        let provider = self.provider_config();
+        let key = self.resolve_api_key();
+        if key.is_some() {
+            return Ok(key);
+        }
+        if provider.api_key_env.trim().is_empty() {
+            return Ok(None);
+        }
+        Err(anyhow!(
+            "{} not set and llm.api_key is empty",
+            provider.api_key_env
+        ))
+    }
+
     fn resolved_endpoint(&self, is_chat: bool, is_fim: bool, is_strict_tools: bool) -> String {
         let default_ep = "https://api.deepseek.com/chat/completions";
         if self.cfg.endpoint != default_ep && !self.cfg.endpoint.is_empty() {
             return self.cfg.endpoint.clone();
         }
-        let base = self.cfg.base_url.trim_end_matches('/');
-        let prefix = if self.cfg.openai_compat_prefix {
+        let provider = self.provider_config();
+        let base = provider.base_url.trim_end_matches('/');
+        let prefix = if provider.openai_compat_prefix {
             "/v1"
         } else {
             ""
         };
-        let path = if is_fim || is_strict_tools {
-            format!("{prefix}/beta/completions")
-        } else if is_chat {
-            format!("{prefix}/chat/completions")
-        } else {
-            format!("{prefix}/completions")
+        let path = match self.provider_kind().unwrap_or(ProviderKind::Deepseek) {
+            ProviderKind::Deepseek => {
+                if is_fim || is_strict_tools {
+                    format!("{prefix}/beta/completions")
+                } else if is_chat {
+                    format!("{prefix}/chat/completions")
+                } else {
+                    format!("{prefix}/completions")
+                }
+            }
+            ProviderKind::OpenAiCompatible | ProviderKind::Ollama => {
+                if is_chat {
+                    format!("{prefix}/chat/completions")
+                } else {
+                    format!("{prefix}/completions")
+                }
+            }
         };
         format!("{base}{path}")
     }
 
-    fn complete_inner(&self, req: &LlmRequest, api_key: &str) -> Result<LlmResponse> {
+    fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let payload = self.build_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
-                .client
-                .post(self.resolved_endpoint(false, false, false))
-                .bearer_auth(api_key)
+                .apply_auth(
+                    self.client
+                        .post(self.resolved_endpoint(false, false, false)),
+                    api_key,
+                )
                 .json(&payload)
                 .send();
 
@@ -169,8 +228,9 @@ impl ApiClient {
     }
 
     fn build_payload(&self, req: &LlmRequest) -> Value {
+        let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
         let fast_mode = self.cfg.fast_mode;
-        let max_cap = model_max_output_tokens(&req.model, false);
+        let max_cap = max_output_tokens_for_model(provider, &req.model, false);
         if req.max_tokens > max_cap {
             eprintln!(
                 "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
@@ -210,8 +270,11 @@ impl ApiClient {
             messages.push(json!({"role": "user", "content": parts}));
         }
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
-
-        let model = normalize_codingbuddy_model(&req.model).unwrap_or(req.model.as_str());
+        let model = if provider == ProviderKind::Deepseek {
+            normalize_codingbuddy_model(&req.model).unwrap_or(req.model.as_str())
+        } else {
+            req.model.as_str()
+        };
 
         json!({
             "model": model,
@@ -223,8 +286,13 @@ impl ApiClient {
     }
 
     fn build_fim_payload(&self, req: &FimRequest) -> Value {
+        let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
         let mut payload = json!({
-            "model": normalize_codingbuddy_model(&req.model).unwrap_or(&req.model),
+            "model": if provider == ProviderKind::Deepseek {
+                normalize_codingbuddy_model(&req.model).unwrap_or(&req.model)
+            } else {
+                &req.model
+            },
             "prompt": req.prompt,
             "max_tokens": req.max_tokens.min(8192),
             "stream": false
@@ -248,10 +316,17 @@ impl ApiClient {
     }
 
     fn build_chat_payload(&self, req: &ChatRequest) -> Result<Value> {
-        let thinking_enabled = req
+        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                self.cfg.provider
+            )
+        })?;
+        let requested_thinking = req
             .thinking
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
+        let thinking_enabled = requested_thinking && capabilities.supports_thinking_config;
 
         let mut messages: Vec<Value> = req
             .messages
@@ -313,19 +388,24 @@ impl ApiClient {
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
-        let max_cap = model_max_output_tokens(&req.model, thinking_enabled);
+        let max_cap =
+            max_output_tokens_for_model(capabilities.provider, &req.model, thinking_enabled);
         let mut payload = json!({
-            "model": normalize_codingbuddy_model(&req.model).unwrap_or(&req.model),
+            "model": if capabilities.provider == ProviderKind::Deepseek {
+                normalize_codingbuddy_model(&req.model).unwrap_or(&req.model)
+            } else {
+                &req.model
+            },
             "messages": messages,
             "max_tokens": req.max_tokens.min(max_cap),
             "stream": false
         });
-        // DeepSeek API requires temperature/top_p/presence_penalty/frequency_penalty
-        // to be omitted when thinking is enabled. logprobs/top_logprobs are errors.
+        // Providers with explicit thinking configs require these sampling
+        // params to be omitted while thinking is enabled.
         if thinking_enabled {
             if req.logprobs == Some(true) || req.top_logprobs.is_some() {
                 // Cannot return Err from a non-Result fn; the caller validates via
-                // complete_chat which calls resolve_request_model. We strip silently
+                // complete_chat which calls validate_thinking_params. We strip silently
                 // here and let validate_thinking_params catch it early.
             }
         } else {
@@ -360,29 +440,31 @@ impl ApiClient {
         // Safety net: deepseek-reasoner thinks natively and rejects both
         // `thinking` config AND `tool_choice` (HTTP 400). The callers should
         // already omit these, but guard here as the last line of defense.
-        let is_reasoner = codingbuddy_core::is_reasoner_model(&req.model);
-        if !is_reasoner && let Some(ref thinking) = req.thinking {
+        if capabilities.supports_thinking_config
+            && let Some(ref thinking) = req.thinking
+        {
             payload["thinking"] = serde_json::to_value(thinking)?;
         }
-        if !req.tools.is_empty() {
+        if capabilities.supports_tool_calling && !req.tools.is_empty() {
             payload["tools"] = serde_json::to_value(&req.tools)?;
-            if !is_reasoner {
+            if capabilities.supports_tool_choice {
                 payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
             }
         }
         Ok(payload)
     }
 
-    fn complete_chat_inner(&self, req: &ChatRequest, api_key: &str) -> Result<LlmResponse> {
+    fn complete_chat_inner(&self, req: &ChatRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let payload = self.build_chat_payload(req)?;
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
-                .client
-                .post(self.resolved_endpoint(true, false, false))
-                .bearer_auth(api_key)
+                .apply_auth(
+                    self.client.post(self.resolved_endpoint(true, false, false)),
+                    api_key,
+                )
                 .json(&payload)
                 .send();
 
@@ -422,15 +504,16 @@ impl ApiClient {
         Err(last_err.unwrap_or_else(|| anyhow!("chat request failed")))
     }
 
-    fn complete_fim_inner(&self, req: &FimRequest, api_key: &str) -> Result<LlmResponse> {
+    fn complete_fim_inner(&self, req: &FimRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let payload = self.build_fim_payload(req);
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
-                .client
-                .post(self.resolved_endpoint(false, true, false))
-                .bearer_auth(api_key)
+                .apply_auth(
+                    self.client.post(self.resolved_endpoint(false, true, false)),
+                    api_key,
+                )
                 .json(&payload)
                 .send();
 
@@ -477,7 +560,7 @@ impl ApiClient {
     fn complete_fim_streaming_inner(
         &self,
         req: &FimRequest,
-        api_key: &str,
+        api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
         let mut payload = self.build_fim_payload(req);
@@ -488,9 +571,10 @@ impl ApiClient {
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
-                .client
-                .post(self.resolved_endpoint(false, true, false))
-                .bearer_auth(api_key)
+                .apply_auth(
+                    self.client.post(self.resolved_endpoint(false, true, false)),
+                    api_key,
+                )
                 .json(&payload)
                 .send();
 
@@ -603,7 +687,7 @@ impl ApiClient {
     fn complete_chat_streaming_inner(
         &self,
         req: &ChatRequest,
-        api_key: &str,
+        api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
         let mut payload = self.build_chat_payload(req)?;
@@ -614,9 +698,10 @@ impl ApiClient {
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
-                .client
-                .post(self.resolved_endpoint(true, false, false))
-                .bearer_auth(api_key)
+                .apply_auth(
+                    self.client.post(self.resolved_endpoint(true, false, false)),
+                    api_key,
+                )
                 .json(&payload)
                 .send();
 
@@ -812,25 +897,35 @@ impl ApiClient {
         resolve_key_from_config(&self.cfg)
     }
 
-    fn resolve_request_model(&self, requested: &str, profile: &str) -> Result<String> {
-        let normalized = normalize_codingbuddy_model(requested).ok_or_else(|| {
-            anyhow!(
-                "unsupported model '{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
-                requested
-            )
-        })?;
-        let _ = profile;
-        Ok(normalized.to_string())
+    fn resolve_request_model(&self, requested: &str) -> Result<String> {
+        let trimmed = requested.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("llm model must not be empty"));
+        }
+        match self.provider_kind()? {
+            ProviderKind::Deepseek => {
+                let normalized = normalize_codingbuddy_model(trimmed).ok_or_else(|| {
+                    anyhow!(
+                        "unsupported model '{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
+                        requested
+                    )
+                })?;
+                Ok(normalized.to_string())
+            }
+            ProviderKind::OpenAiCompatible | ProviderKind::Ollama => Ok(trimmed.to_string()),
+        }
     }
 
-    /// Validate that thinking-mode-incompatible parameters are not set.
-    /// DeepSeek API errors on logprobs/top_logprobs when thinking is enabled,
-    /// and ignores temperature/top_p/presence_penalty/frequency_penalty.
-    fn validate_thinking_params(req: &ChatRequest) -> Result<()> {
+    /// Validate parameters that are incompatible with provider-managed thinking modes.
+    fn validate_thinking_params(&self, req: &ChatRequest) -> Result<()> {
         let thinking_enabled = req
             .thinking
             .as_ref()
-            .is_some_and(|t| t.thinking_type == "enabled");
+            .is_some_and(|t| t.thinking_type == "enabled")
+            && self
+                .cfg
+                .capabilities_for_model(&req.model)
+                .is_some_and(|caps| caps.supports_thinking_config);
         if !thinking_enabled {
             return Ok(());
         }
@@ -852,7 +947,7 @@ impl ApiClient {
     fn complete_streaming_inner(
         &self,
         req: &LlmRequest,
-        api_key: &str,
+        api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
         let mut payload = self.build_payload(req);
@@ -864,9 +959,11 @@ impl ApiClient {
         let mut attempt: u8 = 0;
         while attempt <= self.cfg.max_retries {
             let response = self
-                .client
-                .post(self.resolved_endpoint(false, false, false))
-                .bearer_auth(api_key)
+                .apply_auth(
+                    self.client
+                        .post(self.resolved_endpoint(false, false, false)),
+                    api_key,
+                )
                 .json(&payload)
                 .send();
 
@@ -1033,8 +1130,7 @@ impl ApiClient {
             }
         }
 
-        Err(last_err
-            .unwrap_or_else(|| anyhow!("deepseek streaming request failed without detailed error")))
+        Err(last_err.unwrap_or_else(|| anyhow!("streaming request failed without detailed error")))
     }
 }
 
@@ -1045,10 +1141,14 @@ impl ApiClient {
 ///
 /// Thinking-aware: `deepseek-chat` with thinking enabled can output up to 32K tokens,
 /// compared to 8K without thinking. `deepseek-reasoner` always outputs up to 64K.
-fn model_max_output_tokens(model: &str, thinking_enabled: bool) -> u32 {
-    if codingbuddy_core::is_reasoner_model(model) {
+pub fn max_output_tokens_for_model(
+    provider: ProviderKind,
+    model: &str,
+    thinking_enabled: bool,
+) -> u32 {
+    if provider == ProviderKind::Deepseek && codingbuddy_core::is_reasoner_model(model) {
         codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS // 65536
-    } else if thinking_enabled {
+    } else if provider == ProviderKind::Deepseek && thinking_enabled {
         codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS // 32768
     } else {
         codingbuddy_core::CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS // 8192
@@ -1057,64 +1157,52 @@ fn model_max_output_tokens(model: &str, thinking_enabled: bool) -> u32 {
 
 impl LlmClient for ApiClient {
     fn complete(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!(
-                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
-                self.cfg.provider
-            ));
+        let provider = self.provider_kind()?;
+        let key = self.resolve_request_api_key()?;
+        if provider == ProviderKind::Deepseek {
+            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.profile='{}' (supported: v3_2)",
+                    self.cfg.profile
+                )
+            })?;
         }
-        let key = self
-            .resolve_api_key()
-            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
-
-        let profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.profile='{}' (supported: v3_2)",
-                self.cfg.profile
-            )
-        })?;
         let mut normalized_req = req.clone();
-        normalized_req.model = self.resolve_request_model(&req.model, profile)?;
-        self.complete_inner(&normalized_req, &key)
+        normalized_req.model = self.resolve_request_model(&req.model)?;
+        self.complete_inner(&normalized_req, key.as_deref())
     }
 
     fn complete_streaming(&self, req: &LlmRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!(
-                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
-                self.cfg.provider
-            ));
+        let provider = self.provider_kind()?;
+        let key = self.resolve_request_api_key()?;
+        if provider == ProviderKind::Deepseek {
+            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.profile='{}' (supported: v3_2)",
+                    self.cfg.profile
+                )
+            })?;
         }
-        let key = self
-            .resolve_api_key()
-            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
-
-        let profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
-            anyhow!(
-                "unsupported llm.profile='{}' (supported: v3_2)",
-                self.cfg.profile
-            )
-        })?;
         let mut normalized_req = req.clone();
-        normalized_req.model = self.resolve_request_model(&req.model, profile)?;
-        self.complete_streaming_inner(&normalized_req, &key, cb)
+        normalized_req.model = self.resolve_request_model(&req.model)?;
+        self.complete_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
     fn complete_chat(&self, req: &ChatRequest) -> Result<LlmResponse> {
-        let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!(
-                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
-                self.cfg.provider
-            ));
+        let provider = self.provider_kind()?;
+        if provider == ProviderKind::Deepseek {
+            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.profile='{}' (supported: v3_2)",
+                    self.cfg.profile
+                )
+            })?;
         }
-        Self::validate_thinking_params(req)?;
-        let key = self
-            .resolve_api_key()
-            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
-        self.complete_chat_inner(req, &key)
+        self.validate_thinking_params(req)?;
+        let key = self.resolve_request_api_key()?;
+        let mut normalized_req = req.clone();
+        normalized_req.model = self.resolve_request_model(&req.model)?;
+        self.complete_chat_inner(&normalized_req, key.as_deref())
     }
 
     fn complete_chat_streaming(
@@ -1122,44 +1210,80 @@ impl LlmClient for ApiClient {
         req: &ChatRequest,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!(
-                "unsupported llm.provider='{}' (only 'deepseek' is supported)",
-                self.cfg.provider
-            ));
+        let provider = self.provider_kind()?;
+        if provider == ProviderKind::Deepseek {
+            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.profile='{}' (supported: v3_2)",
+                    self.cfg.profile
+                )
+            })?;
         }
-        Self::validate_thinking_params(req)?;
-        let key = self
-            .resolve_api_key()
-            .ok_or_else(|| anyhow!("{} not set and llm.api_key is empty", self.cfg.api_key_env))?;
-        self.complete_chat_streaming_inner(req, &key, cb)
+        self.validate_thinking_params(req)?;
+        let key = self.resolve_request_api_key()?;
+        let mut normalized_req = req.clone();
+        normalized_req.model = self.resolve_request_model(&req.model)?;
+        self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
     fn complete_fim(&self, req: &FimRequest) -> Result<LlmResponse> {
-        let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!("unsupported llm.provider"));
+        let provider = self.provider_kind()?;
+        if provider == ProviderKind::Deepseek {
+            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.profile='{}' (supported: v3_2)",
+                    self.cfg.profile
+                )
+            })?;
         }
-        let key = self
-            .resolve_api_key()
-            .ok_or_else(|| anyhow!("api_key missing"))?;
-        self.complete_fim_inner(req, &key)
+        if !self
+            .cfg
+            .capabilities_for_model(&req.model)
+            .is_some_and(|caps| caps.supports_fim)
+        {
+            return Err(anyhow!(
+                "provider '{}' does not support fill-in-the-middle requests",
+                self.cfg.provider
+            ));
+        }
+        let key = self.resolve_request_api_key()?;
+        let mut normalized_req = req.clone();
+        if provider == ProviderKind::Deepseek {
+            normalized_req.model = self.resolve_request_model(&req.model)?;
+        }
+        self.complete_fim_inner(&normalized_req, key.as_deref())
     }
 
     fn complete_fim_streaming(&self, req: &FimRequest, cb: StreamCallback) -> Result<LlmResponse> {
-        let provider = self.cfg.provider.to_ascii_lowercase();
-        if provider != "deepseek" {
-            return Err(anyhow!("unsupported llm.provider"));
+        let provider = self.provider_kind()?;
+        if provider == ProviderKind::Deepseek {
+            let _profile = normalize_codingbuddy_profile(&self.cfg.profile).ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.profile='{}' (supported: v3_2)",
+                    self.cfg.profile
+                )
+            })?;
         }
-        let key = self
-            .resolve_api_key()
-            .ok_or_else(|| anyhow!("api_key missing"))?;
-        self.complete_fim_streaming_inner(req, &key, cb)
+        if !self
+            .cfg
+            .capabilities_for_model(&req.model)
+            .is_some_and(|caps| caps.supports_fim)
+        {
+            return Err(anyhow!(
+                "provider '{}' does not support fill-in-the-middle requests",
+                self.cfg.provider
+            ));
+        }
+        let key = self.resolve_request_api_key()?;
+        let mut normalized_req = req.clone();
+        if provider == ProviderKind::Deepseek {
+            normalized_req.model = self.resolve_request_model(&req.model)?;
+        }
+        self.complete_fim_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 }
 
-/// Produce a user-friendly error from a DeepSeek API HTTP response.
+/// Produce a user-friendly error from an LLM API HTTP response.
 fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8) -> anyhow::Error {
     // Parse structured error from JSON body: {"error": {"type": "...", "message": "..."}}
     let parsed = serde_json::from_str::<Value>(body).ok();
@@ -1183,11 +1307,10 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
         ),
         StatusCode::UNAUTHORIZED => anyhow!(
             "Invalid or missing API key (HTTP 401).\n\
-             Set DEEPSEEK_API_KEY environment variable or configure llm.api_key in settings.\n\
-             Get an API key at https://platform.deepseek.com"
+             Set the active provider API key environment variable or configure llm.api_key in settings."
         ),
         StatusCode::PAYMENT_REQUIRED => anyhow!(
-            "Insufficient balance (HTTP 402). Top up your DeepSeek account at https://platform.deepseek.com"
+            "Insufficient balance or billing issue (HTTP 402). Check the active provider account."
         ),
         StatusCode::UNPROCESSABLE_ENTITY => {
             let param = error_obj
@@ -1215,14 +1338,14 @@ fn format_api_error(status: StatusCode, body: &str, attempt: u8, max_retries: u8
             detail
         ),
         StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => anyhow!(
-            "DeepSeek server error (HTTP {}). Exhausted {}/{} retries. The service may be temporarily unavailable. Detail: {}",
+            "LLM provider server error (HTTP {}). Exhausted {}/{} retries. The service may be temporarily unavailable. Detail: {}",
             status.as_u16(),
             attempt + 1,
             max_retries + 1,
             detail
         ),
         _ => anyhow!(
-            "DeepSeek API error (HTTP {}, type={}): {}",
+            "LLM API error (HTTP {}, type={}): {}",
             status.as_u16(),
             error_type,
             detail
@@ -1245,19 +1368,19 @@ fn format_transport_error(err: &reqwest::Error) -> anyhow::Error {
 
     if err.is_timeout() {
         anyhow!(
-            "Request timed out. The DeepSeek API did not respond in time.\n\
+            "Request timed out. The configured LLM endpoint did not respond in time.\n\
              Retrying with exponential backoff. If this persists, try increasing \
              llm.timeout_seconds in your config."
         )
     } else if is_dns {
         anyhow!(
-            "DNS resolution failed. Could not resolve the DeepSeek API hostname.\n\
+            "DNS resolution failed. Could not resolve the configured LLM hostname.\n\
              Check your internet connection and DNS settings. \
              Retrying with exponential backoff."
         )
     } else if err.is_connect() {
         anyhow!(
-            "Connection refused. Could not reach the DeepSeek API at the configured endpoint.\n\
+            "Connection refused. Could not reach the configured LLM endpoint.\n\
              Check your network connection and firewall settings. \
              Retrying with exponential backoff."
         )
@@ -2085,34 +2208,57 @@ mod tests {
     }
 
     #[test]
-    fn non_codingbuddy_provider_is_rejected() {
-        for provider in &["openai", "anthropic", "custom", "local", "ollama"] {
-            let cfg = LlmConfig {
-                provider: provider.to_string(),
-                api_key: Some("test-key".to_string()),
-                ..LlmConfig::default()
-            };
-            let client = ApiClient::new(cfg).expect("client");
-            let err = client
-                .complete(&LlmRequest {
-                    unit: codingbuddy_core::LlmUnit::Planner,
-                    prompt: "hello".to_string(),
-                    model: "deepseek-chat".to_string(),
-                    max_tokens: 128,
-                    non_urgent: false,
-                    images: vec![],
-                })
-                .expect_err("non-deepseek provider should be rejected");
-            assert!(
-                err.to_string().contains("only 'deepseek' is supported"),
-                "provider '{provider}' should be rejected but got: {err}"
-            );
-        }
+    fn openai_compatible_payload_preserves_requested_model_and_strips_thinking() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: Some(true),
+            top_logprobs: Some(3),
+            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(4096)),
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["model"], "gpt-4o-mini");
+        assert!(payload.get("thinking").is_none());
+        assert_eq!(payload["temperature"], 0.5);
+        assert!(
+            (payload["top_p"].as_f64().unwrap_or_default() - 0.9).abs() < 0.000_001,
+            "top_p should be preserved"
+        );
+        assert_eq!(payload["logprobs"], true);
+        assert_eq!(payload["top_logprobs"], 3);
+    }
+
+    #[test]
+    fn ollama_provider_allows_requests_without_api_key() {
+        let cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            api_key: None,
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        assert_eq!(client.resolve_request_api_key().expect("no auth"), None);
     }
 
     #[test]
     fn missing_api_key_is_rejected() {
         let cfg = LlmConfig {
+            providers: std::collections::HashMap::new(),
             api_key: None,
             api_key_env: "CODINGBUDDY_NONEXISTENT_KEY_FOR_TEST".to_string(),
             ..LlmConfig::default()
@@ -2233,16 +2379,12 @@ mod tests {
             "should mention invalid/missing key: {msg}"
         );
         assert!(
-            msg.contains("DEEPSEEK_API_KEY"),
-            "should mention env var: {msg}"
-        );
-        assert!(
             msg.contains("llm.api_key"),
             "should mention config field: {msg}"
         );
         assert!(
-            msg.contains("https://platform.deepseek.com"),
-            "should include signup URL: {msg}"
+            msg.contains("active provider API key"),
+            "should mention provider auth: {msg}"
         );
     }
 
@@ -2307,6 +2449,7 @@ mod tests {
         let cfg = LlmConfig {
             endpoint: server.endpoint.clone(),
             stream: false,
+            providers: std::collections::HashMap::new(),
             api_key_env: "DEEPSEEK_API_KEY_RETRY_TEST".to_string(),
             max_retries: 3,
             retry_base_ms: 1,
@@ -2348,6 +2491,7 @@ mod tests {
         let cfg = LlmConfig {
             endpoint: server.endpoint.clone(),
             stream: false,
+            providers: std::collections::HashMap::new(),
             api_key_env: "DEEPSEEK_API_KEY_RETRY_LIMIT_TEST".to_string(),
             max_retries: 2,
             retry_base_ms: 1,
@@ -2389,6 +2533,7 @@ mod tests {
         let cfg = LlmConfig {
             endpoint: server.endpoint.clone(),
             stream: false,
+            providers: std::collections::HashMap::new(),
             api_key_env: "DEEPSEEK_API_KEY_401_TEST".to_string(),
             max_retries: 2,
             retry_base_ms: 1,
@@ -2417,12 +2562,8 @@ mod tests {
             "401 error should include clear message: {msg}"
         );
         assert!(
-            msg.contains("DEEPSEEK_API_KEY"),
-            "401 error should mention env var: {msg}"
-        );
-        assert!(
-            msg.contains("https://platform.deepseek.com"),
-            "401 error should include platform URL: {msg}"
+            msg.contains("active provider API key"),
+            "401 error should mention provider auth: {msg}"
         );
         // 401 is non-retryable, so only 1 request
         assert_eq!(server.request_count(), 1);
@@ -2600,6 +2741,7 @@ mod tests {
         let cfg = LlmConfig {
             endpoint: server.endpoint.clone(),
             stream: true,
+            providers: std::collections::HashMap::new(),
             api_key_env: "DEEPSEEK_API_KEY_STREAM_TEST".to_string(),
             max_retries: 0,
             ..LlmConfig::default()
@@ -2774,37 +2916,55 @@ mod tests {
     #[test]
     fn model_max_output_tokens_reasoner() {
         assert_eq!(
-            model_max_output_tokens("deepseek-reasoner", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
             codingbuddy_core::CODINGBUDDY_REASONER_MAX_OUTPUT_TOKENS
         );
-        assert_eq!(model_max_output_tokens("deepseek-reasoner", false), 65536);
+        assert_eq!(
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
+            65536
+        );
         // Reasoner always returns 64K regardless of thinking flag
-        assert_eq!(model_max_output_tokens("deepseek-reasoner", true), 65536);
+        assert_eq!(
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", true),
+            65536
+        );
     }
 
     #[test]
     fn model_max_output_tokens_chat() {
         assert_eq!(
-            model_max_output_tokens("deepseek-chat", false),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", false),
             codingbuddy_core::CODINGBUDDY_CHAT_MAX_OUTPUT_TOKENS
         );
-        assert_eq!(model_max_output_tokens("deepseek-chat", false), 8192);
+        assert_eq!(
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", false),
+            8192
+        );
     }
 
     #[test]
     fn max_output_tokens_thinking_chat_32k() {
         assert_eq!(
-            model_max_output_tokens("deepseek-chat", true),
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", true),
             codingbuddy_core::CODINGBUDDY_CHAT_THINKING_MAX_OUTPUT_TOKENS
         );
-        assert_eq!(model_max_output_tokens("deepseek-chat", true), 32768);
+        assert_eq!(
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-chat", true),
+            32768
+        );
     }
 
     #[test]
     fn max_output_tokens_reasoner_64k() {
         // Reasoner is always 64K regardless of thinking param
-        assert_eq!(model_max_output_tokens("deepseek-reasoner", false), 65536);
-        assert_eq!(model_max_output_tokens("deepseek-reasoner", true), 65536);
+        assert_eq!(
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", false),
+            65536
+        );
+        assert_eq!(
+            max_output_tokens_for_model(ProviderKind::Deepseek, "deepseek-reasoner", true),
+            65536
+        );
     }
 
     #[test]
@@ -2892,15 +3052,14 @@ mod tests {
     #[test]
     fn resolved_endpoint_openai_compat_adds_v1_prefix() {
         let cfg = LlmConfig {
-            base_url: "https://api.deepseek.com".to_string(),
+            provider: "openai-compatible".to_string(),
             endpoint: String::new(),
-            openai_compat_prefix: true,
             ..Default::default()
         };
         let client = ApiClient::new(cfg).unwrap();
         assert_eq!(
             client.resolved_endpoint(true, false, false),
-            "https://api.deepseek.com/v1/chat/completions"
+            "https://api.openai.com/v1/chat/completions"
         );
     }
 

@@ -51,11 +51,11 @@ pub fn analyze(
     });
 
     let (model, is_reasoner) = if options.force_max_think {
-        let m = cfg.llm.max_think_model.clone();
+        let m = cfg.llm.active_reasoner_model();
         let r = codingbuddy_core::is_reasoner_model(&m);
         (m, r)
     } else {
-        let m = cfg.llm.base_model.clone();
+        let m = cfg.llm.active_base_model();
         let r = codingbuddy_core::is_reasoner_model(&m);
         (m, r)
     };

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -17,6 +17,25 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use syntect::highlighting::{Theme as SyntectTheme, ThemeSet};
 use syntect::parsing::SyntaxSet;
+
+mod keybindings;
+mod panels;
+mod statusline;
+mod stream_runtime;
+mod theme;
+
+#[cfg(test)]
+use keybindings::KeyBindingsFile;
+pub use keybindings::{KeyBindings, load_keybindings};
+use panels::{load_artifact_lines, render_mission_control_panel};
+#[cfg(test)]
+use statusline::render_statusline_spans;
+use statusline::review_badge;
+pub use statusline::{UiStatus, render_statusline};
+use stream_runtime::{
+    StreamEventResult, StreamRuntimeState, filter_stream_event, handle_stream_event,
+};
+pub use theme::TuiTheme;
 
 /// Lazy-initialized syntect highlighting assets.
 struct SyntectAssets {
@@ -103,6 +122,8 @@ pub enum TuiStreamEvent {
         name: String,
         error: String,
     },
+    /// A persisted system/background notice arrived outside the active turn.
+    SystemNotice { line: String, error: bool },
     /// Watch mode auto-triggered because comment digest changed.
     WatchTriggered { digest: u64, comment_count: usize },
     /// Display an inline image in the terminal (raw bytes).
@@ -160,7 +181,7 @@ pub enum SlashCommand {
     Mcp(Vec<String>),
     Rewind(Vec<String>),
     Export(Vec<String>),
-    Plan,
+    Plan(Vec<String>),
     Status,
     Effort(Option<String>),
     Skills(Vec<String>),
@@ -246,7 +267,7 @@ impl SlashCommand {
             "mcp" => Self::Mcp(args),
             "rewind" => Self::Rewind(args),
             "export" => Self::Export(args),
-            "plan" => Self::Plan,
+            "plan" => Self::Plan(args),
             "status" => Self::Status,
             "effort" => Self::Effort(args.first().cloned()),
             "skills" => Self::Skills(args),
@@ -338,296 +359,6 @@ pub fn render_prompt_suggestions(is_empty_input: bool) -> Vec<Span<'static>> {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    spans
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UiStatus {
-    pub model: String,
-    pub pending_approvals: usize,
-    pub estimated_cost_usd: f64,
-    pub background_jobs: usize,
-    pub autopilot_running: bool,
-    pub permission_mode: String,
-    pub active_tasks: usize,
-    #[serde(default)]
-    pub context_used_tokens: u64,
-    #[serde(default = "default_context_max")]
-    pub context_max_tokens: u64,
-    #[serde(default)]
-    pub session_turns: usize,
-    #[serde(default)]
-    pub working_directory: String,
-    #[serde(default)]
-    pub pr_review_status: Option<String>,
-    /// Optional PR URL for clickable review badge.
-    #[serde(default)]
-    pub pr_url: Option<String>,
-    /// Current agent execution mode label.
-    #[serde(default)]
-    pub agent_mode: String,
-}
-
-fn default_context_max() -> u64 {
-    128_000
-}
-
-pub fn render_statusline(status: &UiStatus) -> String {
-    let mode_indicator = match status.permission_mode.as_str() {
-        "auto" => "[AUTO]",
-        "plan" => "[PLAN]",
-        "locked" => "[LOCKED]",
-        _ => "[ASK]",
-    };
-    let tasks_part = if status.active_tasks > 0 {
-        format!(" tasks={}", status.active_tasks)
-    } else {
-        String::new()
-    };
-    let ctx_pct = if status.context_max_tokens > 0 {
-        (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64
-    } else {
-        0
-    };
-    let ctx_part = if status.context_max_tokens > 0 {
-        format!(
-            " ctx={}K/{}K({}%)",
-            status.context_used_tokens / 1000,
-            status.context_max_tokens / 1000,
-            ctx_pct
-        )
-    } else {
-        String::new()
-    };
-    let review_part = match (&status.pr_review_status, &status.pr_url) {
-        (Some(s), Some(url)) => format!(" review={s} {url}"),
-        (Some(s), None) => format!(" review={s}"),
-        _ => String::new(),
-    };
-    let agent_part = if !status.agent_mode.is_empty()
-        && status.agent_mode != "ToolUseLoop"
-        && status.agent_mode != "ArchitectEditorLoop"
-    {
-        format!(" agent={}", status.agent_mode)
-    } else {
-        String::new()
-    };
-    format!(
-        "model={} {} approvals={} jobs={}{} autopilot={}{}{}{} cost=${:.4}",
-        status.model,
-        mode_indicator,
-        status.pending_approvals,
-        status.background_jobs,
-        tasks_part,
-        if status.autopilot_running {
-            "running"
-        } else {
-            "idle"
-        },
-        ctx_part,
-        review_part,
-        agent_part,
-        status.estimated_cost_usd,
-    )
-}
-
-fn review_badge(status: &str) -> (&'static str, Color) {
-    match status {
-        "approved" => (" REVIEW APPROVED ", Color::Green),
-        "changes_requested" => (" REVIEW CHANGES ", Color::Red),
-        "draft" => (" REVIEW DRAFT ", Color::Blue),
-        "merged" => (" REVIEW MERGED ", Color::Cyan),
-        _ => (" REVIEW PENDING ", Color::Yellow),
-    }
-}
-
-#[cfg(test)]
-fn render_statusline_spans(
-    status: &UiStatus,
-    active_tool: Option<&str>,
-    spinner_frame: &str,
-    scroll_pct: Option<usize>,
-    vim_mode_label: Option<&str>,
-    has_new_content_below: bool,
-    is_thinking: bool,
-) -> Vec<Span<'static>> {
-    let mode_color = match status.permission_mode.as_str() {
-        "auto" => Color::Green,
-        "plan" => Color::Blue,
-        "locked" => Color::Red,
-        _ => Color::Yellow,
-    };
-    let mode_label = match status.permission_mode.as_str() {
-        "auto" => " AUTO ",
-        "plan" => " PLAN ",
-        "locked" => " LOCKED ",
-        _ => " ASK ",
-    };
-
-    let mut spans = Vec::new();
-
-    // Thinking indicator with spinner (takes priority over active tool)
-    if is_thinking {
-        spans.push(Span::styled(
-            format!(" {} Thinking ", spinner_frame),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else if let Some(tool) = active_tool {
-        // Active tool with spinner (left side)
-        spans.push(Span::styled(
-            format!(" {} {} ", spinner_frame, tool),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-
-    spans.push(Span::styled(
-        format!(" {} ", status.model),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        mode_label.to_string(),
-        Style::default()
-            .fg(Color::Black)
-            .bg(mode_color)
-            .add_modifier(Modifier::BOLD),
-    ));
-
-    if status.pending_approvals > 0 {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(" {} pending ", status.pending_approvals),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    if status.active_tasks > 0 {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(" {} tasks ", status.active_tasks),
-            Style::default().fg(Color::Magenta),
-        ));
-    }
-
-    if status.background_jobs > 0 {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(" {} jobs ", status.background_jobs),
-            Style::default().fg(Color::Blue),
-        ));
-    }
-
-    if status.autopilot_running {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            " AUTOPILOT ".to_string(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    // Agent mode badge — only shown when not in default loop mode.
-    if !status.agent_mode.is_empty()
-        && status.agent_mode != "ToolUseLoop"
-        && status.agent_mode != "ArchitectEditorLoop"
-    {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(" {} ", status.agent_mode),
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    if status.context_max_tokens > 0 {
-        let pct =
-            (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64;
-        let ctx_color = if pct > 80 {
-            Color::Red
-        } else if pct > 60 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(
-                " {}K/{}K ",
-                status.context_used_tokens / 1000,
-                status.context_max_tokens / 1000
-            ),
-            Style::default().fg(ctx_color),
-        ));
-    }
-
-    if status.session_turns > 0 {
-        spans.push(Span::styled(
-            format!(" turn {} ", status.session_turns),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    if let Some(review) = status.pr_review_status.as_deref() {
-        let (label, bg) = review_badge(review);
-        let badge_style = Style::default()
-            .fg(Color::Black)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
-        spans.push(Span::raw(" "));
-        if let Some(ref url) = status.pr_url {
-            // OSC 8 hyperlink: \x1b]8;;URL\x1b\\text\x1b]8;;\x1b\\
-            let linked = format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\");
-            spans.push(Span::styled(linked, badge_style));
-        } else {
-            spans.push(Span::styled(label.to_string(), badge_style));
-        }
-    }
-
-    spans.push(Span::styled(
-        format!(" ${:.4} ", status.estimated_cost_usd),
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    // Vim mode badge
-    if let Some(mode) = vim_mode_label {
-        spans.push(Span::styled(
-            format!(" {} ", mode),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    // Scroll position
-    if let Some(pct) = scroll_pct {
-        spans.push(Span::styled(
-            format!(" {}% ", pct),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    // New content below indicator
-    if has_new_content_below {
-        spans.push(Span::styled(
-            " \u{2193} new ".to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
     spans
 }
 
@@ -1304,7 +1035,7 @@ fn compute_inline_heights(total_height: u16, desired_input_rows: usize) -> (u16,
     (stream_height, input_height)
 }
 
-fn truncate_inline(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_inline(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
@@ -2215,6 +1946,12 @@ impl ChatShell {
     pub fn push_status_summary(&mut self, status: &UiStatus) {
         self.push_system(format!("Model: {}", status.model));
         self.push_system(format!("Permission mode: {}", status.permission_mode));
+        if !status.workflow_phase.is_empty() {
+            self.push_system(format!("Workflow phase: {}", status.workflow_phase));
+        }
+        if status.plan_state != "none" {
+            self.push_system(format!("Plan state: {}", status.plan_state));
+        }
         if let Some(review) = status.pr_review_status.as_deref() {
             self.push_system(format!("PR review: {}", review));
         }
@@ -2614,7 +2351,7 @@ const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("mcp", "Manage MCP servers"),
     ("rewind", "Rewind to a checkpoint"),
     ("export", "Export conversation"),
-    ("plan", "Enter plan mode"),
+    ("plan", "Plan mode or review"),
     ("status", "Show session status"),
     ("effort", "Set thinking effort level"),
     ("skills", "List available skills"),
@@ -2710,271 +2447,6 @@ fn autocomplete_at_suggestions(prefix: &str, workspace: &Path) -> Vec<String> {
         })
         .unwrap_or_default();
     matches
-}
-
-// ─── Key Bindings ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct KeyBindings {
-    pub exit: KeyEvent,
-    pub submit: KeyEvent,
-    pub newline: KeyEvent,
-    pub stop: KeyEvent,
-    pub rewind_menu: KeyEvent,
-    pub autocomplete: KeyEvent,
-    pub background: KeyEvent,
-    pub toggle_raw: KeyEvent,
-    pub history_prev: KeyEvent,
-    pub history_search: KeyEvent,
-    pub paste_hint: KeyEvent,
-    pub toggle_mission_control: KeyEvent,
-    pub toggle_artifacts: KeyEvent,
-    pub toggle_plan_collapse: KeyEvent,
-    pub cycle_permission_mode: KeyEvent,
-    pub exit_session: KeyEvent,
-    pub clear_screen: KeyEvent,
-    pub newline_alt: KeyEvent,
-    pub switch_model: KeyEvent,
-    pub toggle_thinking: KeyEvent,
-    pub kill_background: KeyEvent,
-    pub open_editor: KeyEvent,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-struct KeyBindingsFile {
-    exit: Option<String>,
-    submit: Option<String>,
-    newline: Option<String>,
-    stop: Option<String>,
-    rewind_menu: Option<String>,
-    autocomplete: Option<String>,
-    background: Option<String>,
-    toggle_raw: Option<String>,
-    history_prev: Option<String>,
-    history_search: Option<String>,
-    paste_hint: Option<String>,
-    toggle_mission_control: Option<String>,
-    toggle_artifacts: Option<String>,
-    toggle_plan_collapse: Option<String>,
-    cycle_permission_mode: Option<String>,
-    exit_session: Option<String>,
-    clear_screen: Option<String>,
-    newline_alt: Option<String>,
-    switch_model: Option<String>,
-    toggle_thinking: Option<String>,
-    kill_background: Option<String>,
-    open_editor: Option<String>,
-}
-
-impl Default for KeyBindings {
-    fn default() -> Self {
-        Self {
-            exit: KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            submit: KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            newline: KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-            stop: KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            rewind_menu: KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT),
-            autocomplete: KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            background: KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
-            toggle_raw: KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            history_prev: KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-            history_search: KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
-            paste_hint: KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
-            toggle_mission_control: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-            toggle_artifacts: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            toggle_plan_collapse: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-            cycle_permission_mode: KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-            exit_session: KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-            clear_screen: KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
-            newline_alt: KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
-            switch_model: KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
-            toggle_thinking: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
-            kill_background: KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
-            open_editor: KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
-        }
-    }
-}
-
-impl KeyBindings {
-    fn apply_overrides(mut self, raw: KeyBindingsFile) -> Result<Self> {
-        if let Some(value) = raw.exit {
-            self.exit = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.submit {
-            self.submit = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.newline {
-            self.newline = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.stop {
-            self.stop = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.rewind_menu {
-            self.rewind_menu = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.autocomplete {
-            self.autocomplete = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.background {
-            self.background = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.toggle_raw {
-            self.toggle_raw = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.history_prev {
-            self.history_prev = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.history_search {
-            self.history_search = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.paste_hint {
-            self.paste_hint = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.toggle_mission_control {
-            self.toggle_mission_control = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.toggle_artifacts {
-            self.toggle_artifacts = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.toggle_plan_collapse {
-            self.toggle_plan_collapse = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.cycle_permission_mode {
-            self.cycle_permission_mode = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.exit_session {
-            self.exit_session = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.clear_screen {
-            self.clear_screen = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.newline_alt {
-            self.newline_alt = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.switch_model {
-            self.switch_model = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.toggle_thinking {
-            self.toggle_thinking = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.kill_background {
-            self.kill_background = parse_key_event(&value)?;
-        }
-        if let Some(value) = raw.open_editor {
-            self.open_editor = parse_key_event(&value)?;
-        }
-        Ok(self)
-    }
-}
-
-pub fn load_keybindings(path: &Path) -> Result<KeyBindings> {
-    let raw = fs::read_to_string(path)?;
-    let parsed: KeyBindingsFile = serde_json::from_str(&raw)?;
-    KeyBindings::default().apply_overrides(parsed)
-}
-
-fn parse_theme_color(name: &str) -> Color {
-    match name.to_ascii_lowercase().as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "white" => Color::White,
-        "gray" | "grey" => Color::Gray,
-        "darkgray" | "darkgrey" => Color::DarkGray,
-        "lightred" => Color::LightRed,
-        "lightgreen" => Color::LightGreen,
-        "lightyellow" => Color::LightYellow,
-        "lightblue" => Color::LightBlue,
-        "lightmagenta" => Color::LightMagenta,
-        "lightcyan" => Color::LightCyan,
-        _ => Color::Cyan,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TuiTheme {
-    pub primary: Color,
-    pub secondary: Color,
-    pub error: Color,
-}
-
-impl Default for TuiTheme {
-    fn default() -> Self {
-        Self {
-            primary: Color::Cyan,
-            secondary: Color::Yellow,
-            error: Color::Red,
-        }
-    }
-}
-
-impl TuiTheme {
-    pub fn from_config(primary: &str, secondary: &str, error: &str) -> Self {
-        Self {
-            primary: parse_theme_color(primary),
-            secondary: parse_theme_color(secondary),
-            error: parse_theme_color(error),
-        }
-    }
-}
-
-pub fn load_artifact_lines(workspace: &Path) -> Vec<String> {
-    let artifacts_dir = workspace.join(".codingbuddy").join("artifacts");
-    let mut lines = Vec::new();
-    if !artifacts_dir.exists() {
-        lines.push("No artifacts found.".to_string());
-        lines.push(format!("Directory: {}", artifacts_dir.display()));
-        return lines;
-    }
-    let mut entries: Vec<_> = fs::read_dir(&artifacts_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    if entries.is_empty() {
-        lines.push("No task artifacts found.".to_string());
-        return lines;
-    }
-    for entry in entries {
-        let task_dir = entry.path();
-        let task_id = entry.file_name().to_string_lossy().to_string();
-        lines.push(format!("## Task: {task_id}"));
-        for name in &["plan.md", "diff.patch", "verification.md"] {
-            let file_path = task_dir.join(name);
-            if file_path.exists() {
-                let size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-                lines.push(format!("  {name} ({size} bytes)"));
-                // Show first few lines as preview
-                if let Ok(content) = fs::read_to_string(&file_path) {
-                    for (i, line) in content.lines().take(5).enumerate() {
-                        lines.push(format!("    {}", line));
-                        if i == 4 {
-                            lines.push("    ...".to_string());
-                        }
-                    }
-                }
-            }
-        }
-        // Also show any other files in the task directory
-        if let Ok(files) = fs::read_dir(&task_dir) {
-            for file in files.filter_map(|f| f.ok()) {
-                let fname = file.file_name().to_string_lossy().to_string();
-                if !["plan.md", "diff.patch", "verification.md"].contains(&fname.as_str()) {
-                    let size = fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-                    lines.push(format!("  {fname} ({size} bytes)"));
-                }
-            }
-        }
-        lines.push(String::new());
-    }
-    lines
 }
 
 pub fn run_tui_shell<F>(status: UiStatus, mut on_submit: F) -> Result<()>
@@ -3138,6 +2610,7 @@ where
     let mut active_phase: Option<(u64, String)> = None;
     let mut last_phase_event_at = Instant::now();
     let mut last_phase_heartbeat_at = Instant::now();
+    let mut last_mission_refresh_at = Instant::now();
     let mut model_picker: Option<ModelPickerState> = None;
     let mut pending_images: Vec<PathBuf> = Vec::new();
     let mut autocomplete_dropdown: Option<AutocompleteState> = None;
@@ -3168,6 +2641,14 @@ where
                 "iteration {iteration}: {phase} in progress (heartbeat)"
             ));
             last_phase_heartbeat_at = Instant::now();
+        }
+        if mission_control_visible
+            && last_mission_refresh_at.elapsed() >= Duration::from_millis(1500)
+        {
+            if let Some(new_status) = refresh_status() {
+                status = new_status;
+            }
+            last_mission_refresh_at = Instant::now();
         }
 
         // Print any new transcript entries above the inline viewport
@@ -3320,6 +2801,12 @@ where
                     ]))
                     .wrap(Wrap { trim: false })
                     .scroll((scroll_y, 0)),
+                    stream_area,
+                );
+            } else if mission_control_visible {
+                let panel = render_mission_control_panel(&status, &shell.mission_control_lines);
+                frame.render_widget(
+                    Paragraph::new(panel).wrap(Wrap { trim: false }),
                     stream_area,
                 );
             } else {
@@ -3504,6 +2991,62 @@ where
                     .bg(mode_color)
                     .add_modifier(Modifier::BOLD),
             ));
+            if status.active_tasks > 0 {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" {} TASKS ", status.active_tasks),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !status.workflow_phase.is_empty() && status.workflow_phase != "idle" {
+                let phase_color = match status.workflow_phase.as_str() {
+                    "explore" => Color::Cyan,
+                    "plan" => Color::Blue,
+                    "approval" => Color::Yellow,
+                    "execute" => Color::Green,
+                    "verify" => Color::Magenta,
+                    "completed" => Color::Green,
+                    "failed" => Color::Red,
+                    "paused" => Color::Gray,
+                    _ => Color::White,
+                };
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" {} ", status.workflow_phase.to_ascii_uppercase()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(phase_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if status.plan_state != "none" {
+                let plan_bg = if status.plan_state == "awaiting_approval" {
+                    Color::LightYellow
+                } else {
+                    Color::Blue
+                };
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" PLAN:{} ", status.plan_state.to_ascii_uppercase()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(plan_bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if status.background_jobs > 0 {
+                status_spans.push(Span::raw(" "));
+                status_spans.push(Span::styled(
+                    format!(" {} JOBS ", status.background_jobs),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             if let Some(review) = status.pr_review_status.as_deref() {
                 let (label, bg) = review_badge(review);
                 status_spans.push(Span::raw(" "));
@@ -3584,194 +3127,26 @@ where
 
         // Drain streaming events from background agent thread.
         while let Ok(ev) = stream_rx.try_recv() {
-            if cancelled {
-                match ev {
-                    TuiStreamEvent::Done(_) | TuiStreamEvent::Error(_) => {
-                        cancelled = false;
-                    }
-                    TuiStreamEvent::ApprovalNeeded { response_tx, .. } => {
-                        let _ = response_tx.send(false);
-                    }
-                    _ => {}
-                }
+            let Some(ev) = filter_stream_event(ev, &mut cancelled) else {
                 continue;
-            }
-            match ev {
-                TuiStreamEvent::ContentDelta(text) => {
-                    // Transition out of thinking state when content arrives.
-                    if shell.is_thinking {
-                        shell.is_thinking = false;
-                        shell.thinking_buffer.clear();
-                    }
-                    // Buffer streaming text — complete lines will be flushed
-                    // to scrollback on next loop iteration, partial line shown
-                    // in the viewport.
-                    streaming_buffer.push_str(&text);
-                    shell.append_streaming(&text);
-                }
-                TuiStreamEvent::ReasoningDelta(text) => {
-                    if shell.thinking_visibility == "raw" {
-                        if !shell.is_thinking {
-                            shell.is_thinking = true;
-                            shell.thinking_buffer.clear();
-                        }
-                        shell.thinking_buffer.push_str(&text);
-                    } else {
-                        shell.is_thinking = true;
-                        if shell.thinking_buffer.is_empty() {
-                            let label = active_phase
-                                .as_ref()
-                                .map(|(_, phase)| phase.as_str())
-                                .unwrap_or("reasoning");
-                            shell.thinking_buffer = format!("{label}: analyzing...");
-                        }
-                    }
-                }
-                TuiStreamEvent::ToolActive(name) => {
-                    shell.is_thinking = false;
-                    shell.active_tool = Some(name);
-                }
-                TuiStreamEvent::ToolCallStart {
-                    tool_name,
-                    args_summary,
-                } => {
-                    shell.is_thinking = false;
-                    shell.push_tool_call(&tool_name, &args_summary);
-                    shell.active_tool = Some(tool_name);
-                }
-                TuiStreamEvent::ToolCallEnd {
-                    tool_name,
-                    duration_ms,
-                    summary,
-                    success,
-                } => {
-                    let marker = if success { "✓" } else { "✗" };
-                    shell.push_tool_result(&format!("{marker} {tool_name}"), duration_ms, &summary);
-                    shell.active_tool = None;
-                }
-                TuiStreamEvent::ModeTransition { from, to, reason } => {
-                    shell.agent_mode = to.clone();
-                    let label = format!("mode transition {from} -> {to} ({reason})");
-                    shell.push_system(label);
-                    info_line = format!("mode: {from} -> {to}");
-                }
-                TuiStreamEvent::SubagentSpawned { run_id, name, goal } => {
-                    let goal_compact = truncate_inline(&goal.replace('\n', " "), 120);
-                    shell.push_mission_control(format!(
-                        "spawned {name} ({run_id}) goal={goal_compact}"
-                    ));
-                    shell.push_system(format!("[subagent] started {name}: {goal_compact}"));
-                    info_line = format!("subagent started: {name}");
-                }
-                TuiStreamEvent::SubagentCompleted {
-                    run_id,
-                    name,
-                    summary,
-                } => {
-                    let summary_compact = truncate_inline(&summary.replace('\n', " "), 120);
-                    shell.push_mission_control(format!(
-                        "completed {name} ({run_id}) summary={summary_compact}"
-                    ));
-                    shell.push_system(format!("[subagent] completed {name}: {summary_compact}"));
-                    info_line = format!("subagent completed: {name}");
-                }
-                TuiStreamEvent::SubagentFailed {
-                    run_id,
-                    name,
-                    error,
-                } => {
-                    let error_compact = truncate_inline(&error.replace('\n', " "), 120);
-                    shell.push_mission_control(format!(
-                        "failed {name} ({run_id}) error={error_compact}"
-                    ));
-                    shell.push_error(format!("[subagent] failed {name}: {error_compact}"));
-                    info_line = format!("subagent failed: {name}");
-                }
-                TuiStreamEvent::WatchTriggered { comment_count, .. } => {
-                    shell.push_system(format!(
-                        "[watch: {comment_count} comment(s) detected, auto-triggering]"
-                    ));
-                    info_line = format!("watch: {comment_count} hints");
-                }
-                TuiStreamEvent::ImageDisplay { data, label } => {
-                    // Render inline image if terminal supports it
-                    if !display_image_inline(&data) {
-                        shell.push_system(format!("[image: {label} ({} bytes)]", data.len()));
-                    } else {
-                        shell.push_system(format!("[image: {label}]"));
-                    }
-                }
-                TuiStreamEvent::ClearStreamingText => {
-                    // The response contained tool calls — clear the noise text
-                    // fragments that were streamed before/between them.
-                    streaming_buffer.clear();
-                    shell.clear_streaming_text();
-                }
-                TuiStreamEvent::DiffApplied {
-                    path,
-                    hunks,
-                    added,
-                    removed,
-                } => {
-                    shell.push_system(format!(
-                        "  \u{2502} {} \u{2014} {} hunk(s), +{} -{}",
-                        path, hunks, added, removed
-                    ));
-                }
-                TuiStreamEvent::UsageSummary {
-                    input_tokens,
-                    output_tokens,
-                    cache_hit_tokens,
-                    cost_usd,
-                } => {
-                    let cache_info = if cache_hit_tokens > 0 {
-                        format!(" (cache hit: {})", cache_hit_tokens)
-                    } else {
-                        String::new()
-                    };
-                    shell.push_system(format!(
-                        "\u{2500}\u{2500} tokens: {}in / {}out{} \u{2502} cost: ${:.4}",
-                        input_tokens, output_tokens, cache_info, cost_usd
-                    ));
-                }
-                TuiStreamEvent::RoleHeader { role, model } => {
-                    shell.push_system(format!(
-                        "\u{2501}\u{2501} {} ({}) \u{2501}\u{2501}",
-                        role, model
-                    ));
-                }
-                TuiStreamEvent::ApprovalNeeded {
-                    tool_name,
-                    args_summary,
-                    response_tx,
-                } => {
-                    let compact_args = truncate_inline(&args_summary.replace('\n', " "), 96);
-                    info_line = format!(
-                        "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
-                    );
-                    shell.push_system(format!(
-                        "ACTION REQUIRED: `{tool_name}` {compact_args} [press Y to approve / any key denies]"
-                    ));
-                    // Terminal bell helps when the approval prompt appears off-focus.
-                    use std::io::Write as _;
-                    let _ = write!(io::stdout(), "\x07");
-                    let _ = io::stdout().flush();
-                    pending_approval = Some((tool_name, args_summary, response_tx));
-                }
-                TuiStreamEvent::Error(msg) => {
-                    streaming_buffer.clear();
-                    streaming_in_code_block = false;
-                    streaming_in_diff_block = false;
-                    streaming_code_block_lang.clear();
-                    active_phase = None;
-                    shell.is_thinking = false;
-                    shell.thinking_buffer.clear();
-                    shell.push_error(&msg);
-                    info_line = format!("error: {msg}");
-                    is_processing = false;
-                    shell.active_tool = None;
-                }
-                TuiStreamEvent::Done(output) => {
+            };
+            let result = {
+                let mut state = StreamRuntimeState {
+                    shell: &mut shell,
+                    streaming_buffer: &mut streaming_buffer,
+                    active_phase: &mut active_phase,
+                    pending_approval: &mut pending_approval,
+                    info_line: &mut info_line,
+                    is_processing: &mut is_processing,
+                    streaming_in_code_block: &mut streaming_in_code_block,
+                    streaming_in_diff_block: &mut streaming_in_diff_block,
+                    streaming_code_block_lang: &mut streaming_code_block_lang,
+                };
+                handle_stream_event(ev, &mut state)
+            };
+            match result {
+                StreamEventResult::Continue => {}
+                StreamEventResult::Done(output) => {
                     // Flush thinking buffer to transcript as a collapsed summary.
                     if !shell.thinking_buffer.is_empty() {
                         let thought = std::mem::take(&mut shell.thinking_buffer);
@@ -4557,18 +3932,11 @@ where
         if key == bindings.toggle_mission_control {
             mission_control_visible = !mission_control_visible;
             info_line = if mission_control_visible {
-                let lines = if shell.mission_control_lines.is_empty() {
-                    vec![
-                        "Mission control enabled.".to_string(),
-                        "No mission-control events in this session yet.".to_string(),
-                    ]
-                } else {
-                    shell.mission_control_lines.clone()
-                };
-                for line in lines.into_iter().take(12) {
-                    shell.push_system(format!("[mission] {line}"));
+                if let Some(new_status) = refresh_status() {
+                    status = new_status;
                 }
-                "mission control enabled".to_string()
+                last_mission_refresh_at = Instant::now();
+                format!("mission control visible ({})", status.workflow_phase)
             } else {
                 "mission control hidden".to_string()
             };
@@ -4594,6 +3962,37 @@ where
             } else {
                 "plan collapse disabled".to_string()
             };
+            continue;
+        }
+        if key == bindings.approve_plan {
+            if status.plan_state != "awaiting_approval" {
+                info_line = "no plan is awaiting approval".to_string();
+                continue;
+            }
+            if is_processing {
+                info_line = "plan approval is already in progress".to_string();
+                continue;
+            }
+            let plan_cmd = "/plan approve".to_string();
+            shell.push_user(&plan_cmd);
+            is_processing = true;
+            cancelled = false;
+            active_phase = None;
+            last_phase_event_at = Instant::now();
+            last_phase_heartbeat_at = Instant::now();
+            shell.active_tool = Some("plan review".to_string());
+            info_line = "approving current plan".to_string();
+            on_submit(&plan_cmd);
+            continue;
+        }
+        if key == bindings.reject_plan {
+            if status.plan_state != "awaiting_approval" {
+                info_line = "no plan is awaiting approval".to_string();
+                continue;
+            }
+            input = "/plan reject ".to_string();
+            cursor_pos = input.len();
+            info_line = "plan reject: add feedback and press Enter".to_string();
             continue;
         }
         if key == bindings.background {
@@ -4983,47 +4382,6 @@ where
     terminal.show_cursor()?;
     drop(_guard);
     Ok(())
-}
-
-fn parse_key_event(value: &str) -> Result<KeyEvent> {
-    let mut modifiers = KeyModifiers::NONE;
-    let mut key_code: Option<KeyCode> = None;
-    for token in value
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        let normalized = token.to_ascii_lowercase();
-        match normalized.as_str() {
-            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
-            "shift" => modifiers |= KeyModifiers::SHIFT,
-            "alt" | "option" => modifiers |= KeyModifiers::ALT,
-            other => {
-                key_code = Some(
-                    parse_key_code(other)
-                        .ok_or_else(|| anyhow::anyhow!("unsupported keybinding token: {token}"))?,
-                );
-            }
-        }
-    }
-    let code = key_code.ok_or_else(|| anyhow::anyhow!("missing key code in keybinding"))?;
-    Ok(KeyEvent::new(code, modifiers))
-}
-
-fn parse_key_code(value: &str) -> Option<KeyCode> {
-    match value {
-        "enter" => Some(KeyCode::Enter),
-        "esc" | "escape" => Some(KeyCode::Esc),
-        "tab" => Some(KeyCode::Tab),
-        "up" => Some(KeyCode::Up),
-        "down" => Some(KeyCode::Down),
-        "left" => Some(KeyCode::Left),
-        "right" => Some(KeyCode::Right),
-        "backspace" => Some(KeyCode::Backspace),
-        "space" => Some(KeyCode::Char(' ')),
-        value if value.chars().count() == 1 => value.chars().next().map(KeyCode::Char),
-        _ => None,
-    }
 }
 
 /// Execute a `!` prefixed shell command directly, bypassing the LLM.
@@ -5572,6 +4930,7 @@ fn extract_visual_selection(input: &str, anchor: usize, cursor_pos: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
 
     #[test]
     fn parses_slash_commands() {
@@ -5703,6 +5062,8 @@ mod tests {
             autopilot_running: true,
             permission_mode: "ask".to_string(),
             active_tasks: 3,
+            workflow_phase: "execute".to_string(),
+            plan_state: "available".to_string(),
             context_used_tokens: 50_000,
             context_max_tokens: 128_000,
             session_turns: 5,
@@ -5714,6 +5075,8 @@ mod tests {
         assert!(line.contains("autopilot=running"));
         assert!(line.contains("[ASK]"));
         assert!(line.contains("tasks=3"));
+        assert!(line.contains("phase=execute"));
+        assert!(line.contains("plan=available"));
     }
 
     #[test]
@@ -5905,6 +5268,8 @@ mod tests {
             permission_mode: "locked".to_string(),
             pending_approvals: 1,
             active_tasks: 2,
+            workflow_phase: "execute".to_string(),
+            plan_state: "available".to_string(),
             background_jobs: 1,
             autopilot_running: true,
             context_used_tokens: 100_000,
@@ -5917,6 +5282,8 @@ mod tests {
         assert!(text.contains("LOCKED"));
         assert!(text.contains("pending"));
         assert!(text.contains("tasks"));
+        assert!(text.contains("EXECUTE"));
+        assert!(text.contains("PLAN:AVAILABLE"));
         assert!(text.contains("AUTOPILOT"));
         assert!(text.contains("100K/128K"));
 
@@ -5953,6 +5320,40 @@ mod tests {
         assert_eq!(shell.transcript[1].kind, MessageKind::Assistant);
         assert_eq!(shell.transcript[2].kind, MessageKind::System);
         assert_eq!(shell.transcript[3].kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn mission_control_panel_renders_snapshot_and_recent_events() {
+        let status = UiStatus {
+            mission_control_snapshot: vec![
+                "Mission Control: session=abc phase=execute".to_string(),
+                "- Tasks:".to_string(),
+                "  - implement drawer [running]".to_string(),
+            ],
+            ..Default::default()
+        };
+        let mut shell = ChatShell::default();
+        shell.push_mission_control("[background] task completed: audit".to_string());
+        shell.push_mission_control("[plan] approved; workflow moved to execute".to_string());
+
+        let panel = render_mission_control_panel(&status, &shell.mission_control_lines);
+        assert!(panel.contains("Mission Control: session=abc phase=execute"));
+        assert!(panel.contains("implement drawer [running]"));
+        assert!(panel.contains("Recent activity:"));
+        assert!(panel.contains("[background] task completed: audit"));
+        assert!(panel.contains("Ctrl+T hides mission control."));
+    }
+
+    #[test]
+    fn mission_control_panel_shows_plan_review_shortcuts() {
+        let status = UiStatus {
+            plan_state: "awaiting_approval".to_string(),
+            mission_control_snapshot: vec!["Mission Control".to_string()],
+            ..Default::default()
+        };
+        let panel = render_mission_control_panel(&status, &[]);
+        assert!(panel.contains("Ctrl+Y approves the current plan"));
+        assert!(panel.contains("Alt+Y opens a rejection prompt"));
     }
 
     #[test]
@@ -6507,7 +5908,10 @@ mod tests {
         assert_eq!(SlashCommand::parse("/Help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/CONTEXT"), Some(SlashCommand::Context));
         assert_eq!(SlashCommand::parse("/EXIT"), Some(SlashCommand::Exit));
-        assert_eq!(SlashCommand::parse("/Plan"), Some(SlashCommand::Plan));
+        assert_eq!(
+            SlashCommand::parse("/Plan"),
+            Some(SlashCommand::Plan(vec![]))
+        );
     }
 
     #[test]
@@ -6953,6 +6357,10 @@ mod tests {
         assert_eq!(bindings.open_editor.code, KeyCode::Char('g'));
         assert_eq!(bindings.kill_background.code, KeyCode::Char('f'));
         assert_eq!(bindings.toggle_thinking.code, KeyCode::Char('t'));
+        assert_eq!(bindings.approve_plan.code, KeyCode::Char('y'));
+        assert_eq!(bindings.approve_plan.modifiers, KeyModifiers::CONTROL);
+        assert_eq!(bindings.reject_plan.code, KeyCode::Char('y'));
+        assert_eq!(bindings.reject_plan.modifiers, KeyModifiers::ALT);
     }
 
     // ── P1-01: rewind picker state machine tests ────────────────────────

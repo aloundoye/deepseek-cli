@@ -682,6 +682,8 @@ enum TasksCmd {
     List,
     /// Show details for a specific task.
     Show(TaskShowArgs),
+    /// Show the recorded output for a specific task.
+    Output(TaskShowArgs),
     /// Cancel a task.
     Cancel(TaskCancelArgs),
 }
@@ -1413,6 +1415,7 @@ fn run() -> Result<()> {
                 args.tools,
                 args.tui,
                 Some(&cli),
+                None,
             )
         }
         Commands::Autopilot(args) => run_autopilot_cmd(&cwd, args, cli.json),

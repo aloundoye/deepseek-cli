@@ -6,8 +6,8 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, Session, SessionBudgets,
-    SessionState, StreamCallback, TokenUsage,
+    AppConfig, ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, Session,
+    SessionBudgets, SessionState, StreamCallback, StreamChunk, TokenUsage,
 };
 use codingbuddy_llm::LlmClient;
 use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord, TaskQueueRecord};
@@ -1069,9 +1069,7 @@ fn spawn_task_background_keeps_task_running() -> Result<()> {
             tool_call_response(vec![(
                 "call_1",
                 "spawn_task",
-                &format!(
-                    r#"{{"prompt":"analyze the project","description":"explore project","subagent_type":"explore","run_in_background":true,"max_turns":5,"model":"deepseek-chat"}}"#
-                ),
+                r#"{"prompt":"analyze the project","description":"explore project","subagent_type":"explore","run_in_background":true,"max_turns":5,"model":"deepseek-chat"}"#,
             )]),
             text_response("Delegated task queued."),
         ],
@@ -1357,5 +1355,228 @@ fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
     assert_eq!(plan.version, 2);
     assert_eq!(plan.goal, "Plan the parser refactor");
     assert!(!plan.steps.is_empty());
+    Ok(())
+}
+
+#[test]
+fn complex_prompt_auto_enters_plan_and_persists_draft_state() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let engine = build_engine(
+        temp.path(),
+        vec![
+            tool_call_response(vec![("call_1", "fs_read", r#"{"path":"src/main.rs"}"#)]),
+            tool_call_response(vec![(
+                "call_2",
+                "fs_grep",
+                r#"{"pattern":"main","path":"src"}"#,
+            )]),
+            tool_call_response(vec![("call_3", "git_status", "{}")]),
+            text_response(
+                "1. Inspect parser wiring\n2. Update implementation\n3. Verify with cargo test",
+            ),
+            tool_call_response(vec![("call_4", "exit_plan_mode", "{}")]),
+            text_response("Plan saved for review."),
+        ],
+    )?;
+
+    let phase_chunks = Arc::new(Mutex::new(Vec::new()));
+    let phase_chunks_clone = phase_chunks.clone();
+    engine.set_stream_callback(Arc::new(move |chunk| {
+        if let StreamChunk::PhaseTransition { from, to } = chunk {
+            phase_chunks_clone.lock().unwrap().push((from, to));
+        }
+    }));
+
+    let output = engine.chat_with_options(
+        "Refactor the parser across multiple files and verify the result carefully.",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Plan saved"));
+    let phases = phase_chunks.lock().unwrap().clone();
+    assert_eq!(phases, vec![("explore".to_string(), "plan".to_string())]);
+
+    let store = Store::new(temp.path())?;
+    let session = store.load_latest_session()?.expect("session");
+    assert_eq!(session.status, SessionState::AwaitingApproval);
+    let plan = store
+        .load_plan(session.active_plan_id.expect("active plan"))?
+        .expect("plan");
+    assert_eq!(plan.version, 2, "auto-entered plan should create draft v1");
+    assert!(!plan.steps.is_empty());
+    Ok(())
+}
+
+#[test]
+fn approved_plan_execution_emits_full_phase_path_and_loads_plan_context() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![("call_1", "tool_search", r#"{"query":"plan mode"}"#)]),
+        tool_call_response(vec![("call_2", "enter_plan_mode", "{}")]),
+        tool_call_response_with_text(
+            "1. Read src/main.rs\n2. Update parser wiring\n3. Verify with cargo test",
+            vec![("call_3", "exit_plan_mode", "{}")],
+        ),
+        text_response("Plan saved for review."),
+        tool_call_response(vec![("call_4", "fs_read", r#"{"path":"src/main.rs"}"#)]),
+        tool_call_response(vec![(
+            "call_5",
+            "fs_edit",
+            r#"{"path":"src/main.rs","search":"fn main() {}","replace":"fn main() { println!(\"ok\"); }"}"#,
+        )]),
+        text_response("Implemented the approved plan."),
+        tool_call_response(vec![(
+            "call_6",
+            "bash_run",
+            r#"{"command":"printf verified"}"#,
+        )]),
+        text_response("Verified the change."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let mut engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+    engine.set_permission_mode("bypassPermissions");
+
+    let phase_chunks = Arc::new(Mutex::new(Vec::new()));
+    let phase_chunks_clone = phase_chunks.clone();
+    engine.set_stream_callback(Arc::new(move |chunk| {
+        if let StreamChunk::PhaseTransition { from, to } = chunk {
+            phase_chunks_clone.lock().unwrap().push((from, to));
+        }
+    }));
+
+    let planning_output = engine.chat_with_options(
+        "Refactor the parser across multiple steps, then verify the result.",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(planning_output.contains("Plan saved"));
+
+    let store = Store::new(temp.path())?;
+    let session = store.load_latest_session()?.expect("session");
+    assert_eq!(session.status, SessionState::AwaitingApproval);
+
+    let final_output = engine.chat_with_options(
+        "Go ahead and implement the approved plan.",
+        ChatOptions {
+            tools: true,
+            session_id: Some(session.session_id),
+            ..Default::default()
+        },
+    )?;
+
+    assert!(final_output.contains("Verified the change"));
+    assert!(fs::read_to_string(temp.path().join("src/main.rs"))?.contains("println!(\"ok\")"));
+
+    let phases = phase_chunks.lock().unwrap().clone();
+    assert_eq!(
+        phases,
+        vec![
+            ("explore".to_string(), "plan".to_string()),
+            ("plan".to_string(), "execute".to_string()),
+            ("execute".to_string(), "verify".to_string()),
+        ]
+    );
+
+    let requests = captured.lock().unwrap();
+    assert!(
+        requests.len() >= 5,
+        "expected captured requests from both planning and execution"
+    );
+    let execution_request = &requests[4];
+    let system_messages = execution_request
+        .messages
+        .iter()
+        .filter_map(|msg| match msg {
+            ChatMessage::System { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        system_messages
+            .iter()
+            .any(|content| content.contains("## Active Approved Plan")),
+        "execution request should include the approved plan context"
+    );
+    assert!(
+        system_messages
+            .iter()
+            .any(|content| content.contains("Update parser wiring")),
+        "execution request should include persisted plan steps"
+    );
+    Ok(())
+}
+
+#[test]
+fn openai_compatible_surface_prefers_patch_direct_in_requests() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    let mut cfg = AppConfig::default();
+    cfg.llm.provider = "openai-compatible".to_string();
+    cfg.save(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![text_response("Surface ready.")]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Fix a bug in src/main.rs.",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    let tool_names = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"patch_direct"));
+    assert!(!tool_names.contains(&"fs_edit"));
+    assert!(!tool_names.contains(&"multi_edit"));
+    assert!(tool_names.len() <= 18);
+    Ok(())
+}
+
+#[test]
+fn ollama_surface_clamps_request_tool_count() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+    let mut cfg = AppConfig::default();
+    cfg.llm.provider = "ollama".to_string();
+    cfg.save(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![text_response("Surface ready.")]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Refactor src/main.rs and add verification.",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    let tool_names = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"fs_edit"));
+    assert!(tool_names.contains(&"tool_search"));
+    assert!(!tool_names.contains(&"patch_direct"));
+    assert!(tool_names.len() <= 12);
     Ok(())
 }

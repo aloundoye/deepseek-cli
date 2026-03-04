@@ -7,8 +7,8 @@ use codingbuddy_core::{
 use codingbuddy_store::Store;
 use serde_json::json;
 use std::fs;
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 use uuid::Uuid;
 
 use crate::Cli;
@@ -179,6 +179,12 @@ pub(crate) fn wire_subagent_worker(engine: &AgentEngine, cwd: &Path) {
             }
             if let Some(model) = &task.model_override {
                 engine.cfg_mut().llm.base_model = model.clone();
+                engine.cfg_mut().llm.max_think_model = model.clone();
+                let provider_name = engine.cfg_mut().llm.provider.clone();
+                if let Some(provider) = engine.cfg_mut().llm.providers.get_mut(&provider_name) {
+                    provider.models.chat = model.clone();
+                    provider.models.reasoner = Some(model.clone());
+                }
             }
 
             options.system_prompt_append = Some(delegated_prompt);
@@ -245,36 +251,39 @@ pub(crate) fn ensure_llm_ready_with_cfg(
 ) -> Result<()> {
     use std::io::IsTerminal;
 
-    let provider = cfg.llm.provider.trim().to_ascii_lowercase();
-    if provider != "deepseek" {
-        return Err(anyhow!(
-            "unsupported llm.provider='{}' (supported: deepseek)",
-            cfg.llm.provider
-        ));
-    }
-    let _profile = normalize_codingbuddy_profile(&cfg.llm.profile).ok_or_else(|| {
+    let provider_kind = cfg.llm.active_provider_kind().ok_or_else(|| {
         anyhow!(
-            "unsupported llm.profile='{}' (supported: v3_2)",
-            cfg.llm.profile
+            "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+            cfg.llm.provider
         )
     })?;
-    if normalize_codingbuddy_model(&cfg.llm.base_model).is_none() {
-        return Err(anyhow!(
-            "unsupported llm.base_model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
-            cfg.llm.base_model
-        ));
+    if provider_kind == codingbuddy_core::ProviderKind::Deepseek {
+        let _profile = normalize_codingbuddy_profile(&cfg.llm.profile).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.profile='{}' (supported: v3_2)",
+                cfg.llm.profile
+            )
+        })?;
+        let active_base_model = cfg.llm.active_base_model();
+        if normalize_codingbuddy_model(&active_base_model).is_none() {
+            return Err(anyhow!(
+                "unsupported active chat model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
+                active_base_model
+            ));
+        }
+        let active_reasoner_model = cfg.llm.active_reasoner_model();
+        if normalize_codingbuddy_model(&active_reasoner_model).is_none() {
+            return Err(anyhow!(
+                "unsupported active reasoner model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
+                active_reasoner_model
+            ));
+        }
     }
-    if normalize_codingbuddy_model(&cfg.llm.max_think_model).is_none() {
-        return Err(anyhow!(
-            "unsupported llm.max_think_model='{}' (supported aliases: deepseek-chat, deepseek-reasoner)",
-            cfg.llm.max_think_model
-        ));
-    }
-    let env_key = cfg.llm.api_key_env.trim();
+
+    let provider = cfg.llm.active_provider();
+    let env_key = provider.api_key_env.trim();
     if env_key.is_empty() {
-        return Err(anyhow!(
-            "llm.api_key_env is empty; set it in .codingbuddy/settings.json"
-        ));
+        return Ok(());
     }
 
     if std::env::var(env_key)
@@ -484,7 +493,6 @@ pub(crate) fn finalize_background_subagent_run_with_ids(
     task_id: Uuid,
     outcome: std::result::Result<&str, &str>,
 ) -> Result<()> {
-
     let store = Store::new(cwd)?;
     let now = chrono::Utc::now().to_rfc3339();
     let reference = format!("subagent:{run_id}");
@@ -496,7 +504,9 @@ pub(crate) fn finalize_background_subagent_run_with_ids(
     } else {
         store.load_background_job_by_reference(&reference)?
     };
-    if run.background_job_id.is_none() && let Some(job) = &background_job {
+    if run.background_job_id.is_none()
+        && let Some(job) = &background_job
+    {
         run.background_job_id = Some(job.job_id);
     }
 

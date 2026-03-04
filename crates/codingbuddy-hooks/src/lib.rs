@@ -609,17 +609,23 @@ impl HookRuntime {
         // Exit code 2 = block.
         let blocked_by_exit = exit_code == Some(2);
 
-        // Try to parse stdout as JSON for decisions.
-        let stdout_output = child
-            .stdout
-            .and_then(|mut out| {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut out, &mut buf).ok()?;
-                Some(buf)
-            })
-            .unwrap_or_default();
-
-        let output: HookOutput = serde_json::from_str(&stdout_output).unwrap_or_default();
+        // Only parse stdout when the process exited normally. On timeout, descendants
+        // may still hold stdout fds open after killing the shell wrapper, which can make
+        // a blocking read hang until those descendants exit.
+        let output = if !timed_out && status.is_some() {
+            let stdout_output = child
+                .stdout
+                .take()
+                .and_then(|mut out| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut out, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            parse_hook_output(&stdout_output)
+        } else {
+            HookOutput::default()
+        };
 
         let blocked = blocked_by_exit || output.decision.as_deref() == Some("block");
 
@@ -719,6 +725,88 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn parse_hook_output(stdout: &str) -> HookOutput {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return HookOutput::default();
+    }
+    if let Ok(parsed) = serde_json::from_str::<HookOutput>(trimmed) {
+        return parsed;
+    }
+    if let Some(unquoted) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        && let Ok(parsed) = serde_json::from_str::<HookOutput>(unquoted.trim())
+    {
+        return parsed;
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && start <= end
+    {
+        let candidate = &trimmed[start..=end];
+        if let Ok(parsed) = serde_json::from_str::<HookOutput>(candidate) {
+            return parsed;
+        }
+    }
+    let fallback = parse_hook_output_loose(trimmed);
+    if fallback.decision.is_some()
+        || fallback.reason.is_some()
+        || fallback.updated_input.is_some()
+        || fallback.permission_decision.is_some()
+        || fallback.additional_context.is_some()
+    {
+        return fallback;
+    }
+    HookOutput::default()
+}
+
+fn parse_hook_output_loose(stdout: &str) -> HookOutput {
+    let mut output = HookOutput::default();
+    if let Some(value) = extract_loose_field(stdout, "permissionDecision") {
+        let normalized = value.to_ascii_lowercase();
+        if matches!(normalized.as_str(), "allow" | "deny" | "ask") {
+            output.permission_decision = Some(normalized);
+        }
+    }
+    if let Some(value) = extract_loose_field(stdout, "decision")
+        && value.eq_ignore_ascii_case("block")
+    {
+        output.decision = Some("block".to_string());
+    }
+    if let Some(value) = extract_loose_field(stdout, "reason")
+        && !value.is_empty()
+    {
+        output.reason = Some(value);
+    }
+    output
+}
+
+fn extract_loose_field(input: &str, key: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    let start = lower.find(&key_lower)?;
+    let bytes = input.as_bytes();
+    let mut i = start + key.len();
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+        i += 1;
+    }
+    if i < bytes.len() && matches!(bytes[i], b':' | b'=') {
+        i += 1;
+    }
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+        i += 1;
+    }
+    let value_start = i;
+    while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b'\n' | b'\r' | b'"' | b'\'') {
+        i += 1;
+    }
+    if value_start >= i {
+        return None;
+    }
+    Some(input[value_start..i].trim().to_string())
+}
+
 fn build_command(path: &Path) -> Command {
     let ext = path
         .extension()
@@ -726,7 +814,11 @@ fn build_command(path: &Path) -> Command {
         .unwrap_or_default();
     if ext.eq_ignore_ascii_case("ps1") {
         let mut cmd = if cfg!(target_os = "windows") {
-            Command::new("powershell")
+            if command_in_path("pwsh") {
+                Command::new("pwsh")
+            } else {
+                Command::new("powershell")
+            }
         } else {
             Command::new("pwsh")
         };
@@ -737,22 +829,54 @@ fn build_command(path: &Path) -> Command {
         return cmd;
     }
     if ext.eq_ignore_ascii_case("sh") {
-        let mut cmd = Command::new("sh");
+        let shell = if cfg!(target_os = "windows") && command_in_path("bash") {
+            "bash"
+        } else {
+            "sh"
+        };
+        let mut cmd = Command::new(shell);
         cmd.arg(path);
         return cmd;
     }
     if ext.eq_ignore_ascii_case("py") {
-        let mut cmd = Command::new("python");
+        let mut cmd = if cfg!(target_os = "windows") && !command_in_path("python") {
+            let mut py = Command::new("py");
+            py.arg("-3");
+            py
+        } else {
+            Command::new("python")
+        };
         cmd.arg(path);
         return cmd;
     }
     Command::new(path)
 }
 
+fn command_in_path(command: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let mut candidates = vec![command.to_string()];
+    if cfg!(target_os = "windows") && !command.contains('.') {
+        candidates.extend(
+            [".exe", ".cmd", ".bat"]
+                .into_iter()
+                .map(|suffix| format!("{command}{suffix}")),
+        );
+    }
+    std::env::split_paths(&paths).any(|dir| {
+        candidates
+            .iter()
+            .map(|candidate| dir.join(candidate))
+            .any(|candidate| candidate.exists() && candidate.is_file())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    #[cfg(not(target_os = "windows"))]
     use std::fs;
 
     #[test]
@@ -1266,22 +1390,39 @@ mod tests {
 
     // ── P5-11: Permission decision tests ──
 
+    fn permission_allow_command() -> String {
+        if cfg!(target_os = "windows") {
+            r#"echo {"permissionDecision":"allow"}"#.to_string()
+        } else {
+            r#"echo '{"permissionDecision":"allow"}'"#.to_string()
+        }
+    }
+
+    fn permission_deny_command() -> String {
+        if cfg!(target_os = "windows") {
+            r#"echo {"permissionDecision":"deny","decision":"block","reason":"policy_violation"} && exit /b 2"#.to_string()
+        } else {
+            r#"echo '{"permissionDecision":"deny","decision":"block","reason":"policy_violation"}' && exit 2"#.to_string()
+        }
+    }
+
     #[test]
     fn permission_hook_allows() {
+        let temp = tempfile::tempdir().expect("tempdir");
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PermissionRequest".to_string(),
             vec![HookDefinition {
                 matcher: None,
                 hooks: vec![HookHandler::Command {
-                    command: r#"echo '{"permissionDecision":"allow"}'"#.to_string(),
+                    command: permission_allow_command(),
                     timeout: 5,
                 }],
                 once: false,
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(temp.path(), HooksConfig { events });
         let input = HookInput {
             event: "PermissionRequest".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1289,7 +1430,7 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: temp.path().to_string_lossy().to_string(),
         };
 
         let result = rt.fire(HookEvent::PermissionRequest, &input);
@@ -1302,20 +1443,21 @@ mod tests {
 
     #[test]
     fn permission_hook_denies() {
+        let temp = tempfile::tempdir().expect("tempdir");
         let mut events = std::collections::HashMap::new();
         events.insert(
             "PermissionRequest".to_string(),
             vec![HookDefinition {
                 matcher: None,
                 hooks: vec![HookHandler::Command {
-                    command: r#"echo '{"permissionDecision":"deny","decision":"block","reason":"policy violation"}' && exit 2"#.to_string(),
+                    command: permission_deny_command(),
                     timeout: 5,
                 }],
                 once: false,
                 disabled: false,
             }],
         );
-        let rt = HookRuntime::new(Path::new("/tmp"), HooksConfig { events });
+        let rt = HookRuntime::new(temp.path(), HooksConfig { events });
         let input = HookInput {
             event: "PermissionRequest".to_string(),
             tool_name: Some("bash_run".to_string()),
@@ -1323,12 +1465,18 @@ mod tests {
             tool_result: None,
             prompt: None,
             session_type: None,
-            workspace: "/tmp".to_string(),
+            workspace: temp.path().to_string_lossy().to_string(),
         };
 
         let result = rt.fire(HookEvent::PermissionRequest, &input);
         assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
         assert!(result.blocked, "deny decision should also block");
+    }
+
+    #[test]
+    fn parse_hook_output_accepts_single_quoted_json() {
+        let output = parse_hook_output(r#" '{"permissionDecision":"allow"}' "#);
+        assert_eq!(output.permission_decision.as_deref(), Some("allow"));
     }
 
     // ── P5-09: Agent handler test ──

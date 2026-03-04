@@ -3,6 +3,7 @@
 //! Pure `std` — no Candle deps, works without the `local-ml` feature.
 //! Detects GPU availability and total system RAM to recommend the best model.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::OnceLock;
 

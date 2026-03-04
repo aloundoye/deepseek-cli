@@ -709,6 +709,7 @@ dependencies = [
  "codingbuddy-policy",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
  "wait-timeout",
 ]

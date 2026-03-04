@@ -219,6 +219,7 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
     let cfg = AppConfig::ensure(cwd)?;
     let plugin_manager = PluginManager::new(cwd)?;
     let plugins = plugin_manager.list().unwrap_or_default();
+    let provider = cfg.llm.active_provider();
 
     let runtime = runtime_dir(cwd);
     fs::create_dir_all(&runtime)?;
@@ -228,9 +229,10 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
         .ok()
         .or_else(|| std::env::var("ComSpec").ok())
         .unwrap_or_else(|| "unknown".to_string());
-    let api_key_env_set = std::env::var(&cfg.llm.api_key_env)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
+    let api_key_env_set = provider.api_key_env.is_empty()
+        || std::env::var(&provider.api_key_env)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
     let api_key_configured = cfg
         .llm
         .api_key
@@ -250,7 +252,7 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
     if !api_key_env_set && !api_key_configured {
         warnings.push(format!(
             "{} not set and llm.api_key not configured",
-            cfg.llm.api_key_env
+            provider.api_key_env
         ));
     }
     if checks["git"].as_bool() != Some(true) {
@@ -281,12 +283,13 @@ pub(crate) fn doctor_payload(cwd: &Path, _args: &DoctorArgs) -> Result<serde_jso
         },
         "llm": {
             "endpoint": cfg.llm.endpoint,
+            "provider": cfg.llm.provider,
             "profile": cfg.llm.profile,
-            "api_key_env": cfg.llm.api_key_env,
+            "api_key_env": provider.api_key_env,
             "api_key_env_set": api_key_env_set,
             "api_key_configured": api_key_configured,
-            "base_model": cfg.llm.base_model,
-            "max_think_model": cfg.llm.max_think_model,
+            "base_model": cfg.llm.active_base_model(),
+            "max_think_model": cfg.llm.active_reasoner_model(),
         },
         "plugins": {
             "installed": plugins.len(),
