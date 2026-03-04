@@ -1,11 +1,634 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_store::Store;
-use serde_json::json;
+use codingbuddy_core::SessionState;
+use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord};
+use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::TasksCmd;
 use crate::output::*;
+
+pub(crate) struct TasksSlashResponse {
+    pub payload: Value,
+    pub text: String,
+    pub session_switch: Option<Uuid>,
+}
+
+fn scoped_session_id(store: &Store, session_override: Option<Uuid>) -> Result<Option<Uuid>> {
+    if let Some(session_id) = session_override {
+        store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        return Ok(Some(session_id));
+    }
+    Ok(store
+        .load_latest_session()?
+        .map(|session| session.session_id))
+}
+
+fn workflow_phase_label(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Idle => "idle",
+        SessionState::Planning => "plan",
+        SessionState::ExecutingStep => "execute",
+        SessionState::AwaitingApproval => "approval",
+        SessionState::Verifying => "verify",
+        SessionState::Completed => "completed",
+        SessionState::Paused => "paused",
+        SessionState::Failed => "failed",
+    }
+}
+
+fn session_id_from_artifact_path(path: Option<&str>) -> Option<Uuid> {
+    let raw = path?.strip_prefix("session://")?;
+    Uuid::parse_str(raw).ok()
+}
+
+fn background_reason(job: &BackgroundJobRecord) -> Option<String> {
+    serde_json::from_str::<Value>(&job.metadata_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("reason")
+                .and_then(|raw| raw.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn task_output_text(
+    task: &codingbuddy_store::TaskQueueRecord,
+    run: Option<&SubagentRunRecord>,
+    background_job: Option<&BackgroundJobRecord>,
+) -> Option<(String, String)> {
+    if let Some(run) = run {
+        if let Some(output) = run.output.as_deref() {
+            return Some(("subagent".to_string(), output.to_string()));
+        }
+        if let Some(error) = run.error.as_deref() {
+            return Some(("subagent_error".to_string(), error.to_string()));
+        }
+    }
+    if let Some(outcome) = task.outcome.as_deref() {
+        return Some(("task".to_string(), outcome.to_string()));
+    }
+    let metadata = background_job
+        .and_then(|job| serde_json::from_str::<Value>(&job.metadata_json).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(result) = metadata.get("result").and_then(|raw| raw.as_str()) {
+        return Some(("background".to_string(), result.to_string()));
+    }
+    if let Some(error) = metadata.get("error").and_then(|raw| raw.as_str()) {
+        return Some(("background_error".to_string(), error.to_string()));
+    }
+    None
+}
+
+pub(crate) fn mission_control_payload(
+    cwd: &Path,
+    session_override: Option<Uuid>,
+    limit: usize,
+) -> Result<Value> {
+    let store = Store::new(cwd)?;
+    let session_id = scoped_session_id(&store, session_override)?;
+    let session = session_id.and_then(|id| store.load_session(id).ok().flatten());
+    let tasks = store.list_tasks(session_id)?;
+    let subagents = store.list_subagent_runs(session_id, limit)?;
+    let mut background_jobs = Vec::new();
+    let mut seen_jobs = HashSet::new();
+    for run in &subagents {
+        let Some(job_id) = run.background_job_id else {
+            continue;
+        };
+        if !seen_jobs.insert(job_id) {
+            continue;
+        }
+        if let Some(job) = store.load_background_job(job_id)? {
+            background_jobs.push(json!({
+                "job_id": job.job_id.to_string(),
+                "kind": job.kind,
+                "reference": job.reference,
+                "status": job.status,
+                "reason": background_reason(&job),
+                "updated_at": job.updated_at,
+                "run_status": run.status,
+                "task_id": run.task_id.map(|id| id.to_string()),
+            }));
+        }
+    }
+
+    let queued_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("queued"))
+        .count();
+    let running_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("running"))
+        .count();
+    let completed_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("completed"))
+        .count();
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("failed"))
+        .count();
+    let running_subagents = subagents
+        .iter()
+        .filter(|run| run.status.eq_ignore_ascii_case("running"))
+        .count();
+    let failed_subagents = subagents
+        .iter()
+        .filter(|run| run.status.eq_ignore_ascii_case("failed"))
+        .count();
+    let running_background_jobs = background_jobs
+        .iter()
+        .filter(|job| {
+            job.get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("running"))
+        })
+        .count();
+    let stopped_background_jobs = background_jobs
+        .iter()
+        .filter(|job| {
+            job.get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("stopped"))
+        })
+        .count();
+    let task_count = tasks.len();
+    let subagent_count = subagents.len();
+    let background_job_count = background_jobs.len();
+    let workflow_phase = session
+        .as_ref()
+        .map(|record| workflow_phase_label(&record.status));
+    let plan_state = session.as_ref().map(|record| {
+        if record.active_plan_id.is_some() {
+            if matches!(
+                record.status,
+                SessionState::Planning | SessionState::AwaitingApproval
+            ) {
+                "active"
+            } else {
+                "available"
+            }
+        } else {
+            "none"
+        }
+    });
+    let active_plan_id = session
+        .as_ref()
+        .and_then(|record| record.active_plan_id.map(|id| id.to_string()));
+
+    Ok(json!({
+        "schema": "deepseek.chat.mission_control.v1",
+        "session_id": session_id.map(|id| id.to_string()),
+        "workflow_phase": workflow_phase,
+        "plan_state": plan_state,
+        "active_plan_id": active_plan_id,
+        "tasks": tasks,
+        "subagents": subagents,
+        "background_jobs": background_jobs,
+        "summary": {
+            "task_count": task_count,
+            "queued_tasks": queued_tasks,
+            "running_tasks": running_tasks,
+            "completed_tasks": completed_tasks,
+            "failed_tasks": failed_tasks,
+            "subagent_count": subagent_count,
+            "running_subagents": running_subagents,
+            "failed_subagents": failed_subagents,
+            "background_job_count": background_job_count,
+            "running_background_jobs": running_background_jobs,
+            "stopped_background_jobs": stopped_background_jobs,
+        }
+    }))
+}
+
+pub(crate) fn render_mission_control_payload(payload: &Value) -> String {
+    let tasks = payload
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let subagents = payload
+        .get("subagents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let background_jobs = payload
+        .get("background_jobs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let workflow_phase = payload
+        .get("workflow_phase")
+        .and_then(Value::as_str)
+        .unwrap_or("idle");
+    let plan_state = payload
+        .get("plan_state")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("pending");
+    let summary = payload.get("summary").cloned().unwrap_or_else(|| json!({}));
+    let mut lines = vec![format!(
+        "Mission Control (agent queue; /todos scans code comments): session={} phase={} plan={} {} task(s), {} subagent run(s), {} background job(s)",
+        session_id,
+        workflow_phase,
+        plan_state,
+        tasks.len(),
+        subagents.len(),
+        background_jobs.len()
+    )];
+    lines.push(format!(
+        "- Summary: tasks queued={} running={} completed={} failed={} | subagents running={} failed={} | background running={} stopped={}",
+        summary["queued_tasks"].as_u64().unwrap_or(0),
+        summary["running_tasks"].as_u64().unwrap_or(0),
+        summary["completed_tasks"].as_u64().unwrap_or(0),
+        summary["failed_tasks"].as_u64().unwrap_or(0),
+        summary["running_subagents"].as_u64().unwrap_or(0),
+        summary["failed_subagents"].as_u64().unwrap_or(0),
+        summary["running_background_jobs"].as_u64().unwrap_or(0),
+        summary["stopped_background_jobs"].as_u64().unwrap_or(0),
+    ));
+    if tasks.is_empty() {
+        lines.push("- Tasks: none".to_string());
+    } else {
+        lines.push("- Tasks:".to_string());
+        for task in tasks.iter().take(10) {
+            let title = task.get("title").and_then(Value::as_str).unwrap_or("task");
+            let status = task
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let priority = task
+                .get("priority")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let task_id = task
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!(
+                "  - {title} [{status}] priority={priority} {task_id}"
+            ));
+        }
+    }
+    if subagents.is_empty() {
+        lines.push("- Subagents: none".to_string());
+    } else {
+        lines.push("- Subagents:".to_string());
+        for run in subagents.iter().take(10) {
+            let name = run
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("subagent");
+            let status = run
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let run_id = run
+                .get("run_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("  - {name} [{status}] {run_id}"));
+        }
+    }
+    if background_jobs.is_empty() {
+        lines.push("- Background: none".to_string());
+    } else {
+        lines.push("- Background:".to_string());
+        for job in background_jobs.iter().take(10) {
+            let job_id = job
+                .get("job_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let status = job
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let run_status = job
+                .get("run_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = job.get("reason").and_then(Value::as_str).unwrap_or("-");
+            lines.push(format!(
+                "  - {job_id} [{status}] run={run_status} reason={reason}"
+            ));
+        }
+    }
+    lines.push("Use /tasks show <task_id> for one task, /tasks output <task_id> for full output, or /tasks resume <task_id> to switch into a child session.".to_string());
+    lines.join("\n")
+}
+
+pub(crate) fn task_detail_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {
+    let store = Store::new(cwd)?;
+    let task = store
+        .load_task(task_id)?
+        .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+    let run = store.load_subagent_run_for_task(task_id)?;
+    let background_job = run
+        .as_ref()
+        .and_then(|record| record.background_job_id)
+        .map(|job_id| store.load_background_job(job_id))
+        .transpose()?
+        .flatten();
+    let artifacts = store.list_artifacts_for_task(task_id)?;
+    let resume_session_id = run
+        .as_ref()
+        .and_then(|record| record.child_session_id)
+        .or_else(|| session_id_from_artifact_path(task.artifact_path.as_deref()));
+    let (output_source, output_text) =
+        task_output_text(&task, run.as_ref(), background_job.as_ref())
+            .map(|(source, text)| (Some(source), Some(text)))
+            .unwrap_or((None, None));
+
+    Ok(json!({
+        "schema": "deepseek.tasks.detail.v1",
+        "task": task,
+        "run": run,
+        "background_job": background_job,
+        "artifacts": artifacts,
+        "resume_session_id": resume_session_id.map(|id| id.to_string()),
+        "resume_command": resume_session_id.map(|id| format!("codingbuddy --resume {id}")),
+        "output_source": output_source,
+        "output_text": output_text,
+    }))
+}
+
+pub(crate) fn render_task_detail_payload(payload: &Value) -> String {
+    let task = payload.get("task").cloned().unwrap_or_else(|| json!({}));
+    let run = payload.get("run").cloned().unwrap_or_else(|| json!(null));
+    let background_job = payload
+        .get("background_job")
+        .cloned()
+        .unwrap_or_else(|| json!(null));
+    let artifacts = payload
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Task {}",
+        task.get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    )];
+    lines.push(format!(
+        "Title:    {}",
+        task.get("title").and_then(Value::as_str).unwrap_or("task")
+    ));
+    if let Some(description) = task.get("description").and_then(Value::as_str) {
+        lines.push(format!("Desc:     {description}"));
+    }
+    lines.push(format!(
+        "Status:   {}",
+        task.get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "Priority: {}",
+        task.get("priority")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "Session:  {}",
+        task.get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ));
+    if let Some(outcome) = task.get("outcome").and_then(Value::as_str) {
+        lines.push(format!("Outcome:  {outcome}"));
+    }
+    if let Some(path) = task.get("artifact_path").and_then(Value::as_str) {
+        lines.push(format!("Artifact: {path}"));
+    }
+    if let Some(run_id) = run.get("run_id").and_then(Value::as_str) {
+        lines.push(format!(
+            "Run:      {} [{}]",
+            run_id,
+            run.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        if let Some(goal) = run.get("goal").and_then(Value::as_str) {
+            lines.push(format!("Goal:     {goal}"));
+        }
+        if let Some(child_session_id) = run.get("child_session_id").and_then(Value::as_str) {
+            lines.push(format!("Child:    {child_session_id}"));
+        }
+        if let Some(error) = run.get("error").and_then(Value::as_str) {
+            lines.push(format!("Error:    {error}"));
+        }
+    }
+    if let Some(job_id) = background_job.get("job_id").and_then(Value::as_str) {
+        lines.push(format!(
+            "Bg Job:   {} [{}]",
+            job_id,
+            background_job
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        if let Some(reason) = background_job
+            .get("metadata_json")
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        {
+            lines.push(format!("Reason:   {reason}"));
+        }
+    }
+    if !artifacts.is_empty() {
+        lines.push("Artifacts:".to_string());
+        for artifact in artifacts.iter().take(10) {
+            let path = artifact
+                .get("artifact_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("  - {path}"));
+        }
+    }
+    if let Some(session_id) = payload.get("resume_session_id").and_then(Value::as_str) {
+        lines.push(format!("Resume:   /resume {session_id}"));
+    }
+    if let Some(source) = payload.get("output_source").and_then(Value::as_str) {
+        let output = payload
+            .get("output_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let preview = if output.len() > 240 {
+            format!("{}...", &output[..output.floor_char_boundary(240)])
+        } else {
+            output.to_string()
+        };
+        lines.push(format!("Output:   [{source}] {preview}"));
+    }
+    lines.push(format!(
+        "Created:  {}",
+        task.get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "Updated:  {}",
+        task.get("updated_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ));
+    lines.join("\n")
+}
+
+pub(crate) fn task_output_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {
+    let payload = task_detail_payload(cwd, task_id)?;
+    let output_text = payload
+        .get("output_text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("task has no recorded output: {task_id}"))?;
+    Ok(json!({
+        "schema": "deepseek.tasks.output.v1",
+        "task_id": task_id.to_string(),
+        "output_source": payload.get("output_source").and_then(Value::as_str).unwrap_or("task"),
+        "output_text": output_text,
+        "resume_session_id": payload.get("resume_session_id").and_then(Value::as_str),
+    }))
+}
+
+pub(crate) fn render_task_output_payload(payload: &Value) -> String {
+    let task_id = payload
+        .get("task_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source = payload
+        .get("output_source")
+        .and_then(Value::as_str)
+        .unwrap_or("task");
+    let output_text = payload
+        .get("output_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut lines = vec![format!("Task Output: {task_id} [{source}]")];
+    if let Some(session_id) = payload.get("resume_session_id").and_then(Value::as_str) {
+        lines.push(format!("Resume: /resume {session_id}"));
+    }
+    lines.push(String::new());
+    lines.push(output_text.to_string());
+    lines.join("\n")
+}
+
+pub(crate) fn resumable_session_for_task(cwd: &Path, task_id: Uuid) -> Result<Option<Uuid>> {
+    let payload = task_detail_payload(cwd, task_id)?;
+    Ok(payload
+        .get("resume_session_id")
+        .and_then(Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw).ok()))
+}
+
+pub(crate) fn handle_tasks_slash(
+    cwd: &Path,
+    args: &[String],
+    session_override: Option<Uuid>,
+) -> Result<TasksSlashResponse> {
+    let subcommand = args
+        .first()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "list".to_string());
+    match subcommand.as_str() {
+        "list" => {
+            let payload = mission_control_payload(cwd, session_override, 20)?;
+            let text = render_mission_control_payload(&payload);
+            Ok(TasksSlashResponse {
+                payload,
+                text,
+                session_switch: None,
+            })
+        }
+        "show" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow!("usage: /tasks show <task_id>"))?;
+            let task_id = Uuid::parse_str(id)?;
+            let payload = task_detail_payload(cwd, task_id)?;
+            let text = render_task_detail_payload(&payload);
+            Ok(TasksSlashResponse {
+                payload,
+                text,
+                session_switch: None,
+            })
+        }
+        "output" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow!("usage: /tasks output <task_id>"))?;
+            let task_id = Uuid::parse_str(id)?;
+            let payload = task_output_payload(cwd, task_id)?;
+            let text = render_task_output_payload(&payload);
+            Ok(TasksSlashResponse {
+                payload,
+                text,
+                session_switch: None,
+            })
+        }
+        "resume" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow!("usage: /tasks resume <task_id>"))?;
+            let task_id = Uuid::parse_str(id)?;
+            let session_id = resumable_session_for_task(cwd, task_id)?
+                .ok_or_else(|| anyhow!("task has no resumable child session: {task_id}"))?;
+            let payload = json!({
+                "schema": "deepseek.tasks.resume.v1",
+                "task_id": task_id.to_string(),
+                "session_id": session_id.to_string(),
+                "resume_command": format!("codingbuddy --resume {session_id}"),
+                "message": format!("switched active chat session to child session {session_id} for task {task_id}"),
+            });
+            let text = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("task session selected")
+                .to_string();
+            Ok(TasksSlashResponse {
+                payload,
+                text,
+                session_switch: Some(session_id),
+            })
+        }
+        "help" => {
+            let payload = json!({
+                "schema": "deepseek.tasks.help.v1",
+                "usage": [
+                    "/tasks",
+                    "/tasks list",
+                    "/tasks show <task_id>",
+                    "/tasks output <task_id>",
+                    "/tasks resume <task_id>",
+                ],
+                "note": "/todos scans source comments; /tasks inspects agent work tracking."
+            });
+            let text = "Usage: /tasks [list|show <task_id>|output <task_id>|resume <task_id>]\n/todos scans source comments; /tasks inspects agent work tracking.".to_string();
+            Ok(TasksSlashResponse {
+                payload,
+                text,
+                session_switch: None,
+            })
+        }
+        _ => Err(anyhow!(
+            "use /tasks [list|show <task_id>|output <task_id>|resume <task_id>]"
+        )),
+    }
+}
 
 pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Result<()> {
     let store = Store::new(cwd)?;
@@ -46,38 +669,20 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
         }
         TasksCmd::Show(args) => {
             let task_id = Uuid::parse_str(&args.id)?;
-            let tasks = store.list_tasks(None)?;
-            let task = tasks
-                .iter()
-                .find(|t| t.task_id == task_id)
-                .ok_or_else(|| anyhow!("task not found: {}", args.id))?;
+            let payload = task_detail_payload(cwd, task_id)?;
             if json_mode {
-                print_json(&serde_json::to_value(task)?)?;
+                print_json(&payload)?;
             } else {
-                println!("Task:     {}", task.task_id);
-                println!("Title:    {}", task.title);
-                if let Some(description) = &task.description {
-                    println!("Desc:     {description}");
-                }
-                println!("Status:   {}", task.status);
-                println!("Priority: {}", task.priority);
-                if let Some(outcome) = &task.outcome {
-                    println!("Outcome:  {outcome}");
-                }
-                if let Some(run) = store.load_subagent_run_for_task(task.task_id)? {
-                    println!("Run:      {} [{}]", run.run_id, run.status);
-                    if let Some(child_session_id) = run.child_session_id {
-                        println!("Session:  {child_session_id}");
-                    }
-                    if let Some(error) = run.error {
-                        println!("Error:    {error}");
-                    }
-                }
-                if let Some(path) = &task.artifact_path {
-                    println!("Artifacts: {path}");
-                }
-                println!("Created:  {}", task.created_at);
-                println!("Updated:  {}", task.updated_at);
+                println!("{}", render_task_detail_payload(&payload));
+            }
+        }
+        TasksCmd::Output(args) => {
+            let task_id = Uuid::parse_str(&args.id)?;
+            let payload = task_output_payload(cwd, task_id)?;
+            if json_mode {
+                print_json(&payload)?;
+            } else {
+                println!("{}", render_task_output_payload(&payload));
             }
         }
         TasksCmd::Cancel(args) => {
@@ -91,4 +696,80 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
+    use tempfile::tempdir;
+
+    #[test]
+    fn task_detail_payload_surfaces_resume_session_and_output() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let session = codingbuddy_core::Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: codingbuddy_core::SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session)?;
+        let child_session = store.fork_session(session.session_id)?;
+        let now = Utc::now().to_rfc3339();
+        let task_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7();
+        store.insert_task(&TaskQueueRecord {
+            task_id,
+            session_id: session.session_id,
+            title: "Implement task view".to_string(),
+            description: Some("inspect linked output".to_string()),
+            priority: 2,
+            status: "completed".to_string(),
+            outcome: None,
+            artifact_path: Some(format!("session://{}", child_session.session_id)),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_subagent_run(&SubagentRunRecord {
+            run_id,
+            session_id: Some(session.session_id),
+            task_id: Some(task_id),
+            child_session_id: Some(child_session.session_id),
+            background_job_id: Some(job_id),
+            name: "plan".to_string(),
+            goal: "inspect".to_string(),
+            status: "completed".to_string(),
+            output: Some("task finished".to_string()),
+            error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+        store.upsert_background_job(&BackgroundJobRecord {
+            job_id,
+            kind: "subagent".to_string(),
+            reference: format!("subagent:{run_id}"),
+            status: "stopped".to_string(),
+            metadata_json: json!({"reason":"completed"}).to_string(),
+            started_at: now.clone(),
+            updated_at: now,
+        })?;
+
+        let payload = task_detail_payload(temp.path(), task_id)?;
+        let child_session_id = child_session.session_id.to_string();
+        assert_eq!(
+            payload["resume_session_id"].as_str(),
+            Some(child_session_id.as_str())
+        );
+        assert_eq!(payload["output_source"].as_str(), Some("subagent"));
+        assert_eq!(payload["output_text"].as_str(), Some("task finished"));
+        Ok(())
+    }
 }

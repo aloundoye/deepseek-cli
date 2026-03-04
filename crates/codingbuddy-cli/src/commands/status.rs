@@ -29,9 +29,18 @@ pub(crate) fn current_ui_status(
     cwd: &Path,
     cfg: &AppConfig,
     force_max_think: bool,
+    session_override: Option<Uuid>,
 ) -> Result<UiStatus> {
     let store = Store::new(cwd)?;
-    let session = store.load_latest_session()?;
+    let session = if let Some(session_id) = session_override {
+        Some(
+            store
+                .load_session(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?,
+        )
+    } else {
+        store.load_latest_session()?
+    };
     let projection = if let Some(session) = &session {
         store.rebuild_from_events(session.session_id)?
     } else {
