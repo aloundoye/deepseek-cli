@@ -622,7 +622,7 @@ impl HookRuntime {
                     Some(buf)
                 })
                 .unwrap_or_default();
-            serde_json::from_str(&stdout_output).unwrap_or_default()
+            parse_hook_output(&stdout_output)
         } else {
             HookOutput::default()
         };
@@ -723,6 +723,33 @@ pub fn merge_skill_hooks(
 /// Closes the current single-quote, inserts an escaped single-quote, and reopens.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn parse_hook_output(stdout: &str) -> HookOutput {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return HookOutput::default();
+    }
+    if let Ok(parsed) = serde_json::from_str::<HookOutput>(trimmed) {
+        return parsed;
+    }
+    if let Some(unquoted) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        && let Ok(parsed) = serde_json::from_str::<HookOutput>(unquoted.trim())
+    {
+        return parsed;
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && start <= end
+    {
+        let candidate = &trimmed[start..=end];
+        if let Ok(parsed) = serde_json::from_str::<HookOutput>(candidate) {
+            return parsed;
+        }
+    }
+    HookOutput::default()
 }
 
 fn build_command(path: &Path) -> Command {
@@ -1371,6 +1398,12 @@ mod tests {
         let result = rt.fire(HookEvent::PermissionRequest, &input);
         assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
         assert!(result.blocked, "deny decision should also block");
+    }
+
+    #[test]
+    fn parse_hook_output_accepts_single_quoted_json() {
+        let output = parse_hook_output(r#" '{"permissionDecision":"allow"}' "#);
+        assert_eq!(output.permission_decision.as_deref(), Some("allow"));
     }
 
     // ── P5-09: Agent handler test ──
