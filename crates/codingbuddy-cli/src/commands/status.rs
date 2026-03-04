@@ -12,6 +12,19 @@ use crate::UsageArgs;
 use crate::output::*;
 use crate::util::*;
 
+fn workflow_phase_label(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Idle => "idle",
+        SessionState::Planning => "plan",
+        SessionState::ExecutingStep => "execute",
+        SessionState::AwaitingApproval => "approval",
+        SessionState::Verifying => "verify",
+        SessionState::Completed => "completed",
+        SessionState::Paused => "paused",
+        SessionState::Failed => "failed",
+    }
+}
+
 pub(crate) fn current_ui_status(
     cwd: &Path,
     cfg: &AppConfig,
@@ -75,6 +88,26 @@ pub(crate) fn current_ui_status(
             .clone()
             .unwrap_or_else(|| cfg.policy.permission_mode.to_string()),
         active_tasks: projection.task_ids.len(),
+        workflow_phase: session
+            .as_ref()
+            .map(|record| workflow_phase_label(&record.status).to_string())
+            .unwrap_or_default(),
+        plan_state: session
+            .as_ref()
+            .and_then(|record| {
+                record.active_plan_id.map(|_| {
+                    if matches!(
+                        record.status,
+                        SessionState::Planning | SessionState::AwaitingApproval
+                    ) {
+                        "active"
+                    } else {
+                        "available"
+                    }
+                })
+            })
+            .unwrap_or("none")
+            .to_string(),
         context_used_tokens: estimated_context_tokens,
         context_max_tokens: cfg.llm.context_window_tokens,
         session_turns: projection.transcript.len(),
@@ -155,6 +188,16 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         json!({
             "session_id": session.session_id,
             "state": session.status,
+            "workflow_phase": workflow_phase_label(&session.status),
+            "plan_state": if session.active_plan_id.is_some() {
+                if matches!(session.status, SessionState::Planning | SessionState::AwaitingApproval) {
+                    "active"
+                } else {
+                    "available"
+                }
+            } else {
+                "none"
+            },
             "active_plan_id": session.active_plan_id,
             "model": {
                 "profile": cfg.llm.profile,
@@ -186,6 +229,8 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         json!({
             "session_id": null,
             "state": "none",
+            "workflow_phase": "idle",
+            "plan_state": "none",
             "model": {
                 "profile": cfg.llm.profile,
                 "base": cfg.llm.active_base_model(),
@@ -213,9 +258,11 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
         print_json(&payload)?;
     } else {
         println!(
-            "session={} state={} model={}/{}/{} context={:.1}% pending_approvals={} plugins={}/{}",
+            "session={} state={} phase={} plan={} model={}/{}/{} context={:.1}% pending_approvals={} plugins={}/{}",
             payload["session_id"].as_str().unwrap_or("none"),
             payload["state"].as_str().unwrap_or("unknown"),
+            payload["workflow_phase"].as_str().unwrap_or("idle"),
+            payload["plan_state"].as_str().unwrap_or("none"),
             payload["model"]["profile"].as_str().unwrap_or_default(),
             payload["model"]["base"].as_str().unwrap_or_default(),
             payload["model"]["max_think"].as_str().unwrap_or_default(),

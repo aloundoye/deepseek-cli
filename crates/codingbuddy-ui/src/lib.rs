@@ -351,6 +351,10 @@ pub struct UiStatus {
     pub permission_mode: String,
     pub active_tasks: usize,
     #[serde(default)]
+    pub workflow_phase: String,
+    #[serde(default)]
+    pub plan_state: String,
+    #[serde(default)]
     pub context_used_tokens: u64,
     #[serde(default = "default_context_max")]
     pub context_max_tokens: u64,
@@ -384,6 +388,16 @@ pub fn render_statusline(status: &UiStatus) -> String {
     } else {
         String::new()
     };
+    let phase_part = if !status.workflow_phase.is_empty() && status.workflow_phase != "idle" {
+        format!(" phase={}", status.workflow_phase)
+    } else {
+        String::new()
+    };
+    let plan_part = if status.plan_state != "none" {
+        format!(" plan={}", status.plan_state)
+    } else {
+        String::new()
+    };
     let ctx_pct = if status.context_max_tokens > 0 {
         (status.context_used_tokens as f64 / status.context_max_tokens as f64 * 100.0) as u64
     } else {
@@ -413,12 +427,14 @@ pub fn render_statusline(status: &UiStatus) -> String {
         String::new()
     };
     format!(
-        "model={} {} approvals={} jobs={}{} autopilot={}{}{}{} cost=${:.4}",
+        "model={} {} approvals={} jobs={}{}{}{} autopilot={}{}{}{} cost=${:.4}",
         status.model,
         mode_indicator,
         status.pending_approvals,
         status.background_jobs,
         tasks_part,
+        phase_part,
+        plan_part,
         if status.autopilot_running {
             "running"
         } else {
@@ -513,6 +529,36 @@ fn render_statusline_spans(
         spans.push(Span::styled(
             format!(" {} tasks ", status.active_tasks),
             Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    if !status.workflow_phase.is_empty() && status.workflow_phase != "idle" {
+        let phase_color = match status.workflow_phase.as_str() {
+            "explore" => Color::Cyan,
+            "plan" => Color::Blue,
+            "approval" => Color::Yellow,
+            "execute" => Color::Green,
+            "verify" => Color::Magenta,
+            "completed" => Color::Green,
+            "failed" => Color::Red,
+            "paused" => Color::Gray,
+            _ => Color::White,
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} ", status.workflow_phase.to_ascii_uppercase()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(phase_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if status.plan_state != "none" {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" PLAN:{} ", status.plan_state.to_ascii_uppercase()),
+            Style::default().fg(Color::Blue),
         ));
     }
 
@@ -2215,6 +2261,12 @@ impl ChatShell {
     pub fn push_status_summary(&mut self, status: &UiStatus) {
         self.push_system(format!("Model: {}", status.model));
         self.push_system(format!("Permission mode: {}", status.permission_mode));
+        if !status.workflow_phase.is_empty() {
+            self.push_system(format!("Workflow phase: {}", status.workflow_phase));
+        }
+        if status.plan_state != "none" {
+            self.push_system(format!("Plan state: {}", status.plan_state));
+        }
         if let Some(review) = status.pr_review_status.as_deref() {
             self.push_system(format!("PR review: {}", review));
         }
@@ -5703,6 +5755,8 @@ mod tests {
             autopilot_running: true,
             permission_mode: "ask".to_string(),
             active_tasks: 3,
+            workflow_phase: "execute".to_string(),
+            plan_state: "available".to_string(),
             context_used_tokens: 50_000,
             context_max_tokens: 128_000,
             session_turns: 5,
@@ -5714,6 +5768,8 @@ mod tests {
         assert!(line.contains("autopilot=running"));
         assert!(line.contains("[ASK]"));
         assert!(line.contains("tasks=3"));
+        assert!(line.contains("phase=execute"));
+        assert!(line.contains("plan=available"));
     }
 
     #[test]
@@ -5905,6 +5961,8 @@ mod tests {
             permission_mode: "locked".to_string(),
             pending_approvals: 1,
             active_tasks: 2,
+            workflow_phase: "execute".to_string(),
+            plan_state: "available".to_string(),
             background_jobs: 1,
             autopilot_running: true,
             context_used_tokens: 100_000,
@@ -5917,6 +5975,8 @@ mod tests {
         assert!(text.contains("LOCKED"));
         assert!(text.contains("pending"));
         assert!(text.contains("tasks"));
+        assert!(text.contains("EXECUTE"));
+        assert!(text.contains("PLAN:AVAILABLE"));
         assert!(text.contains("AUTOPILOT"));
         assert!(text.contains("100K/128K"));
 

@@ -842,11 +842,26 @@ fn agents_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
 
 fn mission_control_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value> {
     let store = Store::new(cwd)?;
-    let session_id = store
-        .load_latest_session()?
-        .map(|session| session.session_id);
+    let session = store.load_latest_session()?;
+    let session_id = session.as_ref().map(|session| session.session_id);
     let tasks = store.list_tasks(session_id)?;
     let subagents = store.list_subagent_runs(session_id, limit)?;
+    let queued_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("queued"))
+        .count();
+    let running_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("running"))
+        .count();
+    let completed_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("completed"))
+        .count();
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| task.status.eq_ignore_ascii_case("failed"))
+        .count();
     let running_subagents = subagents
         .iter()
         .filter(|run| run.status.eq_ignore_ascii_case("running"))
@@ -858,10 +873,39 @@ fn mission_control_payload(cwd: &Path, limit: usize) -> Result<serde_json::Value
     Ok(json!({
         "schema": "deepseek.chat.mission_control.v1",
         "session_id": session_id.map(|id| id.to_string()),
+        "workflow_phase": session.as_ref().map(|record| match record.status {
+            codingbuddy_core::SessionState::Idle => "idle",
+            codingbuddy_core::SessionState::Planning => "plan",
+            codingbuddy_core::SessionState::ExecutingStep => "execute",
+            codingbuddy_core::SessionState::AwaitingApproval => "approval",
+            codingbuddy_core::SessionState::Verifying => "verify",
+            codingbuddy_core::SessionState::Completed => "completed",
+            codingbuddy_core::SessionState::Paused => "paused",
+            codingbuddy_core::SessionState::Failed => "failed",
+        }),
+        "plan_state": session.as_ref().map(|record| {
+            if record.active_plan_id.is_some() {
+                if matches!(
+                    record.status,
+                    codingbuddy_core::SessionState::Planning | codingbuddy_core::SessionState::AwaitingApproval
+                ) {
+                    "active"
+                } else {
+                    "available"
+                }
+            } else {
+                "none"
+            }
+        }),
+        "active_plan_id": session.and_then(|record| record.active_plan_id.map(|id| id.to_string())),
         "tasks": tasks,
         "subagents": subagents,
         "summary": {
             "task_count": tasks.len(),
+            "queued_tasks": queued_tasks,
+            "running_tasks": running_tasks,
+            "completed_tasks": completed_tasks,
+            "failed_tasks": failed_tasks,
             "subagent_count": subagents.len(),
             "running_subagents": running_subagents,
             "failed_subagents": failed_subagents,
@@ -913,11 +957,31 @@ fn render_mission_control_payload(payload: &serde_json::Value) -> String {
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
+    let workflow_phase = payload
+        .get("workflow_phase")
+        .and_then(|value| value.as_str())
+        .unwrap_or("idle");
+    let plan_state = payload
+        .get("plan_state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("none");
+    let summary = payload.get("summary").cloned().unwrap_or_else(|| json!({}));
     let mut lines = vec![format!(
-        "Mission Control: {} task(s), {} subagent run(s)",
+        "Mission Control: phase={} plan={} {} task(s), {} subagent run(s)",
+        workflow_phase,
+        plan_state,
         tasks.len(),
         subagents.len()
     )];
+    lines.push(format!(
+        "- Summary: queued={} running={} completed={} failed={} | subagents running={} failed={}",
+        summary["queued_tasks"].as_u64().unwrap_or(0),
+        summary["running_tasks"].as_u64().unwrap_or(0),
+        summary["completed_tasks"].as_u64().unwrap_or(0),
+        summary["failed_tasks"].as_u64().unwrap_or(0),
+        summary["running_subagents"].as_u64().unwrap_or(0),
+        summary["failed_subagents"].as_u64().unwrap_or(0),
+    ));
     if tasks.is_empty() {
         lines.push("- Tasks: none".to_string());
     } else {
@@ -932,7 +996,13 @@ fn render_mission_control_payload(payload: &serde_json::Value) -> String {
                 .get("priority")
                 .and_then(|v| v.as_u64())
                 .unwrap_or_default();
-            lines.push(format!("  - {title} [{status}] priority={priority}"));
+            let task_id = task
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            lines.push(format!(
+                "  - {title} [{status}] priority={priority} {task_id}"
+            ));
         }
     }
     if subagents.is_empty() {
