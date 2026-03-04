@@ -3,9 +3,10 @@ mod shell;
 pub mod tool_tiers;
 pub mod validation;
 
+pub use codingbuddy_core::ToolTier;
 pub use tool_tiers::{
-    ToolContextSignals, ToolTier, detect_signals, format_tool_search_results,
-    search_extended_tools, tiered_tool_definitions, tool_search_definition, tool_tier,
+    ToolContextSignals, detect_signals, format_tool_search_results, search_extended_tools,
+    tiered_tool_definitions, tool_search_definition, tool_tier,
 };
 pub use validation::{normalize_tool_args, normalize_tool_args_with_workspace, validate_tool_args};
 
@@ -33,6 +34,7 @@ pub use shell::{PlatformShellRunner, ShellRunResult, ShellRunner};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -2605,29 +2607,14 @@ For each task: id, subject, status, owner, blockedBy list\n\n\
 ///
 /// Plan mode blocks file edits and shell execution, but still allows planning
 /// metadata tools such as task creation and plan completion.
-pub const PLAN_MODE_TOOLS: &[&str] = &[
-    "fs_read",
-    "fs_list",
-    "fs_glob",
-    "fs_grep",
-    "git_status",
-    "git_diff",
-    "git_show",
-    "web_fetch",
-    "web_search",
-    "index_query",
-    "notebook_read",
-    "diagnostics_check",
-    "batch",
-    "user_question",
-    "task_create",
-    "task_update",
-    "task_get",
-    "task_list",
-    "task_output",
-    "spawn_task",
-    "exit_plan_mode",
-];
+pub static PLAN_MODE_TOOLS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    tool_definitions()
+        .into_iter()
+        .filter_map(|tool| codingbuddy_core::ToolName::from_api_name(&tool.function.name))
+        .filter(|tool| tool.is_allowed_in_phase(codingbuddy_core::TaskPhase::Plan))
+        .map(|tool| tool.as_api_name())
+        .collect()
+});
 
 /// Filter tool definitions by allowed/disallowed lists.
 ///
@@ -2847,20 +2834,14 @@ pub fn plugin_tool_definitions(workspace: &Path) -> Vec<ToolDefinition> {
 }
 
 /// Tools that are handled by AgentEngine directly, not by LocalToolHost.
-pub const AGENT_LEVEL_TOOLS: &[&str] = &[
-    "user_question",
-    "task_create",
-    "task_update",
-    "task_get",
-    "task_list",
-    "task_output",
-    "task_stop",
-    "spawn_task",
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "skill",
-    "extended_thinking",
-];
+pub static AGENT_LEVEL_TOOLS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    tool_definitions()
+        .into_iter()
+        .filter_map(|tool| codingbuddy_core::ToolName::from_api_name(&tool.function.name))
+        .filter(|tool| tool.is_agent_level())
+        .map(|tool| tool.as_api_name())
+        .collect()
+});
 
 fn should_skip_rel_path(path: &Path) -> bool {
     path.components().any(|c| {
@@ -5373,6 +5354,10 @@ mod tests {
             "task_output",
             "task_stop",
             "spawn_task",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "skill",
+            "extended_thinking",
         ] {
             assert!(
                 names.contains(&expected),
@@ -5407,13 +5392,14 @@ mod tests {
         assert_eq!(map_tool_name("task_output"), "task_output");
         assert_eq!(map_tool_name("task_stop"), "task_stop");
         assert_eq!(map_tool_name("spawn_task"), "spawn_task");
+        assert_eq!(map_tool_name("extended_thinking"), "extended_thinking");
     }
 
     #[test]
     fn agent_level_tools_constant_matches_definitions() {
         let defs = tool_definitions();
         let def_names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        for tool_name in AGENT_LEVEL_TOOLS {
+        for tool_name in AGENT_LEVEL_TOOLS.iter() {
             assert!(
                 def_names.contains(tool_name),
                 "AGENT_LEVEL_TOOLS contains '{tool_name}' but no definition exists"
@@ -5480,7 +5466,7 @@ mod tests {
     fn plan_mode_tools_all_exist_in_definitions() {
         let defs = tool_definitions();
         let def_names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        for tool_name in PLAN_MODE_TOOLS {
+        for tool_name in PLAN_MODE_TOOLS.iter() {
             assert!(
                 def_names.contains(tool_name),
                 "PLAN_MODE_TOOLS contains '{}' which is not in tool_definitions()",
@@ -5491,9 +5477,9 @@ mod tests {
 
     #[test]
     fn agent_level_tools_excluded_from_plan_mode() {
-        for tool_name in AGENT_LEVEL_TOOLS {
+        for tool_name in AGENT_LEVEL_TOOLS.iter() {
             // Agent-level tools that ARE in plan mode are: user_question, task_*, task_output,
-            // spawn_task, exit_plan_mode
+            // spawn_task, exit_plan_mode, extended_thinking
             // The write-oriented agent-level tools should not be in plan mode:
             // enter_plan_mode makes no sense inside plan mode, kill_shell is mutating, skill is execution
             let expected_in_plan = matches!(
@@ -5504,7 +5490,9 @@ mod tests {
                     | "task_get"
                     | "task_list"
                     | "task_output"
+                    | "task_stop"
                     | "spawn_task"
+                    | "extended_thinking"
                     | "exit_plan_mode"
             );
             let in_plan = PLAN_MODE_TOOLS.contains(tool_name);

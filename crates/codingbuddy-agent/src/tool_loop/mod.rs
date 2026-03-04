@@ -38,6 +38,7 @@ use codingbuddy_core::{
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
 use codingbuddy_llm::LlmClient;
 use codingbuddy_store::{Store, TaskQueueRecord};
+use codingbuddy_tools::{format_tool_search_results, search_extended_tools};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -112,6 +113,7 @@ pub struct ToolUseLoop<'a> {
     config: ToolLoopConfig,
     messages: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
+    discoverable_tools: Vec<ToolDefinition>,
     stream_cb: Option<StreamCallback>,
     approval_cb: Option<ApprovalCallback>,
     user_question_cb: Option<UserQuestionCallback>,
@@ -195,6 +197,7 @@ impl<'a> ToolUseLoop<'a> {
             config,
             messages,
             tools,
+            discoverable_tools: Vec::new(),
             stream_cb: None,
             approval_cb: None,
             user_question_cb: None,
@@ -216,6 +219,11 @@ impl<'a> ToolUseLoop<'a> {
             phase_read_only_calls: 0,
             phase_edit_calls: 0,
         }
+    }
+
+    /// Install tools that can be revealed on demand via `tool_search`.
+    pub fn set_discoverable_tools(&mut self, tools: Vec<ToolDefinition>) {
+        self.discoverable_tools = tools;
     }
 
     /// Build the raw cache input string and its SHA-256 hash key.
@@ -1792,6 +1800,7 @@ impl<'a> ToolUseLoop<'a> {
                 let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
                 self.handle_extended_thinking(question, context)?
             }
+            "tool_search" => self.handle_tool_search(&args),
             "user_question" => {
                 let question = args
                     .get("question")
@@ -1869,6 +1878,38 @@ impl<'a> ToolUseLoop<'a> {
             args_json: args_json_for_record(&llm_call.name, &llm_call.arguments),
             result_preview: None,
         }])
+    }
+
+    fn handle_tool_search(&mut self, args: &serde_json::Value) -> String {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if query.is_empty() {
+            return "Error: tool_search requires a non-empty 'query' string.".to_string();
+        }
+
+        let matches = search_extended_tools(query, &self.discoverable_tools);
+        let mut newly_enabled = 0usize;
+        for tool in &matches {
+            if !self
+                .tools
+                .iter()
+                .any(|t| t.function.name == tool.function.name)
+            {
+                self.tools.push(tool.clone());
+                newly_enabled += 1;
+            }
+        }
+
+        let mut result = format_tool_search_results(&matches);
+        if newly_enabled > 0 {
+            result.push_str(&format!(
+                "\n\nEnabled {newly_enabled} matching tool(s) for subsequent turns."
+            ));
+        }
+        result
     }
 
     /// Handle the extended_thinking tool by calling the reasoner model.

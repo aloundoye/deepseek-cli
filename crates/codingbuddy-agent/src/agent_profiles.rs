@@ -5,14 +5,15 @@
 //! Profiles are selected based on `ChatMode` and prompt content.
 
 use crate::complexity::PromptComplexity;
+use codingbuddy_core::{ToolAgentRole, ToolName};
 
 /// An agent profile constrains tool availability and adds a system prompt addendum.
 #[derive(Debug, Clone)]
 pub struct AgentProfile {
     /// Profile name for logging/debugging.
     pub name: &'static str,
-    /// If non-empty, ONLY these tools are allowed (allowlist). MCP tools always pass.
-    pub allowed_tools: &'static [&'static str],
+    /// The runtime role used to derive the tool set from tool metadata.
+    pub role: ToolAgentRole,
     /// These tools are always blocked (blocklist). Applied after allowed_tools.
     pub blocked_tools: &'static [&'static str],
     /// Extra text appended to the system prompt.
@@ -24,17 +25,8 @@ pub struct AgentProfile {
 /// Full tool set minus browser/web. Focus on code writing and testing.
 pub const PROFILE_BUILD: AgentProfile = AgentProfile {
     name: "build",
-    allowed_tools: &[], // empty = all tools
-    blocked_tools: &[
-        "web_search",
-        "web_fetch",
-        "chrome_navigate",
-        "chrome_screenshot",
-        "chrome_click",
-        "chrome_type",
-        "chrome_evaluate",
-        "chrome_find_text",
-    ],
+    role: ToolAgentRole::Build,
+    blocked_tools: &[],
     system_prompt_addendum: "\n## Agent Profile: Build\n\
         Focus on writing and testing code. Use tools to read, edit, and verify. \
         Do NOT browse the web — all answers must come from the codebase.\n",
@@ -44,21 +36,7 @@ pub const PROFILE_BUILD: AgentProfile = AgentProfile {
 /// Read-only tools only — no modifications allowed.
 pub const PROFILE_EXPLORE: AgentProfile = AgentProfile {
     name: "explore",
-    allowed_tools: &[
-        "fs_read",
-        "fs_glob",
-        "fs_grep",
-        "fs_list",
-        "git_status",
-        "git_diff",
-        "git_show",
-        "notebook_read",
-        "index_query",
-        "extended_thinking",
-        "think_deeply",
-        "user_question",
-        "diagnostics_check",
-    ],
+    role: ToolAgentRole::Explore,
     blocked_tools: &[],
     system_prompt_addendum: "\n## Agent Profile: Explore\n\
         Read and search only. Do NOT modify files. \
@@ -69,25 +47,29 @@ pub const PROFILE_EXPLORE: AgentProfile = AgentProfile {
 /// Like explore but also blocks bash_run — pure read + plan.
 pub const PROFILE_PLAN: AgentProfile = AgentProfile {
     name: "plan",
-    allowed_tools: &[
-        "fs_read",
-        "fs_glob",
-        "fs_grep",
-        "fs_list",
-        "git_status",
-        "git_diff",
-        "git_show",
-        "notebook_read",
-        "index_query",
-        "extended_thinking",
-        "think_deeply",
-        "user_question",
-        "diagnostics_check",
-    ],
+    role: ToolAgentRole::Plan,
     blocked_tools: &[],
     system_prompt_addendum: "\n## Agent Profile: Plan\n\
         Explore then produce a structured plan. Do NOT execute changes. \
         Read files, search the codebase, and analyze — then describe your plan.\n",
+    max_turns: None,
+};
+
+pub const PROFILE_BASH: AgentProfile = AgentProfile {
+    name: "bash",
+    role: ToolAgentRole::Bash,
+    blocked_tools: &[],
+    system_prompt_addendum: "\n## Agent Profile: Bash\n\
+        Focus on running and interpreting shell commands. Prefer command output over speculation.\n",
+    max_turns: None,
+};
+
+pub const PROFILE_GENERAL: AgentProfile = AgentProfile {
+    name: "general",
+    role: ToolAgentRole::General,
+    blocked_tools: &[],
+    system_prompt_addendum: "\n## Agent Profile: General\n\
+        Use the full delegated capability set when the task genuinely spans multiple domains.\n",
     max_turns: None,
 };
 
@@ -135,7 +117,7 @@ const IMPLEMENT_KEYWORDS: &[&str] = &[
 /// Rules:
 /// - `Ask` / `Context` → PROFILE_EXPLORE (read-only modes)
 /// - `Code` + planning keywords (without implement keywords) → PROFILE_PLAN
-/// - `Code` default → None (full tool set, no profile restriction)
+/// - `Code` default → PROFILE_BUILD
 pub fn select_profile(
     mode: super::ChatMode,
     prompt: &str,
@@ -151,7 +133,7 @@ pub fn select_profile(
             if has_planning && !has_implement {
                 Some(&PROFILE_PLAN)
             } else {
-                None // Full tool set
+                Some(&PROFILE_BUILD)
             }
         }
     }
@@ -159,42 +141,25 @@ pub fn select_profile(
 
 /// Filter tool definitions by an agent profile.
 ///
-/// If the profile has an allowlist, only those tools pass (plus MCP tools).
-/// Then the blocklist removes any remaining blocked tools.
+/// The profile's runtime role is resolved against canonical tool metadata.
 /// MCP tools (`mcp__*`) always pass through both filters.
 pub fn filter_by_profile(
     tools: Vec<codingbuddy_core::ToolDefinition>,
     profile: &AgentProfile,
 ) -> Vec<codingbuddy_core::ToolDefinition> {
-    let tools = if profile.allowed_tools.is_empty() {
-        tools
-    } else {
-        tools
-            .into_iter()
-            .filter(|t| {
-                // MCP tools always pass
-                if t.function.name.starts_with("mcp__") {
-                    return true;
-                }
-                profile.allowed_tools.iter().any(|a| *a == t.function.name)
-            })
-            .collect()
-    };
-
-    if profile.blocked_tools.is_empty() {
-        tools
-    } else {
-        tools
-            .into_iter()
-            .filter(|t| {
-                // MCP tools always pass
-                if t.function.name.starts_with("mcp__") {
-                    return true;
-                }
-                !profile.blocked_tools.iter().any(|b| *b == t.function.name)
-            })
-            .collect()
-    }
+    tools
+        .into_iter()
+        .filter(|t| {
+            if t.function.name.starts_with("mcp__") {
+                return true;
+            }
+            let allowed_by_role = ToolName::from_api_name(&t.function.name)
+                .map(|tool| tool.is_allowed_for_role(profile.role))
+                .unwrap_or(true);
+            let blocked = profile.blocked_tools.iter().any(|b| *b == t.function.name);
+            allowed_by_role && !blocked
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -247,29 +212,23 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_with_implement_returns_none() {
+    fn code_mode_with_implement_selects_build() {
         let profile = select_profile(
             ChatMode::Code,
             "implement the plan for the auth module",
             PromptComplexity::Complex,
         );
-        assert!(
-            profile.is_none(),
-            "implement keyword should prevent plan profile"
-        );
+        assert_eq!(profile.unwrap().name, "build");
     }
 
     #[test]
-    fn code_mode_default_returns_none() {
+    fn code_mode_default_returns_build() {
         let profile = select_profile(
             ChatMode::Code,
             "fix the bug in main.rs",
             PromptComplexity::Simple,
         );
-        assert!(
-            profile.is_none(),
-            "default code mode should have no profile restriction"
-        );
+        assert_eq!(profile.unwrap().name, "build");
     }
 
     #[test]
@@ -317,11 +276,13 @@ mod tests {
             make_tool("fs_read"),
             make_tool("bash_run"),
             make_tool("fs_glob"),
+            make_tool("task_create"),
         ];
         let filtered = filter_by_profile(tools, &PROFILE_PLAN);
         let names: Vec<_> = filtered.iter().map(|t| t.function.name.as_str()).collect();
         assert!(names.contains(&"fs_read"));
         assert!(names.contains(&"fs_glob"));
+        assert!(names.contains(&"task_create"));
         assert!(
             !names.contains(&"bash_run"),
             "bash_run should be blocked in plan"
@@ -350,6 +311,22 @@ mod tests {
             !names.contains(&"web_fetch"),
             "web_fetch should be blocked in build"
         );
+    }
+
+    #[test]
+    fn general_profile_keeps_extended_execution_tools() {
+        let tools = vec![
+            make_tool("fs_edit"),
+            make_tool("chrome_navigate"),
+            make_tool("skill"),
+            make_tool("tool_search"),
+        ];
+        let filtered = filter_by_profile(tools, &PROFILE_GENERAL);
+        let names: Vec<_> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(names.contains(&"fs_edit"));
+        assert!(names.contains(&"chrome_navigate"));
+        assert!(names.contains(&"skill"));
+        assert!(names.contains(&"tool_search"));
     }
 
     #[test]
@@ -384,14 +361,8 @@ mod tests {
     #[test]
     fn build_profile_has_reasonable_defaults() {
         assert_eq!(PROFILE_BUILD.name, "build");
-        assert!(
-            PROFILE_BUILD.allowed_tools.is_empty(),
-            "build allows all tools"
-        );
-        assert!(
-            !PROFILE_BUILD.blocked_tools.is_empty(),
-            "build blocks some tools"
-        );
+        assert_eq!(PROFILE_BUILD.role, ToolAgentRole::Build);
+        assert!(PROFILE_BUILD.blocked_tools.is_empty());
         assert!(PROFILE_BUILD.max_turns.is_none());
     }
 }

@@ -648,6 +648,102 @@ fn context_mode_uses_read_only_tools() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn code_mode_build_profile_uses_smaller_tool_surface() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![text_response("Scoped tool set ready.")]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let _output = engine.chat_with_options(
+        "Fix the bug in src/main.rs",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    let requests = captured.lock().unwrap();
+    assert!(!requests.is_empty());
+    let tool_names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert!(
+        tool_names.contains(&"fs_edit"),
+        "build profile should keep fs_edit"
+    );
+    assert!(
+        tool_names.contains(&"bash_run"),
+        "build profile should keep bash_run"
+    );
+    assert!(
+        tool_names.contains(&"tool_search"),
+        "tool_search should appear when discoverable tools exist"
+    );
+    assert!(
+        !tool_names.contains(&"web_search"),
+        "build profile should not expose web_search by default"
+    );
+    assert!(
+        !tool_names.contains(&"chrome_navigate"),
+        "chrome tools should stay hidden without chrome-specific signals"
+    );
+    Ok(())
+}
+
+#[test]
+fn tool_search_enables_matching_tools_for_followup_turns() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    init_workspace(temp.path())?;
+
+    let (llm, captured) = CapturingLlm::new(vec![
+        tool_call_response(vec![("call_1", "tool_search", r#"{"query":"plan mode"}"#)]),
+        tool_call_response(vec![("call_2", "enter_plan_mode", "{}")]),
+        text_response("Planning mode entered."),
+    ]);
+    let llm: Box<dyn LlmClient + Send + Sync> = Box::new(llm);
+    let engine = AgentEngine::new_with_llm(temp.path(), llm)?;
+
+    let output = engine.chat_with_options(
+        "Inspect this repository",
+        ChatOptions {
+            tools: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(output.contains("Planning mode entered"));
+    let requests = captured.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected at least two captured requests"
+    );
+    let first_tools: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    let second_tools: Vec<&str> = requests[1]
+        .tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert!(first_tools.contains(&"tool_search"));
+    assert!(
+        !first_tools.contains(&"enter_plan_mode"),
+        "enter_plan_mode should be hidden until discovered"
+    );
+    assert!(
+        second_tools.contains(&"enter_plan_mode"),
+        "tool_search should promote matching tools into the next request"
+    );
+    Ok(())
+}
+
 /// When tools=false, the analysis path is used (no tools in request).
 #[test]
 fn tools_false_uses_analysis_path() -> Result<()> {
@@ -1216,7 +1312,10 @@ fn task_create_persists_to_store() -> Result<()> {
     let tasks = store.list_tasks(None)?;
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].title, "Audit parser");
-    assert_eq!(tasks[0].description.as_deref(), Some("Inspect parser edge cases"));
+    assert_eq!(
+        tasks[0].description.as_deref(),
+        Some("Inspect parser edge cases")
+    );
     assert_eq!(tasks[0].priority, 2);
     Ok(())
 }
@@ -1249,7 +1348,10 @@ fn exit_plan_mode_persists_plan_and_session_state() -> Result<()> {
     assert!(output.contains("Plan saved"));
     let store = Store::new(temp.path())?;
     let session = store.load_latest_session()?.expect("session");
-    assert_eq!(session.status, codingbuddy_core::SessionState::AwaitingApproval);
+    assert_eq!(
+        session.status,
+        codingbuddy_core::SessionState::AwaitingApproval
+    );
     let plan_id = session.active_plan_id.expect("active plan");
     let plan = store.load_plan(plan_id)?.expect("plan");
     assert_eq!(plan.version, 2);
