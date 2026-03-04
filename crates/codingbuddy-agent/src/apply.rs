@@ -100,7 +100,7 @@ pub fn extract_target_files(diff: &str) -> Vec<String> {
 
 pub fn ensure_repo_relative_path(path: &str) -> std::result::Result<(), ApplyFailure> {
     let rel = Path::new(path);
-    if rel.is_absolute() {
+    if rel.is_absolute() || rel.has_root() || is_windows_drive_prefixed(path) {
         return Err(ApplyFailure {
             class: ApplyFailureClass::PatchMismatch,
             reason: format!("absolute paths are forbidden: {path}"),
@@ -120,6 +120,17 @@ pub fn ensure_repo_relative_path(path: &str) -> std::result::Result<(), ApplyFai
         });
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_drive_prefixed(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_windows_drive_prefixed(_path: &str) -> bool {
+    false
 }
 
 pub fn apply_unified_diff(
@@ -374,7 +385,19 @@ mod tests {
 
     #[test]
     fn ensure_repo_relative_rejects_absolute() {
-        let err = ensure_repo_relative_path("/etc/passwd").unwrap_err();
+        let path = if cfg!(target_os = "windows") {
+            r"C:\Windows\System32\drivers\etc\hosts"
+        } else {
+            "/etc/passwd"
+        };
+        let err = ensure_repo_relative_path(path).unwrap_err();
+        assert!(err.reason.contains("absolute"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ensure_repo_relative_rejects_rooted_backslash_path() {
+        let err = ensure_repo_relative_path(r"\Windows\System32").unwrap_err();
         assert!(err.reason.contains("absolute"));
     }
 

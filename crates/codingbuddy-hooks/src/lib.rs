@@ -732,7 +732,11 @@ fn build_command(path: &Path) -> Command {
         .unwrap_or_default();
     if ext.eq_ignore_ascii_case("ps1") {
         let mut cmd = if cfg!(target_os = "windows") {
-            Command::new("powershell")
+            if command_in_path("pwsh") {
+                Command::new("pwsh")
+            } else {
+                Command::new("powershell")
+            }
         } else {
             Command::new("pwsh")
         };
@@ -743,16 +747,47 @@ fn build_command(path: &Path) -> Command {
         return cmd;
     }
     if ext.eq_ignore_ascii_case("sh") {
-        let mut cmd = Command::new("sh");
+        let shell = if cfg!(target_os = "windows") && command_in_path("bash") {
+            "bash"
+        } else {
+            "sh"
+        };
+        let mut cmd = Command::new(shell);
         cmd.arg(path);
         return cmd;
     }
     if ext.eq_ignore_ascii_case("py") {
-        let mut cmd = Command::new("python");
+        let mut cmd = if cfg!(target_os = "windows") && !command_in_path("python") {
+            let mut py = Command::new("py");
+            py.arg("-3");
+            py
+        } else {
+            Command::new("python")
+        };
         cmd.arg(path);
         return cmd;
     }
     Command::new(path)
+}
+
+fn command_in_path(command: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let mut candidates = vec![command.to_string()];
+    if cfg!(target_os = "windows") && !command.contains('.') {
+        candidates.extend(
+            [".exe", ".cmd", ".bat"]
+                .into_iter()
+                .map(|suffix| format!("{command}{suffix}")),
+        );
+    }
+    std::env::split_paths(&paths).any(|dir| {
+        candidates
+            .iter()
+            .map(|candidate| dir.join(candidate))
+            .any(|candidate| candidate.exists() && candidate.is_file())
+    })
 }
 
 #[cfg(test)]

@@ -1167,7 +1167,7 @@ fn build_retriever_callback(
 
     // Build hybrid retriever: use UsearchBackend only when explicitly enabled;
     // otherwise stick to the built-in brute-force backend for portability.
-    #[cfg(feature = "local-ml-usearch")]
+    #[cfg(all(feature = "local-ml-usearch", not(target_os = "windows")))]
     let retriever = match codingbuddy_local_ml::UsearchBackend::new(embeddings.dimension()) {
         Ok(backend) => codingbuddy_local_ml::HybridRetriever::new_with_backend(
             &index_path,
@@ -1185,7 +1185,10 @@ fn build_retriever_callback(
             chunk_config,
         ),
     };
-    #[cfg(all(feature = "local-ml", not(feature = "local-ml-usearch")))]
+    #[cfg(all(
+        feature = "local-ml",
+        any(not(feature = "local-ml-usearch"), target_os = "windows")
+    ))]
     let retriever = codingbuddy_local_ml::HybridRetriever::new(
         &index_path,
         embeddings,

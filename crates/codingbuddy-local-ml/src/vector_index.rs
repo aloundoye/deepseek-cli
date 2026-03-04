@@ -296,8 +296,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Provides O(log n) approximate nearest neighbor search, significantly faster
 /// than BruteForceBackend for large indices (10K+ chunks). Only available when
-/// compiled with both the `local-ml` and `usearch-backend` features.
-#[cfg(all(feature = "local-ml", feature = "usearch-backend"))]
+/// compiled with both the `local-ml` and `usearch-backend` features on non-Windows targets.
+#[cfg(all(
+    feature = "local-ml",
+    feature = "usearch-backend",
+    not(target_os = "windows")
+))]
 pub struct UsearchBackend {
     index: usearch::Index,
     dimension: usize,
@@ -309,7 +313,11 @@ pub struct UsearchBackend {
     next_key: u64,
 }
 
-#[cfg(all(feature = "local-ml", feature = "usearch-backend"))]
+#[cfg(all(
+    feature = "local-ml",
+    feature = "usearch-backend",
+    not(target_os = "windows")
+))]
 impl UsearchBackend {
     pub fn new(dimension: usize) -> Result<Self> {
         let options = usearch::IndexOptions {
@@ -334,7 +342,11 @@ impl UsearchBackend {
     }
 }
 
-#[cfg(all(feature = "local-ml", feature = "usearch-backend"))]
+#[cfg(all(
+    feature = "local-ml",
+    feature = "usearch-backend",
+    not(target_os = "windows")
+))]
 impl VectorIndexBackend for UsearchBackend {
     fn insert(&mut self, chunk_id: &str, vector: &[f32]) -> Result<()> {
         // Remove existing entry if re-indexing
