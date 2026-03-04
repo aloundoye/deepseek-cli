@@ -41,10 +41,10 @@ check_forbidden_symbol "deepseek-router"
 check_forbidden_symbol "\"status\": \"queued\""
 check_forbidden_symbol "Processing prompt:"
 
-# Router event symbols are allowed only in deepseek-core compat parser.
+# Router event symbols are allowed only in codingbuddy-core compat parser.
 router_matches=$(rg -n --hidden --glob '!target/**' --glob '!.git/**' "RouterDecisionV1|RouterEscalationV1" crates || true)
 if [[ -n "$router_matches" ]]; then
-  filtered=$(echo "$router_matches" | rg -v "crates/deepseek-core/src/lib.rs" || true)
+  filtered=$(echo "$router_matches" | rg -v "crates/codingbuddy-core/src/lib.rs" || true)
   if [[ -n "$filtered" ]]; then
     echo "[conformance] router event symbols found outside compat shim:"
     echo "$filtered"
