@@ -357,11 +357,11 @@ pub(crate) fn task_detail_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {
 
 pub(crate) fn render_task_detail_payload(payload: &Value) -> String {
     let task = payload.get("task").cloned().unwrap_or_else(|| json!({}));
-    let run = payload.get("run").cloned().unwrap_or_else(|| json!(null));
+    let run = payload.get("run").cloned().unwrap_or(Value::Null);
     let background_job = payload
         .get("background_job")
         .cloned()
-        .unwrap_or_else(|| json!(null));
+        .unwrap_or(Value::Null);
     let artifacts = payload
         .get("artifacts")
         .and_then(Value::as_array)

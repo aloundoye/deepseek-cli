@@ -1069,9 +1069,7 @@ fn spawn_task_background_keeps_task_running() -> Result<()> {
             tool_call_response(vec![(
                 "call_1",
                 "spawn_task",
-                &format!(
-                    r#"{{"prompt":"analyze the project","description":"explore project","subagent_type":"explore","run_in_background":true,"max_turns":5,"model":"deepseek-chat"}}"#
-                ),
+                r#"{"prompt":"analyze the project","description":"explore project","subagent_type":"explore","run_in_background":true,"max_turns":5,"model":"deepseek-chat"}"#,
             )]),
             text_response("Delegated task queued."),
         ],
