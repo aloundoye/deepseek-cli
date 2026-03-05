@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord};
+use codingbuddy_store::{BackgroundJobRecord, SessionTodoRecord, Store, SubagentRunRecord};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
@@ -43,6 +43,61 @@ fn background_reason(job: &BackgroundJobRecord) -> Option<String> {
         })
 }
 
+fn todos_summary_payload(todos: &[SessionTodoRecord]) -> Value {
+    let completed = todos
+        .iter()
+        .filter(|todo| todo.status.eq_ignore_ascii_case("completed"))
+        .count();
+    let in_progress = todos
+        .iter()
+        .filter(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+        .count();
+    let active = todos.len().saturating_sub(completed);
+    let current = todos
+        .iter()
+        .find(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+        .or_else(|| {
+            todos
+                .iter()
+                .find(|todo| todo.status.eq_ignore_ascii_case("pending"))
+        })
+        .map(|todo| {
+            json!({
+                "todo_id": todo.todo_id.to_string(),
+                "content": todo.content,
+                "status": todo.status,
+                "position": todo.position,
+            })
+        });
+    json!({
+        "total": todos.len(),
+        "active": active,
+        "completed": completed,
+        "in_progress": in_progress,
+        "current": current,
+    })
+}
+
+fn current_plan_step_payload(plan: Option<&Value>) -> Value {
+    let Some(plan) = plan else {
+        return Value::Null;
+    };
+    let Some(steps) = plan.get("steps").and_then(Value::as_array) else {
+        return Value::Null;
+    };
+    for (index, step) in steps.iter().enumerate() {
+        if !step.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            return json!({
+                "index": index + 1,
+                "step_id": step.get("step_id").and_then(Value::as_str),
+                "title": step.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "intent": step.get("intent").and_then(Value::as_str).unwrap_or_default(),
+            });
+        }
+    }
+    Value::Null
+}
+
 fn task_output_text(
     task: &codingbuddy_store::TaskQueueRecord,
     run: Option<&SubagentRunRecord>,
@@ -80,6 +135,11 @@ pub(crate) fn mission_control_payload(
     let session_id = scoped_session_id(&store, session_override)?;
     let session = session_id.and_then(|id| store.load_session(id).ok().flatten());
     let tasks = store.list_tasks(session_id)?;
+    let todos = if let Some(session_id) = session_id {
+        store.list_session_todos(session_id)?
+    } else {
+        Vec::new()
+    };
     let subagents = store.list_subagent_runs(session_id, limit)?;
     let mut background_jobs = Vec::new();
     let mut seen_jobs = HashSet::new();
@@ -145,6 +205,7 @@ pub(crate) fn mission_control_payload(
         })
         .count();
     let task_count = tasks.len();
+    let todo_summary = todos_summary_payload(&todos);
     let subagent_count = subagents.len();
     let background_job_count = background_jobs.len();
     let workflow_phase = session
@@ -155,6 +216,7 @@ pub(crate) fn mission_control_payload(
         .as_ref()
         .and_then(|record| record.active_plan_id.map(|id| id.to_string()));
     let active_plan = current_plan_payload(&store, session.as_ref())?;
+    let current_step = current_plan_step_payload(active_plan.as_ref());
 
     Ok(json!({
         "schema": "deepseek.chat.mission_control.v1",
@@ -163,10 +225,17 @@ pub(crate) fn mission_control_payload(
         "plan_state": plan_state,
         "active_plan_id": active_plan_id,
         "plan": active_plan.unwrap_or(Value::Null),
+        "current_step": current_step,
+        "todos": todos,
         "tasks": tasks,
         "subagents": subagents,
         "background_jobs": background_jobs,
         "summary": {
+            "todo_count": todo_summary["total"].as_u64().unwrap_or(0),
+            "active_todos": todo_summary["active"].as_u64().unwrap_or(0),
+            "completed_todos": todo_summary["completed"].as_u64().unwrap_or(0),
+            "in_progress_todos": todo_summary["in_progress"].as_u64().unwrap_or(0),
+            "current_todo": todo_summary["current"].clone(),
             "task_count": task_count,
             "queued_tasks": queued_tasks,
             "running_tasks": running_tasks,
@@ -183,6 +252,11 @@ pub(crate) fn mission_control_payload(
 }
 
 pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
+    let todos = payload
+        .get("todos")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let tasks = payload
         .get("tasks")
         .and_then(Value::as_array)
@@ -211,9 +285,10 @@ pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
         .get("session_id")
         .and_then(Value::as_str)
         .unwrap_or("pending");
+    let current_step = payload.get("current_step").filter(|value| !value.is_null());
     let summary = payload.get("summary").cloned().unwrap_or_else(|| json!({}));
     let mut lines = vec![format!(
-        "Mission Control (agent queue; /todos scans code comments): session={} phase={} plan={} {} task(s), {} subagent run(s), {} background job(s)",
+        "Mission Control (agent queue + session todos): session={} phase={} plan={} {} task(s), {} subagent run(s), {} background job(s)",
         session_id,
         workflow_phase,
         plan_state,
@@ -232,6 +307,37 @@ pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
         summary["running_background_jobs"].as_u64().unwrap_or(0),
         summary["stopped_background_jobs"].as_u64().unwrap_or(0),
     ));
+    lines.push(format!(
+        "- Todos: active={} in_progress={} completed={}",
+        summary["active_todos"].as_u64().unwrap_or(0),
+        summary["in_progress_todos"].as_u64().unwrap_or(0),
+        summary["completed_todos"].as_u64().unwrap_or(0),
+    ));
+    if let Some(current_todo) = summary
+        .get("current_todo")
+        .and_then(Value::as_object)
+        .map(|todo| {
+            format!(
+                "{} [{}]",
+                todo.get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                todo.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+            )
+        })
+    {
+        lines.push(format!("- Current todo: {current_todo}"));
+    }
+    if let Some(step) = current_step {
+        lines.push(format!(
+            "- Current step: {}",
+            step.get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ));
+    }
     if let Some(plan) = plan {
         lines.push(format!(
             "- Plan: state={} version={} steps={} goal={}",
@@ -267,6 +373,26 @@ pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
             lines.push(format!(
                 "  - {title} [{status}] priority={priority} {task_id}"
             ));
+        }
+    }
+    if todos.is_empty() {
+        lines.push("- Session todos: none".to_string());
+    } else {
+        lines.push("- Session todos:".to_string());
+        for todo in todos.iter().take(12) {
+            let content = todo
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("todo");
+            let status = todo
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            let todo_id = todo
+                .get("todo_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("  - [{status}] {content} {todo_id}"));
         }
     }
     if subagents.is_empty() {
@@ -312,6 +438,10 @@ pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
             ));
         }
     }
+    lines.push(
+        "Use /todos for session checklist updates and /comment-todos for source TODO/FIXME scans."
+            .to_string(),
+    );
     lines.push("Use /tasks show <task_id> for one task, /tasks output <task_id> for full output, or /tasks resume <task_id> to switch into a child session.".to_string());
     lines
 }
@@ -610,9 +740,9 @@ pub(crate) fn handle_tasks_slash(
                     "/tasks output <task_id>",
                     "/tasks resume <task_id>",
                 ],
-                "note": "/todos scans source comments; /tasks inspects agent work tracking."
+                "note": "/todos inspects session-native agent checklist; /comment-todos scans source comments; /tasks inspects delegated work tracking."
             });
-            let text = "Usage: /tasks [list|show <task_id>|output <task_id>|resume <task_id>]\n/todos scans source comments; /tasks inspects agent work tracking.".to_string();
+            let text = "Usage: /tasks [list|show <task_id>|output <task_id>|resume <task_id>]\n/todos inspects session-native agent checklist.\n/comment-todos scans source comments.\n/tasks inspects delegated work tracking.".to_string();
             Ok(TasksSlashResponse {
                 payload,
                 text,
@@ -697,9 +827,104 @@ pub(crate) fn run_tasks(cwd: &Path, command: TasksCmd, json_mode: bool) -> Resul
 mod tests {
     use super::*;
     use chrono::Utc;
-    use codingbuddy_core::SessionState;
-    use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
+    use codingbuddy_core::{Plan, PlanStep, SessionState};
+    use codingbuddy_store::{
+        BackgroundJobRecord, SessionTodoRecord, SubagentRunRecord, TaskQueueRecord,
+    };
     use tempfile::tempdir;
+
+    #[test]
+    fn mission_control_payload_includes_session_todos_and_current_step() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let plan_id = Uuid::now_v7();
+        let session = codingbuddy_core::Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: codingbuddy_core::SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session)?;
+        store.save_plan(
+            session.session_id,
+            &Plan {
+                plan_id,
+                version: 1,
+                goal: "Stabilize workspace automation".to_string(),
+                assumptions: vec![],
+                steps: vec![
+                    PlanStep {
+                        step_id: Uuid::now_v7(),
+                        title: "Audit current signals".to_string(),
+                        intent: "Confirm failure modes".to_string(),
+                        tools: vec![],
+                        files: vec![],
+                        done: true,
+                    },
+                    PlanStep {
+                        step_id: Uuid::now_v7(),
+                        title: "Patch windows-specific path handling".to_string(),
+                        intent: "Fix platform parity".to_string(),
+                        tools: vec![],
+                        files: vec!["crates/codingbuddy-agent/src/apply.rs".to_string()],
+                        done: false,
+                    },
+                ],
+                verification: vec!["cargo test -p codingbuddy-agent --lib".to_string()],
+                risk_notes: vec![],
+            },
+        )?;
+        let now = Utc::now().to_rfc3339();
+        store.replace_session_todos(
+            session.session_id,
+            &[
+                SessionTodoRecord {
+                    todo_id: Uuid::now_v7(),
+                    session_id: session.session_id,
+                    content: "Audit current signals".to_string(),
+                    status: "completed".to_string(),
+                    position: 0,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                SessionTodoRecord {
+                    todo_id: Uuid::now_v7(),
+                    session_id: session.session_id,
+                    content: "Patch windows-specific path handling".to_string(),
+                    status: "in_progress".to_string(),
+                    position: 1,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            ],
+        )?;
+
+        let payload = mission_control_payload(temp.path(), Some(session.session_id), 20)?;
+        assert_eq!(payload["summary"]["todo_count"].as_u64(), Some(2));
+        assert_eq!(payload["summary"]["completed_todos"].as_u64(), Some(1));
+        assert_eq!(payload["summary"]["in_progress_todos"].as_u64(), Some(1));
+        assert_eq!(
+            payload["summary"]["current_todo"]["content"].as_str(),
+            Some("Patch windows-specific path handling")
+        );
+        assert_eq!(
+            payload["current_step"]["title"].as_str(),
+            Some("Patch windows-specific path handling")
+        );
+        assert_eq!(payload["todos"].as_array().map(Vec::len), Some(2));
+
+        let rendered = render_mission_control_payload(&payload);
+        assert!(rendered.contains("Mission Control (agent queue + session todos)"));
+        assert!(rendered.contains("Current todo:"));
+        assert!(rendered.contains("Current step: Patch windows-specific path handling"));
+        assert!(rendered.contains("/comment-todos"));
+        Ok(())
+    }
 
     #[test]
     fn task_detail_payload_surfaces_resume_session_and_output() -> Result<()> {

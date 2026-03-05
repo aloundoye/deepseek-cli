@@ -2380,6 +2380,80 @@ Always set in_progress before starting, completed only when fully done".to_strin
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
+                name: "todo_read".to_string(),
+                description: "Read the session-native working checklist for this conversation.\n\n\
+## When to use\n\
+- At the start of complex work to see the current checklist\n\
+- Before updating todos so you keep existing IDs and ordering stable\n\
+- After subagent work to decide which items to mark complete\n\n\
+## Returns\n\
+- Current todo items with id/content/status\n\
+- Summary counts (active/completed/in_progress)\n\
+- Current executing item (if any)\n\n\
+## Notes\n\
+- This checklist is session-local and separate from task queue delegation.\n\
+- Use task_* tools for durable delegated/background units; use todo_* for the live checklist.".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "todo_write".to_string(),
+                description: "Replace the session-native working checklist with an updated ordered list.\n\n\
+## CRITICAL RULES\n\
+- Send the FULL desired checklist each time; omitted items are removed.\n\
+- Keep exactly one in_progress item while actively executing.\n\
+- Mark items completed as soon as work is verified.\n\
+- Preserve existing ids when possible (read first with todo_read).\n\n\
+## Status values\n\
+- pending\n\
+- in_progress\n\
+- completed\n\
+\n\
+## Notes\n\
+- This checklist is separate from task_* delegated work records.\n\
+- For complex tasks, update this after each meaningful step.".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "Complete ordered todo checklist for this session.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "Existing todo UUID (optional; preserve if known)."
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Todo item description."
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "Todo status."
+                                    }
+                                },
+                                "required": ["content"]
+                            }
+                        }
+                    },
+                    "required": ["items"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
                 name: "spawn_task".to_string(),
                 description: "Launch a specialized sub-agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities.\n\n\
 ## Agent types\n\
@@ -5509,6 +5583,8 @@ mod tests {
             "user_question",
             "task_create",
             "task_update",
+            "todo_read",
+            "todo_write",
             "task_output",
             "task_stop",
             "spawn_task",
@@ -5547,6 +5623,8 @@ mod tests {
         assert_eq!(map_tool_name("user_question"), "user_question");
         assert_eq!(map_tool_name("task_create"), "task_create");
         assert_eq!(map_tool_name("task_update"), "task_update");
+        assert_eq!(map_tool_name("todo_read"), "todo_read");
+        assert_eq!(map_tool_name("todo_write"), "todo_write");
         assert_eq!(map_tool_name("task_output"), "task_output");
         assert_eq!(map_tool_name("task_stop"), "task_stop");
         assert_eq!(map_tool_name("spawn_task"), "spawn_task");
@@ -5636,8 +5714,8 @@ mod tests {
     #[test]
     fn agent_level_tools_excluded_from_plan_mode() {
         for tool_name in AGENT_LEVEL_TOOLS.iter() {
-            // Agent-level tools that ARE in plan mode are: user_question, task_*, task_output,
-            // spawn_task, exit_plan_mode, extended_thinking
+            // Agent-level tools that ARE in plan mode are: user_question, task_*, todo_*,
+            // task_output, spawn_task, exit_plan_mode, extended_thinking
             // The write-oriented agent-level tools should not be in plan mode:
             // enter_plan_mode makes no sense inside plan mode, kill_shell is mutating, skill is execution
             let expected_in_plan = matches!(
@@ -5645,6 +5723,8 @@ mod tests {
                 "user_question"
                     | "task_create"
                     | "task_update"
+                    | "todo_read"
+                    | "todo_write"
                     | "task_get"
                     | "task_list"
                     | "task_output"

@@ -304,12 +304,16 @@ This task requires architectural thinking. Before making ANY changes:\n\n\
 ### Step 2: Plan (state this explicitly)\n\
 - List the files to modify in dependency order (change dependencies BEFORE dependents)\n\
 - For each file: what changes, what could break, what to verify\n\
-- Identify risks: shared state, concurrent access, type mismatches, missing imports\n\n\
+- Identify risks: shared state, concurrent access, type mismatches, missing imports\n\
+- Initialize the session checklist with `todo_read`/`todo_write` before editing\n\
+- Keep exactly one `in_progress` todo while executing\n\n\
 ### Step 3: Execute Incrementally\n\
 - Modify ONE file at a time\n\
 - After each file: run `bash_run` with the build/test command to verify\n\
 - If a test fails: fix it BEFORE moving to the next file\n\
-- If your plan was wrong: stop, re-read affected files, adjust plan\n\n\
+- If your plan was wrong: stop, re-read affected files, adjust plan\n\
+- Update todos after each meaningful step (`completed` / next `in_progress`)\n\
+- If a subagent finishes work, reflect it in parent todos with `todo_write`\n\n\
 ### Anti-Patterns (NEVER do these)\n\
 - Editing a file you haven't read in THIS session\n\
 - Changing a function signature without grepping for all callers\n\

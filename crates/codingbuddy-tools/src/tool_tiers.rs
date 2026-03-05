@@ -56,6 +56,8 @@ pub fn contextual_tool_names(signals: &ToolContextSignals) -> Vec<&'static str> 
             "extended_thinking",
             "task_create",
             "task_update",
+            "todo_read",
+            "todo_write",
             "task_get",
             "task_list",
             "task_output",

@@ -212,6 +212,7 @@ pub enum SlashCommand {
     Voice(Vec<String>),
     Desktop(Vec<String>),
     Todos(Vec<String>),
+    CommentTodos(Vec<String>),
     Chrome(Vec<String>),
     Exit,
     Hooks(Vec<String>),
@@ -298,6 +299,7 @@ impl SlashCommand {
             "debug" => Self::Debug(args),
             "desktop" => Self::Desktop(args),
             "todos" => Self::Todos(args),
+            "comment-todos" | "comment_todos" => Self::CommentTodos(args),
             "chrome" => Self::Chrome(args),
             "exit" | "quit" => Self::Exit,
             "hooks" => Self::Hooks(args),
@@ -2360,6 +2362,8 @@ const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("sandbox", "Configure sandbox mode"),
     ("agents", "List custom agents"),
     ("tasks", "Manage background tasks"),
+    ("todos", "Show/update session todo checklist"),
+    ("comment-todos", "Scan TODO/FIXME comments in source files"),
     ("review", "Review PR changes"),
     ("search", "Search codebase"),
     ("vim", "Toggle vim keybindings"),
@@ -5184,6 +5188,10 @@ mod tests {
             Some(SlashCommand::Todos(vec!["fix".to_string()]))
         );
         assert_eq!(
+            SlashCommand::parse("/comment-todos auth"),
+            Some(SlashCommand::CommentTodos(vec!["auth".to_string()]))
+        );
+        assert_eq!(
             SlashCommand::parse("/chrome reconnect"),
             Some(SlashCommand::Chrome(vec!["reconnect".to_string()]))
         );
@@ -5873,6 +5881,10 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/todos"),
             Some(SlashCommand::Todos(vec![]))
+        );
+        assert_eq!(
+            SlashCommand::parse("/comment-todos"),
+            Some(SlashCommand::CommentTodos(vec![]))
         );
         assert_eq!(
             SlashCommand::parse("/chrome"),

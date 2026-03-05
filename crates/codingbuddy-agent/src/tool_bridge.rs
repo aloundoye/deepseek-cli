@@ -397,6 +397,8 @@ mod tests {
     #[test]
     fn agent_level_tools_identified() {
         assert!(is_agent_level_tool("user_question"));
+        assert!(is_agent_level_tool("todo_read"));
+        assert!(is_agent_level_tool("todo_write"));
         assert!(is_agent_level_tool("spawn_task"));
         assert!(is_agent_level_tool("skill"));
         assert!(is_agent_level_tool("enter_plan_mode"));

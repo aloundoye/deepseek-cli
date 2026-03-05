@@ -12,7 +12,7 @@ use codingbuddy_mcp::McpManager;
 use codingbuddy_memory::{ExportFormat, MemoryManager};
 use codingbuddy_policy::PolicyEngine;
 use codingbuddy_skills::SkillManager;
-use codingbuddy_store::{Store, SubagentRunRecord};
+use codingbuddy_store::{SessionTodoRecord, Store, SubagentRunRecord};
 use codingbuddy_tools::LocalToolHost;
 use codingbuddy_ui::{
     KeyBindings, SlashCommand, TuiStreamEvent, TuiTheme, load_keybindings, render_statusline,
@@ -54,7 +54,10 @@ use crate::commands::git::{
 };
 use crate::commands::mcp::run_mcp;
 use crate::commands::memory::{run_export, run_memory};
-use crate::commands::plan::{current_plan_payload, handle_plan_slash, render_plan_notice_lines};
+use crate::commands::plan::{
+    current_plan_payload, handle_plan_slash, plan_state_label, render_plan_notice_lines,
+    workflow_phase_label,
+};
 use crate::commands::search::run_search;
 use crate::commands::skills::run_skills;
 use crate::commands::status::{current_ui_status, run_context, run_usage};
@@ -881,9 +884,81 @@ fn render_todos_payload(payload: &serde_json::Value) -> String {
         .get("count")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
+    let session_id = payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("pending");
+    let workflow_phase = payload
+        .get("workflow_phase")
+        .and_then(|value| value.as_str())
+        .unwrap_or("idle");
+    let plan_state = payload
+        .get("plan_state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("none");
+    let summary = payload.get("summary").cloned().unwrap_or_else(|| json!({}));
+    let mut lines = vec![
+        format!(
+            "Session todos: {count} item(s) — session={session_id} phase={workflow_phase} plan={plan_state}"
+        ),
+        format!(
+            "Active={} In progress={} Completed={}",
+            summary["active"].as_u64().unwrap_or(0),
+            summary["in_progress"].as_u64().unwrap_or(0),
+            summary["completed"].as_u64().unwrap_or(0),
+        ),
+    ];
+    if let Some(current) = summary
+        .get("current")
+        .and_then(|value| value.as_object())
+        .map(|obj| {
+            format!(
+                "{} [{}]",
+                obj.get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                obj.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending")
+            )
+        })
+    {
+        lines.push(format!("Current todo: {current}"));
+    }
+    if let Some(step) = payload
+        .get("current_step")
+        .and_then(|value| value.as_object())
+    {
+        lines.push(format!(
+            "Current plan step: {}",
+            step.get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("none")
+        ));
+    }
+    if let Some(rows) = payload.get("items").and_then(|value| value.as_array()) {
+        for row in rows.iter().take(30) {
+            lines.push(format!(
+                "- [{}] {} ({})",
+                row["status"].as_str().unwrap_or("pending"),
+                row["content"].as_str().unwrap_or_default(),
+                row["todo_id"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    lines.push("Use /comment-todos to scan TODO/FIXME comments in source files.".to_string());
+    lines.join("\n")
+}
+
+fn render_comment_todos_payload(payload: &serde_json::Value) -> String {
+    let count = payload
+        .get("count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
     let mut lines = vec![
         format!("Workspace comment scan: {count} result(s)"),
-        "This is not the agent task queue. Use /tasks for delegated work, subagents, and background jobs.".to_string(),
+        "This is source-comment scanning only. Use /todos for session-native agent checklist tracking."
+            .to_string(),
     ];
     if let Some(rows) = payload.get("items").and_then(|value| value.as_array()) {
         for row in rows.iter().take(20) {
@@ -1281,6 +1356,7 @@ pub(crate) fn run_chat(
                             "/debug",
                             "/desktop",
                             "/todos",
+                            "/comment-todos",
                             "/chrome",
                             "/exit",
                             "/hooks",
@@ -2378,11 +2454,19 @@ pub(crate) fn run_chat(
                     }
                 }
                 SlashCommand::Todos(args) => {
-                    let payload = todos_payload(cwd, &args)?;
+                    let payload = todos_payload(cwd, selected_session_id, &args)?;
                     if json_mode {
                         print_json(&payload)?;
                     } else {
                         println!("{}", render_todos_payload(&payload));
+                    }
+                }
+                SlashCommand::CommentTodos(args) => {
+                    let payload = comment_todos_payload(cwd, &args)?;
+                    if json_mode {
+                        print_json(&payload)?;
+                    } else {
+                        println!("{}", render_comment_todos_payload(&payload));
                     }
                 }
                 SlashCommand::Chrome(args) => {
@@ -2957,7 +3041,7 @@ pub(crate) fn run_chat_tui(
             if let Some(cmd) = SlashCommand::parse(prompt) {
                 let result: Result<String> = (|| {
                     let out = match cmd {
-                SlashCommand::Help => "commands: /help /ask /code /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /git /settings /load /save /paste /voice /desktop /todos /chrome /vim".to_string(),
+                SlashCommand::Help => "commands: /help /ask /code /chat-mode /init /clear /compact /memory /config /model /cost /mcp /rewind /export /plan /status /add /drop /read-only /map /map-refresh /run /test /lint /web /diff /stage /unstage /commit /undo /effort /skills /permissions /background /git /settings /load /save /paste /voice /desktop /todos /comment-todos /chrome /vim".to_string(),
                 SlashCommand::Ask(_) => {
                     if let Ok(mut guard) = active_mode_for_closure.lock() {
                         *guard = ChatMode::Ask;
@@ -3556,8 +3640,16 @@ pub(crate) fn run_chat_tui(
                     serde_json::to_string_pretty(&payload)?
                 }
                 SlashCommand::Todos(args) => {
-                    let payload = todos_payload(cwd, &args)?;
+                    let session_override = active_session_for_closure
+                        .lock()
+                        .map(|guard| *guard)
+                        .unwrap_or(None);
+                    let payload = todos_payload(cwd, session_override, &args)?;
                     render_todos_payload(&payload)
+                }
+                SlashCommand::CommentTodos(args) => {
+                    let payload = comment_todos_payload(cwd, &args)?;
+                    render_comment_todos_payload(&payload)
                 }
                 SlashCommand::Chrome(args) => {
                     let payload = chrome_payload(cwd, &args)?;
@@ -4062,7 +4154,143 @@ fn generate_prompt_suggestions(response: &str) -> Vec<String> {
 
     suggestions
 }
-fn todos_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
+fn todo_summary_payload(items: &[SessionTodoRecord]) -> serde_json::Value {
+    let completed = items
+        .iter()
+        .filter(|item| item.status.eq_ignore_ascii_case("completed"))
+        .count();
+    let in_progress = items
+        .iter()
+        .filter(|item| item.status.eq_ignore_ascii_case("in_progress"))
+        .count();
+    let active = items.len().saturating_sub(completed);
+    let current = items
+        .iter()
+        .find(|item| item.status.eq_ignore_ascii_case("in_progress"))
+        .or_else(|| {
+            items
+                .iter()
+                .find(|item| item.status.eq_ignore_ascii_case("pending"))
+        })
+        .map(|item| {
+            json!({
+                "todo_id": item.todo_id.to_string(),
+                "content": item.content,
+                "status": item.status,
+                "position": item.position,
+            })
+        });
+    json!({
+        "total": items.len(),
+        "active": active,
+        "completed": completed,
+        "in_progress": in_progress,
+        "current": current,
+    })
+}
+
+fn current_plan_step_payload(plan_payload: &serde_json::Value) -> Option<serde_json::Value> {
+    let steps = plan_payload.get("steps")?.as_array()?;
+    for (index, step) in steps.iter().enumerate() {
+        if !step
+            .get("done")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Some(json!({
+                "index": index + 1,
+                "step_id": step.get("step_id").and_then(|value| value.as_str()),
+                "title": step.get("title").and_then(|value| value.as_str()).unwrap_or_default(),
+                "intent": step.get("intent").and_then(|value| value.as_str()).unwrap_or_default(),
+            }));
+        }
+    }
+    None
+}
+
+fn todos_payload(
+    cwd: &Path,
+    session_override: Option<Uuid>,
+    args: &[String],
+) -> Result<serde_json::Value> {
+    let mut max_results = 200usize;
+    let mut query_parts = Vec::new();
+    for arg in args {
+        if query_parts.is_empty()
+            && let Ok(parsed) = arg.parse::<usize>()
+        {
+            max_results = parsed.clamp(1, 2000);
+            continue;
+        }
+        query_parts.push(arg.clone());
+    }
+    let query = (!query_parts.is_empty()).then(|| query_parts.join(" "));
+    let query_lower = query.as_deref().map(|value| value.to_ascii_lowercase());
+
+    let store = Store::new(cwd)?;
+    let session = if let Some(session_id) = session_override {
+        Some(
+            store
+                .load_session(session_id)?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?,
+        )
+    } else {
+        store.load_latest_session()?
+    };
+    let Some(session) = session else {
+        return Ok(json!({
+            "schema": "deepseek.session_todos.v1",
+            "session_id": serde_json::Value::Null,
+            "workflow_phase": "idle",
+            "plan_state": "none",
+            "current_step": serde_json::Value::Null,
+            "query": query,
+            "count": 0,
+            "summary": {
+                "total": 0,
+                "active": 0,
+                "completed": 0,
+                "in_progress": 0,
+                "current": serde_json::Value::Null,
+            },
+            "items": [],
+        }));
+    };
+
+    let all_items = store.list_session_todos(session.session_id)?;
+    let mut filtered = Vec::new();
+    for item in all_items.iter() {
+        if let Some(filter) = query_lower.as_deref()
+            && !item.content.to_ascii_lowercase().contains(filter)
+        {
+            continue;
+        }
+        filtered.push(item.clone());
+        if filtered.len() >= max_results {
+            break;
+        }
+    }
+    let summary = todo_summary_payload(&all_items);
+    let active_plan = current_plan_payload(&store, Some(&session))?;
+    let current_step = active_plan
+        .as_ref()
+        .and_then(current_plan_step_payload)
+        .unwrap_or(serde_json::Value::Null);
+
+    Ok(json!({
+        "schema": "deepseek.session_todos.v1",
+        "session_id": session.session_id.to_string(),
+        "workflow_phase": workflow_phase_label(&session.status),
+        "plan_state": plan_state_label(Some(&session)),
+        "current_step": current_step,
+        "query": query,
+        "count": filtered.len(),
+        "summary": summary,
+        "items": filtered,
+    }))
+}
+
+fn comment_todos_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
     let mut max_results = 100usize;
     let mut query = None;
     if let Some(first) = args.first() {
@@ -4120,7 +4348,7 @@ fn todos_payload(cwd: &Path, args: &[String]) -> Result<serde_json::Value> {
     }
 
     Ok(json!({
-        "schema": "deepseek.todos.v1",
+        "schema": "deepseek.comment_todos.v1",
         "count": items.len(),
         "query": query,
         "items": items,
@@ -4832,7 +5060,9 @@ pub(crate) fn run_resume_specific(
 mod tests {
     use super::*;
     use codingbuddy_core::{EventEnvelope, Plan, PlanStep, Session, SessionBudgets, SessionState};
-    use codingbuddy_store::{BackgroundJobRecord, SubagentRunRecord, TaskQueueRecord};
+    use codingbuddy_store::{
+        BackgroundJobRecord, SessionTodoRecord, SubagentRunRecord, TaskQueueRecord,
+    };
     use std::fs;
     use tempfile::tempdir;
 
@@ -4903,6 +5133,132 @@ mod tests {
         assert!(rendered.contains("1. CodingBuddy docs"));
         assert!(rendered.contains("## Extract (https://example.com/docs)"));
         assert!(rendered.contains("CodingBuddy is terminal-native."));
+    }
+
+    #[test]
+    fn todos_payload_uses_session_native_checklist() -> Result<()> {
+        let temp = tempdir()?;
+        let store = Store::new(temp.path())?;
+        let plan_id = Uuid::now_v7();
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: temp.path().display().to_string(),
+            baseline_commit: None,
+            status: SessionState::ExecutingStep,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: Some(plan_id),
+        };
+        store.save_session(&session)?;
+        store.save_plan(
+            session.session_id,
+            &Plan {
+                plan_id,
+                version: 1,
+                goal: "Stabilize CI".to_string(),
+                assumptions: vec![],
+                steps: vec![
+                    PlanStep {
+                        step_id: Uuid::now_v7(),
+                        title: "Collect failing logs".to_string(),
+                        intent: "Understand root cause".to_string(),
+                        tools: vec![],
+                        files: vec![],
+                        done: true,
+                    },
+                    PlanStep {
+                        step_id: Uuid::now_v7(),
+                        title: "Patch flaky path".to_string(),
+                        intent: "Fix cross-platform behavior".to_string(),
+                        tools: vec![],
+                        files: vec!["crates/codingbuddy-hooks/src/lib.rs".to_string()],
+                        done: false,
+                    },
+                ],
+                verification: vec!["cargo test -p codingbuddy-hooks".to_string()],
+                risk_notes: vec![],
+            },
+        )?;
+        let now = Utc::now().to_rfc3339();
+        store.replace_session_todos(
+            session.session_id,
+            &[
+                SessionTodoRecord {
+                    todo_id: Uuid::now_v7(),
+                    session_id: session.session_id,
+                    content: "Collect failing logs".to_string(),
+                    status: "completed".to_string(),
+                    position: 0,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+                SessionTodoRecord {
+                    todo_id: Uuid::now_v7(),
+                    session_id: session.session_id,
+                    content: "Patch flaky path".to_string(),
+                    status: "in_progress".to_string(),
+                    position: 1,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            ],
+        )?;
+
+        let payload = todos_payload(temp.path(), Some(session.session_id), &[])?;
+        assert_eq!(
+            payload["schema"].as_str(),
+            Some("deepseek.session_todos.v1")
+        );
+        assert_eq!(payload["workflow_phase"].as_str(), Some("execute"));
+        assert_eq!(payload["plan_state"].as_str(), Some("approved"));
+        assert_eq!(payload["count"].as_u64(), Some(2));
+        assert_eq!(payload["summary"]["completed"].as_u64(), Some(1));
+        assert_eq!(payload["summary"]["in_progress"].as_u64(), Some(1));
+        assert_eq!(
+            payload["summary"]["current"]["content"].as_str(),
+            Some("Patch flaky path")
+        );
+        assert_eq!(
+            payload["current_step"]["title"].as_str(),
+            Some("Patch flaky path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn comment_todos_payload_reports_comment_scan_schema() -> Result<()> {
+        let rg_available = std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !rg_available {
+            eprintln!("skipping comment_todos test: rg not found on PATH");
+            return Ok(());
+        }
+
+        let temp = tempdir()?;
+        fs::write(
+            temp.path().join("notes.md"),
+            "# Notes\nTODO: tighten test coverage\n",
+        )?;
+        let payload = comment_todos_payload(temp.path(), &[])?;
+        assert_eq!(
+            payload["schema"].as_str(),
+            Some("deepseek.comment_todos.v1")
+        );
+        assert!(payload["count"].as_u64().unwrap_or(0) >= 1);
+        assert!(
+            payload["items"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .any(|row| row["text"].as_str().unwrap_or_default().contains("TODO"))
+                })
+                .unwrap_or(false)
+        );
+        Ok(())
     }
 
     #[test]

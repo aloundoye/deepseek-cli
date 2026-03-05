@@ -733,6 +733,22 @@ fn parse_hook_output(stdout: &str) -> HookOutput {
     if let Ok(parsed) = serde_json::from_str::<HookOutput>(trimmed) {
         return parsed;
     }
+    // Windows shell commands sometimes emit JSON with escaped quotes.
+    // Example: {\"permissionDecision\":\"allow\"}
+    if trimmed.contains("\\\"") {
+        let unescaped = trimmed.replace("\\\"", "\"");
+        if let Ok(parsed) = serde_json::from_str::<HookOutput>(&unescaped) {
+            return parsed;
+        }
+        if let (Some(start), Some(end)) = (unescaped.find('{'), unescaped.rfind('}'))
+            && start <= end
+        {
+            let candidate = &unescaped[start..=end];
+            if let Ok(parsed) = serde_json::from_str::<HookOutput>(candidate) {
+                return parsed;
+            }
+        }
+    }
     if let Some(unquoted) = trimmed
         .strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
@@ -785,20 +801,54 @@ fn parse_hook_output_loose(stdout: &str) -> HookOutput {
 fn extract_loose_field(input: &str, key: &str) -> Option<String> {
     let lower = input.to_ascii_lowercase();
     let key_lower = key.to_ascii_lowercase();
-    let start = lower.find(&key_lower)?;
+    let start = lower.match_indices(&key_lower).find_map(|(idx, _)| {
+        let before_ok = if idx == 0 {
+            true
+        } else {
+            let b = lower.as_bytes()[idx - 1];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        let end = idx + key_lower.len();
+        let after_ok = if end >= lower.len() {
+            true
+        } else {
+            let b = lower.as_bytes()[end];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        };
+        if before_ok && after_ok {
+            Some(idx)
+        } else {
+            None
+        }
+    })?;
     let bytes = input.as_bytes();
     let mut i = start + key.len();
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\'
+        )
+    {
         i += 1;
     }
     if i < bytes.len() && matches!(bytes[i], b':' | b'=') {
         i += 1;
     }
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\'
+        )
+    {
         i += 1;
     }
     let value_start = i;
-    while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b'\n' | b'\r' | b'"' | b'\'') {
+    while i < bytes.len()
+        && !matches!(
+            bytes[i],
+            b',' | b'}' | b'\n' | b'\r' | b'"' | b'\'' | b'\\' | b' ' | b'\t'
+        )
+    {
         i += 1;
     }
     if value_start >= i {
@@ -1477,6 +1527,21 @@ mod tests {
     fn parse_hook_output_accepts_single_quoted_json() {
         let output = parse_hook_output(r#" '{"permissionDecision":"allow"}' "#);
         assert_eq!(output.permission_decision.as_deref(), Some("allow"));
+    }
+
+    #[test]
+    fn parse_hook_output_accepts_escaped_json() {
+        let output =
+            parse_hook_output(r#"{\"permissionDecision\":\"deny\",\"decision\":\"block\"}"#);
+        assert_eq!(output.permission_decision.as_deref(), Some("deny"));
+        assert_eq!(output.decision.as_deref(), Some("block"));
+    }
+
+    #[test]
+    fn parse_hook_output_accepts_windows_loose_tokens() {
+        let output = parse_hook_output(r#"{permissionDecision:allow,decision:block}"#);
+        assert_eq!(output.permission_decision.as_deref(), Some("allow"));
+        assert_eq!(output.decision.as_deref(), Some("block"));
     }
 
     // ── P5-09: Agent handler test ──

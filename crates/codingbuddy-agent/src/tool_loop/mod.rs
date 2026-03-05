@@ -37,7 +37,7 @@ use codingbuddy_core::{
 };
 use codingbuddy_hooks::{HookEvent, HookInput, HookRuntime};
 use codingbuddy_llm::{LlmClient, max_output_tokens_for_model};
-use codingbuddy_store::{Store, TaskQueueRecord};
+use codingbuddy_store::{SessionTodoRecord, Store, TaskQueueRecord};
 use codingbuddy_tools::{format_tool_search_results, search_extended_tools};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -90,6 +90,10 @@ fn args_json_for_record(tool_name: &str, raw_args: &str) -> Option<String> {
 /// Brief reminder injected every `MID_CONVERSATION_REMINDER_INTERVAL` tool calls.
 const MID_CONVERSATION_REMINDER: &str =
     "Reminder: Verify changes with tests. Be concise. Use tools — do not guess.";
+
+/// Runtime checklist policy for complex work.
+const COMPLEX_TODO_POLICY: &str = "For complex tasks, maintain a live checklist with todo_read/todo_write. \
+Initialize it before edits, keep exactly one in_progress item, and update it after each meaningful step.";
 
 /// TTL for cached read-only tool results (in seconds).
 const TOOL_CACHE_TTL_SECS: u64 = 60;
@@ -180,6 +184,11 @@ impl<'a> ToolUseLoop<'a> {
         // Inject initial context (bootstrap, retrieval) after system prompt
         for msg in &config.initial_context {
             messages.push(msg.clone());
+        }
+        if config.complexity == crate::complexity::PromptComplexity::Complex {
+            messages.push(ChatMessage::System {
+                content: COMPLEX_TODO_POLICY.to_string(),
+            });
         }
 
         let workspace_path_str = config
@@ -2072,6 +2081,8 @@ impl<'a> ToolUseLoop<'a> {
             }
             "task_create" => self.handle_task_create(&args)?,
             "task_update" => self.handle_task_update(&args)?,
+            "todo_read" => self.handle_todo_read()?,
+            "todo_write" => self.handle_todo_write(&args)?,
             "task_get" => self.handle_task_get(&args)?,
             "task_list" => self.handle_task_list()?,
             "task_output" => self.handle_task_output(&args)?,
@@ -2249,6 +2260,134 @@ impl<'a> ToolUseLoop<'a> {
             "task_id": task_id,
             "status": status,
             "outcome": outcome,
+        })
+        .to_string())
+    }
+
+    fn canonical_todo_status(value: Option<&str>) -> &'static str {
+        match value
+            .unwrap_or("pending")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "in_progress" | "in-progress" | "active" | "working" | "current" => "in_progress",
+            "completed" | "done" | "finished" => "completed",
+            _ => "pending",
+        }
+    }
+
+    fn todo_summary_payload(todos: &[SessionTodoRecord]) -> serde_json::Value {
+        let completed = todos
+            .iter()
+            .filter(|todo| todo.status.eq_ignore_ascii_case("completed"))
+            .count();
+        let in_progress = todos
+            .iter()
+            .filter(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+            .count();
+        let active = todos.len().saturating_sub(completed);
+        let current = todos
+            .iter()
+            .find(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+            .or_else(|| {
+                todos
+                    .iter()
+                    .find(|todo| todo.status.eq_ignore_ascii_case("pending"))
+            })
+            .map(|todo| {
+                serde_json::json!({
+                    "todo_id": todo.todo_id.to_string(),
+                    "content": todo.content,
+                    "status": todo.status,
+                    "position": todo.position,
+                })
+            });
+        serde_json::json!({
+            "total": todos.len(),
+            "active": active,
+            "completed": completed,
+            "in_progress": in_progress,
+            "current": current,
+        })
+    }
+
+    fn handle_todo_read(&self) -> Result<String> {
+        let store = self.workspace_store()?;
+        let session = self.current_session(&store)?;
+        let todos = store.list_session_todos(session.session_id)?;
+        let summary = Self::todo_summary_payload(&todos);
+        Ok(serde_json::json!({
+            "session_id": session.session_id.to_string(),
+            "todos": todos,
+            "summary": summary,
+        })
+        .to_string())
+    }
+
+    fn handle_todo_write(&self, args: &serde_json::Value) -> Result<String> {
+        let items = args
+            .get("items")
+            .or_else(|| args.get("todos"))
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow!("todo_write requires an 'items' array"))?;
+        let store = self.workspace_store()?;
+        let session = self.current_session(&store)?;
+        let existing = store.list_session_todos(session.session_id)?;
+        let existing_created_at = existing
+            .iter()
+            .map(|todo| (todo.todo_id, todo.created_at.clone()))
+            .collect::<HashMap<_, _>>();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut todos = Vec::with_capacity(items.len());
+        for (idx, item) in items.iter().enumerate() {
+            let content = item
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("todo_write items[{idx}] requires non-empty 'content'"))?;
+            let todo_id = item
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(Uuid::parse_str)
+                .transpose()?
+                .unwrap_or_else(Uuid::now_v7);
+            if !seen_ids.insert(todo_id) {
+                return Err(anyhow!("todo_write items include duplicate id: {todo_id}"));
+            }
+            let status =
+                Self::canonical_todo_status(item.get("status").and_then(|value| value.as_str()));
+            let created_at = existing_created_at
+                .get(&todo_id)
+                .cloned()
+                .unwrap_or_else(|| now.clone());
+            todos.push(SessionTodoRecord {
+                todo_id,
+                session_id: session.session_id,
+                content: content.to_string(),
+                status: status.to_string(),
+                position: idx as u32,
+                created_at,
+                updated_at: now.clone(),
+            });
+        }
+        let in_progress_count = todos
+            .iter()
+            .filter(|todo| todo.status.eq_ignore_ascii_case("in_progress"))
+            .count();
+        if in_progress_count > 1 {
+            return Err(anyhow!(
+                "todo_write allows at most one 'in_progress' item (got {in_progress_count})"
+            ));
+        }
+        store.replace_session_todos(session.session_id, &todos)?;
+        let summary = Self::todo_summary_payload(&todos);
+        Ok(serde_json::json!({
+            "session_id": session.session_id.to_string(),
+            "todos": todos,
+            "summary": summary,
         })
         .to_string())
     }
@@ -2585,6 +2724,11 @@ impl<'a> ToolUseLoop<'a> {
                             "child_session_id": child_session.session_id,
                             "background_job_id": background_job_id,
                             "status": "running",
+                            "todo_update_hint": {
+                                "action": "set_in_progress",
+                                "content": task_name,
+                                "suggested_status": "in_progress",
+                            }
                         })
                         .to_string());
                     }
@@ -2622,6 +2766,11 @@ impl<'a> ToolUseLoop<'a> {
                         "child_session_id": child_session.session_id,
                         "status": "completed",
                         "output": result,
+                        "todo_update_hint": {
+                            "action": "mark_completed",
+                            "content": task_name,
+                            "suggested_status": "completed",
+                        }
                     })
                     .to_string())
                 }
@@ -2646,7 +2795,8 @@ impl<'a> ToolUseLoop<'a> {
                         status: "failed".to_string(),
                     });
                     let message = format!(
-                        "Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly."
+                        "Subagent '{task_name}' failed: {e}. Try a different approach or handle the task directly. \
+                         Update your todo checklist to reflect this blocker (status=pending or completed with note)."
                     );
                     self.emit(StreamChunk::SubagentFailed {
                         run_id: run_id.to_string(),
@@ -3376,7 +3526,7 @@ mod tests {
         LlmResponse, Plan, PlanStep, Session, SessionBudgets, SessionState, TaskPhase, ToolCall,
         ToolProposal, ToolResult,
     };
-    use codingbuddy_store::TaskQueueRecord;
+    use codingbuddy_store::{Store, TaskQueueRecord};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -3576,6 +3726,111 @@ mod tests {
         assert_eq!(result.tool_calls_made.len(), 1);
         assert_eq!(result.tool_calls_made[0].tool_name, "fs_read");
         assert!(result.tool_calls_made[0].success);
+    }
+
+    #[test]
+    fn todo_tools_persist_session_checklist() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-tool-loop-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Store::new(&workspace).expect("store");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.display().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        let llm = ScriptedLlm::new(vec![
+            make_tool_response(vec![LlmToolCall {
+                id: "todo_write_1".to_string(),
+                name: "todo_write".to_string(),
+                arguments: r#"{"items":[{"content":"Investigate failing CI","status":"in_progress"},{"content":"Patch Windows build","status":"pending"}]}"#.to_string(),
+            }]),
+            make_tool_response(vec![LlmToolCall {
+                id: "todo_read_1".to_string(),
+                name: "todo_read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            make_text_response("Checklist initialized."),
+        ]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig {
+            workspace: Some(workspace.clone()),
+            session_id: Some(session.session_id),
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+        let result = loop_.run("start complex work").expect("run");
+        assert_eq!(result.response, "Checklist initialized.");
+        assert_eq!(result.tool_calls_made.len(), 2);
+        assert_eq!(result.tool_calls_made[0].tool_name, "todo_write");
+        assert_eq!(result.tool_calls_made[1].tool_name, "todo_read");
+
+        let persisted = store
+            .list_session_todos(session.session_id)
+            .expect("list todos");
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0].status, "in_progress");
+        assert_eq!(persisted[1].status, "pending");
+    }
+
+    #[test]
+    fn todo_write_rejects_multiple_in_progress_items() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-tool-loop-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Store::new(&workspace).expect("store");
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.display().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 4096,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        let llm = ScriptedLlm::new(vec![make_tool_response(vec![LlmToolCall {
+            id: "todo_write_1".to_string(),
+            name: "todo_write".to_string(),
+            arguments: r#"{"items":[{"content":"A","status":"in_progress"},{"content":"B","status":"in_progress"}]}"#.to_string(),
+        }])]);
+        let tool_host = Arc::new(MockToolHost::new(vec![], true));
+        let config = ToolLoopConfig {
+            workspace: Some(workspace),
+            session_id: Some(session.session_id),
+            max_turns: 1,
+            ..Default::default()
+        };
+        let mut loop_ = ToolUseLoop::new(
+            &llm,
+            tool_host,
+            config,
+            "system".to_string(),
+            default_tools(),
+        );
+
+        let err = loop_.run("set checklist").expect_err("run should fail");
+        assert!(
+            err.to_string()
+                .contains("todo_write allows at most one 'in_progress'")
+        );
     }
 
     #[test]

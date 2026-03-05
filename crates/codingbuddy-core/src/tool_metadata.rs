@@ -124,6 +124,7 @@ impl ToolName {
             | Self::UserQuestion
             | Self::TaskGet
             | Self::TaskList
+            | Self::TodoRead
             | Self::TaskOutput
             | Self::ExtendedThinking
             | Self::ToolSearch => ToolMetadata {
@@ -134,6 +135,7 @@ impl ToolName {
                     Self::UserQuestion
                         | Self::TaskGet
                         | Self::TaskList
+                        | Self::TodoRead
                         | Self::TaskOutput
                         | Self::ExtendedThinking
                         | Self::ToolSearch
@@ -202,14 +204,16 @@ impl ToolName {
                 tier: ToolTier::Extended,
                 allowed_roles: BUILD_GENERAL,
             },
-            Self::TaskCreate | Self::TaskUpdate | Self::TaskStop => ToolMetadata {
-                read_only: false,
-                phase_access: PLAN_EXECUTE_VERIFY,
-                agent_level: true,
-                review_blocked: false,
-                tier: ToolTier::Contextual,
-                allowed_roles: BUILD_PLAN_BASH_GENERAL,
-            },
+            Self::TaskCreate | Self::TaskUpdate | Self::TodoWrite | Self::TaskStop => {
+                ToolMetadata {
+                    read_only: false,
+                    phase_access: PLAN_EXECUTE_VERIFY,
+                    agent_level: true,
+                    review_blocked: false,
+                    tier: ToolTier::Contextual,
+                    allowed_roles: BUILD_PLAN_BASH_GENERAL,
+                }
+            }
             Self::SpawnTask => ToolMetadata {
                 read_only: false,
                 phase_access: PLAN_EXECUTE_VERIFY,

@@ -362,6 +362,20 @@ const MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE subagent_runs ADD COLUMN child_session_id TEXT;
          ALTER TABLE subagent_runs ADD COLUMN background_job_id TEXT;",
     ),
+    (
+        12,
+        "CREATE TABLE IF NOT EXISTS session_todos (
+            todo_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_todos_session_position
+            ON session_todos(session_id, position, created_at);",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -603,6 +617,17 @@ pub struct TaskQueueRecord {
     pub status: String,
     pub outcome: Option<String>,
     pub artifact_path: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTodoRecord {
+    pub todo_id: Uuid,
+    pub session_id: Uuid,
+    pub content: String,
+    pub status: String,
+    pub position: u32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2454,6 +2479,95 @@ impl Store {
         Ok(out)
     }
 
+    // --- Session Todos ---
+
+    pub fn upsert_session_todo(&self, record: &SessionTodoRecord) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO session_todos
+             (todo_id, session_id, content, status, position, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.todo_id.to_string(),
+                record.session_id.to_string(),
+                record.content,
+                record.status,
+                record.position as i64,
+                record.created_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_session_todos(&self, session_id: Uuid) -> Result<Vec<SessionTodoRecord>> {
+        let conn = self.db()?;
+        let mut stmt = conn.prepare(
+            "SELECT todo_id, session_id, content, status, position, created_at, updated_at
+             FROM session_todos
+             WHERE session_id = ?1
+             ORDER BY position ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([session_id.to_string()], |r| {
+            Ok(SessionTodoRecord {
+                todo_id: Uuid::parse_str(r.get::<_, String>(0)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                session_id: Uuid::parse_str(r.get::<_, String>(1)?.as_str())
+                    .unwrap_or_else(|_| Uuid::nil()),
+                content: r.get(2)?,
+                status: r.get(3)?,
+                position: r.get::<_, i64>(4)? as u32,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_session_todo(&self, todo_id: Uuid) -> Result<()> {
+        let conn = self.db()?;
+        conn.execute(
+            "DELETE FROM session_todos WHERE todo_id = ?1",
+            [todo_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_session_todos(
+        &self,
+        session_id: Uuid,
+        todos: &[SessionTodoRecord],
+    ) -> Result<()> {
+        let mut conn = self.db()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM session_todos WHERE session_id = ?1",
+            [session_id.to_string()],
+        )?;
+        for todo in todos {
+            tx.execute(
+                "INSERT OR REPLACE INTO session_todos
+                 (todo_id, session_id, content, status, position, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    todo.todo_id.to_string(),
+                    todo.session_id.to_string(),
+                    todo.content,
+                    todo.status,
+                    todo.position as i64,
+                    todo.created_at,
+                    todo.updated_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load_plan(&self, plan_id: Uuid) -> Result<Option<Plan>> {
         let conn = self.db()?;
         let mut stmt = conn.prepare("SELECT payload FROM plans WHERE plan_id = ?1")?;
@@ -3790,6 +3904,76 @@ mod tests {
             .expect("list s2");
         assert_eq!(s2_runs.len(), 1);
         assert_eq!(s2_runs[0].run_id, run2);
+    }
+
+    #[test]
+    fn session_todos_roundtrip_and_replace() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-store-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&workspace).expect("temp workspace");
+        let store = Store::new(&workspace).expect("store");
+
+        let session = Session {
+            session_id: Uuid::now_v7(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            baseline_commit: None,
+            status: SessionState::Idle,
+            budgets: SessionBudgets {
+                per_turn_seconds: 30,
+                max_think_tokens: 1000,
+            },
+            active_plan_id: None,
+        };
+        store.save_session(&session).expect("save session");
+
+        let now = Utc::now().to_rfc3339();
+        let first = SessionTodoRecord {
+            todo_id: Uuid::now_v7(),
+            session_id: session.session_id,
+            content: "Inspect auth flow".to_string(),
+            status: "in_progress".to_string(),
+            position: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let second = SessionTodoRecord {
+            todo_id: Uuid::now_v7(),
+            session_id: session.session_id,
+            content: "Add integration test".to_string(),
+            status: "pending".to_string(),
+            position: 1,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.upsert_session_todo(&first).expect("insert first");
+        store.upsert_session_todo(&second).expect("insert second");
+
+        let listed = store
+            .list_session_todos(session.session_id)
+            .expect("list todos");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].content, "Inspect auth flow");
+        assert_eq!(listed[1].content, "Add integration test");
+
+        let replacement = SessionTodoRecord {
+            todo_id: second.todo_id,
+            session_id: session.session_id,
+            content: "Add integration test".to_string(),
+            status: "completed".to_string(),
+            position: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        store
+            .replace_session_todos(session.session_id, std::slice::from_ref(&replacement))
+            .expect("replace todos");
+
+        let after = store
+            .list_session_todos(session.session_id)
+            .expect("list replaced");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].todo_id, replacement.todo_id);
+        assert_eq!(after[0].status, "completed");
     }
 
     #[test]

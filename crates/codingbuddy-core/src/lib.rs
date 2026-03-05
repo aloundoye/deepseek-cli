@@ -236,6 +236,8 @@ pub enum ToolName {
     UserQuestion,
     TaskCreate,
     TaskUpdate,
+    TodoRead,
+    TodoWrite,
     TaskGet,
     TaskList,
     SpawnTask,
@@ -285,6 +287,8 @@ impl ToolName {
             "user_question" => Self::UserQuestion,
             "task_create" => Self::TaskCreate,
             "task_update" => Self::TaskUpdate,
+            "todo_read" => Self::TodoRead,
+            "todo_write" => Self::TodoWrite,
             "task_get" => Self::TaskGet,
             "task_list" => Self::TaskList,
             "spawn_task" => Self::SpawnTask,
@@ -335,6 +339,8 @@ impl ToolName {
             "user_question" => Self::UserQuestion,
             "task_create" => Self::TaskCreate,
             "task_update" => Self::TaskUpdate,
+            "todo_read" => Self::TodoRead,
+            "todo_write" => Self::TodoWrite,
             "task_get" => Self::TaskGet,
             "task_list" => Self::TaskList,
             "spawn_task" => Self::SpawnTask,
@@ -384,6 +390,8 @@ impl ToolName {
             Self::UserQuestion => "user_question",
             Self::TaskCreate => "task_create",
             Self::TaskUpdate => "task_update",
+            Self::TodoRead => "todo_read",
+            Self::TodoWrite => "todo_write",
             Self::TaskGet => "task_get",
             Self::TaskList => "task_list",
             Self::SpawnTask => "spawn_task",
@@ -432,6 +440,8 @@ impl ToolName {
             Self::UserQuestion => "user_question",
             Self::TaskCreate => "task_create",
             Self::TaskUpdate => "task_update",
+            Self::TodoRead => "todo_read",
+            Self::TodoWrite => "todo_write",
             Self::TaskGet => "task_get",
             Self::TaskList => "task_list",
             Self::SpawnTask => "spawn_task",
@@ -496,6 +506,8 @@ impl ToolName {
         Self::UserQuestion,
         Self::TaskCreate,
         Self::TaskUpdate,
+        Self::TodoRead,
+        Self::TodoWrite,
         Self::TaskGet,
         Self::TaskList,
         Self::SpawnTask,
@@ -3538,6 +3550,7 @@ mod tests {
             "diagnostics_check",
             "extended_thinking",
             "tool_search",
+            "todo_read",
         ] {
             let tool = ToolName::from_api_name(name).expect("known tool");
             assert!(tool.is_read_only(), "{name} should be read-only");
@@ -3560,7 +3573,13 @@ mod tests {
             );
         }
 
-        for name in &["task_create", "task_update", "spawn_task", "exit_plan_mode"] {
+        for name in &[
+            "task_create",
+            "task_update",
+            "todo_write",
+            "spawn_task",
+            "exit_plan_mode",
+        ] {
             let tool = ToolName::from_api_name(name).expect("known tool");
             assert!(
                 tool.is_allowed_in_phase(TaskPhase::Plan),
