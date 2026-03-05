@@ -2527,6 +2527,108 @@ mod tests {
     }
 
     #[test]
+    fn openai_reasoning_family_with_thinking_strips_sampling_controls() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "o3-mini".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            presence_penalty: Some(0.1),
+            frequency_penalty: Some(0.2),
+            logprobs: Some(true),
+            top_logprobs: Some(3),
+            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(16_384)),
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["reasoning_effort"], "high");
+        assert!(payload.get("temperature").is_none());
+        assert!(payload.get("top_p").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("logprobs").is_none());
+        assert!(payload.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn openai_gemini_payload_adds_max_output_tokens_alias() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gemini-2.0-flash".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["max_tokens"], 256);
+        assert_eq!(payload["max_output_tokens"], 256);
+    }
+
+    #[test]
+    fn openai_gemini_downgrades_required_tool_choice() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gemini-2.0-flash".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "run tool".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "fs_read".to_string(),
+                    description: "Read file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::required(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
     fn openai_reasoning_family_uses_max_completion_tokens_key() {
         let cfg = LlmConfig {
             provider: "openai-compatible".to_string(),
@@ -2694,6 +2796,35 @@ mod tests {
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
         assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn ollama_payload_sets_num_predict_option_alias() {
+        let cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "qwen2.5-coder:7b".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 512,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["options"]["num_predict"], 512);
     }
 
     #[test]
