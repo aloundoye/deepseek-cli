@@ -171,7 +171,7 @@ impl SlashCommand {
 }
 
 /// Slash commands with short descriptions for the autocomplete dropdown.
-pub(crate) const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
+pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("help", "Show available commands"),
     ("ask", "Ask a question (read-only)"),
     ("code", "Switch to code mode"),
@@ -225,6 +225,10 @@ pub(crate) const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
     ("voice", "Voice input mode"),
     ("read-only", "Toggle read-only mode"),
 ];
+
+pub fn slash_command_catalog_entries() -> &'static [(&'static str, &'static str)] {
+    SLASH_COMMAND_CATALOG
+}
 
 /// Filter slash commands by prefix, returning up to `limit` matches as "name — description".
 pub(crate) fn slash_command_suggestions(prefix: &str, limit: usize) -> Vec<String> {

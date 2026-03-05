@@ -28,13 +28,11 @@ mod theme;
 use keybindings::KeyBindingsFile;
 pub use keybindings::{KeyBindings, load_keybindings};
 use panels::{load_artifact_lines, render_mission_control_panel};
-pub use slash_commands::SlashCommand;
 use slash_commands::{
     SLASH_COMMAND_CATALOG, slash_command_suggestions, slash_suggestion_to_command,
 };
-#[cfg(test)]
+pub use slash_commands::{SlashCommand, slash_command_catalog_entries};
 use statusline::render_statusline_spans;
-use statusline::review_badge;
 pub use statusline::{UiStatus, render_statusline};
 use stream_runtime::{
     StreamEventResult, StreamRuntimeState, filter_stream_event, handle_stream_event,
@@ -882,6 +880,43 @@ pub(crate) fn truncate_inline(text: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+fn operator_summary_line(status: &UiStatus) -> String {
+    let phase = if status.workflow_phase.is_empty() {
+        "idle"
+    } else {
+        status.workflow_phase.as_str()
+    };
+    let todo = if status.current_todo.trim().is_empty() {
+        "none".to_string()
+    } else {
+        truncate_inline(&status.current_todo, 36)
+    };
+    let step = if status.current_step.trim().is_empty() {
+        "none".to_string()
+    } else {
+        truncate_inline(&status.current_step, 28)
+    };
+    let blockers = format!(
+        "failed(tasks={},subagents={})",
+        status.failed_tasks, status.failed_subagents
+    );
+    let capabilities = if status.capability_summary.trim().is_empty() {
+        "n/a".to_string()
+    } else {
+        truncate_inline(&status.capability_summary, 48)
+    };
+    format!(
+        "phase={phase} step={step} todo={todo} subagents={}/{} bg={} {} caps={} compaction/replay={}/{}",
+        status.running_subagents,
+        status.failed_subagents,
+        status.running_background_jobs.max(status.background_jobs),
+        blockers,
+        capabilities,
+        status.compaction_count,
+        status.replay_count
+    )
 }
 
 fn compact_tool_meta_tail(tail: &str, max_chars: usize) -> String {
@@ -2241,7 +2276,7 @@ where
 pub fn run_tui_shell_with_bindings<F, S>(
     mut status: UiStatus,
     bindings: KeyBindings,
-    theme: TuiTheme,
+    _theme: TuiTheme,
     reduced_motion: bool,
     stream_rx: mpsc::Receiver<TuiStreamEvent>,
     mut on_submit: F,
@@ -2695,139 +2730,47 @@ where
                     input_area,
                 );
             }
-            // Row N+1: thin separator line below input
-            let sep2_area = Rect::new(area.x, sep2_y, width, 1);
+            // Row N+1: always-visible operator summary (phase/todo/subagents/capabilities/counters)
+            let summary_area = Rect::new(area.x, sep2_y, width, 1);
+            let operator_summary = operator_summary_line(&status);
+            let operator_style = if status.failed_tasks > 0 || status.failed_subagents > 0 {
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else if approval_alert_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    if approval_alert_active {
-                        "\u{2550}".repeat(width as usize)
-                    } else {
-                        "\u{2500}".repeat(width as usize)
-                    },
-                    sep_style,
-                )),
-                sep2_area,
+                Paragraph::new(Line::from(vec![Span::styled(
+                    format!(" {}", truncate_inline(&operator_summary, width.saturating_sub(1) as usize)),
+                    operator_style,
+                )])),
+                summary_area,
             );
 
-            // Row N+2: status bar (compact inline — model, active tool spinner, info)
+            // Row N+2: compact status bar (model/mode/usage + dynamic notices)
             let status_area = Rect::new(area.x, status_y, width, 1);
-            let mut status_spans: Vec<Span<'static>> = Vec::new();
-            if shell.is_thinking {
-                status_spans.push(Span::styled(
-                    format!(" {} Thinking ", shell.spinner_frame()),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                status_spans.push(Span::raw(" "));
-            } else if let Some(ref tool) = shell.active_tool {
-                status_spans.push(Span::styled(
-                    format!(" {} {} ", shell.spinner_frame(), tool),
-                    Style::default().fg(theme.secondary),
-                ));
-                status_spans.push(Span::raw(" "));
-            }
-            status_spans.push(Span::styled(
-                format!(" {} ", status.model),
-                Style::default()
-                    .fg(theme.primary)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            let mode_color = match status.permission_mode.as_str() {
-                "auto" => Color::Green,
-                "plan" => Color::Blue,
-                "locked" => Color::Red,
-                _ => Color::Yellow,
-            };
-            let mode_label = match status.permission_mode.as_str() {
-                "auto" => " AUTO ",
-                "plan" => " PLAN ",
-                "locked" => " LOCKED ",
-                _ => " ASK ",
-            };
-            status_spans.push(Span::styled(
-                mode_label.to_string(),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(mode_color)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            if status.active_tasks > 0 {
-                status_spans.push(Span::raw(" "));
-                status_spans.push(Span::styled(
-                    format!(" {} TASKS ", status.active_tasks),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if !status.workflow_phase.is_empty() && status.workflow_phase != "idle" {
-                let phase_color = match status.workflow_phase.as_str() {
-                    "explore" => Color::Cyan,
-                    "plan" => Color::Blue,
-                    "approval" => Color::Yellow,
-                    "execute" => Color::Green,
-                    "verify" => Color::Magenta,
-                    "completed" => Color::Green,
-                    "failed" => Color::Red,
-                    "paused" => Color::Gray,
-                    _ => Color::White,
-                };
-                status_spans.push(Span::raw(" "));
-                status_spans.push(Span::styled(
-                    format!(" {} ", status.workflow_phase.to_ascii_uppercase()),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(phase_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if status.plan_state != "none" {
-                let plan_bg = if status.plan_state == "awaiting_approval" {
-                    Color::LightYellow
+            let mut status_spans = render_statusline_spans(
+                &status,
+                if shell.is_thinking {
+                    None
                 } else {
-                    Color::Blue
-                };
-                status_spans.push(Span::raw(" "));
-                status_spans.push(Span::styled(
-                    format!(" PLAN:{} ", status.plan_state.to_ascii_uppercase()),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(plan_bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if status.background_jobs > 0 {
-                status_spans.push(Span::raw(" "));
-                status_spans.push(Span::styled(
-                    format!(" {} JOBS ", status.background_jobs),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if let Some(review) = status.pr_review_status.as_deref() {
-                let (label, bg) = review_badge(review);
-                status_spans.push(Span::raw(" "));
-                status_spans.push(Span::styled(
-                    label.to_string(),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if vim_enabled {
-                status_spans.push(Span::styled(
-                    format!(" {} ", vim_mode.label()),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Gray)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+                    shell.active_tool.as_deref()
+                },
+                shell.spinner_frame(),
+                None,
+                if vim_enabled {
+                    Some(vim_mode.label())
+                } else {
+                    None
+                },
+                false,
+                shell.is_thinking,
+            );
             if mission_control_visible {
                 status_spans.push(Span::raw(" "));
                 status_spans.push(Span::styled(

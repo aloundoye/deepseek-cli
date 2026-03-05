@@ -1,5 +1,5 @@
 use anyhow::Result;
-use codingbuddy_core::{AppConfig, SessionState};
+use codingbuddy_core::{AppConfig, PreferredEditTool, SessionState};
 use codingbuddy_mcp::McpManager;
 use codingbuddy_store::Store;
 use codingbuddy_tools::PluginManager;
@@ -70,20 +70,117 @@ pub(crate) fn current_ui_status(
         let transcript_chars: u64 = projection.transcript.iter().map(|t| t.len() as u64).sum();
         transcript_chars / 4
     };
-    let mission_control_snapshot = if let Some(session) = session.as_ref() {
-        mission_control_payload(cwd, Some(session.session_id), 8)
-            .map(|payload| render_mission_control_lines(&payload))
-            .unwrap_or_default()
+    let mission_payload = if let Some(session) = session.as_ref() {
+        mission_control_payload(cwd, Some(session.session_id), 8).ok()
     } else {
-        Vec::new()
+        None
+    };
+    let mission_control_snapshot = mission_payload
+        .as_ref()
+        .map(render_mission_control_lines)
+        .unwrap_or_default();
+
+    let summary = mission_payload
+        .as_ref()
+        .and_then(|payload| payload.get("summary"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let current_todo = summary
+        .get("current_todo")
+        .and_then(|value| value.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let current_step = mission_payload
+        .as_ref()
+        .and_then(|payload| payload.get("current_step"))
+        .and_then(|value| value.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let running_subagents = summary
+        .get("running_subagents")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let failed_subagents = summary
+        .get("failed_subagents")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let failed_tasks = summary
+        .get("failed_tasks")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let running_background_jobs = summary
+        .get("running_background_jobs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+
+    let compaction_count = if let Some(session) = session.as_ref() {
+        store
+            .list_context_compactions(Some(session.session_id))?
+            .len()
+    } else {
+        0
+    };
+    let replay_count = if let Some(session) = session.as_ref() {
+        store
+            .list_replay_cassettes(Some(session.session_id), 500)?
+            .len()
+    } else {
+        0
     };
 
-    Ok(UiStatus {
-        model: if force_max_think {
-            cfg.llm.active_reasoner_model()
+    let selected_model = if force_max_think {
+        cfg.llm.active_reasoner_model()
+    } else {
+        cfg.llm.active_base_model()
+    };
+    let provider = {
+        let active_provider = cfg.llm.active_provider();
+        if active_provider.kind.trim().is_empty() {
+            cfg.llm.provider.clone()
         } else {
-            cfg.llm.active_base_model()
-        },
+            active_provider.kind
+        }
+    };
+    let capability_summary = cfg
+        .llm
+        .capability_resolution_for_model(&selected_model)
+        .map(|resolution| {
+            let caps = resolution.capabilities;
+            let edit_tool = match caps.preferred_edit_tool {
+                PreferredEditTool::FsEdit => "fs_edit",
+                PreferredEditTool::MultiEdit => "multi_edit",
+                PreferredEditTool::PatchDirect => "patch_direct",
+            };
+            let tool_choice = if caps.supports_tool_choice {
+                "choice"
+            } else {
+                "auto"
+            };
+            let parallel = if caps.supports_parallel_tool_calls {
+                "parallel"
+            } else {
+                "serial"
+            };
+            let vision = if caps.supports_image_input {
+                "vision"
+            } else {
+                "text"
+            };
+            format!(
+                "{}:{} {tool_choice}/{parallel} {vision} edit={edit_tool} max_tools={}",
+                provider,
+                caps.family.as_key(),
+                caps.max_safe_tool_count
+            )
+        })
+        .unwrap_or_default();
+
+    Ok(UiStatus {
+        model: selected_model,
+        provider,
         pending_approvals,
         estimated_cost_usd,
         background_jobs,
@@ -106,6 +203,15 @@ pub(crate) fn current_ui_status(
         pr_url: None,
         agent_mode: String::new(),
         mission_control_snapshot,
+        current_todo,
+        current_step,
+        running_subagents,
+        failed_subagents,
+        failed_tasks,
+        running_background_jobs,
+        capability_summary,
+        compaction_count,
+        replay_count,
     })
 }
 

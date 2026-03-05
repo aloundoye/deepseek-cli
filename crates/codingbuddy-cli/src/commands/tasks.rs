@@ -364,6 +364,16 @@ pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
         summary["running_background_jobs"].as_u64().unwrap_or(0),
         summary["stopped_background_jobs"].as_u64().unwrap_or(0),
     ));
+    let failed_tasks = summary["failed_tasks"].as_u64().unwrap_or(0);
+    let failed_subagents = summary["failed_subagents"].as_u64().unwrap_or(0);
+    if failed_tasks > 0 || failed_subagents > 0 {
+        lines.push(format!(
+            "- Blockers: failed_tasks={} failed_subagents={} (inspect with /tasks list and /tasks show <task_id>)",
+            failed_tasks, failed_subagents
+        ));
+    } else {
+        lines.push("- Blockers: none detected".to_string());
+    }
     lines.push(format!(
         "- Todos: active={} in_progress={} completed={}",
         summary["active_todos"].as_u64().unwrap_or(0),
