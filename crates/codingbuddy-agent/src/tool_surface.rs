@@ -209,6 +209,38 @@ mod tests {
     }
 
     #[test]
+    fn ollama_qwen_surface_prefers_multi_edit() {
+        let active = vec![
+            make_tool("fs_read"),
+            make_tool("fs_edit"),
+            make_tool("patch_direct"),
+            make_tool("bash_run"),
+        ];
+        let discoverable = vec![make_tool("multi_edit"), make_tool("web_search")];
+
+        let (active, discoverable) = shape_tool_surface(
+            active,
+            discoverable,
+            model_capabilities(ProviderKind::Ollama, "qwen2.5-coder:7b"),
+        );
+
+        let active_names = active
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<HashSet<_>>();
+        let discoverable_names = discoverable
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(active_names.contains("multi_edit"));
+        assert!(!active_names.contains("fs_edit"));
+        assert!(!active_names.contains("patch_direct"));
+        assert!(discoverable_names.contains("fs_edit"));
+        assert!(discoverable_names.contains("patch_direct"));
+    }
+
+    #[test]
     fn active_tool_count_respects_model_limit() {
         let active = vec![
             make_tool("fs_read"),

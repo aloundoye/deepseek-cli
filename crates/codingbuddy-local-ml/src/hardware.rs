@@ -46,6 +46,20 @@ pub struct HardwareInfo {
     pub recommended_threads: u32,
 }
 
+/// Runtime lifecycle hints for local model runners.
+///
+/// Inspired by Ollama's keep-warm model scheduling: we keep recently used models
+/// alive for a bounded window and cap concurrent loaded models by hardware class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalModelRuntimePolicy {
+    /// Number of models to keep warm concurrently.
+    pub max_loaded_models: usize,
+    /// Keep-warm window for a recently used model.
+    pub keep_warm_secs: u64,
+    /// When true, evict stale models aggressively under memory pressure.
+    pub aggressive_eviction: bool,
+}
+
 const OS_RESERVE_MB: u64 = 4096;
 
 /// Detect hardware capabilities (GPU type and available RAM).
@@ -80,6 +94,55 @@ pub fn detect_hardware() -> HardwareInfo {
             }
         })
         .clone()
+}
+
+/// Recommend a local runtime lifecycle policy for model reuse and eviction.
+#[must_use]
+pub fn recommend_runtime_policy(hw: &HardwareInfo) -> LocalModelRuntimePolicy {
+    match hw.device {
+        DetectedDevice::Metal | DetectedDevice::Cuda => {
+            if hw.available_for_models_mb >= 24_000 {
+                LocalModelRuntimePolicy {
+                    max_loaded_models: 3,
+                    keep_warm_secs: 900,
+                    aggressive_eviction: false,
+                }
+            } else if hw.available_for_models_mb >= 12_000 {
+                LocalModelRuntimePolicy {
+                    max_loaded_models: 2,
+                    keep_warm_secs: 600,
+                    aggressive_eviction: false,
+                }
+            } else {
+                LocalModelRuntimePolicy {
+                    max_loaded_models: 1,
+                    keep_warm_secs: 300,
+                    aggressive_eviction: true,
+                }
+            }
+        }
+        DetectedDevice::Cpu => {
+            if hw.available_for_models_mb >= 16_000 {
+                LocalModelRuntimePolicy {
+                    max_loaded_models: 2,
+                    keep_warm_secs: 420,
+                    aggressive_eviction: false,
+                }
+            } else if hw.available_for_models_mb >= 8_000 {
+                LocalModelRuntimePolicy {
+                    max_loaded_models: 1,
+                    keep_warm_secs: 240,
+                    aggressive_eviction: true,
+                }
+            } else {
+                LocalModelRuntimePolicy {
+                    max_loaded_models: 1,
+                    keep_warm_secs: 90,
+                    aggressive_eviction: true,
+                }
+            }
+        }
+    }
 }
 
 /// Return current available (free) system memory in MB.
@@ -401,5 +464,29 @@ mod tests {
                 assert!(hw.gpu_memory_mb.is_none());
             }
         }
+    }
+
+    #[test]
+    fn runtime_policy_is_always_valid() {
+        let hw = detect_hardware();
+        let policy = recommend_runtime_policy(&hw);
+        assert!(policy.max_loaded_models >= 1);
+        assert!(policy.keep_warm_secs > 0);
+    }
+
+    #[test]
+    fn cpu_policy_is_conservative_for_low_memory() {
+        let hw = HardwareInfo {
+            device: DetectedDevice::Cpu,
+            total_ram_mb: 8192,
+            available_for_models_mb: 2048,
+            gpu_memory_mb: None,
+            performance_cores: None,
+            efficiency_cores: None,
+            recommended_threads: 4,
+        };
+        let policy = recommend_runtime_policy(&hw);
+        assert_eq!(policy.max_loaded_models, 1);
+        assert!(policy.aggressive_eviction);
     }
 }

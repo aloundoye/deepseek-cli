@@ -6,8 +6,9 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_agent::{AgentEngine, ChatMode, ChatOptions};
 use codingbuddy_core::{
-    AppConfig, ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, Session,
-    SessionBudgets, SessionState, StreamCallback, StreamChunk, TokenUsage,
+    AppConfig, ChatMessage, ChatRequest, LlmRequest, LlmResponse, LlmToolCall, PreferredEditTool,
+    ProviderKind, Session, SessionBudgets, SessionState, StreamCallback, StreamChunk, TokenUsage,
+    model_capabilities,
 };
 use codingbuddy_llm::LlmClient;
 use codingbuddy_store::{BackgroundJobRecord, Store, SubagentRunRecord, TaskQueueRecord};
@@ -1574,9 +1575,28 @@ fn ollama_surface_clamps_request_tool_count() -> Result<()> {
         .iter()
         .map(|tool| tool.function.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"fs_edit"));
+
+    let model_name = cfg
+        .llm
+        .providers
+        .get("ollama")
+        .map(|provider| provider.models.chat.clone())
+        .unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+    let capabilities = model_capabilities(ProviderKind::Ollama, &model_name);
+    let preferred_edit = match capabilities.preferred_edit_tool {
+        PreferredEditTool::FsEdit => "fs_edit",
+        PreferredEditTool::MultiEdit => "multi_edit",
+        PreferredEditTool::PatchDirect => "patch_direct",
+    };
+
+    assert!(
+        tool_names.contains(&preferred_edit),
+        "surface should include preferred edit tool: {preferred_edit}"
+    );
     assert!(tool_names.contains(&"tool_search"));
-    assert!(!tool_names.contains(&"patch_direct"));
-    assert!(tool_names.len() <= 12);
+    if preferred_edit != "patch_direct" {
+        assert!(!tool_names.contains(&"patch_direct"));
+    }
+    assert!(tool_names.len() <= capabilities.max_safe_tool_count);
     Ok(())
 }

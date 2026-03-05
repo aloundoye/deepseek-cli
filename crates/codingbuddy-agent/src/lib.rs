@@ -36,8 +36,8 @@ use codingbuddy_policy::PolicyEngine;
 use codingbuddy_store::Store;
 use codingbuddy_subagent::SubagentTask;
 use codingbuddy_tools::{
-    LocalToolHost, detect_signals, tiered_tool_definitions, tool_definitions,
-    tool_search_definition,
+    LocalToolHost, detect_signals, plugin_tool_definitions, tiered_tool_definitions,
+    tool_definitions, tool_search_definition,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,12 @@ use uuid::Uuid;
 /// but the core loop does not dispatch subagents in this architecture.
 pub type SubagentWorkerFn = Arc<dyn Fn(&SubagentTask) -> Result<String> + Send + Sync>;
 type ApprovalHandler = Box<dyn FnMut(&ToolCall) -> Result<bool> + Send>;
+
+fn runtime_tool_definitions(workspace: &Path) -> Vec<codingbuddy_core::ToolDefinition> {
+    let mut tools = tool_definitions();
+    tools.extend(plugin_tool_definitions(workspace));
+    tools
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatMode {
@@ -741,7 +747,7 @@ impl AgentEngine {
         };
 
         // Build tool list: built-in tools + contextual filtering + MCP-discovered tools.
-        let builtin_tools = tool_definitions();
+        let builtin_tools = runtime_tool_definitions(&self.workspace);
         let signals = detect_signals(prompt, &self.workspace);
         let (mut tools, mut discoverable_tools) = tiered_tool_definitions(builtin_tools, &signals);
         if let Some(ref mcp) = self.mcp
@@ -1458,6 +1464,33 @@ mod tests {
         let result = truncate_to_token_budget(text, 4);
         assert!(result.contains("truncated"));
         assert!(result.len() < text.len() + 40); // truncated + marker
+    }
+
+    #[test]
+    fn runtime_tool_definitions_include_plugin_commands() {
+        let workspace =
+            std::env::temp_dir().join(format!("codingbuddy-agent-plugin-tools-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        let plugin_src = workspace.join("plugin-src");
+        std::fs::create_dir_all(plugin_src.join(".codingbuddy-plugin")).expect("plugin dir");
+        std::fs::create_dir_all(plugin_src.join("commands")).expect("commands dir");
+        std::fs::write(
+            plugin_src.join(".codingbuddy-plugin/plugin.json"),
+            r#"{"id":"phase-c-plugin","name":"Phase C Plugin","version":"0.1.0"}"#,
+        )
+        .expect("manifest");
+        std::fs::write(plugin_src.join("commands/review.md"), "# review").expect("command");
+
+        let manager = codingbuddy_tools::PluginManager::new(&workspace).expect("plugin manager");
+        manager.install(&plugin_src).expect("install plugin");
+
+        let defs = runtime_tool_definitions(&workspace);
+        assert!(
+            defs.iter()
+                .any(|def| def.function.name == "plugin__phase_c_plugin__review"),
+            "plugin command should be exposed as runtime tool definition"
+        );
     }
 
     #[test]
