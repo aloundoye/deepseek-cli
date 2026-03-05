@@ -176,6 +176,91 @@ fn chat_mode_name(mode: ChatMode) -> &'static str {
     }
 }
 
+fn resolve_autocomplete_model_id(model_id_cfg: &str) -> Option<String> {
+    if model_id_cfg != "auto" {
+        return Some(model_id_cfg.to_string());
+    }
+
+    let hw = codingbuddy_local_ml::hardware::detect_hardware();
+    let selected = codingbuddy_local_ml::model_registry::recommend_completion_model(
+        hw.available_for_models_mb,
+    );
+    match selected {
+        Some(entry) => {
+            eprintln!(
+                "[codingbuddy] auto-selected model: {} ({:.1}B params, needs {} MB)",
+                entry.display_name, entry.params_b, entry.estimated_vram_mb
+            );
+            Some(entry.model_id.to_string())
+        }
+        None => {
+            eprintln!(
+                "[codingbuddy] insufficient RAM ({} MB available) for local autocomplete",
+                hw.available_for_models_mb
+            );
+            None
+        }
+    }
+}
+
+fn load_autocomplete_backend(
+    model_id: &str,
+    cache_dir: &str,
+    device_str: &str,
+) -> Result<Arc<dyn codingbuddy_local_ml::LocalGenBackend>> {
+    #[cfg(feature = "local-ml")]
+    {
+        let (entry, gguf_filename) =
+            match codingbuddy_local_ml::model_registry::find_completion_model(model_id) {
+                Some(e) => match e.gguf_filename {
+                    Some(name) => (e, name),
+                    None => anyhow::bail!(
+                        "model '{model_id}' has no GGUF file configured for local completion"
+                    ),
+                },
+                None => anyhow::bail!("model '{model_id}' not found in local registry"),
+            };
+
+        let mut mgr = codingbuddy_local_ml::ModelManager::new(PathBuf::from(cache_dir));
+        let files = entry.download_files();
+        let model_path =
+            mgr.ensure_model_with_progress(model_id, entry.hf_repo, &files, |current, total| {
+                if current < total {
+                    eprintln!(
+                        "[codingbuddy] downloading model file {}/{}",
+                        current + 1,
+                        total
+                    );
+                }
+            })?;
+
+        let hw = codingbuddy_local_ml::hardware::detect_hardware();
+        if let Err(msg) = codingbuddy_local_ml::model_registry::check_model_fits(
+            model_id,
+            hw.available_for_models_mb,
+        ) {
+            anyhow::bail!(msg);
+        }
+
+        let (device, detected) = codingbuddy_local_ml::resolve_device(device_str);
+        eprintln!("[codingbuddy] loading {} on {detected}", entry.display_name);
+        let backend = codingbuddy_local_ml::CandleCompletion::load(
+            &model_path.join(gguf_filename),
+            &model_path.join("tokenizer.json"),
+            &device,
+        )?;
+        return Ok(Arc::new(backend));
+    }
+
+    #[cfg(not(feature = "local-ml"))]
+    {
+        let _ = (model_id, cache_dir, device_str);
+        Ok(Arc::new(codingbuddy_local_ml::MockGenerator::new(
+            String::new(),
+        )))
+    }
+}
+
 fn resolve_chat_profile_path(cwd: &Path, args: &[String]) -> PathBuf {
     if let Some(first) = args.first() {
         resolve_additional_dir(cwd, first)
@@ -2712,140 +2797,67 @@ pub(crate) fn run_chat_tui(
     }
 
     // Build ML completion callback for ghost text (if local_ml + autocomplete enabled).
-    // Model loading runs in a background thread to avoid blocking TUI startup.
+    // Runners are loaded lazily and reused via a lifecycle manager with queueing/eviction.
     let ml_completion_cb: Option<codingbuddy_ui::MlCompletionCallback> = if cfg.local_ml.enabled
         && cfg.local_ml.autocomplete.enabled
     {
-        // Start with a mock backend, swap in real model once loaded
-        let generator: Arc<
-            std::sync::Mutex<Arc<dyn codingbuddy_local_ml::completion::LocalGenBackend>>,
-        > = Arc::new(std::sync::Mutex::new(Arc::new(
-            codingbuddy_local_ml::completion::MockGenerator::new(String::new()),
-        )));
-
-        // Spawn background model loading (non-blocking)
-        #[cfg(feature = "local-ml")]
+        if let Some(resolved_model_id) =
+            resolve_autocomplete_model_id(&cfg.local_ml.autocomplete.model_id)
         {
-            let gen_slot = Arc::clone(&generator);
             let cache_dir = cfg.local_ml.cache_dir.clone();
-            let model_id_cfg = cfg.local_ml.autocomplete.model_id.clone();
             let device_str = cfg.local_ml.device.clone();
-            std::thread::spawn(move || {
-                // Resolve "auto" device via hardware detection
-                let (device, detected) = codingbuddy_local_ml::resolve_device(&device_str);
-
-                // Resolve "auto" model_id via hardware-aware recommendation
-                let resolved_model_id = if model_id_cfg == "auto" {
-                    let hw = codingbuddy_local_ml::hardware::detect_hardware();
-                    match codingbuddy_local_ml::model_registry::recommend_completion_model(
-                        hw.available_for_models_mb,
-                    ) {
-                        Some(entry) => {
-                            eprintln!(
-                                "[codingbuddy] auto-selected model: {} ({:.1}B params, needs {} MB)",
-                                entry.display_name, entry.params_b, entry.estimated_vram_mb
-                            );
-                            entry.model_id.to_string()
-                        }
-                        None => {
-                            eprintln!(
-                                "[codingbuddy] insufficient RAM ({} MB available) for any local model, using mock",
-                                hw.available_for_models_mb
-                            );
-                            return;
-                        }
-                    }
-                } else {
-                    model_id_cfg
-                };
-
-                let mut mgr =
-                    codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cache_dir));
-                // Look up registry entry to get HF repo and GGUF filename
-                let (entry, gguf_filename) =
-                    match codingbuddy_local_ml::model_registry::find_completion_model(
-                        &resolved_model_id,
-                    ) {
-                        Some(e) => match e.gguf_filename {
-                            Some(name) => (e, name),
-                            None => {
+            let runtime_manager =
+                codingbuddy_local_ml::ModelManager::new(PathBuf::from(&cache_dir));
+            let scheduler = Arc::new(codingbuddy_local_ml::LocalRunnerLifecycleManager::new(
+                runtime_manager,
+                Arc::new({
+                    let cache_dir = cache_dir.clone();
+                    let device_str = device_str.clone();
+                    move |model_id: &str| -> Result<Arc<dyn codingbuddy_local_ml::LocalGenBackend>> {
+                        load_autocomplete_backend(model_id, &cache_dir, &device_str).or_else(
+                            |error| {
                                 eprintln!(
-                                    "[codingbuddy] model '{resolved_model_id}' has no GGUF file configured, using mock"
+                                    "[codingbuddy] local completion backend load failed for '{model_id}' ({error}), using mock backend"
                                 );
-                                return;
-                            }
-                        },
-                        None => {
-                            eprintln!(
-                                "[codingbuddy] model '{resolved_model_id}' not found in registry, using mock"
-                            );
-                            return;
-                        }
-                    };
-                let files = entry.download_files();
-                let model_path = match mgr.ensure_model_with_progress(
-                    &resolved_model_id,
-                    entry.hf_repo,
-                    &files,
-                    |current, total| {
-                        if current < total {
-                            eprintln!(
-                                "[codingbuddy] downloading model file {}/{}",
-                                current + 1,
-                                total
-                            );
-                        }
-                    },
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!(
-                            "[codingbuddy] model '{resolved_model_id}' not available ({e}), using mock"
-                        );
-                        return;
+                                Ok(Arc::new(codingbuddy_local_ml::MockGenerator::new(
+                                    String::new(),
+                                ))
+                                    as Arc<dyn codingbuddy_local_ml::LocalGenBackend>)
+                            },
+                        )
                     }
-                };
-                // Pre-load memory check (detect_hardware is OnceLock-cached)
-                let hw = codingbuddy_local_ml::hardware::detect_hardware();
-                if let Err(msg) = codingbuddy_local_ml::model_registry::check_model_fits(
-                    &resolved_model_id,
-                    hw.available_for_models_mb,
-                ) {
-                    eprintln!("[codingbuddy] {msg} Using mock.");
-                    return;
-                }
-                eprintln!("[codingbuddy] loading {} on {detected}", entry.display_name);
-                match codingbuddy_local_ml::CandleCompletion::load(
-                    &model_path.join(gguf_filename),
-                    &model_path.join("tokenizer.json"),
-                    &device,
-                ) {
-                    Ok(comp) => {
-                        if let Ok(mut guard) = gen_slot.lock() {
-                            *guard = Arc::new(comp);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[codingbuddy] candle completion load failed ({e}), using mock");
-                    }
-                }
-            });
-        }
+                }),
+            ));
 
-        let max_tokens = cfg.local_ml.autocomplete.max_tokens;
-        let timeout_ms = cfg.local_ml.autocomplete.timeout_ms;
-        Some(Arc::new(move |input: &str| -> Option<String> {
-            let opts = codingbuddy_local_ml::completion::GenOpts {
-                max_tokens,
-                timeout_ms,
-                ..Default::default()
-            };
-            let backend = generator.lock().ok()?;
-            backend
-                .generate(input, &opts)
-                .ok()
-                .filter(|s| !s.is_empty())
-        }))
+            // Prewarm the chosen autocomplete model in the background.
+            {
+                let scheduler = Arc::clone(&scheduler);
+                let model_id = resolved_model_id.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = scheduler.prewarm(&model_id) {
+                        eprintln!(
+                            "[codingbuddy] failed to prewarm local autocomplete model '{model_id}': {error}"
+                        );
+                    }
+                });
+            }
+
+            let max_tokens = cfg.local_ml.autocomplete.max_tokens;
+            let timeout_ms = cfg.local_ml.autocomplete.timeout_ms;
+            Some(Arc::new(move |input: &str| -> Option<String> {
+                let opts = codingbuddy_local_ml::completion::GenOpts {
+                    max_tokens,
+                    timeout_ms,
+                    ..Default::default()
+                };
+                scheduler
+                    .generate(&resolved_model_id, input, &opts)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            }))
+        } else {
+            None
+        }
     } else {
         None
     };

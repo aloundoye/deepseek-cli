@@ -233,6 +233,40 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                 .as_bool()
                 .unwrap_or(false),
         );
+        if payload["local_ml"]["runtime"].is_object() {
+            let warm_models = payload["local_ml"]["runtime"]["warm_models"]
+                .as_array()
+                .map_or(0usize, std::vec::Vec::len);
+            let max_loaded = payload["local_ml"]["runtime"]["max_loaded_models"]
+                .as_u64()
+                .unwrap_or(0);
+            let keep_warm = payload["local_ml"]["runtime"]["keep_warm_secs"]
+                .as_u64()
+                .unwrap_or(0);
+            let queue_peak = payload["local_ml"]["runtime"]["metrics"]["max_observed_queue_depth"]
+                .as_u64()
+                .unwrap_or(0);
+            let queue_enqueued = payload["local_ml"]["runtime"]["metrics"]["total_queue_enqueued"]
+                .as_u64()
+                .unwrap_or(0);
+            let queue_completed =
+                payload["local_ml"]["runtime"]["metrics"]["total_queue_completed"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let capacity_evictions =
+                payload["local_ml"]["runtime"]["metrics"]["total_capacity_evictions"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let idle_evictions = payload["local_ml"]["runtime"]["metrics"]["total_idle_evictions"]
+                .as_u64()
+                .unwrap_or(0);
+            let recent_events = payload["local_ml"]["runtime"]["recent_events"]
+                .as_array()
+                .map_or(0usize, std::vec::Vec::len);
+            println!(
+                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=enq:{queue_enqueued}/done:{queue_completed}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions} events={recent_events}"
+            );
+        }
         if let Some(warnings) = payload["warnings"].as_array()
             && !warnings.is_empty()
         {
@@ -354,6 +388,11 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         }
     }
 
+    let runtime_snapshot =
+        codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
+            .runtime_snapshot();
+    let local_ml_runtime = serde_json::to_value(runtime_snapshot).unwrap_or_else(|_| json!({}));
+
     let payload = json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -393,6 +432,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "enabled": cfg.local_ml.enabled,
             "privacy_enabled": cfg.local_ml.privacy.enabled,
             "autocomplete_enabled": cfg.local_ml.autocomplete.enabled,
+            "runtime": local_ml_runtime,
         },
         "checks": checks,
         "warnings": warnings,
@@ -977,6 +1017,13 @@ mod tests {
         assert!(local_ml.get("enabled").is_some());
         assert!(local_ml.get("privacy_enabled").is_some());
         assert!(local_ml.get("autocomplete_enabled").is_some());
+        assert!(
+            local_ml["runtime"].is_object(),
+            "doctor payload must include local_ml runtime lifecycle snapshot"
+        );
+        assert!(local_ml["runtime"]["metrics"].is_object());
+        assert!(local_ml["runtime"]["recent_events"].is_array());
+        assert!(local_ml["runtime"]["warm_models"].is_array());
     }
 
     #[test]
