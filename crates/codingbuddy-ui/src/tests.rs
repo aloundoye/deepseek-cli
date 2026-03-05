@@ -1786,6 +1786,93 @@ fn slash_tab_completion_uses_catalog() {
     assert!(found.is_some(), "should find a command starting with 'co'");
 }
 
+#[test]
+fn slash_catalog_covers_all_canonical_parse_commands() {
+    let canonical_commands = [
+        "help",
+        "ask",
+        "code",
+        "chat-mode",
+        "init",
+        "clear",
+        "compact",
+        "memory",
+        "config",
+        "model",
+        "provider",
+        "cost",
+        "mcp",
+        "rewind",
+        "export",
+        "plan",
+        "status",
+        "effort",
+        "skills",
+        "permissions",
+        "background",
+        "commit",
+        "stage",
+        "unstage",
+        "diff",
+        "undo",
+        "context",
+        "sandbox",
+        "agents",
+        "tasks",
+        "review",
+        "search",
+        "vim",
+        "terminal-setup",
+        "keybindings",
+        "doctor",
+        "copy",
+        "paste",
+        "git",
+        "settings",
+        "load",
+        "save",
+        "voice",
+        "debug",
+        "desktop",
+        "todos",
+        "comment-todos",
+        "chrome",
+        "exit",
+        "hooks",
+        "rename",
+        "resume",
+        "stats",
+        "statusline",
+        "theme",
+        "usage",
+        "add",
+        "drop",
+        "read-only",
+        "map",
+        "map-refresh",
+        "run",
+        "test",
+        "lint",
+        "tokens",
+        "web",
+        "add-dir",
+        "bug",
+        "pr-comments",
+        "release-notes",
+        "login",
+        "logout",
+    ];
+
+    for name in canonical_commands {
+        let parsed = SlashCommand::parse(&format!("/{name}"));
+        assert!(parsed.is_some(), "parser should accept /{name}");
+        assert!(
+            SLASH_COMMAND_CATALOG.iter().any(|(cmd, _)| *cmd == name),
+            "catalog missing /{name}"
+        );
+    }
+}
+
 // ── P8-08: ML Ghost Text tests ─────────────────────────────────────
 
 #[test]
