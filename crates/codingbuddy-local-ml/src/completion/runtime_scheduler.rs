@@ -31,6 +31,12 @@ struct RequestGateState {
     max_queue_wait_ms: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LoadLaneState {
+    active_model: Option<String>,
+    waiting_requests: usize,
+}
+
 /// Observability snapshot for the local runtime scheduler.
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeSchedulerSnapshot {
@@ -39,6 +45,8 @@ pub struct LocalRuntimeSchedulerSnapshot {
     pub max_concurrent_requests: usize,
     pub max_queue_depth: usize,
     pub max_queue_wait_ms: u64,
+    pub loading_model: Option<String>,
+    pub loading_waiters: usize,
     pub loaded_runners: Vec<String>,
     pub lifecycle: RuntimeLifecycleSnapshot,
 }
@@ -48,6 +56,8 @@ struct SharedState {
     runners: Mutex<BTreeMap<String, Arc<dyn LocalGenBackend>>>,
     gate: Mutex<RequestGateState>,
     gate_cv: Condvar,
+    load_lane: Mutex<LoadLaneState>,
+    load_lane_cv: Condvar,
     loader: Arc<dyn BackendFactory>,
     memory_probe: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -69,6 +79,11 @@ struct RequestPermit {
     active: bool,
 }
 
+struct LoadLanePermit {
+    shared: Arc<SharedState>,
+    model_id: String,
+}
+
 impl Drop for RequestPermit {
     fn drop(&mut self) {
         if !self.active {
@@ -87,6 +102,20 @@ impl Drop for RequestPermit {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         mgr.record_runtime_queue_completed();
+    }
+}
+
+impl Drop for LoadLanePermit {
+    fn drop(&mut self) {
+        let mut lane = self
+            .shared
+            .load_lane
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if lane.active_model.as_deref() == Some(self.model_id.as_str()) {
+            lane.active_model = None;
+            self.shared.load_lane_cv.notify_all();
+        }
     }
 }
 
@@ -176,6 +205,8 @@ impl LocalRunnerLifecycleManager {
                     max_queue_wait_ms,
                 }),
                 gate_cv: Condvar::new(),
+                load_lane: Mutex::new(LoadLaneState::default()),
+                load_lane_cv: Condvar::new(),
                 loader,
                 memory_probe,
             }),
@@ -246,6 +277,11 @@ impl LocalRunnerLifecycleManager {
     /// Return scheduler + runtime lifecycle diagnostics.
     pub fn snapshot(&self) -> LocalRuntimeSchedulerSnapshot {
         let gate = self.shared.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let load_lane = self
+            .shared
+            .load_lane
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let loaded_runners = self
             .shared
             .runners
@@ -267,6 +303,8 @@ impl LocalRunnerLifecycleManager {
             max_concurrent_requests: gate.max_concurrent_requests,
             max_queue_depth: gate.max_queue_depth,
             max_queue_wait_ms: gate.max_queue_wait_ms,
+            loading_model: load_lane.active_model.clone(),
+            loading_waiters: load_lane.waiting_requests,
             loaded_runners,
             lifecycle,
         }
@@ -372,6 +410,20 @@ impl LocalRunnerLifecycleManager {
             return Ok(existing);
         }
 
+        let _load_lane = self.acquire_load_lane(model_id);
+
+        if let Some(existing) = self
+            .shared
+            .runners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model_id)
+            .cloned()
+        {
+            self.touch_runtime(model_id);
+            return Ok(existing);
+        }
+
         let mut available_mb = (self.shared.memory_probe)();
         let mut eviction_attempt = 0usize;
         loop {
@@ -436,6 +488,51 @@ impl LocalRunnerLifecycleManager {
         Ok(runner)
     }
 
+    fn acquire_load_lane(&self, model_id: &str) -> LoadLanePermit {
+        let mut lane = self
+            .shared
+            .load_lane
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut recorded_wait = false;
+        let mut blocked_by: Option<String> = None;
+
+        loop {
+            if lane.active_model.is_none() {
+                if recorded_wait {
+                    lane.waiting_requests = lane.waiting_requests.saturating_sub(1);
+                }
+                lane.active_model = Some(model_id.to_string());
+                drop(lane);
+
+                if let Some(blocker) = blocked_by {
+                    let mut mgr = self
+                        .shared
+                        .model_manager
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    mgr.record_runtime_runner_load_wait(model_id, &blocker);
+                }
+
+                return LoadLanePermit {
+                    shared: Arc::clone(&self.shared),
+                    model_id: model_id.to_string(),
+                };
+            }
+
+            blocked_by = lane.active_model.clone();
+            if !recorded_wait {
+                lane.waiting_requests = lane.waiting_requests.saturating_add(1);
+                recorded_wait = true;
+            }
+            lane = self
+                .shared
+                .load_lane_cv
+                .wait(lane)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     fn touch_runtime(&self, model_id: &str) {
         let mut evicted = {
             let mut mgr = self
@@ -482,7 +579,7 @@ mod tests {
     use super::*;
     use crate::completion::MockGenerator;
     use crate::hardware::LocalModelRuntimePolicy;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::thread;
     use tempfile::TempDir;
 
@@ -816,6 +913,122 @@ mod tests {
                 .iter()
                 .any(|model| model == "qwen2.5-coder-7b")
         );
+    }
+
+    #[test]
+    fn scheduler_serializes_runner_loads_for_different_models() {
+        let dir = TempDir::new().unwrap();
+        let manager = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 2,
+                keep_warm_secs: 300,
+                aggressive_eviction: false,
+            },
+        );
+        let active_loads = Arc::new(AtomicUsize::new(0));
+        let max_active_loads = Arc::new(AtomicUsize::new(0));
+        let loader: Arc<dyn BackendFactory> = Arc::new({
+            let active_loads = Arc::clone(&active_loads);
+            let max_active_loads = Arc::clone(&max_active_loads);
+            move |model_id: &str| {
+                let current = active_loads.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active_loads.fetch_max(current, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(120));
+                active_loads.fetch_sub(1, Ordering::SeqCst);
+                Ok(Arc::new(MockGenerator::new(format!("loaded:{model_id}")))
+                    as Arc<dyn LocalGenBackend>)
+            }
+        });
+
+        let scheduler = LocalRunnerLifecycleManager::with_limits_and_queue(manager, loader, 2, 2);
+        let opts = GenOpts::default();
+
+        let s1 = scheduler.clone();
+        let opts1 = opts.clone();
+        let h1 = thread::spawn(move || s1.generate("model-a", "prompt-a", &opts1));
+
+        let load_start = Instant::now();
+        while load_start.elapsed() < Duration::from_millis(500) {
+            if scheduler.snapshot().loading_model.as_deref() == Some("model-a") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let s2 = scheduler.clone();
+        let opts2 = opts.clone();
+        let h2 = thread::spawn(move || s2.generate("model-b", "prompt-b", &opts2));
+
+        let wait_start = Instant::now();
+        let mut observed_waiter = false;
+        while wait_start.elapsed() < Duration::from_millis(500) {
+            let snapshot = scheduler.snapshot();
+            if snapshot.loading_waiters > 0 {
+                observed_waiter = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            observed_waiter,
+            "expected second request to wait on load lane"
+        );
+        assert!(h1.join().unwrap().is_ok());
+        assert!(h2.join().unwrap().is_ok());
+        assert_eq!(max_active_loads.load(Ordering::SeqCst), 1);
+
+        let snapshot = scheduler.snapshot();
+        assert!(snapshot.loading_model.is_none());
+        assert_eq!(snapshot.loading_waiters, 0);
+        assert_eq!(snapshot.lifecycle.metrics.total_runner_load_waits, 1);
+    }
+
+    #[test]
+    fn scheduler_deduplicates_same_model_loads_while_loading() {
+        let dir = TempDir::new().unwrap();
+        let manager = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 2,
+                keep_warm_secs: 300,
+                aggressive_eviction: false,
+            },
+        );
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let loader: Arc<dyn BackendFactory> = Arc::new({
+            let load_count = Arc::clone(&load_count);
+            move |model_id: &str| {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(120));
+                Ok(Arc::new(MockGenerator::new(format!("loaded:{model_id}")))
+                    as Arc<dyn LocalGenBackend>)
+            }
+        });
+
+        let scheduler = LocalRunnerLifecycleManager::with_limits_and_queue(manager, loader, 2, 2);
+        let opts = GenOpts::default();
+
+        let s1 = scheduler.clone();
+        let opts1 = opts.clone();
+        let h1 = thread::spawn(move || s1.generate("model-a", "prompt-a", &opts1));
+
+        let load_start = Instant::now();
+        while load_start.elapsed() < Duration::from_millis(500) {
+            if scheduler.snapshot().loading_model.as_deref() == Some("model-a") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let s2 = scheduler.clone();
+        let opts2 = opts.clone();
+        let h2 = thread::spawn(move || s2.generate("model-a", "prompt-b", &opts2));
+
+        assert!(h1.join().unwrap().is_ok());
+        assert!(h2.join().unwrap().is_ok());
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

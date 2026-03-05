@@ -79,6 +79,7 @@ pub struct RuntimeLifecycleMetrics {
     pub total_queue_wait_timeouts: u64,
     pub total_memory_admission_denied: u64,
     pub total_memory_pressure_evictions: u64,
+    pub total_runner_load_waits: u64,
     pub total_runner_reloads: u64,
     pub total_runner_load_failures: u64,
     pub max_observed_queue_depth: usize,
@@ -544,6 +545,21 @@ impl ModelManager {
             model_id: Some(model_id.to_string()),
             at_epoch_secs: now_epoch_secs(),
             detail: Some(compact_detail(reason)),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record a request waiting on the global runner load lane.
+    pub fn record_runtime_runner_load_wait(&mut self, model_id: &str, blocked_by: &str) {
+        self.runtime_metrics.total_runner_load_waits = self
+            .runtime_metrics
+            .total_runner_load_waits
+            .saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_load_wait".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!("blocked_by={}", compact_detail(blocked_by))),
         });
         self.persist_runtime_state();
     }
@@ -1332,6 +1348,7 @@ mod tests {
         mgr.record_runtime_queue_completed();
         mgr.record_runtime_queue_rejected(1, 1, 1, 1);
         mgr.record_runtime_memory_admission_denied("model-a", 1024, "requires more memory");
+        mgr.record_runtime_runner_load_wait("model-a", "model-b");
         mgr.record_runtime_runner_reload("model-a", "first generation failed");
         mgr.record_runtime_runner_load_failure("model-b", "backend init failed");
         assert!(mgr.mark_runtime_used_at("model-a", 100).is_empty());
@@ -1351,6 +1368,7 @@ mod tests {
         assert_eq!(snapshot.metrics.total_queue_completed, 1);
         assert_eq!(snapshot.metrics.total_queue_rejected, 1);
         assert_eq!(snapshot.metrics.total_memory_admission_denied, 1);
+        assert_eq!(snapshot.metrics.total_runner_load_waits, 1);
         assert_eq!(snapshot.metrics.total_runner_reloads, 1);
         assert_eq!(snapshot.metrics.total_runner_load_failures, 1);
         assert_eq!(snapshot.metrics.max_observed_queue_depth, 2);

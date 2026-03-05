@@ -289,6 +289,10 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
             let runner_reloads = payload["local_ml"]["runtime"]["metrics"]["total_runner_reloads"]
                 .as_u64()
                 .unwrap_or(0);
+            let runner_load_waits =
+                payload["local_ml"]["runtime"]["metrics"]["total_runner_load_waits"]
+                    .as_u64()
+                    .unwrap_or(0);
             let runner_load_failures =
                 payload["local_ml"]["runtime"]["metrics"]["total_runner_load_failures"]
                     .as_u64()
@@ -297,7 +301,7 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
                 .as_array()
                 .map_or(0usize, std::vec::Vec::len);
             println!(
-                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=concurrency:{max_concurrent_requests}/max:{max_queue_depth}/wait_ms:{max_queue_wait_ms}/enq:{queue_enqueued}/done:{queue_completed}/rejected:{queue_rejected}/timeouts:{queue_wait_timeouts}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions}/memory_pressure:{pressure_evictions} memory_denied:{memory_denied} reloads:{runner_reloads} load_failures:{runner_load_failures} events={recent_events}"
+                "local_ml_runtime: warm={warm_models}/{max_loaded} keep_warm={keep_warm}s queue=concurrency:{max_concurrent_requests}/max:{max_queue_depth}/wait_ms:{max_queue_wait_ms}/enq:{queue_enqueued}/done:{queue_completed}/rejected:{queue_rejected}/timeouts:{queue_wait_timeouts}/peak:{queue_peak} evictions=cap:{capacity_evictions}/idle:{idle_evictions}/memory_pressure:{pressure_evictions} memory_denied:{memory_denied} load_waits:{runner_load_waits} reloads:{runner_reloads} load_failures:{runner_load_failures} events={recent_events}"
             );
         }
         if let Some(warnings) = payload["warnings"].as_array()
