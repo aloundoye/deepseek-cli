@@ -18,6 +18,8 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 | `base_model` | string | `"deepseek-chat"` | Default model for tool-use loop and Editor mode |
 | `max_think_model` | string | `"deepseek-reasoner"` | Thinking model for Architect mode, `/thinking`, and `think_deeply` tool |
 | `provider` | string | `"deepseek"` | LLM provider identifier |
+| `providers` | object | built-in map | Named provider definitions (`deepseek`, `openai-compatible`, `ollama`) |
+| `capability_overrides` | object | `{}` | Optional per-family/per-model capability overrides |
 | `profile` | string | `"v3_2"` | Active model profile |
 | `context_window_tokens` | int | `128000` | Maximum context window (raise for long-context use) |
 | `temperature` | float? | per-model | Sampling temperature (auto-tuned per model family: deepseek 0.0, qwen 0.55, gemini 1.0, default 0.2). User value overrides. |
@@ -30,6 +32,23 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 | `max_retries` | int | `3` | Maximum retry attempts |
 | `retry_base_ms` | int | `400` | Exponential backoff base |
 | `stream` | bool | `true` | Enable streaming responses |
+
+### `llm.capability_overrides`
+
+Override registry keys:
+- Family key: `<family>` or `<provider>@<family>` (example: `qwen`, `ollama@qwen`)
+- Model key: exact model id or prefix wildcard, optionally provider scoped (example: `qwen2.5-coder:*`, `ollama@deepseek-r1:*`)
+
+Override fields:
+- `supports_tool_calling`
+- `supports_tool_choice`
+- `supports_parallel_tool_calls`
+- `supports_reasoning_mode`
+- `supports_thinking_config`
+- `supports_streaming_tool_deltas`
+- `supports_fim`
+- `max_safe_tool_count`
+- `preferred_edit_tool` (`fs-edit`, `multi-edit`, `patch-direct`)
 
 ## `agent_loop` — Agent Loop
 

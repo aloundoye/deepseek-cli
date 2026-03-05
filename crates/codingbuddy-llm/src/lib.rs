@@ -447,6 +447,16 @@ impl ApiClient {
         }
         if capabilities.supports_tool_calling && !req.tools.is_empty() {
             payload["tools"] = serde_json::to_value(&req.tools)?;
+            if capabilities.supports_parallel_tool_calls
+                && matches!(
+                    capabilities.provider,
+                    ProviderKind::OpenAiCompatible | ProviderKind::Ollama
+                )
+            {
+                // OpenAI-compatible payload knob; omit for providers that do not
+                // advertise this field to avoid spurious 400s.
+                payload["parallel_tool_calls"] = json!(true);
+            }
             if capabilities.supports_tool_choice {
                 payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
             }
@@ -2242,6 +2252,94 @@ mod tests {
         );
         assert_eq!(payload["logprobs"], true);
         assert_eq!(payload["top_logprobs"], 3);
+    }
+
+    #[test]
+    fn openai_payload_enables_parallel_tool_calls_when_supported() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "read a file".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "fs_read".to_string(),
+                    description: "Read file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::required(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["parallel_tool_calls"], true);
+        assert!(payload.get("tool_choice").is_some());
+    }
+
+    #[test]
+    fn capability_override_can_disable_tool_choice_and_parallel_payload_flags() {
+        let mut cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        cfg.capability_overrides.models.insert(
+            "openai-compatible@gpt-4o-mini".to_string(),
+            codingbuddy_core::CapabilityOverride {
+                supports_tool_choice: Some(false),
+                supports_parallel_tool_calls: Some(false),
+                ..codingbuddy_core::CapabilityOverride::default()
+            },
+        );
+        let client = ApiClient::new(cfg).expect("client");
+
+        let req = ChatRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "read a file".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "fs_read".to_string(),
+                    description: "Read file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::required(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert!(payload.get("parallel_tool_calls").is_none());
+        assert!(payload.get("tool_choice").is_none());
+        assert!(payload.get("tools").is_some());
     }
 
     #[test]

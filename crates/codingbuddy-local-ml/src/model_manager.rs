@@ -1,3 +1,4 @@
+use crate::hardware::{LocalModelRuntimePolicy, detect_hardware, recommend_runtime_policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -49,6 +50,12 @@ pub struct ModelManifest {
     pub files: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeSlotState {
+    loaded_at_epoch_secs: u64,
+    last_used_epoch_secs: u64,
+}
+
 /// Manages local model downloads and cache.
 ///
 /// Uses a content-addressable storage scheme:
@@ -63,13 +70,26 @@ pub struct ModelManifest {
 pub struct ModelManager {
     cache_dir: PathBuf,
     statuses: BTreeMap<String, ModelStatus>,
+    runtime_policy: LocalModelRuntimePolicy,
+    runtime_slots: BTreeMap<String, RuntimeSlotState>,
 }
 
 impl ModelManager {
     pub fn new(cache_dir: PathBuf) -> Self {
+        let hardware = detect_hardware();
+        let runtime_policy = recommend_runtime_policy(&hardware);
+        Self::with_runtime_policy(cache_dir, runtime_policy)
+    }
+
+    pub fn with_runtime_policy(
+        cache_dir: PathBuf,
+        runtime_policy: LocalModelRuntimePolicy,
+    ) -> Self {
         Self {
             cache_dir,
             statuses: BTreeMap::new(),
+            runtime_policy,
+            runtime_slots: BTreeMap::new(),
         }
     }
 
@@ -239,6 +259,85 @@ impl ModelManager {
         models
     }
 
+    /// Runtime lifecycle policy used for local model keep-warm behavior.
+    pub fn runtime_policy(&self) -> LocalModelRuntimePolicy {
+        self.runtime_policy
+    }
+
+    /// List currently warm runtime models.
+    pub fn warm_runtime_models(&self) -> Vec<String> {
+        self.runtime_slots.keys().cloned().collect()
+    }
+
+    /// Mark a model as recently used by the local runner and enforce slot caps.
+    ///
+    /// Returns evicted model ids (if any) from slot pressure.
+    pub fn mark_runtime_used(&mut self, model_id: &str) -> Vec<String> {
+        self.mark_runtime_used_at(model_id, now_epoch_secs())
+    }
+
+    /// Evict models that have been idle longer than the keep-warm window.
+    pub fn evict_idle_runtime_models(&mut self) -> Vec<String> {
+        self.evict_idle_runtime_models_at(now_epoch_secs())
+    }
+
+    fn mark_runtime_used_at(&mut self, model_id: &str, now_epoch_secs: u64) -> Vec<String> {
+        if model_id.trim().is_empty() {
+            return Vec::new();
+        }
+
+        match self.runtime_slots.get_mut(model_id) {
+            Some(slot) => {
+                slot.last_used_epoch_secs = now_epoch_secs;
+            }
+            None => {
+                self.runtime_slots.insert(
+                    model_id.to_string(),
+                    RuntimeSlotState {
+                        loaded_at_epoch_secs: now_epoch_secs,
+                        last_used_epoch_secs: now_epoch_secs,
+                    },
+                );
+            }
+        }
+
+        let cap = self.runtime_policy.max_loaded_models.max(1);
+        let mut evicted = Vec::new();
+        while self.runtime_slots.len() > cap {
+            let victim = self
+                .runtime_slots
+                .iter()
+                .filter(|(candidate, _)| candidate.as_str() != model_id)
+                .min_by_key(|(_, slot)| (slot.last_used_epoch_secs, slot.loaded_at_epoch_secs))
+                .map(|(candidate, _)| candidate.clone())
+                .or_else(|| self.runtime_slots.keys().next().cloned());
+            let Some(victim) = victim else {
+                break;
+            };
+            self.runtime_slots.remove(&victim);
+            evicted.push(victim);
+        }
+
+        evicted
+    }
+
+    fn evict_idle_runtime_models_at(&mut self, now_epoch_secs: u64) -> Vec<String> {
+        let mut keep_warm = self.runtime_policy.keep_warm_secs.max(1);
+        if self.runtime_policy.aggressive_eviction {
+            keep_warm = keep_warm.saturating_div(2).max(1);
+        }
+        let threshold = now_epoch_secs.saturating_sub(keep_warm);
+        let mut evicted = Vec::new();
+        self.runtime_slots.retain(|model_id, slot| {
+            let keep = slot.last_used_epoch_secs >= threshold;
+            if !keep {
+                evicted.push(model_id.clone());
+            }
+            keep
+        });
+        evicted
+    }
+
     /// Ensure a model is downloaded and ready. Without `local-ml` feature,
     /// this only checks if the model directory exists.
     ///
@@ -270,12 +369,16 @@ impl ModelManager {
         match self.status(model_id) {
             ModelStatus::Ready => {
                 progress_cb(files.len(), files.len());
+                let _ = self.mark_runtime_used(model_id);
+                let _ = self.evict_idle_runtime_models();
                 Ok(model_path)
             }
             ModelStatus::NotDownloaded => {
                 #[cfg(feature = "local-ml")]
                 {
                     self.download_model(model_id, hf_repo, files, &progress_cb)?;
+                    let _ = self.mark_runtime_used(model_id);
+                    let _ = self.evict_idle_runtime_models();
                     Ok(model_path)
                 }
                 #[cfg(not(feature = "local-ml"))]
@@ -545,6 +648,13 @@ fn has_model_files(dir: &Path) -> bool {
     false
 }
 
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +877,52 @@ mod tests {
             models.iter().any(|m| m.model_id == "listed-model"),
             "should list manifest-based model"
         );
+    }
+
+    #[test]
+    fn runtime_slots_respect_capacity() {
+        let dir = TempDir::new().unwrap();
+        let mut mgr = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 2,
+                keep_warm_secs: 600,
+                aggressive_eviction: false,
+            },
+        );
+
+        assert!(mgr.mark_runtime_used_at("model-a", 10).is_empty());
+        assert!(mgr.mark_runtime_used_at("model-b", 11).is_empty());
+        let evicted = mgr.mark_runtime_used_at("model-c", 12);
+
+        assert_eq!(mgr.warm_runtime_models().len(), 2);
+        assert_eq!(evicted.len(), 1);
+        assert!(
+            !mgr.warm_runtime_models().iter().any(|m| m == "model-a"),
+            "least recently used model should be evicted first"
+        );
+    }
+
+    #[test]
+    fn runtime_slots_evict_idle_models() {
+        let dir = TempDir::new().unwrap();
+        let mut mgr = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 3,
+                keep_warm_secs: 30,
+                aggressive_eviction: true,
+            },
+        );
+
+        mgr.mark_runtime_used_at("model-a", 100);
+        mgr.mark_runtime_used_at("model-b", 120);
+        mgr.mark_runtime_used_at("model-c", 129);
+        let evicted = mgr.evict_idle_runtime_models_at(131);
+
+        assert_eq!(evicted, vec!["model-a".to_string()]);
+        assert_eq!(mgr.warm_runtime_models().len(), 2);
+        assert!(mgr.warm_runtime_models().iter().any(|m| m == "model-b"));
+        assert!(mgr.warm_runtime_models().iter().any(|m| m == "model-c"));
     }
 }

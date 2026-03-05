@@ -7,8 +7,9 @@ use uuid::Uuid;
 mod llm_capabilities;
 mod tool_metadata;
 pub use llm_capabilities::{
-    ModelCapabilities, ModelFamily, PreferredEditTool, ProviderKind, detect_model_family,
-    model_capabilities, normalize_provider_kind,
+    CapabilityOverride, CapabilityRegistryOverrides, CapabilityResolution, ModelCapabilities,
+    ModelFamily, PreferredEditTool, ProviderKind, detect_model_family, model_capabilities,
+    model_capabilities_with_registry, normalize_provider_kind, resolve_model_capabilities,
 };
 pub use tool_metadata::{
     ToolAgentRole, ToolMetadata, ToolPhaseAccess, ToolTier, is_api_tool_name_read_only,
@@ -2186,6 +2187,8 @@ pub struct LlmConfig {
     pub provider: String,
     #[serde(default = "default_providers")]
     pub providers: std::collections::HashMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub capability_overrides: CapabilityRegistryOverrides,
     pub profile: String,
     pub context_window_tokens: u64,
     pub temperature: f32,
@@ -2250,9 +2253,16 @@ impl LlmConfig {
     }
 
     #[must_use]
+    pub fn capability_resolution_for_model(&self, model: &str) -> Option<CapabilityResolution> {
+        self.active_provider_kind().map(|provider| {
+            resolve_model_capabilities(provider, model, Some(&self.capability_overrides))
+        })
+    }
+
+    #[must_use]
     pub fn capabilities_for_model(&self, model: &str) -> Option<ModelCapabilities> {
-        self.active_provider_kind()
-            .map(|provider| model_capabilities(provider, model))
+        self.capability_resolution_for_model(model)
+            .map(|resolution| resolution.capabilities)
     }
 }
 
@@ -2263,6 +2273,7 @@ impl Default for LlmConfig {
             max_think_model: CODINGBUDDY_V32_REASONER_MODEL.to_string(),
             provider: "deepseek".to_string(),
             providers: default_providers(),
+            capability_overrides: CapabilityRegistryOverrides::default(),
             profile: CODINGBUDDY_PROFILE_V32.to_string(),
             context_window_tokens: 128_000,
             temperature: 0.2,
@@ -4193,6 +4204,54 @@ mod tests {
             .expect("ollama caps");
         assert!(!ollama.supports_thinking_config);
         assert_eq!(ollama.family, ModelFamily::Qwen);
+    }
+
+    #[test]
+    fn capabilities_allow_config_driven_model_override() {
+        let mut cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        cfg.capability_overrides.models.insert(
+            "ollama@qwen2.5-coder:*".to_string(),
+            CapabilityOverride {
+                supports_tool_choice: Some(false),
+                max_safe_tool_count: Some(6),
+                ..CapabilityOverride::default()
+            },
+        );
+
+        let caps = cfg
+            .capabilities_for_model("qwen2.5-coder:7b")
+            .expect("caps");
+        assert!(!caps.supports_tool_choice);
+        assert_eq!(caps.max_safe_tool_count, 6);
+    }
+
+    #[test]
+    fn capability_resolution_tracks_applied_rules() {
+        let mut cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        cfg.capability_overrides.families.insert(
+            "ollama@qwen".to_string(),
+            CapabilityOverride {
+                max_safe_tool_count: Some(5),
+                ..CapabilityOverride::default()
+            },
+        );
+        let resolution = cfg
+            .capability_resolution_for_model("qwen2.5-coder:3b")
+            .expect("resolution");
+        assert_eq!(resolution.capabilities.max_safe_tool_count, 5);
+        assert!(
+            resolution
+                .applied_rules
+                .iter()
+                .any(|rule| rule.contains("config_family:ollama@qwen")),
+            "expected config family override in applied rules"
+        );
     }
 
     // ── Phase 3 EventKind variant tests ──
