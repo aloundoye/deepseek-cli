@@ -7,8 +7,6 @@ pub mod model_registry;
 pub mod privacy;
 pub mod reranker;
 pub mod retrieval;
-#[cfg(feature = "experimental-speculative")]
-pub mod speculative;
 pub mod vector_index;
 
 pub use chunker::{Chunk, ChunkConfig, ChunkManifest, ChunkStrategy, chunk_workspace_metadata};

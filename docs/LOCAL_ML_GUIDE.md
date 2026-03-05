@@ -11,8 +11,8 @@ CodingBuddy includes an optional local ML layer that runs entirely on your machi
 - **Ghost text** — inline code completions in the TUI, powered by local models
 - **Local routing** — routes simple non-project questions to a local model (project-context queries always go to the API)
 
-**Deprecated (not production-wired):**
-- **Speculative decoding** — draft+verify acceleration. Marked `#[deprecated]` — focus on retrieval/privacy/reranking instead.
+**Not supported:**
+- **Speculative decoding** — removed from the public local-ml API because it is not runtime-wired. Focus remains on retrieval/privacy/reranking.
 
 All of this is **off by default**. No models are bundled — they're downloaded from HuggingFace on first use.
 
