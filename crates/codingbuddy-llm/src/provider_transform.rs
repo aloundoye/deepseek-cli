@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, ModelCapabilities};
+use codingbuddy_core::{ChatMessage, ChatRequest, LlmResponse, ModelCapabilities, ProviderKind};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -51,6 +51,7 @@ pub(crate) fn preflight_chat_messages(
 
                 if let Some(rc) = reasoning_content
                     && (!capabilities.strict_empty_content_filtering || !rc.trim().is_empty())
+                    && provider_supports_reasoning_content(capabilities.provider)
                 {
                     msg["reasoning_content"] = json!(rc);
                     has_visible_content = true;
@@ -89,6 +90,11 @@ pub(crate) fn preflight_chat_messages(
                 if !normalized_tool_calls.is_empty() {
                     msg["tool_calls"] = json!(normalized_tool_calls);
                     has_visible_content = true;
+                    if capabilities.strict_empty_content_filtering && msg.get("content").is_none() {
+                        // Some strict OpenAI-compatible gateways require explicit
+                        // assistant content=null when tool_calls are present.
+                        msg["content"] = Value::Null;
+                    }
                 }
 
                 if !capabilities.strict_empty_content_filtering || has_visible_content {
@@ -170,6 +176,65 @@ pub(crate) fn postprocess_chat_response(
     }
 
     response
+}
+
+pub(crate) fn apply_chat_payload_compatibility(
+    payload: &mut Value,
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+) {
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && prefers_max_completion_tokens(&req.model)
+        && let Some(max_tokens) = payload.get("max_tokens").cloned()
+    {
+        payload["max_completion_tokens"] = max_tokens;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("max_tokens");
+        }
+    }
+
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type == "enabled")
+    {
+        let effort = thinking_budget_to_reasoning_effort(
+            req.thinking.as_ref().and_then(|t| t.budget_tokens),
+        );
+        payload["reasoning_effort"] = json!(effort);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("thinking");
+        }
+    }
+
+    if capabilities.provider == ProviderKind::Ollama
+        && payload.get("tool_choice").and_then(Value::as_str) == Some("required")
+    {
+        // Ollama accepts tool_choice but "required" is inconsistently supported
+        // across model families and fronting gateways.
+        payload["tool_choice"] = json!("auto");
+    }
+}
+
+fn provider_supports_reasoning_content(provider: ProviderKind) -> bool {
+    provider == ProviderKind::Deepseek
+}
+
+fn prefers_max_completion_tokens(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.contains("reasoning")
+}
+
+fn thinking_budget_to_reasoning_effort(budget_tokens: Option<u32>) -> &'static str {
+    match budget_tokens.unwrap_or(4096) {
+        0..=2048 => "low",
+        2049..=8192 => "medium",
+        _ => "high",
+    }
 }
 
 fn attach_images_to_last_user_message(
@@ -451,5 +516,93 @@ mod tests {
         let messages = preflight_chat_messages(&req, &caps).expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn openai_compatible_drops_reasoning_content_from_assistant_messages() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "hello".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("answer".to_string()),
+                reasoning_content: Some("hidden reasoning".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "answer");
+        assert!(
+            messages[1].get("reasoning_content").is_none(),
+            "non-deepseek providers should not receive reasoning_content field"
+        );
+    }
+
+    #[test]
+    fn strict_provider_sets_null_content_for_tool_calls() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tool".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages[1]["content"], Value::Null);
+        assert!(messages[1].get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn payload_compat_remaps_max_tokens_for_openai_reasoning_models() {
+        let (req, caps) = req_for(ProviderKind::OpenAiCompatible, "o3-mini");
+        let mut payload = json!({
+            "model": "o3-mini",
+            "messages": [],
+            "max_tokens": 2048
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["max_completion_tokens"], 2048);
+        assert!(payload.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn payload_compat_maps_thinking_to_reasoning_effort_for_openai_compat() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.thinking = Some(codingbuddy_core::ThinkingConfig::enabled(16_384));
+        let mut payload = json!({
+            "model": "gpt-4o-mini",
+            "messages": [],
+            "max_tokens": 1024
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn payload_compat_downgrades_required_tool_choice_for_ollama() {
+        let (req, caps) = req_for(ProviderKind::Ollama, "qwen2.5-coder:7b");
+        let mut payload = json!({
+            "model": "qwen2.5-coder:7b",
+            "messages": [],
+            "tool_choice": "required"
+        });
+
+        apply_chat_payload_compatibility(&mut payload, &req, &caps);
+        assert_eq!(payload["tool_choice"], "auto");
     }
 }

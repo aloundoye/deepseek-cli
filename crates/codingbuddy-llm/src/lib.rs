@@ -406,6 +406,7 @@ impl ApiClient {
                 payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
             }
         }
+        provider_transform::apply_chat_payload_compatibility(&mut payload, req, &capabilities);
         Ok(payload)
     }
 
@@ -988,6 +989,11 @@ impl ApiClient {
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
         if thinking_requested && !caps.supports_thinking_config {
+            if caps.provider == ProviderKind::OpenAiCompatible {
+                // OpenAI-compatible proxies may accept a coarse reasoning hint via
+                // `reasoning_effort`; handled by provider payload compatibility.
+                return Ok(());
+            }
             if caps.supports_reasoning_mode {
                 return Err(anyhow!(
                     "model '{}' uses native reasoning mode and rejects explicit thinking config (capability rules: {}); remove thinking config for this model",
@@ -2067,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_contract_rejects_thinking_for_model_without_thinking_config() {
+    fn capability_contract_allows_openai_compat_thinking_shim() {
         let cfg = LlmConfig {
             provider: "openai-compatible".to_string(),
             ..LlmConfig::default()
@@ -2091,9 +2097,39 @@ mod tests {
             images: vec![],
             response_format: None,
         };
+        client
+            .validate_chat_request_contract(&req)
+            .expect("openai-compatible thinking shim should be accepted");
+    }
+
+    #[test]
+    fn capability_contract_rejects_ollama_thinking_config() {
+        let cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "qwen2.5-coder:7b".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(2048)),
+            images: vec![],
+            response_format: None,
+        };
         let err = client
             .validate_chat_request_contract(&req)
-            .expect_err("thinking should be rejected");
+            .expect_err("ollama should reject thinking config");
         assert!(err.to_string().contains("does not support thinking config"));
     }
 
@@ -2453,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_payload_preserves_requested_model_and_strips_thinking() {
+    fn openai_compatible_payload_maps_thinking_to_reasoning_effort() {
         let cfg = LlmConfig {
             provider: "openai-compatible".to_string(),
             ..LlmConfig::default()
@@ -2480,6 +2516,7 @@ mod tests {
         let payload = client.build_chat_payload(&req).expect("build payload");
         assert_eq!(payload["model"], "gpt-4o-mini");
         assert!(payload.get("thinking").is_none());
+        assert_eq!(payload["reasoning_effort"], "medium");
         assert_eq!(payload["temperature"], 0.5);
         assert!(
             (payload["top_p"].as_f64().unwrap_or_default() - 0.9).abs() < 0.000_001,
@@ -2487,6 +2524,40 @@ mod tests {
         );
         assert_eq!(payload["logprobs"], true);
         assert_eq!(payload["top_logprobs"], 3);
+    }
+
+    #[test]
+    fn openai_reasoning_family_uses_max_completion_tokens_key() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "o3-mini".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 4096,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["max_completion_tokens"], 4096);
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "openai reasoning families should use max_completion_tokens"
+        );
     }
 
     #[test]
@@ -2586,6 +2657,43 @@ mod tests {
         };
         let client = ApiClient::new(cfg).expect("client");
         assert_eq!(client.resolve_request_api_key().expect("no auth"), None);
+    }
+
+    #[test]
+    fn ollama_payload_downgrades_required_tool_choice() {
+        let cfg = LlmConfig {
+            provider: "ollama".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "qwen2.5-coder:7b".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "read a file".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "fs_read".to_string(),
+                    description: "Read file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::required(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["tool_choice"], "auto");
     }
 
     #[test]
