@@ -265,4 +265,26 @@ mod tests {
             assert_eq!(batch[i], single, "batch[{}] must match individual embed", i);
         }
     }
+
+    #[test]
+    fn speculative_source_file_is_not_present() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let speculative_path = manifest_dir.join("src/speculative.rs");
+        assert!(
+            !speculative_path.exists(),
+            "speculative API source must not be reintroduced: {}",
+            speculative_path.display()
+        );
+    }
+
+    #[test]
+    fn cargo_toml_has_no_speculative_feature_flag() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml = manifest_dir.join("Cargo.toml");
+        let raw = std::fs::read_to_string(&cargo_toml).expect("read Cargo.toml");
+        assert!(
+            !raw.contains("experimental-speculative"),
+            "Cargo feature flag experimental-speculative must remain removed"
+        );
+    }
 }
