@@ -32,7 +32,6 @@ base64.workspace = true
 chrono.workspace = true
 regex.workspace = true
 notify.workspace = true
-strsim.workspace = true
 sha2.workspace = true
 glob.workspace = true
 

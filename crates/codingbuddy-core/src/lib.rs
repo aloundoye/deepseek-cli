@@ -522,6 +522,34 @@ impl ToolName {
     ];
 }
 
+fn normalize_tool_name_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace(['-', '.'], "_")
+}
+
+/// Canonicalize a built-in tool name to its underscored API form.
+///
+/// Accepts either underscored API names (`fs_read`) or dotted internal names
+/// (`fs.read`), plus common casing/hyphen variations. Returns `None` for
+/// unknown names such as MCP or plugin tools.
+#[must_use]
+pub fn canonical_tool_api_name(name: &str) -> Option<&'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(tool) = ToolName::from_api_name(trimmed) {
+        return Some(tool.as_api_name());
+    }
+
+    if let Some(tool) = ToolName::from_internal_name(trimmed) {
+        return Some(tool.as_api_name());
+    }
+
+    let normalized = normalize_tool_name_key(trimmed);
+    ToolName::from_api_name(&normalized).map(|tool| tool.as_api_name())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
@@ -1785,6 +1813,50 @@ pub struct FunctionDefinition {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub strict: Option<bool>,
     pub parameters: serde_json::Value,
+}
+
+/// Attempt to repair a tool call name to the active tool surface.
+///
+/// Built-in tools are canonicalized to their underscored API names even if the
+/// provider returns internal dotted names. For active tools, this also applies
+/// lowercase/hyphen normalization and a small Levenshtein repair window.
+#[must_use]
+pub fn repair_tool_api_name(api_name: &str, available_tools: &[ToolDefinition]) -> Option<String> {
+    let trimmed = api_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(canonical) = canonical_tool_api_name(trimmed) {
+        return Some(canonical.to_string());
+    }
+
+    let tool_names: Vec<&str> = available_tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect();
+
+    if tool_names.contains(&trimmed) {
+        return Some(trimmed.to_string());
+    }
+
+    let normalized = normalize_tool_name_key(trimmed);
+    if let Some(name) = tool_names
+        .iter()
+        .find(|name| normalize_tool_name_key(name) == normalized)
+    {
+        return Some((*name).to_string());
+    }
+
+    let mut best_match: Option<(&str, usize)> = None;
+    for name in &tool_names {
+        let dist = strsim::levenshtein(&normalized, &normalize_tool_name_key(name));
+        if dist <= 2 && best_match.as_ref().is_none_or(|(_, best)| dist < *best) {
+            best_match = Some((name, dist));
+        }
+    }
+
+    best_match.map(|(name, _)| name.to_string())
 }
 
 /// Controls how the model picks tools.
@@ -3374,6 +3446,18 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    fn sample_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("Tool {name}"),
+                strict: None,
+                parameters: json!({}),
+            },
+        }
+    }
+
     fn model_alias_strategy() -> impl Strategy<Value = &'static str> {
         prop_oneof![
             Just("deepseek-chat"),
@@ -3542,6 +3626,45 @@ mod tests {
                 "from_internal_name roundtrip failed for {internal}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_tool_api_name_accepts_internal_and_variant_spellings() {
+        assert_eq!(canonical_tool_api_name("fs_read"), Some("fs_read"));
+        assert_eq!(canonical_tool_api_name("fs.read"), Some("fs_read"));
+        assert_eq!(canonical_tool_api_name("FS-READ"), Some("fs_read"));
+        assert_eq!(canonical_tool_api_name(" Git.Status "), Some("git_status"));
+        assert_eq!(canonical_tool_api_name("plugin__custom__tool"), None);
+    }
+
+    #[test]
+    fn repair_tool_api_name_repairs_known_and_active_tool_names() {
+        let tools = vec![
+            sample_tool("fs_read"),
+            sample_tool("fs_write"),
+            sample_tool("plugin__phase_c_plugin__review"),
+        ];
+
+        assert_eq!(
+            repair_tool_api_name("fs.read", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("FS-READ", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("fs_reaf", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("plugin__phase-c-plugin__review", &tools),
+            Some("plugin__phase_c_plugin__review".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("plugin__custom__unknown", &tools),
+            None
+        );
     }
 
     #[test]

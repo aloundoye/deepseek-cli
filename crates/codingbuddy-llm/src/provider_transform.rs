@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
     ChatMessage, ChatRequest, LlmResponse, ModelCapabilities, ModelFamily, ProviderKind,
-    ToolDefinition,
+    ToolDefinition, repair_tool_api_name,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -84,12 +84,14 @@ pub(crate) fn preflight_chat_messages(
                         tool_call_id_map.insert(tool_call.id.clone(), normalized_id.clone());
                     }
                     declared_tool_call_ids.insert(normalized_id.clone());
+                    let tool_name = repair_tool_api_name(&tool_call.name, &req.tools)
+                        .unwrap_or_else(|| tool_call.name.clone());
 
                     normalized_tool_calls.push(json!({
                         "id": normalized_id,
                         "type": "function",
                         "function": {
-                            "name": tool_call.name,
+                            "name": tool_name,
                             "arguments": tool_call.arguments,
                         }
                     }));
@@ -161,13 +163,18 @@ pub(crate) fn preflight_chat_messages(
 pub(crate) fn postprocess_chat_response(
     mut response: LlmResponse,
     capabilities: &ModelCapabilities,
+    available_tools: &[ToolDefinition],
 ) -> LlmResponse {
     if response.text.trim().is_empty() && !response.reasoning_content.trim().is_empty() {
         response.text = response.reasoning_content.clone();
     }
 
-    if capabilities.normalize_tool_call_ids {
-        for (idx, tool_call) in response.tool_calls.iter_mut().enumerate() {
+    for (idx, tool_call) in response.tool_calls.iter_mut().enumerate() {
+        if let Some(repaired_name) = repair_tool_api_name(&tool_call.name, available_tools) {
+            tool_call.name = repaired_name;
+        }
+
+        if capabilities.normalize_tool_call_ids {
             tool_call.id = normalize_tool_call_id(&tool_call.id, idx + 1, true);
         }
     }
@@ -645,7 +652,8 @@ fn repair_message_sequence_for_provider(
 mod tests {
     use super::*;
     use codingbuddy_core::{
-        ChatMessage, ChatRequest, LlmToolCall, ProviderKind, ToolChoice, model_capabilities,
+        ChatMessage, ChatRequest, FunctionDefinition, LlmToolCall, ProviderKind, ToolChoice,
+        ToolDefinition, model_capabilities,
     };
 
     fn req_for(provider: ProviderKind, model: &str) -> (ChatRequest, ModelCapabilities) {
@@ -668,6 +676,18 @@ mod tests {
             response_format: None,
         };
         (req, model_capabilities(provider, model))
+    }
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("Tool {name}"),
+                strict: None,
+                parameters: json!({}),
+            },
+        }
     }
 
     #[test]
@@ -793,7 +813,7 @@ mod tests {
             }),
         };
 
-        let normalized = postprocess_chat_response(response, &caps);
+        let normalized = postprocess_chat_response(response, &caps, &[]);
         assert_eq!(normalized.text, "thoughts");
         assert_eq!(normalized.tool_calls[0].id, "bad");
         assert_eq!(
@@ -812,6 +832,70 @@ mod tests {
                 .prompt_cache_miss_tokens,
             0
         );
+    }
+
+    #[test]
+    fn response_postprocess_normalizes_built_in_tool_names_to_api_format() {
+        let (_, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        let response = LlmResponse {
+            text: String::new(),
+            finish_reason: "tool_calls".to_string(),
+            reasoning_content: String::new(),
+            tool_calls: vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "FS.Read".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            usage: None,
+        };
+
+        let normalized = postprocess_chat_response(response, &caps, &[]);
+        assert_eq!(normalized.tool_calls[0].name, "fs_read");
+    }
+
+    #[test]
+    fn response_postprocess_repairs_active_plugin_tool_names() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.tools = vec![tool_def("plugin__phase_c_plugin__review")];
+        let response = LlmResponse {
+            text: String::new(),
+            finish_reason: "tool_calls".to_string(),
+            reasoning_content: String::new(),
+            tool_calls: vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "plugin__phase-c-plugin__review".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            usage: None,
+        };
+
+        let normalized = postprocess_chat_response(response, &caps, &req.tools);
+        assert_eq!(
+            normalized.tool_calls[0].name,
+            "plugin__phase_c_plugin__review"
+        );
+    }
+
+    #[test]
+    fn preflight_normalizes_historical_tool_call_names() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tool".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs.read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "fs_read");
     }
 
     #[test]

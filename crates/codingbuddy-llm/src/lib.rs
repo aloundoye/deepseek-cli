@@ -451,6 +451,7 @@ impl ApiClient {
                         return Ok(provider_transform::postprocess_chat_response(
                             response,
                             &capabilities,
+                            &req.tools,
                         ));
                     }
                     last_err = Some(format_api_error(
@@ -842,6 +843,7 @@ impl ApiClient {
                         return Ok(provider_transform::postprocess_chat_response(
                             response,
                             &capabilities,
+                            &req.tools,
                         ));
                     }
 
