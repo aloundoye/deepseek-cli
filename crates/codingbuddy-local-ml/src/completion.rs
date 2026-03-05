@@ -141,6 +141,10 @@ impl Utf8StreamBuffer {
 }
 
 pub mod kv_cache;
+pub mod runtime_scheduler;
+pub use runtime_scheduler::{
+    BackendFactory, LocalRunnerLifecycleManager, LocalRuntimeSchedulerSnapshot,
+};
 
 #[cfg(feature = "local-ml")]
 pub mod candle_backend;

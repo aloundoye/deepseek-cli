@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
     CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse,
-    LlmToolCall, ProviderKind, StreamCallback, StreamChunk, normalize_codingbuddy_model,
-    normalize_codingbuddy_profile,
+    LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
+    normalize_codingbuddy_model, normalize_codingbuddy_profile,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -14,6 +14,8 @@ use std::error::Error as StdError;
 use std::io::BufRead;
 use std::thread;
 use std::time::Duration;
+
+mod provider_transform;
 
 /// Base delay for network/transport error retries (1s, 2s, 4s exponential backoff).
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
@@ -327,64 +329,7 @@ impl ApiClient {
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
         let thinking_enabled = requested_thinking && capabilities.supports_thinking_config;
-
-        let mut messages: Vec<Value> = req
-            .messages
-            .iter()
-            .map(|m| match m {
-                ChatMessage::System { content } => json!({"role": "system", "content": content}),
-                ChatMessage::User { content } => json!({"role": "user", "content": content}),
-                ChatMessage::Assistant {
-                    content,
-                    reasoning_content,
-                    tool_calls,
-                } => {
-                    let mut msg = json!({"role": "assistant"});
-                    if let Some(c) = content {
-                        msg["content"] = json!(c);
-                    }
-                    if let Some(rc) = reasoning_content {
-                        msg["reasoning_content"] = json!(rc);
-                    }
-                    if !tool_calls.is_empty() {
-                        let tc: Vec<Value> = tool_calls
-                            .iter()
-                            .map(|tc| {
-                                json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": tc.arguments
-                                    }
-                                })
-                            })
-                            .collect();
-                        msg["tool_calls"] = json!(tc);
-                    }
-                    msg
-                }
-                ChatMessage::Tool {
-                    tool_call_id,
-                    content,
-                } => json!({"role": "tool", "tool_call_id": tool_call_id, "content": content}),
-            })
-            .collect();
-
-        // If images are provided, convert the last User message to multipart content
-        if !req.images.is_empty()
-            && let Some(last_user) = messages.iter_mut().rev().find(|m| m["role"] == "user")
-        {
-            let text = last_user["content"].as_str().unwrap_or("").to_string();
-            let mut parts = vec![json!({"type": "text", "text": text})];
-            for img in &req.images {
-                parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
-                }));
-            }
-            last_user["content"] = json!(parts);
-        }
+        let messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
@@ -466,6 +411,12 @@ impl ApiClient {
 
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: Option<&str>) -> Result<LlmResponse> {
         let payload = self.build_chat_payload(req)?;
+        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                self.cfg.provider
+            )
+        })?;
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -485,7 +436,11 @@ impl ApiClient {
                     let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
-                        return parse_non_streaming_payload(&body);
+                        let response = parse_non_streaming_payload(&body)?;
+                        return Ok(provider_transform::postprocess_chat_response(
+                            response,
+                            &capabilities,
+                        ));
                     }
                     last_err = Some(format_api_error(
                         status,
@@ -701,6 +656,12 @@ impl ApiClient {
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
         let mut payload = self.build_chat_payload(req)?;
+        let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
+            anyhow!(
+                "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                self.cfg.provider
+            )
+        })?;
         payload["stream"] = json!(true);
         payload["stream_options"] = json!({"include_usage": true});
 
@@ -860,13 +821,17 @@ impl ApiClient {
                             String::new()
                         };
 
-                        return Ok(LlmResponse {
+                        let response = LlmResponse {
                             text,
                             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
-                        });
+                        };
+                        return Ok(provider_transform::postprocess_chat_response(
+                            response,
+                            &capabilities,
+                        ));
                     }
 
                     let body = resp.text().unwrap_or_default();
@@ -949,6 +914,100 @@ impl ApiClient {
                 "top_logprobs is incompatible with thinking mode; remove top_logprobs or disable thinking"
             ));
         }
+        Ok(())
+    }
+
+    /// Validate chat request parameters against the resolved capability profile
+    /// before any provider request is dispatched.
+    fn validate_chat_request_contract(&self, req: &ChatRequest) -> Result<()> {
+        let resolution = self
+            .cfg
+            .capability_resolution_for_model(&req.model)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                    self.cfg.provider
+                )
+            })?;
+        let caps = resolution.capabilities;
+        let applied_rules = if resolution.applied_rules.is_empty() {
+            "none".to_string()
+        } else {
+            resolution.applied_rules.join(", ")
+        };
+
+        if !req.images.is_empty() && !caps.supports_image_input {
+            return Err(anyhow!(
+                "model '{}' does not support image input (capability rules: {}); remove images or switch to a vision-capable model",
+                req.model,
+                applied_rules
+            ));
+        }
+
+        let has_assistant_tool_calls = req.messages.iter().any(|message| {
+            matches!(
+                message,
+                ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+            )
+        });
+        let has_tool_messages = req
+            .messages
+            .iter()
+            .any(|message| matches!(message, ChatMessage::Tool { .. }));
+        let uses_tool_protocol =
+            !req.tools.is_empty() || has_assistant_tool_calls || has_tool_messages;
+
+        if uses_tool_protocol && !caps.supports_tool_calling {
+            return Err(anyhow!(
+                "model '{}' does not support tool-calling protocol (capability rules: {}); disable tools for this model",
+                req.model,
+                applied_rules
+            ));
+        }
+
+        if req.tools.len() > caps.max_safe_tool_count {
+            return Err(anyhow!(
+                "request defines {} tools but model '{}' max_safe_tool_count is {} (capability rules: {}); reduce active tools before dispatch",
+                req.tools.len(),
+                req.model,
+                caps.max_safe_tool_count,
+                applied_rules
+            ));
+        }
+
+        if req.tool_choice != ToolChoice::none() && !caps.supports_tool_choice {
+            return Err(anyhow!(
+                "model '{}' does not support tool_choice (capability rules: {}); set tool_choice to \"none\" or switch models",
+                req.model,
+                applied_rules
+            ));
+        }
+
+        let thinking_requested = req
+            .thinking
+            .as_ref()
+            .is_some_and(|t| t.thinking_type == "enabled");
+        if thinking_requested && !caps.supports_thinking_config {
+            if caps.supports_reasoning_mode {
+                return Err(anyhow!(
+                    "model '{}' uses native reasoning mode and rejects explicit thinking config (capability rules: {}); remove thinking config for this model",
+                    req.model,
+                    applied_rules
+                ));
+            }
+            return Err(anyhow!(
+                "model '{}' does not support thinking config (capability rules: {}); disable thinking or switch models",
+                req.model,
+                applied_rules
+            ));
+        }
+
+        if !thinking_requested && req.top_logprobs.is_some() && req.logprobs != Some(true) {
+            return Err(anyhow!(
+                "top_logprobs requires logprobs=true; set logprobs or remove top_logprobs"
+            ));
+        }
+
         Ok(())
     }
 
@@ -1208,10 +1267,11 @@ impl LlmClient for ApiClient {
                 )
             })?;
         }
-        self.validate_thinking_params(req)?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
+        self.validate_chat_request_contract(&normalized_req)?;
+        self.validate_thinking_params(&normalized_req)?;
         self.complete_chat_inner(&normalized_req, key.as_deref())
     }
 
@@ -1229,10 +1289,11 @@ impl LlmClient for ApiClient {
                 )
             })?;
         }
-        self.validate_thinking_params(req)?;
         let key = self.resolve_request_api_key()?;
         let mut normalized_req = req.clone();
         normalized_req.model = self.resolve_request_model(&req.model)?;
+        self.validate_chat_request_contract(&normalized_req)?;
+        self.validate_thinking_params(&normalized_req)?;
         self.complete_chat_streaming_inner(&normalized_req, key.as_deref(), cb)
     }
 
@@ -1246,14 +1307,25 @@ impl LlmClient for ApiClient {
                 )
             })?;
         }
-        if !self
+        let resolution = self
             .cfg
-            .capabilities_for_model(&req.model)
-            .is_some_and(|caps| caps.supports_fim)
-        {
+            .capability_resolution_for_model(&req.model)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                    self.cfg.provider
+                )
+            })?;
+        if !resolution.capabilities.supports_fim {
+            let applied_rules = if resolution.applied_rules.is_empty() {
+                "none".to_string()
+            } else {
+                resolution.applied_rules.join(", ")
+            };
             return Err(anyhow!(
-                "provider '{}' does not support fill-in-the-middle requests",
-                self.cfg.provider
+                "model '{}' does not support fill-in-the-middle requests (capability rules: {}); switch to a model/profile with supports_fim=true",
+                req.model,
+                applied_rules
             ));
         }
         let key = self.resolve_request_api_key()?;
@@ -1274,14 +1346,25 @@ impl LlmClient for ApiClient {
                 )
             })?;
         }
-        if !self
+        let resolution = self
             .cfg
-            .capabilities_for_model(&req.model)
-            .is_some_and(|caps| caps.supports_fim)
-        {
+            .capability_resolution_for_model(&req.model)
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
+                    self.cfg.provider
+                )
+            })?;
+        if !resolution.capabilities.supports_fim {
+            let applied_rules = if resolution.applied_rules.is_empty() {
+                "none".to_string()
+            } else {
+                resolution.applied_rules.join(", ")
+            };
             return Err(anyhow!(
-                "provider '{}' does not support fill-in-the-middle requests",
-                self.cfg.provider
+                "model '{}' does not support fill-in-the-middle requests (capability rules: {}); switch to a model/profile with supports_fim=true",
+                req.model,
+                applied_rules
             ));
         }
         let key = self.resolve_request_api_key()?;
@@ -1751,6 +1834,7 @@ fn parse_tool_calls_array(value: &Value) -> Vec<LlmToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codingbuddy_core::ChatMessage;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1979,6 +2063,157 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("top_logprobs is incompatible with thinking mode")
+        );
+    }
+
+    #[test]
+    fn capability_contract_rejects_thinking_for_model_without_thinking_config() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: Some(codingbuddy_core::ThinkingConfig::enabled(2048)),
+            images: vec![],
+            response_format: None,
+        };
+        let err = client
+            .validate_chat_request_contract(&req)
+            .expect_err("thinking should be rejected");
+        assert!(err.to_string().contains("does not support thinking config"));
+    }
+
+    #[test]
+    fn capability_contract_rejects_tool_choice_when_unsupported() {
+        let cfg = LlmConfig::default();
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-reasoner".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "fs_read".to_string(),
+                    description: "Read file".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::required(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let err = client
+            .validate_chat_request_contract(&req)
+            .expect_err("tool_choice should be rejected");
+        assert!(err.to_string().contains("does not support tool_choice"));
+    }
+
+    #[test]
+    fn capability_contract_rejects_too_many_tools() {
+        let mut cfg = LlmConfig::default();
+        cfg.capability_overrides.models.insert(
+            "deepseek@deepseek-chat".to_string(),
+            codingbuddy_core::CapabilityOverride {
+                max_safe_tool_count: Some(1),
+                ..codingbuddy_core::CapabilityOverride::default()
+            },
+        );
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![
+                codingbuddy_core::ToolDefinition {
+                    tool_type: "function".to_string(),
+                    function: codingbuddy_core::FunctionDefinition {
+                        name: "fs_read".to_string(),
+                        description: "Read file".to_string(),
+                        strict: None,
+                        parameters: serde_json::json!({"type": "object"}),
+                    },
+                },
+                codingbuddy_core::ToolDefinition {
+                    tool_type: "function".to_string(),
+                    function: codingbuddy_core::FunctionDefinition {
+                        name: "fs_list".to_string(),
+                        description: "List dir".to_string(),
+                        strict: None,
+                        parameters: serde_json::json!({"type": "object"}),
+                    },
+                },
+            ],
+            tool_choice: codingbuddy_core::ToolChoice::auto(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let err = client
+            .validate_chat_request_contract(&req)
+            .expect_err("tool count should be rejected");
+        assert!(err.to_string().contains("max_safe_tool_count"));
+    }
+
+    #[test]
+    fn capability_contract_rejects_top_logprobs_without_logprobs() {
+        let client = ApiClient::new(LlmConfig::default()).expect("client");
+        let req = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: Some(3),
+            thinking: None,
+            images: vec![],
+            response_format: None,
+        };
+        let err = client
+            .validate_chat_request_contract(&req)
+            .expect_err("top_logprobs without logprobs should be rejected");
+        assert!(
+            err.to_string()
+                .contains("top_logprobs requires logprobs=true")
         );
     }
 

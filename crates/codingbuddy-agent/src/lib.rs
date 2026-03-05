@@ -1129,7 +1129,7 @@ fn build_retriever_callback(
     // Models are pre-downloaded via `codingbuddy setup` or the first-time wizard.
     #[cfg(feature = "local-ml")]
     let embeddings: std::sync::Arc<dyn codingbuddy_local_ml::EmbeddingsBackend> = {
-        let mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
+        let mut mgr = codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(
             &cfg.local_ml.cache_dir,
         ));
         if mgr.status(&cfg.local_ml.embeddings.model_id) != codingbuddy_local_ml::ModelStatus::Ready
@@ -1142,6 +1142,8 @@ fn build_retriever_callback(
         } else {
             let model_path = std::path::PathBuf::from(&cfg.local_ml.cache_dir)
                 .join(&cfg.local_ml.embeddings.model_id);
+            let _ = mgr.mark_runtime_used(&cfg.local_ml.embeddings.model_id);
+            let _ = mgr.evict_idle_runtime_models();
             let device = codingbuddy_local_ml::parse_device(&cfg.local_ml.device);
             match codingbuddy_local_ml::CandleEmbeddings::load(
                 &model_path.join("model.safetensors"),

@@ -66,6 +66,12 @@ pub struct ModelCapabilities {
     pub supports_thinking_config: bool,
     pub supports_streaming_tool_deltas: bool,
     pub supports_fim: bool,
+    /// Whether chat payloads may include image inputs.
+    pub supports_image_input: bool,
+    /// Whether outbound chat messages should be strictly filtered for empty content.
+    pub strict_empty_content_filtering: bool,
+    /// Whether tool call ids should be normalized to provider-safe identifiers.
+    pub normalize_tool_call_ids: bool,
     pub max_safe_tool_count: usize,
     pub preferred_edit_tool: PreferredEditTool,
 }
@@ -80,6 +86,9 @@ pub struct CapabilityOverride {
     pub supports_thinking_config: Option<bool>,
     pub supports_streaming_tool_deltas: Option<bool>,
     pub supports_fim: Option<bool>,
+    pub supports_image_input: Option<bool>,
+    pub strict_empty_content_filtering: Option<bool>,
+    pub normalize_tool_call_ids: Option<bool>,
     pub max_safe_tool_count: Option<usize>,
     pub preferred_edit_tool: Option<PreferredEditTool>,
 }
@@ -106,6 +115,15 @@ impl CapabilityOverride {
         }
         if let Some(value) = self.supports_fim {
             capabilities.supports_fim = value;
+        }
+        if let Some(value) = self.supports_image_input {
+            capabilities.supports_image_input = value;
+        }
+        if let Some(value) = self.strict_empty_content_filtering {
+            capabilities.strict_empty_content_filtering = value;
+        }
+        if let Some(value) = self.normalize_tool_call_ids {
+            capabilities.normalize_tool_call_ids = value;
         }
         if let Some(value) = self.max_safe_tool_count {
             capabilities.max_safe_tool_count = value.max(1);
@@ -244,6 +262,9 @@ fn base_capabilities(
                 supports_thinking_config: !is_reasoner,
                 supports_streaming_tool_deltas: true,
                 supports_fim: true,
+                supports_image_input: !is_reasoner,
+                strict_empty_content_filtering: false,
+                normalize_tool_call_ids: false,
                 max_safe_tool_count: if is_reasoner { 18 } else { 24 },
                 preferred_edit_tool: PreferredEditTool::FsEdit,
             }
@@ -258,6 +279,9 @@ fn base_capabilities(
             supports_thinking_config: false,
             supports_streaming_tool_deltas: true,
             supports_fim: false,
+            supports_image_input: true,
+            strict_empty_content_filtering: true,
+            normalize_tool_call_ids: false,
             max_safe_tool_count: 18,
             preferred_edit_tool: PreferredEditTool::PatchDirect,
         },
@@ -271,6 +295,9 @@ fn base_capabilities(
             supports_thinking_config: false,
             supports_streaming_tool_deltas: true,
             supports_fim: false,
+            supports_image_input: false,
+            strict_empty_content_filtering: true,
+            normalize_tool_call_ids: true,
             max_safe_tool_count: 12,
             preferred_edit_tool: PreferredEditTool::FsEdit,
         },
@@ -410,6 +437,19 @@ fn built_in_model_override(
             },
         ));
     }
+    if lower.contains("llava")
+        || lower.contains("bakllava")
+        || lower.contains("moondream")
+        || lower.contains("vision")
+    {
+        return Some((
+            "builtin_model:vision-family",
+            CapabilityOverride {
+                supports_image_input: Some(true),
+                ..CapabilityOverride::default()
+            },
+        ));
+    }
     None
 }
 
@@ -500,6 +540,9 @@ mod tests {
         assert_eq!(caps.family, ModelFamily::Qwen);
         assert_eq!(caps.preferred_edit_tool, PreferredEditTool::MultiEdit);
         assert_eq!(caps.max_safe_tool_count, 14);
+        assert!(!caps.supports_image_input);
+        assert!(caps.strict_empty_content_filtering);
+        assert!(caps.normalize_tool_call_ids);
     }
 
     #[test]
@@ -611,5 +654,30 @@ mod tests {
         let caps =
             model_capabilities_with_registry(ProviderKind::Ollama, "qwen2.5-coder:7b", &registry);
         assert_ne!(caps.max_safe_tool_count, 3);
+    }
+
+    #[test]
+    fn vision_family_model_override_enables_image_input() {
+        let caps = model_capabilities(ProviderKind::Ollama, "llava:13b");
+        assert!(caps.supports_image_input);
+    }
+
+    #[test]
+    fn transform_flags_can_be_overridden_from_registry() {
+        let mut registry = CapabilityRegistryOverrides::default();
+        registry.models.insert(
+            "ollama@qwen2.5-coder:7b".to_string(),
+            CapabilityOverride {
+                supports_image_input: Some(true),
+                strict_empty_content_filtering: Some(false),
+                normalize_tool_call_ids: Some(false),
+                ..CapabilityOverride::default()
+            },
+        );
+        let caps =
+            model_capabilities_with_registry(ProviderKind::Ollama, "qwen2.5-coder:7b", &registry);
+        assert!(caps.supports_image_input);
+        assert!(!caps.strict_empty_content_filtering);
+        assert!(!caps.normalize_tool_call_ids);
     }
 }

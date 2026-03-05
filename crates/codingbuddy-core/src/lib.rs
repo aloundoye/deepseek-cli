@@ -4217,6 +4217,9 @@ mod tests {
             CapabilityOverride {
                 supports_tool_choice: Some(false),
                 max_safe_tool_count: Some(6),
+                supports_image_input: Some(true),
+                strict_empty_content_filtering: Some(false),
+                normalize_tool_call_ids: Some(false),
                 ..CapabilityOverride::default()
             },
         );
@@ -4226,6 +4229,9 @@ mod tests {
             .expect("caps");
         assert!(!caps.supports_tool_choice);
         assert_eq!(caps.max_safe_tool_count, 6);
+        assert!(caps.supports_image_input);
+        assert!(!caps.strict_empty_content_filtering);
+        assert!(!caps.normalize_tool_call_ids);
     }
 
     #[test]

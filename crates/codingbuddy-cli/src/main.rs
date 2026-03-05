@@ -647,7 +647,11 @@ struct SetupArgs {
 }
 
 #[derive(Args, Clone, Default)]
-struct DoctorArgs {}
+struct DoctorArgs {
+    /// Optional model id to include in capability resolution output.
+    #[arg(long)]
+    model: Option<String>,
+}
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum UpdateChannelArg {

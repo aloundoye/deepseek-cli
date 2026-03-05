@@ -269,6 +269,9 @@ mod tests {
             supports_thinking_config: false,
             supports_streaming_tool_deltas: true,
             supports_fim: false,
+            supports_image_input: false,
+            strict_empty_content_filtering: true,
+            normalize_tool_call_ids: true,
             max_safe_tool_count: 6,
             preferred_edit_tool: PreferredEditTool::FsEdit,
         };

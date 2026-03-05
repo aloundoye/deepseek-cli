@@ -50,11 +50,54 @@ pub struct ModelManifest {
     pub files: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeSlotState {
     loaded_at_epoch_secs: u64,
     last_used_epoch_secs: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLifecycleEvent {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub at_epoch_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLifecycleMetrics {
+    pub total_slot_activations: u64,
+    pub total_slot_reuses: u64,
+    pub total_capacity_evictions: u64,
+    pub total_idle_evictions: u64,
+    pub total_queue_enqueued: u64,
+    pub total_queue_completed: u64,
+    pub max_observed_queue_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeLifecycleSnapshot {
+    pub max_loaded_models: usize,
+    pub keep_warm_secs: u64,
+    pub aggressive_eviction: bool,
+    pub warm_models: Vec<String>,
+    pub metrics: RuntimeLifecycleMetrics,
+    pub recent_events: Vec<RuntimeLifecycleEvent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RuntimeStateFile {
+    #[serde(default)]
+    runtime_slots: BTreeMap<String, RuntimeSlotState>,
+    #[serde(default)]
+    metrics: RuntimeLifecycleMetrics,
+    #[serde(default)]
+    recent_events: Vec<RuntimeLifecycleEvent>,
+}
+
+const MAX_RUNTIME_EVENTS: usize = 64;
 
 /// Manages local model downloads and cache.
 ///
@@ -72,6 +115,8 @@ pub struct ModelManager {
     statuses: BTreeMap<String, ModelStatus>,
     runtime_policy: LocalModelRuntimePolicy,
     runtime_slots: BTreeMap<String, RuntimeSlotState>,
+    runtime_metrics: RuntimeLifecycleMetrics,
+    runtime_events: Vec<RuntimeLifecycleEvent>,
 }
 
 impl ModelManager {
@@ -85,11 +130,14 @@ impl ModelManager {
         cache_dir: PathBuf,
         runtime_policy: LocalModelRuntimePolicy,
     ) -> Self {
+        let persisted = load_runtime_state_file(&cache_dir).unwrap_or_default();
         Self {
             cache_dir,
             statuses: BTreeMap::new(),
             runtime_policy,
-            runtime_slots: BTreeMap::new(),
+            runtime_slots: persisted.runtime_slots,
+            runtime_metrics: persisted.metrics,
+            runtime_events: persisted.recent_events,
         }
     }
 
@@ -269,6 +317,48 @@ impl ModelManager {
         self.runtime_slots.keys().cloned().collect()
     }
 
+    /// Snapshot runtime lifecycle state (policy, warm models, metrics, events).
+    pub fn runtime_snapshot(&self) -> RuntimeLifecycleSnapshot {
+        RuntimeLifecycleSnapshot {
+            max_loaded_models: self.runtime_policy.max_loaded_models,
+            keep_warm_secs: self.runtime_policy.keep_warm_secs,
+            aggressive_eviction: self.runtime_policy.aggressive_eviction,
+            warm_models: self.warm_runtime_models(),
+            metrics: self.runtime_metrics.clone(),
+            recent_events: self.runtime_events.clone(),
+        }
+    }
+
+    /// Record queue depth when a scheduler enqueues a request.
+    pub fn record_runtime_queue_enqueued(&mut self, queue_depth: usize) {
+        self.runtime_metrics.total_queue_enqueued =
+            self.runtime_metrics.total_queue_enqueued.saturating_add(1);
+        self.runtime_metrics.max_observed_queue_depth = self
+            .runtime_metrics
+            .max_observed_queue_depth
+            .max(queue_depth);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "request_queued".to_string(),
+            model_id: None,
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(format!("depth={queue_depth}")),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Record completion of a queued request.
+    pub fn record_runtime_queue_completed(&mut self) {
+        self.runtime_metrics.total_queue_completed =
+            self.runtime_metrics.total_queue_completed.saturating_add(1);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "request_completed".to_string(),
+            model_id: None,
+            at_epoch_secs: now_epoch_secs(),
+            detail: None,
+        });
+        self.persist_runtime_state();
+    }
+
     /// Mark a model as recently used by the local runner and enforce slot caps.
     ///
     /// Returns evicted model ids (if any) from slot pressure.
@@ -289,6 +379,14 @@ impl ModelManager {
         match self.runtime_slots.get_mut(model_id) {
             Some(slot) => {
                 slot.last_used_epoch_secs = now_epoch_secs;
+                self.runtime_metrics.total_slot_reuses =
+                    self.runtime_metrics.total_slot_reuses.saturating_add(1);
+                self.push_runtime_event(RuntimeLifecycleEvent {
+                    kind: "runner_reused".to_string(),
+                    model_id: Some(model_id.to_string()),
+                    at_epoch_secs: now_epoch_secs,
+                    detail: None,
+                });
             }
             None => {
                 self.runtime_slots.insert(
@@ -298,6 +396,16 @@ impl ModelManager {
                         last_used_epoch_secs: now_epoch_secs,
                     },
                 );
+                self.runtime_metrics.total_slot_activations = self
+                    .runtime_metrics
+                    .total_slot_activations
+                    .saturating_add(1);
+                self.push_runtime_event(RuntimeLifecycleEvent {
+                    kind: "runner_activated".to_string(),
+                    model_id: Some(model_id.to_string()),
+                    at_epoch_secs: now_epoch_secs,
+                    detail: None,
+                });
             }
         }
 
@@ -318,6 +426,23 @@ impl ModelManager {
             evicted.push(victim);
         }
 
+        if !evicted.is_empty() {
+            self.runtime_metrics.total_capacity_evictions = self
+                .runtime_metrics
+                .total_capacity_evictions
+                .saturating_add(evicted.len() as u64);
+            for victim in &evicted {
+                self.push_runtime_event(RuntimeLifecycleEvent {
+                    kind: "runner_evicted_capacity".to_string(),
+                    model_id: Some(victim.clone()),
+                    at_epoch_secs: now_epoch_secs,
+                    detail: Some(format!("cap={cap}")),
+                });
+            }
+        }
+
+        self.persist_runtime_state();
+
         evicted
     }
 
@@ -335,6 +460,21 @@ impl ModelManager {
             }
             keep
         });
+        if !evicted.is_empty() {
+            self.runtime_metrics.total_idle_evictions = self
+                .runtime_metrics
+                .total_idle_evictions
+                .saturating_add(evicted.len() as u64);
+            for victim in &evicted {
+                self.push_runtime_event(RuntimeLifecycleEvent {
+                    kind: "runner_evicted_idle".to_string(),
+                    model_id: Some(victim.clone()),
+                    at_epoch_secs: now_epoch_secs,
+                    detail: Some(format!("threshold={threshold}")),
+                });
+            }
+            self.persist_runtime_state();
+        }
         evicted
     }
 
@@ -615,6 +755,41 @@ impl ModelManager {
             .insert(model_id.to_string(), ModelStatus::Ready);
         Ok(())
     }
+
+    fn runtime_state_path(&self) -> PathBuf {
+        self.cache_dir.join("runtime_state.json")
+    }
+
+    fn push_runtime_event(&mut self, event: RuntimeLifecycleEvent) {
+        self.runtime_events.push(event);
+        if self.runtime_events.len() > MAX_RUNTIME_EVENTS {
+            let drop_count = self.runtime_events.len() - MAX_RUNTIME_EVENTS;
+            self.runtime_events.drain(..drop_count);
+        }
+    }
+
+    fn persist_runtime_state(&self) {
+        let state = RuntimeStateFile {
+            runtime_slots: self.runtime_slots.clone(),
+            metrics: self.runtime_metrics.clone(),
+            recent_events: self.runtime_events.clone(),
+        };
+        let path = self.runtime_state_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp_path = path.with_extension("json.partial");
+        if let Ok(payload) = serde_json::to_vec_pretty(&state) {
+            let _ = std::fs::write(&tmp_path, payload);
+            let _ = std::fs::rename(&tmp_path, &path);
+        }
+    }
+}
+
+fn load_runtime_state_file(cache_dir: &Path) -> Option<RuntimeStateFile> {
+    let path = cache_dir.join("runtime_state.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// Compute SHA-256 digest of a file.
@@ -924,5 +1099,64 @@ mod tests {
         assert_eq!(mgr.warm_runtime_models().len(), 2);
         assert!(mgr.warm_runtime_models().iter().any(|m| m == "model-b"));
         assert!(mgr.warm_runtime_models().iter().any(|m| m == "model-c"));
+    }
+
+    #[test]
+    fn runtime_snapshot_tracks_lifecycle_metrics() {
+        let dir = TempDir::new().unwrap();
+        let mut mgr = ModelManager::with_runtime_policy(
+            dir.path().to_path_buf(),
+            LocalModelRuntimePolicy {
+                max_loaded_models: 1,
+                keep_warm_secs: 30,
+                aggressive_eviction: false,
+            },
+        );
+
+        mgr.record_runtime_queue_enqueued(2);
+        mgr.record_runtime_queue_completed();
+        assert!(mgr.mark_runtime_used_at("model-a", 100).is_empty());
+        assert!(mgr.mark_runtime_used_at("model-a", 110).is_empty());
+        let capacity_evicted = mgr.mark_runtime_used_at("model-b", 120);
+        assert_eq!(capacity_evicted, vec!["model-a".to_string()]);
+        let idle_evicted = mgr.evict_idle_runtime_models_at(200);
+        assert_eq!(idle_evicted, vec!["model-b".to_string()]);
+
+        let snapshot = mgr.runtime_snapshot();
+        assert!(snapshot.warm_models.is_empty());
+        assert_eq!(snapshot.metrics.total_slot_activations, 2);
+        assert_eq!(snapshot.metrics.total_slot_reuses, 1);
+        assert_eq!(snapshot.metrics.total_capacity_evictions, 1);
+        assert_eq!(snapshot.metrics.total_idle_evictions, 1);
+        assert_eq!(snapshot.metrics.total_queue_enqueued, 1);
+        assert_eq!(snapshot.metrics.total_queue_completed, 1);
+        assert_eq!(snapshot.metrics.max_observed_queue_depth, 2);
+        assert!(!snapshot.recent_events.is_empty());
+    }
+
+    #[test]
+    fn runtime_state_persists_across_restarts() {
+        let dir = TempDir::new().unwrap();
+        let policy = LocalModelRuntimePolicy {
+            max_loaded_models: 2,
+            keep_warm_secs: 600,
+            aggressive_eviction: false,
+        };
+
+        {
+            let mut mgr = ModelManager::with_runtime_policy(dir.path().to_path_buf(), policy);
+            let _ = mgr.mark_runtime_used_at("persisted-model", 42);
+            mgr.record_runtime_queue_enqueued(1);
+        }
+
+        let restored = ModelManager::with_runtime_policy(dir.path().to_path_buf(), policy);
+        let snapshot = restored.runtime_snapshot();
+        assert_eq!(
+            snapshot.warm_models,
+            vec!["persisted-model".to_string()],
+            "warm model slots should survive process restart"
+        );
+        assert_eq!(snapshot.metrics.total_slot_activations, 1);
+        assert_eq!(snapshot.metrics.total_queue_enqueued, 1);
     }
 }

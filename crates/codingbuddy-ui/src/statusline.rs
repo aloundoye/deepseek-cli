@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UiStatus {
     pub model: String,
+    #[serde(default)]
+    pub provider: String,
     pub pending_approvals: usize,
     pub estimated_cost_usd: f64,
     pub background_jobs: usize,
@@ -30,6 +32,24 @@ pub struct UiStatus {
     pub agent_mode: String,
     #[serde(default)]
     pub mission_control_snapshot: Vec<String>,
+    #[serde(default)]
+    pub current_todo: String,
+    #[serde(default)]
+    pub current_step: String,
+    #[serde(default)]
+    pub running_subagents: usize,
+    #[serde(default)]
+    pub failed_subagents: usize,
+    #[serde(default)]
+    pub failed_tasks: usize,
+    #[serde(default)]
+    pub running_background_jobs: usize,
+    #[serde(default)]
+    pub capability_summary: String,
+    #[serde(default)]
+    pub compaction_count: usize,
+    #[serde(default)]
+    pub replay_count: usize,
 }
 
 fn default_context_max() -> u64 {
@@ -78,6 +98,37 @@ pub fn render_statusline(status: &UiStatus) -> String {
         (Some(s), None) => format!(" review={s}"),
         _ => String::new(),
     };
+    let todo_part = if status.current_todo.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" todo={}", status.current_todo)
+    };
+    let step_part = if status.current_step.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" step={}", status.current_step)
+    };
+    let subagent_part = if status.running_subagents > 0 || status.failed_subagents > 0 {
+        format!(
+            " subagents={}/{}",
+            status.running_subagents, status.failed_subagents
+        )
+    } else {
+        String::new()
+    };
+    let counters_part = if status.compaction_count > 0 || status.replay_count > 0 {
+        format!(
+            " compact={} replay={}",
+            status.compaction_count, status.replay_count
+        )
+    } else {
+        String::new()
+    };
+    let caps_part = if status.capability_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" caps={}", status.capability_summary)
+    };
     let agent_part = if !status.agent_mode.is_empty()
         && status.agent_mode != "ToolUseLoop"
         && status.agent_mode != "ArchitectEditorLoop"
@@ -87,7 +138,7 @@ pub fn render_statusline(status: &UiStatus) -> String {
         String::new()
     };
     format!(
-        "model={} {} approvals={} jobs={}{}{}{} autopilot={}{}{}{} cost=${:.4}",
+        "model={} {} approvals={} jobs={}{}{}{} autopilot={}{}{}{}{}{}{}{}{} cost=${:.4}",
         status.model,
         mode_indicator,
         status.pending_approvals,
@@ -101,6 +152,11 @@ pub fn render_statusline(status: &UiStatus) -> String {
             "idle"
         },
         ctx_part,
+        step_part,
+        todo_part,
+        subagent_part,
+        counters_part,
+        caps_part,
         review_part,
         agent_part,
         status.estimated_cost_usd,
@@ -117,7 +173,6 @@ pub(crate) fn review_badge(status: &str) -> (&'static str, Color) {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn render_statusline_spans(
     status: &UiStatus,
     active_tool: Option<&str>,
@@ -165,6 +220,12 @@ pub(crate) fn render_statusline_spans(
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
+    if !status.provider.is_empty() && status.provider != status.model {
+        spans.push(Span::styled(
+            format!(" {} ", status.provider),
+            Style::default().fg(Color::Blue),
+        ));
+    }
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         mode_label.to_string(),
@@ -228,6 +289,33 @@ pub(crate) fn render_statusline_spans(
         spans.push(Span::styled(
             format!(" {} jobs ", status.background_jobs),
             Style::default().fg(Color::Blue),
+        ));
+    }
+
+    if status.running_subagents > 0 || status.failed_subagents > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(
+                " subagents {}/{} ",
+                status.running_subagents, status.failed_subagents
+            ),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    if !status.current_step.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" step {} ", status.current_step),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if !status.current_todo.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" todo {} ", status.current_todo),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 
@@ -303,6 +391,20 @@ pub(crate) fn render_statusline_spans(
         format!(" ${:.4} ", status.estimated_cost_usd),
         Style::default().fg(Color::DarkGray),
     ));
+
+    if status.compaction_count > 0 || status.replay_count > 0 {
+        spans.push(Span::styled(
+            format!(" c/r {}/{} ", status.compaction_count, status.replay_count),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if !status.capability_summary.is_empty() {
+        spans.push(Span::styled(
+            format!(" {} ", status.capability_summary),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     if let Some(mode) = vim_mode_label {
         spans.push(Span::styled(

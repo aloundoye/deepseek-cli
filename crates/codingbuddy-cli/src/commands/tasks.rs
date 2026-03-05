@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_store::{BackgroundJobRecord, SessionTodoRecord, Store, SubagentRunRecord};
+use codingbuddy_store::{
+    BackgroundJobRecord, SessionTodoRecord, Store, SubagentRunRecord, TaskQueueRecord,
+};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
@@ -124,6 +126,61 @@ fn task_output_text(
         return Some(("background_error".to_string(), error.to_string()));
     }
     None
+}
+
+fn summarize_handoff_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let limit = 240usize.min(trimmed.len());
+    let end = trimmed.floor_char_boundary(limit);
+    if trimmed.len() > limit {
+        format!("{}...", &trimmed[..end])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn task_handoff_payload(
+    task: &TaskQueueRecord,
+    run: Option<&SubagentRunRecord>,
+    resume_session_id: Option<Uuid>,
+    output_source: Option<&str>,
+    output_text: Option<&str>,
+) -> Value {
+    let status = run
+        .map(|record| record.status.as_str())
+        .unwrap_or(&task.status);
+    let failed = status.eq_ignore_ascii_case("failed")
+        || status.eq_ignore_ascii_case("error")
+        || status.eq_ignore_ascii_case("cancelled");
+    let next_action = if status.eq_ignore_ascii_case("running") {
+        "monitor_or_resume"
+    } else if failed {
+        "inspect_failure"
+    } else if resume_session_id.is_some() {
+        "resume_child_session_or_integrate_output"
+    } else {
+        "integrate_output"
+    };
+
+    let summary = output_text
+        .map(summarize_handoff_text)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("Task '{}' is {status}.", task.title));
+
+    json!({
+        "schema": "deepseek.task_handoff.v1",
+        "task_id": task.task_id.to_string(),
+        "run_id": run.map(|record| record.run_id.to_string()),
+        "status": status,
+        "summary": summary,
+        "next_action": next_action,
+        "resume_session_id": resume_session_id.map(|id| id.to_string()),
+        "resume_command": resume_session_id.map(|id| format!("codingbuddy --resume {id}")),
+        "output_source": output_source,
+    })
 }
 
 pub(crate) fn mission_control_payload(
@@ -307,6 +364,16 @@ pub(crate) fn render_mission_control_lines(payload: &Value) -> Vec<String> {
         summary["running_background_jobs"].as_u64().unwrap_or(0),
         summary["stopped_background_jobs"].as_u64().unwrap_or(0),
     ));
+    let failed_tasks = summary["failed_tasks"].as_u64().unwrap_or(0);
+    let failed_subagents = summary["failed_subagents"].as_u64().unwrap_or(0);
+    if failed_tasks > 0 || failed_subagents > 0 {
+        lines.push(format!(
+            "- Blockers: failed_tasks={} failed_subagents={} (inspect with /tasks list and /tasks show <task_id>)",
+            failed_tasks, failed_subagents
+        ));
+    } else {
+        lines.push("- Blockers: none detected".to_string());
+    }
     lines.push(format!(
         "- Todos: active={} in_progress={} completed={}",
         summary["active_todos"].as_u64().unwrap_or(0),
@@ -471,6 +538,13 @@ pub(crate) fn task_detail_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {
         task_output_text(&task, run.as_ref(), background_job.as_ref())
             .map(|(source, text)| (Some(source), Some(text)))
             .unwrap_or((None, None));
+    let handoff = task_handoff_payload(
+        &task,
+        run.as_ref(),
+        resume_session_id,
+        output_source.as_deref(),
+        output_text.as_deref(),
+    );
 
     Ok(json!({
         "schema": "deepseek.tasks.detail.v1",
@@ -482,6 +556,7 @@ pub(crate) fn task_detail_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {
         "resume_command": resume_session_id.map(|id| format!("codingbuddy --resume {id}")),
         "output_source": output_source,
         "output_text": output_text,
+        "handoff": handoff,
     }))
 }
 
@@ -600,6 +675,22 @@ pub(crate) fn render_task_detail_payload(payload: &Value) -> String {
         };
         lines.push(format!("Output:   [{source}] {preview}"));
     }
+    if let Some(handoff) = payload.get("handoff").and_then(Value::as_object) {
+        lines.push(format!(
+            "Handoff:  status={} next={}",
+            handoff
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            handoff
+                .get("next_action")
+                .and_then(Value::as_str)
+                .unwrap_or("inspect")
+        ));
+        if let Some(summary) = handoff.get("summary").and_then(Value::as_str) {
+            lines.push(format!("Summary:  {summary}"));
+        }
+    }
     lines.push(format!(
         "Created:  {}",
         task.get("created_at")
@@ -627,6 +718,7 @@ pub(crate) fn task_output_payload(cwd: &Path, task_id: Uuid) -> Result<Value> {
         "output_source": payload.get("output_source").and_then(Value::as_str).unwrap_or("task"),
         "output_text": output_text,
         "resume_session_id": payload.get("resume_session_id").and_then(Value::as_str),
+        "handoff": payload.get("handoff").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -646,6 +738,19 @@ pub(crate) fn render_task_output_payload(payload: &Value) -> String {
     let mut lines = vec![format!("Task Output: {task_id} [{source}]")];
     if let Some(session_id) = payload.get("resume_session_id").and_then(Value::as_str) {
         lines.push(format!("Resume: /resume {session_id}"));
+    }
+    if let Some(handoff) = payload.get("handoff").and_then(Value::as_object) {
+        lines.push(format!(
+            "Handoff: status={} next={}",
+            handoff
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            handoff
+                .get("next_action")
+                .and_then(Value::as_str)
+                .unwrap_or("inspect")
+        ));
     }
     lines.push(String::new());
     lines.push(output_text.to_string());
@@ -710,14 +815,36 @@ pub(crate) fn handle_tasks_slash(
                 .get(1)
                 .ok_or_else(|| anyhow!("usage: /tasks resume <task_id>"))?;
             let task_id = Uuid::parse_str(id)?;
+            let detail = task_detail_payload(cwd, task_id)?;
             let session_id = resumable_session_for_task(cwd, task_id)?
                 .ok_or_else(|| anyhow!("task has no resumable child session: {task_id}"))?;
+            let resume_context = mission_control_payload(cwd, Some(session_id), 10)?;
+            let task_title = detail
+                .get("task")
+                .and_then(|task| task.get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or("task");
+            let phase = resume_context
+                .get("workflow_phase")
+                .and_then(Value::as_str)
+                .unwrap_or("idle");
+            let current_step = resume_context
+                .get("current_step")
+                .and_then(Value::as_object)
+                .and_then(|step| step.get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or("-");
             let payload = json!({
                 "schema": "deepseek.tasks.resume.v1",
                 "task_id": task_id.to_string(),
                 "session_id": session_id.to_string(),
+                "task_title": task_title,
                 "resume_command": format!("codingbuddy --resume {session_id}"),
-                "message": format!("switched active chat session to child session {session_id} for task {task_id}"),
+                "resume_context": resume_context,
+                "handoff": detail.get("handoff").cloned().unwrap_or(Value::Null),
+                "message": format!(
+                    "switched active chat session to child session {session_id} for task {task_id} ({task_title}); phase={phase}; step={current_step}"
+                ),
             });
             let text = payload
                 .get("message")
@@ -991,6 +1118,15 @@ mod tests {
         );
         assert_eq!(payload["output_source"].as_str(), Some("subagent"));
         assert_eq!(payload["output_text"].as_str(), Some("task finished"));
+        assert_eq!(
+            payload["handoff"]["status"].as_str(),
+            Some("completed"),
+            "detail payload should expose deterministic handoff status"
+        );
+        assert_eq!(
+            payload["handoff"]["next_action"].as_str(),
+            Some("resume_child_session_or_integrate_output")
+        );
         Ok(())
     }
 
@@ -1056,6 +1192,18 @@ mod tests {
         assert!(
             response.text.contains(&child_session_id),
             "resume text should reference the child session"
+        );
+        assert!(
+            response.payload["resume_context"].is_object(),
+            "resume payload should include mission-control context"
+        );
+        assert!(
+            response.payload["handoff"].is_object(),
+            "resume payload should include deterministic handoff data"
+        );
+        assert_eq!(
+            response.payload["task_title"].as_str(),
+            Some("Resume subagent")
         );
         Ok(())
     }

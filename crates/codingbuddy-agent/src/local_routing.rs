@@ -15,6 +15,14 @@ pub struct LocalRoutingDecision {
     pub reason: &'static str,
 }
 
+/// Lightweight runtime pressure snapshot for local model scheduling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalRuntimePressure {
+    pub active_requests: usize,
+    pub max_concurrent_requests: usize,
+    pub queued_requests: usize,
+}
+
 /// Maximum prompt length (chars) considered "locally solvable".
 const MAX_LOCAL_PROMPT_CHARS: usize = 2000;
 
@@ -159,6 +167,45 @@ pub fn should_use_local(
     }
 }
 
+/// Runtime-aware local routing decision.
+///
+/// Starts with [`should_use_local`] and then refuses local routing when the
+/// local runtime is saturated (all concurrent slots busy) or queue backlog is high.
+pub fn should_use_local_with_pressure(
+    prompt: &str,
+    complexity: PromptComplexity,
+    local_ml_enabled: bool,
+    pressure: Option<LocalRuntimePressure>,
+) -> LocalRoutingDecision {
+    let baseline = should_use_local(prompt, complexity, local_ml_enabled);
+    if !baseline.use_local {
+        return baseline;
+    }
+
+    let Some(pressure) = pressure else {
+        return baseline;
+    };
+
+    if pressure.max_concurrent_requests > 0
+        && pressure.active_requests >= pressure.max_concurrent_requests
+    {
+        return LocalRoutingDecision {
+            use_local: false,
+            reason: "local runtime saturated",
+        };
+    }
+
+    let max_backlog = pressure.max_concurrent_requests.max(1);
+    if pressure.queued_requests >= max_backlog {
+        return LocalRoutingDecision {
+            use_local: false,
+            reason: "local runtime queue depth high",
+        };
+    }
+
+    baseline
+}
+
 /// Maximum output tokens for local inference.
 pub fn local_max_tokens() -> u32 {
     MAX_LOCAL_OUTPUT_TOKENS
@@ -238,5 +285,37 @@ mod tests {
             decision.use_local,
             "generic Q&A without project context should route locally"
         );
+    }
+
+    #[test]
+    fn runtime_saturation_routes_to_api() {
+        let decision = should_use_local_with_pressure(
+            "What is ownership in Rust?",
+            PromptComplexity::Simple,
+            true,
+            Some(LocalRuntimePressure {
+                active_requests: 1,
+                max_concurrent_requests: 1,
+                queued_requests: 0,
+            }),
+        );
+        assert!(!decision.use_local);
+        assert_eq!(decision.reason, "local runtime saturated");
+    }
+
+    #[test]
+    fn runtime_backlog_routes_to_api() {
+        let decision = should_use_local_with_pressure(
+            "Explain iterators",
+            PromptComplexity::Simple,
+            true,
+            Some(LocalRuntimePressure {
+                active_requests: 0,
+                max_concurrent_requests: 2,
+                queued_requests: 2,
+            }),
+        );
+        assert!(!decision.use_local);
+        assert_eq!(decision.reason, "local runtime queue depth high");
     }
 }

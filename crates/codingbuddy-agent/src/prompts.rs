@@ -313,7 +313,9 @@ This task requires architectural thinking. Before making ANY changes:\n\n\
 - If a test fails: fix it BEFORE moving to the next file\n\
 - If your plan was wrong: stop, re-read affected files, adjust plan\n\
 - Update todos after each meaningful step (`completed` / next `in_progress`)\n\
-- If a subagent finishes work, reflect it in parent todos with `todo_write`\n\n\
+- If a subagent finishes work, reflect it in parent todos with `todo_write`\n\
+- On continuation turns, re-check current step + current todo before the next edit\n\
+- Keep subtask handoffs deterministic: include `status`, `summary`, `next_action`, and `resume_session_id`\n\n\
 ### Anti-Patterns (NEVER do these)\n\
 - Editing a file you haven't read in THIS session\n\
 - Changing a function signature without grepping for all callers\n\

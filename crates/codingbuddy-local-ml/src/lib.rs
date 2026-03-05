@@ -7,13 +7,20 @@ pub mod model_registry;
 pub mod privacy;
 pub mod reranker;
 pub mod retrieval;
+#[cfg(feature = "experimental-speculative")]
 pub mod speculative;
 pub mod vector_index;
 
 pub use chunker::{Chunk, ChunkConfig, ChunkManifest, ChunkStrategy, chunk_workspace_metadata};
-pub use completion::{GenOpts, LocalGenBackend, MockGenerator};
+pub use completion::{
+    BackendFactory, GenOpts, LocalGenBackend, LocalRunnerLifecycleManager,
+    LocalRuntimeSchedulerSnapshot, MockGenerator,
+};
 pub use embeddings::{EmbeddingsBackend, MockEmbeddings};
-pub use model_manager::{ModelInfo, ModelManager, ModelManifest, ModelStatus};
+pub use model_manager::{
+    ModelInfo, ModelManager, ModelManifest, ModelStatus, RuntimeLifecycleEvent,
+    RuntimeLifecycleMetrics, RuntimeLifecycleSnapshot,
+};
 pub use privacy::{PrivacyConfig, PrivacyPolicy, PrivacyResult, PrivacyRouter, SensitiveMatch};
 pub use reranker::{MockReranker, RerankerBackend};
 pub use retrieval::{HybridRetriever, IndexBuildReport, IndexUpdateReport, RetrievalResult};

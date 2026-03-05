@@ -1,4 +1,5 @@
 use super::*;
+use codingbuddy_core::{ToolName, ToolTier};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -119,26 +120,104 @@ pub(super) fn handle_tool_search(
         return "Error: tool_search requires a non-empty 'query' string.".to_string();
     }
 
-    let matches = search_extended_tools(query, &tool_loop.discoverable_tools);
+    let mut matches = search_extended_tools(query, &tool_loop.discoverable_tools);
+    matches.sort_by_key(|tool| tool_search_priority(&tool.function.name));
+
+    let weak_model = is_weak_model_for_tool_search(&tool_loop.config.model);
+    let keyword_count = query
+        .split_whitespace()
+        .filter(|segment| !segment.trim().is_empty())
+        .count();
+    let promotion_cap = if weak_model {
+        if keyword_count <= 1 { 1 } else { 2 }
+    } else {
+        6
+    };
+
     let mut newly_enabled = 0usize;
+    let mut already_enabled = 0usize;
+    let mut deferred = 0usize;
     for tool in &matches {
-        if !tool_loop
+        if tool_loop
             .tools
             .iter()
-            .any(|t| t.function.name == tool.function.name)
+            .any(|existing| existing.function.name == tool.function.name)
         {
+            already_enabled += 1;
+            continue;
+        }
+        if newly_enabled < promotion_cap {
             tool_loop.tools.push(tool.clone());
             newly_enabled += 1;
+        } else {
+            deferred += 1;
         }
     }
 
-    let mut result = format_tool_search_results(&matches);
+    let visible = matches
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<ToolDefinition>>();
+    let mut result = format_tool_search_results(&visible);
+    if matches.len() > visible.len() {
+        let hidden = matches.len().saturating_sub(visible.len());
+        result.push_str(&format!(
+            "\n\n{hidden} additional match(es) hidden for brevity."
+        ));
+    }
     if newly_enabled > 0 {
         result.push_str(&format!(
-            "\n\nEnabled {newly_enabled} matching tool(s) for subsequent turns."
+            "\n\nEnabled {newly_enabled} matching tool(s) for subsequent turns{}.",
+            if weak_model {
+                " (weak-model guardrail: limited promotion set)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if already_enabled > 0 {
+        result.push_str(&format!(
+            "\nAlready active in this session: {already_enabled} match(es)."
+        ));
+    }
+    if deferred > 0 {
+        result.push_str(&format!(
+            "\nDeferred {deferred} match(es). Narrow your query to promote more tools."
         ));
     }
     result
+}
+
+fn is_weak_model_for_tool_search(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    !codingbuddy_core::is_reasoner_model(model)
+        && (lower.contains("deepseek")
+            || lower.contains("qwen")
+            || lower.contains("phi")
+            || lower.contains("tinyllama"))
+}
+
+fn tool_search_priority(name: &str) -> (u8, u8, String) {
+    let primary = match name {
+        "enter_plan_mode" | "exit_plan_mode" => 0,
+        "task_output" | "task_get" | "task_list" => 1,
+        "todo_read" | "todo_write" => 2,
+        "spawn_task" => 3,
+        "diagnostics_check" => 4,
+        "patch_direct" | "multi_edit" | "fs_edit" => 5,
+        "web_fetch" | "web_search" => 6,
+        "chrome_navigate" | "chrome_click" | "chrome_screenshot" => 7,
+        _ => 20,
+    };
+    let tier = ToolName::from_api_name(name)
+        .map(|tool| match tool.metadata().tier {
+            ToolTier::Core => 0,
+            ToolTier::Contextual => 1,
+            ToolTier::Extended => 2,
+        })
+        .unwrap_or(3);
+    (primary, tier, name.to_string())
 }
 
 pub(super) fn handle_extended_thinking(
@@ -448,11 +527,76 @@ pub(super) fn handle_task_output(
         .transpose()?
         .flatten();
 
+    let (output_source, output_text) = if let Some(run) = run.as_ref() {
+        if let Some(output) = run.output.as_deref() {
+            (Some("subagent"), Some(output.to_string()))
+        } else if let Some(error) = run.error.as_deref() {
+            (Some("subagent_error"), Some(error.to_string()))
+        } else if let Some(task) = task.as_ref() {
+            (
+                task.outcome.as_deref().map(|_| "task"),
+                task.outcome.as_deref().map(str::to_string),
+            )
+        } else {
+            (None, None)
+        }
+    } else if let Some(task) = task.as_ref() {
+        (
+            task.outcome.as_deref().map(|_| "task"),
+            task.outcome.as_deref().map(str::to_string),
+        )
+    } else {
+        (None, None)
+    };
+
+    let task_status = run
+        .as_ref()
+        .map(|record| record.status.as_str())
+        .or_else(|| task.as_ref().map(|record| record.status.as_str()))
+        .unwrap_or("unknown");
+    let resume_session_id = child_session
+        .as_ref()
+        .map(|session| session.session_id.to_string());
+    let next_action = if task_status.eq_ignore_ascii_case("running") {
+        "monitor_or_resume"
+    } else if task_status.eq_ignore_ascii_case("failed")
+        || task_status.eq_ignore_ascii_case("error")
+    {
+        "inspect_failure"
+    } else if resume_session_id.is_some() {
+        "resume_child_session_or_integrate_output"
+    } else {
+        "integrate_output"
+    };
+    let summary = output_text
+        .as_deref()
+        .map(|text| {
+            let trimmed = text.trim();
+            let end = trimmed.floor_char_boundary(240.min(trimmed.len()));
+            if trimmed.len() > end {
+                format!("{}...", &trimmed[..end])
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .filter(|text| !text.is_empty());
+
     Ok(serde_json::json!({
         "task": task,
         "run": run,
         "background_job": background_job,
         "child_session": child_session,
+        "output_source": output_source,
+        "output_text": output_text,
+        "handoff": {
+            "schema": "deepseek.task_handoff.v1",
+            "status": task_status,
+            "summary": summary,
+            "next_action": next_action,
+            "resume_session_id": resume_session_id,
+            "resume_command": resume_session_id.as_ref().map(|id| format!("codingbuddy --resume {id}")),
+            "source": output_source,
+        }
     })
     .to_string())
 }
@@ -721,6 +865,14 @@ pub(super) fn handle_spawn_task(
                         "child_session_id": child_session.session_id,
                         "background_job_id": background_job_id,
                         "status": "running",
+                        "handoff": {
+                            "schema": "deepseek.task_handoff.v1",
+                            "status": "running",
+                            "summary": "Subagent scheduled in background.",
+                            "next_action": "monitor_or_resume",
+                            "resume_session_id": child_session.session_id,
+                            "resume_command": format!("codingbuddy --resume {}", child_session.session_id),
+                        },
                         "todo_update_hint": {
                             "action": "set_in_progress",
                             "content": task_name,
@@ -763,6 +915,14 @@ pub(super) fn handle_spawn_task(
                     "child_session_id": child_session.session_id,
                     "status": "completed",
                     "output": result,
+                    "handoff": {
+                        "schema": "deepseek.task_handoff.v1",
+                        "status": "completed",
+                        "summary": "Subagent finished. Integrate output and advance checklist.",
+                        "next_action": "integrate_output",
+                        "resume_session_id": child_session.session_id,
+                        "resume_command": format!("codingbuddy --resume {}", child_session.session_id),
+                    },
                     "todo_update_hint": {
                         "action": "mark_completed",
                         "content": task_name,
@@ -804,7 +964,22 @@ pub(super) fn handle_spawn_task(
                     run_id,
                     error: e.to_string(),
                 });
-                Ok(message)
+                Ok(serde_json::json!({
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "child_session_id": child_session.session_id,
+                    "status": "failed",
+                    "error": message,
+                    "handoff": {
+                        "schema": "deepseek.task_handoff.v1",
+                        "status": "failed",
+                        "summary": "Subagent failed; inspect error and retry with narrowed scope.",
+                        "next_action": "inspect_failure",
+                        "resume_session_id": child_session.session_id,
+                        "resume_command": format!("codingbuddy --resume {}", child_session.session_id),
+                    }
+                })
+                .to_string())
             }
         };
         if let Some(ref hooks) = tool_loop.hooks {

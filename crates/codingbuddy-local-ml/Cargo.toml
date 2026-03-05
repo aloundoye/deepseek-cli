@@ -15,6 +15,7 @@ local-ml = [
     "tree-sitter-go", "tree-sitter-java",
 ]
 usearch-backend = ["dep:usearch"]
+experimental-speculative = []
 
 [dependencies]
 anyhow.workspace = true

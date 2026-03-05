@@ -1,0 +1,252 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Ask(Vec<String>),
+    Code(Vec<String>),
+    ChatMode(Option<String>),
+    Init,
+    Clear,
+    Compact(Option<String>),
+    Memory(Vec<String>),
+    Config,
+    Model(Option<String>),
+    Provider(Option<String>),
+    Cost,
+    Mcp(Vec<String>),
+    Rewind(Vec<String>),
+    Export(Vec<String>),
+    Plan(Vec<String>),
+    Status,
+    Effort(Option<String>),
+    Skills(Vec<String>),
+    Permissions(Vec<String>),
+    Background(Vec<String>),
+    Commit(Vec<String>),
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
+    Diff(Vec<String>),
+    Undo(Vec<String>),
+    Context,
+    Sandbox(Vec<String>),
+    Agents,
+    Tasks(Vec<String>),
+    Review(Vec<String>),
+    Search(Vec<String>),
+    Vim(Vec<String>),
+    TerminalSetup,
+    Keybindings,
+    Doctor,
+    Copy,
+    Paste,
+    Debug(Vec<String>),
+    Git(Vec<String>),
+    Settings,
+    Load(Vec<String>),
+    Save(Vec<String>),
+    Voice(Vec<String>),
+    Desktop(Vec<String>),
+    Todos(Vec<String>),
+    CommentTodos(Vec<String>),
+    Chrome(Vec<String>),
+    Exit,
+    Hooks(Vec<String>),
+    Rename(Option<String>),
+    Resume(Option<String>),
+    Stats,
+    Statusline(Vec<String>),
+    Theme(Option<String>),
+    Usage,
+    Add(Vec<String>),
+    Drop(Vec<String>),
+    ReadOnly(Vec<String>),
+    Map(Vec<String>),
+    MapRefresh(Vec<String>),
+    Run(Vec<String>),
+    Test(Vec<String>),
+    Lint(Vec<String>),
+    Tokens,
+    Web(Vec<String>),
+    AddDir(Vec<String>),
+    Bug,
+    PrComments(Vec<String>),
+    ReleaseNotes(Vec<String>),
+    Login,
+    Logout,
+    Unknown { name: String, args: Vec<String> },
+}
+
+impl SlashCommand {
+    pub fn parse(input: &str) -> Option<Self> {
+        let line = input.trim();
+        if !line.starts_with('/') {
+            return None;
+        }
+        let tokens = shell_words::split(&line[1..]).unwrap_or_default();
+        let mut parts = tokens.iter().map(String::as_str);
+        let name = parts.next()?.to_ascii_lowercase();
+        let args = parts.map(ToString::to_string).collect::<Vec<_>>();
+
+        let cmd = match name.as_str() {
+            "help" => Self::Help,
+            "ask" => Self::Ask(args),
+            "code" => Self::Code(args),
+            "chat-mode" | "chat_mode" => Self::ChatMode(args.first().cloned()),
+            "init" => Self::Init,
+            "clear" => Self::Clear,
+            "compact" => Self::Compact(args.first().cloned()),
+            "memory" => Self::Memory(args),
+            "config" => Self::Config,
+            "model" => Self::Model(args.first().cloned()),
+            "provider" => Self::Provider(args.first().cloned()),
+            "cost" => Self::Cost,
+            "mcp" => Self::Mcp(args),
+            "rewind" => Self::Rewind(args),
+            "export" => Self::Export(args),
+            "plan" => Self::Plan(args),
+            "status" => Self::Status,
+            "effort" => Self::Effort(args.first().cloned()),
+            "skills" => Self::Skills(args),
+            "permissions" => Self::Permissions(args),
+            "background" => Self::Background(args),
+            "commit" => Self::Commit(args),
+            "stage" => Self::Stage(args),
+            "unstage" => Self::Unstage(args),
+            "diff" => Self::Diff(args),
+            "undo" => Self::Undo(args),
+            "context" => Self::Context,
+            "sandbox" => Self::Sandbox(args),
+            "agents" => Self::Agents,
+            "tasks" => Self::Tasks(args),
+            "review" => Self::Review(args),
+            "search" => Self::Search(args),
+            "vim" => Self::Vim(args),
+            "terminal-setup" => Self::TerminalSetup,
+            "keybindings" => Self::Keybindings,
+            "doctor" => Self::Doctor,
+            "copy" => Self::Copy,
+            "paste" => Self::Paste,
+            "git" => Self::Git(args),
+            "settings" => Self::Settings,
+            "load" => Self::Load(args),
+            "save" => Self::Save(args),
+            "voice" => Self::Voice(args),
+            "debug" => Self::Debug(args),
+            "desktop" => Self::Desktop(args),
+            "todos" => Self::Todos(args),
+            "comment-todos" | "comment_todos" => Self::CommentTodos(args),
+            "chrome" => Self::Chrome(args),
+            "exit" | "quit" => Self::Exit,
+            "hooks" => Self::Hooks(args),
+            "rename" => Self::Rename(args.first().cloned()),
+            "resume" => Self::Resume(args.first().cloned()),
+            "stats" => Self::Stats,
+            "statusline" => Self::Statusline(args),
+            "theme" => Self::Theme(args.first().cloned()),
+            "usage" => Self::Usage,
+            "add" => Self::Add(args),
+            "drop" => Self::Drop(args),
+            "read-only" | "readonly" => Self::ReadOnly(args),
+            "map" => Self::Map(args),
+            "map-refresh" | "map_refresh" => Self::MapRefresh(args),
+            "run" => Self::Run(args),
+            "test" => Self::Test(args),
+            "lint" => Self::Lint(args),
+            "tokens" => Self::Tokens,
+            "web" => Self::Web(args),
+            "add-dir" => Self::AddDir(args),
+            "bug" => Self::Bug,
+            "pr_comments" | "pr-comments" => Self::PrComments(args),
+            "release-notes" | "release_notes" => Self::ReleaseNotes(args),
+            "login" => Self::Login,
+            "logout" => Self::Logout,
+            other => Self::Unknown {
+                name: other.to_string(),
+                args,
+            },
+        };
+        Some(cmd)
+    }
+}
+
+/// Slash commands with short descriptions for the autocomplete dropdown.
+pub const SLASH_COMMAND_CATALOG: &[(&str, &str)] = &[
+    ("help", "Show available commands"),
+    ("ask", "Ask a question (read-only)"),
+    ("code", "Switch to code mode"),
+    ("init", "Initialize project config"),
+    ("clear", "Clear conversation history"),
+    ("compact", "Compact conversation context"),
+    ("memory", "Edit project memory"),
+    ("config", "Show current configuration"),
+    ("model", "Switch or view model"),
+    ("cost", "Show session cost estimate"),
+    ("mcp", "Manage MCP servers"),
+    ("rewind", "Rewind to a checkpoint"),
+    ("export", "Export conversation"),
+    ("plan", "Plan mode or review"),
+    ("status", "Show session status"),
+    ("effort", "Set thinking effort level"),
+    ("skills", "List available skills"),
+    ("permissions", "Manage permissions"),
+    ("context", "Switch to context mode"),
+    ("sandbox", "Configure sandbox mode"),
+    ("agents", "List custom agents"),
+    ("tasks", "Manage background tasks"),
+    ("todos", "Show/update session todo checklist"),
+    ("comment-todos", "Scan TODO/FIXME comments in source files"),
+    ("review", "Review PR changes"),
+    ("search", "Search codebase"),
+    ("vim", "Toggle vim keybindings"),
+    ("commit", "Create a git commit"),
+    ("diff", "Show git diff"),
+    ("undo", "Undo last file change"),
+    ("add", "Add files to context"),
+    ("drop", "Drop files from context"),
+    ("tokens", "Show token usage"),
+    ("stats", "Show usage statistics"),
+    ("usage", "Show session usage"),
+    ("theme", "Change color theme"),
+    ("hooks", "Manage lifecycle hooks"),
+    ("web", "Fetch a web page"),
+    ("bug", "Report a bug"),
+    ("exit", "Exit the session"),
+    ("doctor", "Run diagnostics"),
+    ("copy", "Copy last response"),
+    ("debug", "Show debug info"),
+    ("login", "Authenticate with API"),
+    ("logout", "Remove API credentials"),
+    ("run", "Run a shell command"),
+    ("test", "Run project tests"),
+    ("lint", "Run project linter"),
+    ("map", "Show repo map"),
+    ("git", "Run git commands"),
+    ("voice", "Voice input mode"),
+    ("read-only", "Toggle read-only mode"),
+];
+
+pub fn slash_command_catalog_entries() -> &'static [(&'static str, &'static str)] {
+    SLASH_COMMAND_CATALOG
+}
+
+/// Filter slash commands by prefix, returning up to `limit` matches as "name — description".
+pub(crate) fn slash_command_suggestions(prefix: &str, limit: usize) -> Vec<String> {
+    let lower = prefix.to_ascii_lowercase();
+    SLASH_COMMAND_CATALOG
+        .iter()
+        .filter(|(name, _)| name.starts_with(&lower))
+        .take(limit)
+        .map(|(name, desc)| format!("/{name}  {desc}"))
+        .collect()
+}
+
+/// Return the raw command name from a slash suggestion display string.
+pub(crate) fn slash_suggestion_to_command(suggestion: &str) -> String {
+    // Format is "/name  description" — extract up to first double-space
+    suggestion
+        .split("  ")
+        .next()
+        .unwrap_or(suggestion)
+        .to_string()
+}
