@@ -31,7 +31,7 @@ edition = "2024"
 rust-version = "1.93"
 license-file = "LICENSE"
 license = "MIT"
-version = "0.1.7"
+version = "0.1.8"
 authors = ["CodingBuddy Contributors"]
 
 [workspace.dependencies]
