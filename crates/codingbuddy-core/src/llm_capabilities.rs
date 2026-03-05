@@ -543,7 +543,8 @@ mod tests {
         for (provider, model, expected) in cases {
             let caps = model_capabilities(provider, model);
             assert_eq!(
-                caps.preferred_edit_tool, expected,
+                caps.preferred_edit_tool,
+                expected,
                 "unexpected preferred edit tool for provider={} model={}",
                 provider.as_key(),
                 model
