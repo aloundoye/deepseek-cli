@@ -7,7 +7,8 @@ use codingbuddy_llm::LlmClient;
 use codingbuddy_store::Store;
 use codingbuddy_testkit::{
     CodingBenchmarkCaseResult, CodingBenchmarkGateThresholds, CodingBenchmarkReport, ScriptedLlm,
-    evaluate_coding_benchmark_gate_with_thresholds, read_coding_benchmark_report,
+    compare_coding_benchmark_reports, evaluate_coding_benchmark_gate_with_thresholds,
+    read_coding_benchmark_report, write_coding_benchmark_comparison_report,
     write_coding_benchmark_report,
 };
 use std::fs;
@@ -214,6 +215,48 @@ fn repo_root() -> PathBuf {
         .expect("workspace root")
 }
 
+fn benchmark_model_name() -> String {
+    std::env::var("CODINGBUDDY_BENCHMARK_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "scripted-tool-loop".to_string())
+}
+
+fn sanitize_benchmark_slug(input: &str) -> String {
+    let mut slug = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn benchmark_baseline_path(root: &Path, suite: &str, model: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CODINGBUDDY_BENCHMARK_BASELINE") {
+        let path = PathBuf::from(path);
+        return path.exists().then_some(path);
+    }
+
+    let model_specific = root.join("docs/benchmarks").join(format!(
+        "{suite}.{}.baseline.json",
+        sanitize_benchmark_slug(model)
+    ));
+    if model_specific.exists() {
+        return Some(model_specific);
+    }
+
+    let legacy = root.join("docs/benchmarks/coding_quality_baseline.json");
+    if model == "scripted-tool-loop" && legacy.exists() {
+        return Some(legacy);
+    }
+
+    None
+}
+
 #[test]
 fn coding_quality_benchmark_suite() -> Result<()> {
     let results = vec![
@@ -302,11 +345,9 @@ fn coding_quality_benchmark_suite() -> Result<()> {
         })?,
     ];
 
-    let report = CodingBenchmarkReport::from_case_results(
-        "coding-quality-core",
-        "scripted-tool-loop",
-        results,
-    );
+    let benchmark_model = benchmark_model_name();
+    let report =
+        CodingBenchmarkReport::from_case_results("coding-quality-core", &benchmark_model, results);
     assert_eq!(report.summary.total_cases, 4);
     assert!(
         report.summary.pass_rate_pct >= 75.0,
@@ -318,9 +359,9 @@ fn coding_quality_benchmark_suite() -> Result<()> {
     let output_dir = root.join(".codingbuddy/benchmarks");
     let report_path = write_coding_benchmark_report(&output_dir, &report)?;
     println!("coding_quality_benchmark_report={}", report_path.display());
+    println!("coding_quality_benchmark_model={}", report.model);
 
-    let baseline_path = root.join("docs/benchmarks/coding_quality_baseline.json");
-    if baseline_path.exists() {
+    if let Some(baseline_path) = benchmark_baseline_path(&root, &report.suite, &report.model) {
         let baseline = read_coding_benchmark_report(&baseline_path)?;
         let gate = evaluate_coding_benchmark_gate_with_thresholds(
             &report,
@@ -347,6 +388,38 @@ fn coding_quality_benchmark_suite() -> Result<()> {
             gate.baseline_avg_retries,
             gate.retries_delta,
             gate.max_retry_increase
+        );
+    }
+
+    if let Some(compare_to) = std::env::var_os("CODINGBUDDY_BENCHMARK_COMPARE_TO") {
+        let compare_to = PathBuf::from(compare_to);
+        let reference = read_coding_benchmark_report(&compare_to)?;
+        let comparison = compare_coding_benchmark_reports(&report, &reference);
+        assert!(
+            comparison.summary.comparable,
+            "coding benchmark comparison incompatible: suite_compatible={} case_ids_compatible={} case_categories_compatible={} current_only_cases={:?} reference_only_cases={:?} category_mismatch_cases={:?}",
+            comparison.summary.suite_compatible,
+            comparison.summary.case_ids_compatible,
+            comparison.summary.case_categories_compatible,
+            comparison.summary.current_only_cases,
+            comparison.summary.reference_only_cases,
+            comparison.summary.category_mismatch_cases,
+        );
+        let comparison_path = write_coding_benchmark_comparison_report(&output_dir, &comparison)?;
+        println!(
+            "coding_quality_benchmark_comparison={}",
+            comparison_path.display()
+        );
+        println!(
+            "coding_quality_benchmark_comparison_summary=current_model={} reference_model={} pass_rate_delta_pct={:.1} avg_quality_delta={:.3} avg_retries_delta={:.3} avg_duration_delta_ms={:.1} improved_cases={} regressed_cases={}",
+            comparison.current_model,
+            comparison.reference_model,
+            comparison.summary.pass_rate_delta_pct,
+            comparison.summary.avg_completion_quality_delta,
+            comparison.summary.avg_retries_delta,
+            comparison.summary.avg_duration_delta_ms,
+            comparison.summary.improved_case_count,
+            comparison.summary.regressed_case_count,
         );
     }
 

@@ -337,6 +337,53 @@ pub struct CodingBenchmarkGateResult {
     pub retries_delta: f32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkCaseComparison {
+    pub case_id: String,
+    pub category: String,
+    pub current_passed: bool,
+    pub reference_passed: bool,
+    pub tool_invocation_delta: isize,
+    pub retries_delta: isize,
+    pub quality_score_delta: f32,
+    pub duration_delta_ms: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CodingBenchmarkComparisonSummary {
+    pub comparable: bool,
+    pub suite_compatible: bool,
+    pub case_ids_compatible: bool,
+    pub case_categories_compatible: bool,
+    pub comparable_case_count: usize,
+    pub improved_case_count: usize,
+    pub regressed_case_count: usize,
+    pub current_only_cases: Vec<String>,
+    pub reference_only_cases: Vec<String>,
+    pub category_mismatch_cases: Vec<String>,
+    pub pass_rate_delta_pct: f32,
+    pub avg_completion_quality_delta: f32,
+    pub avg_retries_delta: f32,
+    pub avg_duration_delta_ms: f32,
+    pub category_pass_rate_delta_pct: BTreeMap<String, f32>,
+    pub category_avg_quality_delta: BTreeMap<String, f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkComparisonReport {
+    pub suite: String,
+    pub current_model: String,
+    pub reference_model: String,
+    pub generated_at_epoch_secs: u64,
+    pub cases: Vec<CodingBenchmarkCaseComparison>,
+    pub summary: CodingBenchmarkComparisonSummary,
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CodingBenchmarkGateThresholds {
     pub max_pass_rate_drop_pct: f32,
@@ -466,6 +513,135 @@ pub fn write_coding_benchmark_report(
 pub fn read_coding_benchmark_report(path: &Path) -> Result<CodingBenchmarkReport> {
     let raw = std::fs::read(path)?;
     Ok(serde_json::from_slice(&raw)?)
+}
+
+pub fn compare_coding_benchmark_reports(
+    current: &CodingBenchmarkReport,
+    reference: &CodingBenchmarkReport,
+) -> CodingBenchmarkComparisonReport {
+    let suite_compatible = current.suite == reference.suite;
+
+    let current_by_case: BTreeMap<&str, &CodingBenchmarkCaseResult> = current
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect();
+    let reference_by_case: BTreeMap<&str, &CodingBenchmarkCaseResult> = reference
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect();
+
+    let current_only_cases: Vec<String> = current_by_case
+        .keys()
+        .filter(|case_id| !reference_by_case.contains_key(**case_id))
+        .map(|case_id| (*case_id).to_string())
+        .collect();
+    let reference_only_cases: Vec<String> = reference_by_case
+        .keys()
+        .filter(|case_id| !current_by_case.contains_key(**case_id))
+        .map(|case_id| (*case_id).to_string())
+        .collect();
+    let case_ids_compatible = current_only_cases.is_empty() && reference_only_cases.is_empty();
+
+    let mut category_mismatch_cases = Vec::new();
+    let mut improved_case_count = 0usize;
+    let mut regressed_case_count = 0usize;
+    let mut cases = Vec::new();
+
+    for (case_id, current_case) in &current_by_case {
+        let Some(reference_case) = reference_by_case.get(case_id) else {
+            continue;
+        };
+
+        if current_case.category != reference_case.category {
+            category_mismatch_cases.push((*case_id).to_string());
+        }
+        if current_case.passed && !reference_case.passed {
+            improved_case_count = improved_case_count.saturating_add(1);
+        }
+        if !current_case.passed && reference_case.passed {
+            regressed_case_count = regressed_case_count.saturating_add(1);
+        }
+
+        cases.push(CodingBenchmarkCaseComparison {
+            case_id: (*case_id).to_string(),
+            category: current_case.category.clone(),
+            current_passed: current_case.passed,
+            reference_passed: reference_case.passed,
+            tool_invocation_delta: current_case.tool_invocations as isize
+                - reference_case.tool_invocations as isize,
+            retries_delta: current_case.retries as isize - reference_case.retries as isize,
+            quality_score_delta: current_case.completion_quality_score
+                - reference_case.completion_quality_score,
+            duration_delta_ms: current_case.duration_ms as f32 - reference_case.duration_ms as f32,
+            current_note: current_case.note.clone(),
+            reference_note: reference_case.note.clone(),
+        });
+    }
+
+    let case_categories_compatible = category_mismatch_cases.is_empty();
+    let comparable = suite_compatible && case_ids_compatible && case_categories_compatible;
+    let comparable_case_count = cases.len();
+
+    let mut category_pass_rate_delta_pct = BTreeMap::new();
+    for (category, current_value) in &current.summary.category_pass_rate_pct {
+        if let Some(reference_value) = reference.summary.category_pass_rate_pct.get(category) {
+            category_pass_rate_delta_pct.insert(category.clone(), current_value - reference_value);
+        }
+    }
+
+    let mut category_avg_quality_delta = BTreeMap::new();
+    for (category, current_value) in &current.summary.category_avg_quality_score {
+        if let Some(reference_value) = reference.summary.category_avg_quality_score.get(category) {
+            category_avg_quality_delta.insert(category.clone(), current_value - reference_value);
+        }
+    }
+
+    CodingBenchmarkComparisonReport {
+        suite: current.suite.clone(),
+        current_model: current.model.clone(),
+        reference_model: reference.model.clone(),
+        generated_at_epoch_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+        cases,
+        summary: CodingBenchmarkComparisonSummary {
+            comparable,
+            suite_compatible,
+            case_ids_compatible,
+            case_categories_compatible,
+            comparable_case_count,
+            improved_case_count,
+            regressed_case_count,
+            current_only_cases,
+            reference_only_cases,
+            category_mismatch_cases,
+            pass_rate_delta_pct: current.summary.pass_rate_pct - reference.summary.pass_rate_pct,
+            avg_completion_quality_delta: current.summary.avg_completion_quality_score
+                - reference.summary.avg_completion_quality_score,
+            avg_retries_delta: current.summary.avg_retries - reference.summary.avg_retries,
+            avg_duration_delta_ms: current.summary.avg_duration_ms
+                - reference.summary.avg_duration_ms,
+            category_pass_rate_delta_pct,
+            category_avg_quality_delta,
+        },
+    }
+}
+
+pub fn write_coding_benchmark_comparison_report(
+    output_root: &Path,
+    report: &CodingBenchmarkComparisonReport,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(output_root)?;
+    let suite = sanitize_slug(&report.suite);
+    let current_model = sanitize_slug(&report.current_model);
+    let reference_model = sanitize_slug(&report.reference_model);
+    let filename = format!("{suite}.{current_model}.vs.{reference_model}.comparison.json");
+    let path = output_root.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
+    Ok(path)
 }
 
 pub fn evaluate_coding_benchmark_gate(
@@ -983,5 +1159,140 @@ mod tests {
         );
         assert!(!gate.passed);
         assert!(!gate.suite_model_compatible);
+    }
+
+    #[test]
+    fn benchmark_comparison_reports_case_and_category_deltas() {
+        let current = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "deepseek-coder",
+            vec![
+                CodingBenchmarkCaseResult {
+                    case_id: "edit-single-file".to_string(),
+                    category: "edit".to_string(),
+                    passed: true,
+                    tool_invocations: 2,
+                    retries: 0,
+                    completion_quality_score: 1.0,
+                    duration_ms: 18,
+                    note: None,
+                },
+                CodingBenchmarkCaseResult {
+                    case_id: "debug-bugfix".to_string(),
+                    category: "debug".to_string(),
+                    passed: false,
+                    tool_invocations: 3,
+                    retries: 1,
+                    completion_quality_score: 0.5,
+                    duration_ms: 27,
+                    note: Some("missed edge case".to_string()),
+                },
+            ],
+        );
+        let reference = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "claude-code",
+            vec![
+                CodingBenchmarkCaseResult {
+                    case_id: "edit-single-file".to_string(),
+                    category: "edit".to_string(),
+                    passed: false,
+                    tool_invocations: 1,
+                    retries: 0,
+                    completion_quality_score: 0.4,
+                    duration_ms: 12,
+                    note: Some("patch incomplete".to_string()),
+                },
+                CodingBenchmarkCaseResult {
+                    case_id: "debug-bugfix".to_string(),
+                    category: "debug".to_string(),
+                    passed: true,
+                    tool_invocations: 2,
+                    retries: 0,
+                    completion_quality_score: 1.0,
+                    duration_ms: 20,
+                    note: None,
+                },
+            ],
+        );
+
+        let comparison = compare_coding_benchmark_reports(&current, &reference);
+        assert!(comparison.summary.comparable);
+        assert!(comparison.summary.suite_compatible);
+        assert!(comparison.summary.case_ids_compatible);
+        assert!(comparison.summary.case_categories_compatible);
+        assert_eq!(comparison.summary.comparable_case_count, 2);
+        assert_eq!(comparison.summary.improved_case_count, 1);
+        assert_eq!(comparison.summary.regressed_case_count, 1);
+        assert!(comparison.summary.pass_rate_delta_pct.abs() < f32::EPSILON);
+        assert!(
+            comparison.summary.avg_completion_quality_delta > 0.0,
+            "current quality should be higher than reference aggregate"
+        );
+        assert_eq!(
+            comparison.summary.category_pass_rate_delta_pct.get("edit"),
+            Some(&100.0)
+        );
+        assert_eq!(
+            comparison.summary.category_pass_rate_delta_pct.get("debug"),
+            Some(&-100.0)
+        );
+        assert_eq!(comparison.cases.len(), 2);
+        assert_eq!(comparison.cases[0].case_id, "debug-bugfix");
+        assert_eq!(comparison.cases[0].retries_delta, 1);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            write_coding_benchmark_comparison_report(dir.path(), &comparison).expect("write");
+        let written = std::fs::read(&path).expect("read comparison report");
+        let round_trip: CodingBenchmarkComparisonReport =
+            serde_json::from_slice(&written).expect("deserialize comparison report");
+        assert_eq!(round_trip.current_model, "deepseek-coder");
+        assert_eq!(round_trip.reference_model, "claude-code");
+    }
+
+    #[test]
+    fn benchmark_comparison_flags_case_set_mismatch() {
+        let current = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "deepseek-coder",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "edit-single-file".to_string(),
+                category: "edit".to_string(),
+                passed: true,
+                tool_invocations: 1,
+                retries: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                note: None,
+            }],
+        );
+        let reference = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "claude-code",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "multi-file-update".to_string(),
+                category: "multi-file".to_string(),
+                passed: true,
+                tool_invocations: 2,
+                retries: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                note: None,
+            }],
+        );
+
+        let comparison = compare_coding_benchmark_reports(&current, &reference);
+        assert!(!comparison.summary.comparable);
+        assert!(!comparison.summary.case_ids_compatible);
+        assert_eq!(
+            comparison.summary.current_only_cases,
+            vec!["edit-single-file".to_string()]
+        );
+        assert_eq!(
+            comparison.summary.reference_only_cases,
+            vec!["multi-file-update".to_string()]
+        );
+        assert!(comparison.cases.is_empty());
     }
 }
