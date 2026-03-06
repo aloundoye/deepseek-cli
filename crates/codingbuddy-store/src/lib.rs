@@ -3505,6 +3505,8 @@ pub struct RebuildProjection {
     pub permission_mode: Option<String>,
     pub task_ids: Vec<Uuid>,
     pub review_ids: Vec<Uuid>,
+    pub last_provider_model: Option<String>,
+    pub last_provider_compatibility: Option<codingbuddy_core::AppliedCompatibility>,
 }
 
 fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
@@ -3583,6 +3585,20 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
         EventKind::PermissionModeChanged { to, .. } => proj.permission_mode = Some(to.clone()),
         EventKind::TaskCreated { task_id, .. } => proj.task_ids.push(*task_id),
         EventKind::ReviewStarted { review_id, .. } => proj.review_ids.push(*review_id),
+        EventKind::ProviderCompatibilityApplied {
+            model,
+            provider,
+            transforms,
+            degraded_inputs,
+        } => {
+            proj.last_provider_model = Some(model.clone());
+            proj.last_provider_compatibility = Some(codingbuddy_core::AppliedCompatibility {
+                provider: provider.clone(),
+                family: String::new(),
+                transforms: transforms.clone(),
+                degraded_inputs: degraded_inputs.clone(),
+            });
+        }
         _ => {}
     }
 }
@@ -3668,6 +3684,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::EnterPlanMode { .. } => "EnterPlanMode@v1",
         EventKind::ExitPlanMode { .. } => "ExitPlanMode@v1",
         EventKind::ProviderSelected { .. } => "ProviderSelected@v1",
+        EventKind::ProviderCompatibilityApplied { .. } => "ProviderCompatibilityApplied@v1",
         EventKind::IndexBuild { .. } => "IndexBuild@v1",
         EventKind::IndexUpdate { .. } => "IndexUpdate@v1",
         EventKind::IndexQueryEvent { .. } => "IndexQuery@v1",

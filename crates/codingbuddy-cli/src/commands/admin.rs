@@ -335,6 +335,7 @@ pub(crate) fn run_doctor(cwd: &Path, args: DoctorArgs, json_mode: bool) -> Resul
 
 pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json::Value> {
     let cfg = AppConfig::ensure(cwd)?;
+    let store = Store::new(cwd)?;
     let plugin_manager = PluginManager::new(cwd)?;
     let plugins = plugin_manager.list().unwrap_or_default();
     let provider = cfg.llm.active_provider();
@@ -441,6 +442,12 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
         }
     }
 
+    let last_applied_compatibility = store
+        .load_latest_session()?
+        .map(|session| store.rebuild_from_events(session.session_id))
+        .transpose()?
+        .and_then(|projection| projection.last_provider_compatibility);
+
     let runtime_snapshot =
         codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
             .runtime_snapshot();
@@ -484,6 +491,7 @@ pub(crate) fn doctor_payload(cwd: &Path, args: &DoctorArgs) -> Result<serde_json
             "max_think_model": cfg.llm.active_reasoner_model(),
             "active_provider_kind": active_provider_kind.map(codingbuddy_core::ProviderKind::as_key),
             "capability_profiles": capability_profiles,
+            "last_applied_compatibility": last_applied_compatibility,
         },
         "plugins": {
             "installed": plugins.len(),

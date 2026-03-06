@@ -260,6 +260,7 @@ impl AgentEngine {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
 
@@ -582,13 +583,31 @@ impl AgentEngine {
             stream_cb.clone(),
         )?;
 
+        if let Some(compatibility) = response.compatibility.as_ref()
+            && (!compatibility.transforms.is_empty() || !compatibility.degraded_inputs.is_empty())
+        {
+            self.append_event_best_effort_for_session(
+                options.session_id,
+                EventKind::ProviderCompatibilityApplied {
+                    model: if options.force_max_think {
+                        self.cfg.llm.active_reasoner_model()
+                    } else {
+                        self.cfg.llm.active_base_model()
+                    },
+                    provider: compatibility.provider.clone(),
+                    transforms: compatibility.transforms.clone(),
+                    degraded_inputs: compatibility.degraded_inputs.clone(),
+                },
+            );
+        }
+
         // If we streamed token-by-token, complete_chat_streaming already emitted Done.
         // Only emit bulk ContentDelta + Done for the non-streaming fallback path.
         if stream_cb.is_none() {
-            self.stream(StreamChunk::ContentDelta(response.clone()));
+            self.stream(StreamChunk::ContentDelta(response.text.clone()));
             self.stream(StreamChunk::Done { reason: None });
         }
-        Ok(response)
+        Ok(response.text)
     }
 
     pub fn context_debug_preview(&self, prompt: &str, options: &ChatOptions) -> String {

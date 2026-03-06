@@ -3,6 +3,19 @@
 base_model = "deepseek-chat"
 max_think_model = "deepseek-reasoner"
 provider = "deepseek"
+# Optional named provider definitions. Provider-level `payload_options` are merged
+# into outbound requests before request-level namespaces.
+#
+#[llm.providers.deepseek]
+#kind = "deepseek"
+#base_url = "https://api.deepseek.com"
+#api_key_env = "DEEPSEEK_API_KEY"
+#openai_compat_prefix = false
+#payload_options = {}
+#
+#[llm.providers.deepseek.models]
+#chat = "deepseek-chat"
+#reasoner = "deepseek-reasoner"
 profile = "v3_2"
 context_window_tokens = 128000
 temperature = 0.2
@@ -20,16 +33,11 @@ retry_base_ms = 400
 stream = true
 
 [agent_loop]
-# Deterministic Architect -> Editor -> Apply -> Verify loop controls.
-max_iterations = 6
-architect_parse_retries = 2
-editor_parse_retries = 2
-max_files_per_iteration = 12
-max_file_bytes = 200000
-max_diff_bytes = 400000
+# Current runtime: tool-use loop (think -> act -> observe).
+# Complex tasks add an automatic Explore -> Plan -> Execute -> Verify phase overlay.
+# Legacy architect/editor compatibility keys are intentionally omitted from this sample.
+tool_loop_max_turns = 50
 verify_timeout_seconds = 60
-max_context_requests_per_iteration = 3
-max_context_range_lines = 400
 context_bootstrap_enabled = true
 context_bootstrap_max_tree_entries = 120
 context_bootstrap_max_readme_bytes = 24000

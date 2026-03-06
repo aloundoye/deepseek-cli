@@ -58,6 +58,7 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
             usage: None,
+            compatibility: None,
         },
         // Tool-use loop: model responds with text (no tool calls) → loop exits
         LlmResponse {
@@ -66,6 +67,7 @@ fn teammate_mode_single_lane_falls_back_to_tool_use_loop() -> Result<()> {
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
             usage: None,
+            compatibility: None,
         },
     ]));
     let mut engine = AgentEngine::new_with_llm(dir.path(), llm)?;

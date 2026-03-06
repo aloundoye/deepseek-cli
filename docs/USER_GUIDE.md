@@ -278,13 +278,27 @@ On your first message, the agent gathers context about your project:
 
 This means the agent understands your project before it starts working.
 
+### Agentic Loop
+
+CodingBuddy's default runtime is a tool-use loop:
+
+`User -> LLM -> Tool calls -> Results -> LLM -> ... -> Final response`
+
+For complex tasks, the same loop gains an automatic phase overlay:
+
+`Explore -> Plan -> Execute -> Verify`
+
+This is not a separate `Architect -> Editor -> Apply -> Verify` pipeline. Some old config keys still exist for compatibility, but the active runtime is the tool-use loop plus optional phase filtering.
+
 ### Task Complexity
 
 Every prompt is automatically classified:
 
+All task classes run inside the same tool-use loop. Complexity changes the prompt style, thinking budget, and whether the explicit phase overlay is enabled.
+
 - **Simple** (e.g., "fix the typo in README") → Fast response, minimal thinking
 - **Medium** (e.g., "add input validation to the form") → Reads files first, tests after
-- **Complex** (e.g., "refactor the database layer to use connection pooling") → Full planning protocol with explicit phase loop: Explore (read-only) → Plan (state approach) → Execute (implement) → Verify (test). Tools are filtered per phase — e.g., write tools are unavailable during Explore. Phase transitions happen automatically based on read-only call count, plan keywords, and edit count.
+- **Complex** (e.g., "refactor the database layer to use connection pooling") → Same tool-use loop, but with the explicit phase overlay: Explore (read-only) → Plan (state approach) → Execute (implement) → Verify (test). Tools are filtered per phase — e.g., write tools are unavailable during Explore. Phase transitions happen automatically based on read-only call count, plan keywords, and edit count.
 
 ### Post-Edit Validation
 
@@ -642,7 +656,7 @@ codingbuddy privacy redact-preview    # Preview what would be redacted
 
 ### Full ML (with models)
 
-Build with `--features local-ml` to enable Candle-powered backends. Models (~300MB–1.5GB) download from HuggingFace on first use and cache locally in `~/.cache/deepseek/`.
+Build with `--features local-ml` to enable Candle-powered backends. Models (~300MB–1.5GB) download from HuggingFace on first use and cache locally in `.codingbuddy/models/`.
 
 ---
 
@@ -654,8 +668,17 @@ Every conversation is automatically persisted.
 codingbuddy run                       # Resume last session
 codingbuddy run <session-id>          # Resume specific session
 codingbuddy status                    # Show current session status
+codingbuddy status --json             # Machine-readable provider/runtime diagnostics
+codingbuddy doctor --json             # Capability profiles + last applied compatibility/runtime snapshot
 codingbuddy usage                     # Show token usage and cost
 ```
+
+`status` and `doctor` now expose:
+
+- provider compatibility summaries for the active/base/reasoner models
+- the last applied compatibility transforms for the current session
+- local runtime queue/load state when local ML is enabled
+- stale-vs-live runtime timestamps so operators can tell when a snapshot is old
 
 ### Checkpoints & Rewind
 
@@ -755,6 +778,20 @@ codingbuddy --setting-sources          # Show which files contributed each setti
   "llm": {
     "base_model": "deepseek-chat",
     "max_think_model": "deepseek-reasoner",
+    "provider": "deepseek",
+    "providers": {
+      "deepseek": {
+        "kind": "deepseek",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "openai_compat_prefix": false,
+        "payload_options": null,
+        "models": {
+          "chat": "deepseek-chat",
+          "reasoner": "deepseek-reasoner"
+        }
+      }
+    },
     "context_window_tokens": 128000,
     "temperature": 0.2,
     "api_key_env": "DEEPSEEK_API_KEY"
@@ -770,7 +807,8 @@ codingbuddy --setting-sources          # Show which files contributed each setti
   },
   "ui": {
     "enable_tui": true,
-    "reduced_motion": false
+    "reduced_motion": false,
+    "thinking_visibility": "concise"
   }
 }
 ```
@@ -860,4 +898,4 @@ Quick fixes:
 - Ghost text empty → need `--features local-ml` build for real completions
 - Retrieval irrelevant → `codingbuddy index --hybrid clean` to rebuild
 - Privacy false positives → adjust `local_ml.privacy.path_globs` in config
-- Model download fails → check `~/.cache/deepseek/` permissions, falls back to mocks automatically
+- Model download fails → check `.codingbuddy/models/` permissions, falls back to mocks automatically

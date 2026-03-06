@@ -1038,6 +1038,7 @@ impl<'a> ToolUseLoop<'a> {
                     top_logprobs: None,
                     thinking: None,
                     images: vec![],
+                    provider_options: Default::default(),
                     response_format: None,
                 };
                 let summary_text = match self.llm.complete_chat(&summary_request) {
@@ -1148,6 +1149,18 @@ impl<'a> ToolUseLoop<'a> {
             } else {
                 self.llm.complete_chat(&request)?
             };
+
+            if let Some(compatibility) = response.compatibility.as_ref()
+                && (!compatibility.transforms.is_empty()
+                    || !compatibility.degraded_inputs.is_empty())
+            {
+                self.emit_event_if_present(EventKind::ProviderCompatibilityApplied {
+                    model: request.model.clone(),
+                    provider: compatibility.provider.clone(),
+                    transforms: compatibility.transforms.clone(),
+                    degraded_inputs: compatibility.degraded_inputs.clone(),
+                });
+            }
 
             // Accumulate usage
             if let Some(ref usage) = response.usage {
@@ -2270,6 +2283,7 @@ impl<'a> ToolUseLoop<'a> {
             top_logprobs: None,
             thinking,
             images: self.config.images.clone(),
+            provider_options: Default::default(),
             response_format: None,
         }
     }

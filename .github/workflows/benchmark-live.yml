@@ -1,0 +1,176 @@
+name: Live Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Benchmark suite to run
+        required: false
+        default: coding-quality-core
+        type: choice
+        options:
+          - coding-quality-core
+          - coding-quality-repo
+      deepseek_model:
+        description: DeepSeek model ID for the live lane
+        required: false
+        default: deepseek-chat
+      reference_model:
+        description: Reference model ID (leave blank to skip reference lane)
+        required: false
+        default: ""
+      reference_base_url:
+        description: Reference provider base URL (leave blank to skip reference lane)
+        required: false
+        default: ""
+      reference_provider_kind:
+        description: Reference provider kind
+        required: false
+        default: openai-compatible
+      reference_profile:
+        description: Reference profile label
+        required: false
+        default: reference
+  schedule:
+    - cron: '0 3 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  LIVE_BENCHMARK_SUITE: ${{ vars.LIVE_BENCHMARK_SUITE }}
+  LIVE_BENCHMARK_DEEPSEEK_MODEL: ${{ vars.LIVE_BENCHMARK_DEEPSEEK_MODEL }}
+  LIVE_BENCHMARK_REFERENCE_MODEL: ${{ vars.LIVE_BENCHMARK_REFERENCE_MODEL }}
+  LIVE_BENCHMARK_REFERENCE_BASE_URL: ${{ vars.LIVE_BENCHMARK_REFERENCE_BASE_URL }}
+  LIVE_BENCHMARK_REFERENCE_PROVIDER_KIND: ${{ vars.LIVE_BENCHMARK_REFERENCE_PROVIDER_KIND }}
+  LIVE_BENCHMARK_REFERENCE_PROFILE: ${{ vars.LIVE_BENCHMARK_REFERENCE_PROFILE }}
+
+jobs:
+  live-benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare benchmark workspace
+        run: mkdir -p .codingbuddy/benchmarks
+
+      - name: Run DeepSeek live lane
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SUITE_INPUT: ${{ github.event.inputs.suite }}
+          DEEPSEEK_MODEL_INPUT: ${{ github.event.inputs.deepseek_model }}
+        run: |
+          SUITE="${SUITE_INPUT:-${LIVE_BENCHMARK_SUITE:-coding-quality-core}}"
+          DEEPSEEK_MODEL="${DEEPSEEK_MODEL_INPUT:-${LIVE_BENCHMARK_DEEPSEEK_MODEL:-deepseek-chat}}"
+          if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+            echo "DEEPSEEK_API_KEY is not configured; skipping live benchmark lane."
+            exit 0
+          fi
+
+          cat > .codingbuddy/settings.local.json <<JSON
+          {
+            "llm": {
+              "provider": "deepseek",
+              "base_model": "${DEEPSEEK_MODEL}",
+              "max_think_model": "${DEEPSEEK_MODEL}",
+              "providers": {
+                "deepseek": {
+                  "kind": "deepseek",
+                  "base_url": "https://api.deepseek.com",
+                  "api_key_env": "DEEPSEEK_API_KEY",
+                  "openai_compat_prefix": false,
+                  "payload_options": null,
+                  "models": {
+                    "chat": "${DEEPSEEK_MODEL}",
+                    "reasoner": "${DEEPSEEK_MODEL}"
+                  }
+                }
+              }
+            }
+          }
+          JSON
+
+          CODINGBUDDY_BENCHMARK_LIVE=1 \
+          CODINGBUDDY_BENCHMARK_SUITE="${SUITE}" \
+          CODINGBUDDY_BENCHMARK_MODEL="deepseek-live" \
+          CODINGBUDDY_BENCHMARK_PROVIDER="deepseek" \
+          CODINGBUDDY_BENCHMARK_PROFILE="live" \
+          ./scripts/run_coding_quality_benchmark.sh
+
+      - name: Run reference live lane and comparison
+        env:
+          LIVE_BENCHMARK_REFERENCE_API_KEY: ${{ secrets.LIVE_BENCHMARK_REFERENCE_API_KEY }}
+          SUITE_INPUT: ${{ github.event.inputs.suite }}
+          REFERENCE_MODEL_INPUT: ${{ github.event.inputs.reference_model }}
+          REFERENCE_BASE_URL_INPUT: ${{ github.event.inputs.reference_base_url }}
+          REFERENCE_PROVIDER_KIND_INPUT: ${{ github.event.inputs.reference_provider_kind }}
+          REFERENCE_PROFILE_INPUT: ${{ github.event.inputs.reference_profile }}
+        run: |
+          SUITE="${SUITE_INPUT:-${LIVE_BENCHMARK_SUITE:-coding-quality-core}}"
+          REFERENCE_MODEL="${REFERENCE_MODEL_INPUT:-${LIVE_BENCHMARK_REFERENCE_MODEL:-}}"
+          REFERENCE_BASE_URL="${REFERENCE_BASE_URL_INPUT:-${LIVE_BENCHMARK_REFERENCE_BASE_URL:-}}"
+          REFERENCE_PROVIDER_KIND="${REFERENCE_PROVIDER_KIND_INPUT:-${LIVE_BENCHMARK_REFERENCE_PROVIDER_KIND:-openai-compatible}}"
+          REFERENCE_PROFILE="${REFERENCE_PROFILE_INPUT:-${LIVE_BENCHMARK_REFERENCE_PROFILE:-reference}}"
+          DEEPSEEK_REPORT=".codingbuddy/benchmarks/${SUITE}.deepseek-live.latest.json"
+
+          if [[ ! -f "${DEEPSEEK_REPORT}" ]]; then
+            echo "DeepSeek report not found; skipping reference lane."
+            exit 0
+          fi
+          if [[ -z "${LIVE_BENCHMARK_REFERENCE_API_KEY:-}" || -z "${REFERENCE_MODEL}" || -z "${REFERENCE_BASE_URL}" ]]; then
+            echo "Reference lane inputs/secrets are incomplete; skipping reference lane."
+            exit 0
+          fi
+
+          OPENAI_COMPAT=false
+          if [[ "${REFERENCE_PROVIDER_KIND}" == "openai-compatible" ]]; then
+            OPENAI_COMPAT=true
+          fi
+
+          cat > .codingbuddy/settings.local.json <<JSON
+          {
+            "llm": {
+              "provider": "reference",
+              "base_model": "${REFERENCE_MODEL}",
+              "max_think_model": "${REFERENCE_MODEL}",
+              "providers": {
+                "reference": {
+                  "kind": "${REFERENCE_PROVIDER_KIND}",
+                  "base_url": "${REFERENCE_BASE_URL}",
+                  "api_key_env": "LIVE_BENCHMARK_REFERENCE_API_KEY",
+                  "openai_compat_prefix": ${OPENAI_COMPAT},
+                  "payload_options": null,
+                  "models": {
+                    "chat": "${REFERENCE_MODEL}",
+                    "reasoner": "${REFERENCE_MODEL}"
+                  }
+                }
+              }
+            }
+          }
+          JSON
+
+          CODINGBUDDY_BENCHMARK_LIVE=1 \
+          CODINGBUDDY_BENCHMARK_SUITE="${SUITE}" \
+          CODINGBUDDY_BENCHMARK_MODEL="reference-live" \
+          CODINGBUDDY_BENCHMARK_PROVIDER="${REFERENCE_PROVIDER_KIND}" \
+          CODINGBUDDY_BENCHMARK_PROFILE="${REFERENCE_PROFILE}" \
+          CODINGBUDDY_BENCHMARK_COMPARE_TO="${DEEPSEEK_REPORT}" \
+          ./scripts/run_coding_quality_benchmark.sh
+
+      - name: Upload live benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-benchmark-artifacts
+          path: |
+            .codingbuddy/benchmarks/*.latest.json
+            .codingbuddy/benchmarks/*.comparison.json
+          if-no-files-found: ignore

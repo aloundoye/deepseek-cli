@@ -208,6 +208,7 @@ pub(crate) fn build_compaction_summary_with_llm(
         tool_choice: ToolChoice::none(),
         thinking: None,
         images: vec![],
+        provider_options: Default::default(),
         response_format: None,
     };
 

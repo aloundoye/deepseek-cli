@@ -93,6 +93,7 @@ pub fn scripted_text_response(text: &str) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        compatibility: None,
     }
 }
 
@@ -108,6 +109,7 @@ pub fn scripted_tool_response(calls: Vec<LlmToolCall>) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        compatibility: None,
     }
 }
 
@@ -289,7 +291,11 @@ pub struct CodingBenchmarkCaseResult {
     pub case_id: String,
     pub category: String,
     pub passed: bool,
+    pub patch_applied: bool,
+    pub build_passed: bool,
+    pub tests_passed: bool,
     pub tool_invocations: usize,
+    pub verification_attempts: usize,
     pub retries: usize,
     pub tool_denials: usize,
     pub compaction_events: usize,
@@ -310,7 +316,11 @@ pub struct CodingBenchmarkSummary {
     pub total_cases: usize,
     pub passed_cases: usize,
     pub pass_rate_pct: f32,
+    pub patch_applied_rate_pct: f32,
+    pub build_pass_rate_pct: f32,
+    pub test_pass_rate_pct: f32,
     pub avg_tool_invocations: f32,
+    pub avg_verification_attempts: f32,
     pub avg_retries: f32,
     pub avg_tool_denials: f32,
     pub avg_compaction_events: f32,
@@ -329,6 +339,12 @@ pub struct CodingBenchmarkSummary {
 pub struct CodingBenchmarkReport {
     pub suite: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
     pub generated_at_epoch_secs: u64,
     pub cases: Vec<CodingBenchmarkCaseResult>,
     pub summary: CodingBenchmarkSummary,
@@ -358,7 +374,14 @@ pub struct CodingBenchmarkCaseComparison {
     pub category: String,
     pub current_passed: bool,
     pub reference_passed: bool,
+    pub current_patch_applied: bool,
+    pub reference_patch_applied: bool,
+    pub current_build_passed: bool,
+    pub reference_build_passed: bool,
+    pub current_tests_passed: bool,
+    pub reference_tests_passed: bool,
     pub tool_invocation_delta: isize,
+    pub verification_attempts_delta: isize,
     pub retries_delta: isize,
     pub quality_score_delta: f32,
     pub duration_delta_ms: f32,
@@ -382,7 +405,11 @@ pub struct CodingBenchmarkComparisonSummary {
     pub reference_only_cases: Vec<String>,
     pub category_mismatch_cases: Vec<String>,
     pub pass_rate_delta_pct: f32,
+    pub patch_applied_rate_delta_pct: f32,
+    pub build_pass_rate_delta_pct: f32,
+    pub test_pass_rate_delta_pct: f32,
     pub avg_completion_quality_delta: f32,
+    pub avg_verification_attempts_delta: f32,
     pub avg_retries_delta: f32,
     pub avg_tool_denials_delta: f32,
     pub avg_compaction_events_delta: f32,
@@ -398,7 +425,19 @@ pub struct CodingBenchmarkComparisonSummary {
 pub struct CodingBenchmarkComparisonReport {
     pub suite: String,
     pub current_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_lane: Option<String>,
     pub reference_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_lane: Option<String>,
     pub generated_at_epoch_secs: u64,
     pub cases: Vec<CodingBenchmarkCaseComparison>,
     pub summary: CodingBenchmarkComparisonSummary,
@@ -427,6 +466,17 @@ impl CodingBenchmarkReport {
         model: &str,
         cases: Vec<CodingBenchmarkCaseResult>,
     ) -> Self {
+        Self::from_case_results_with_metadata(suite, model, None, None, None, cases)
+    }
+
+    pub fn from_case_results_with_metadata(
+        suite: &str,
+        model: &str,
+        provider: Option<String>,
+        profile: Option<String>,
+        lane: Option<String>,
+        cases: Vec<CodingBenchmarkCaseResult>,
+    ) -> Self {
         let total_cases = cases.len();
         let passed_cases = cases.iter().filter(|case| case.passed).count();
         let pass_rate_pct = if total_cases == 0 {
@@ -434,12 +484,39 @@ impl CodingBenchmarkReport {
         } else {
             passed_cases as f32 * 100.0 / total_cases as f32
         };
+        let patch_applied_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().filter(|case| case.patch_applied).count() as f32 * 100.0
+                / total_cases as f32
+        };
+        let build_pass_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().filter(|case| case.build_passed).count() as f32 * 100.0
+                / total_cases as f32
+        };
+        let test_pass_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().filter(|case| case.tests_passed).count() as f32 * 100.0
+                / total_cases as f32
+        };
         let avg_tool_invocations = if total_cases == 0 {
             0.0
         } else {
             cases
                 .iter()
                 .map(|case| case.tool_invocations as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_verification_attempts = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.verification_attempts as f32)
                 .sum::<f32>()
                 / total_cases as f32
         };
@@ -560,6 +637,9 @@ impl CodingBenchmarkReport {
         Self {
             suite: suite.to_string(),
             model: model.to_string(),
+            provider,
+            profile,
+            lane,
             generated_at_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -569,7 +649,11 @@ impl CodingBenchmarkReport {
                 total_cases,
                 passed_cases,
                 pass_rate_pct,
+                patch_applied_rate_pct,
+                build_pass_rate_pct,
+                test_pass_rate_pct,
                 avg_tool_invocations,
+                avg_verification_attempts,
                 avg_retries,
                 avg_tool_denials,
                 avg_compaction_events,
@@ -659,8 +743,16 @@ pub fn compare_coding_benchmark_reports(
             category: current_case.category.clone(),
             current_passed: current_case.passed,
             reference_passed: reference_case.passed,
+            current_patch_applied: current_case.patch_applied,
+            reference_patch_applied: reference_case.patch_applied,
+            current_build_passed: current_case.build_passed,
+            reference_build_passed: reference_case.build_passed,
+            current_tests_passed: current_case.tests_passed,
+            reference_tests_passed: reference_case.tests_passed,
             tool_invocation_delta: current_case.tool_invocations as isize
                 - reference_case.tool_invocations as isize,
+            verification_attempts_delta: current_case.verification_attempts as isize
+                - reference_case.verification_attempts as isize,
             retries_delta: current_case.retries as isize - reference_case.retries as isize,
             quality_score_delta: current_case.completion_quality_score
                 - reference_case.completion_quality_score,
@@ -691,7 +783,13 @@ pub fn compare_coding_benchmark_reports(
     CodingBenchmarkComparisonReport {
         suite: current.suite.clone(),
         current_model: current.model.clone(),
+        current_provider: current.provider.clone(),
+        current_profile: current.profile.clone(),
+        current_lane: current.lane.clone(),
         reference_model: reference.model.clone(),
+        reference_provider: reference.provider.clone(),
+        reference_profile: reference.profile.clone(),
+        reference_lane: reference.lane.clone(),
         generated_at_epoch_secs: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -709,8 +807,16 @@ pub fn compare_coding_benchmark_reports(
             reference_only_cases,
             category_mismatch_cases,
             pass_rate_delta_pct: current.summary.pass_rate_pct - reference.summary.pass_rate_pct,
+            patch_applied_rate_delta_pct: current.summary.patch_applied_rate_pct
+                - reference.summary.patch_applied_rate_pct,
+            build_pass_rate_delta_pct: current.summary.build_pass_rate_pct
+                - reference.summary.build_pass_rate_pct,
+            test_pass_rate_delta_pct: current.summary.test_pass_rate_pct
+                - reference.summary.test_pass_rate_pct,
             avg_completion_quality_delta: current.summary.avg_completion_quality_score
                 - reference.summary.avg_completion_quality_score,
+            avg_verification_attempts_delta: current.summary.avg_verification_attempts
+                - reference.summary.avg_verification_attempts,
             avg_retries_delta: current.summary.avg_retries - reference.summary.avg_retries,
             avg_tool_denials_delta: current.summary.avg_tool_denials
                 - reference.summary.avg_tool_denials,
@@ -1164,6 +1270,10 @@ mod tests {
                     case_id: "edit-single-file".to_string(),
                     category: "edit".to_string(),
                     passed: true,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 2,
                     retries: 0,
                     tool_denials: 0,
@@ -1181,6 +1291,10 @@ mod tests {
                     case_id: "debug-bugfix".to_string(),
                     category: "debug".to_string(),
                     passed: false,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 1,
                     retries: 1,
                     tool_denials: 1,
@@ -1217,6 +1331,10 @@ mod tests {
                 case_id: "baseline".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
                 tool_denials: 0,
@@ -1254,6 +1372,10 @@ mod tests {
                 case_id: "c1".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
                 tool_denials: 0,
@@ -1275,6 +1397,10 @@ mod tests {
                 case_id: "b1".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
                 tool_denials: 0,
@@ -1308,6 +1434,10 @@ mod tests {
                     case_id: "edit-single-file".to_string(),
                     category: "edit".to_string(),
                     passed: true,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 2,
                     retries: 0,
                     tool_denials: 0,
@@ -1325,6 +1455,10 @@ mod tests {
                     case_id: "debug-bugfix".to_string(),
                     category: "debug".to_string(),
                     passed: false,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 3,
                     retries: 1,
                     tool_denials: 1,
@@ -1348,6 +1482,10 @@ mod tests {
                     case_id: "edit-single-file".to_string(),
                     category: "edit".to_string(),
                     passed: false,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 1,
                     retries: 0,
                     tool_denials: 0,
@@ -1365,6 +1503,10 @@ mod tests {
                     case_id: "debug-bugfix".to_string(),
                     category: "debug".to_string(),
                     passed: true,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 2,
                     retries: 0,
                     tool_denials: 0,
@@ -1427,6 +1569,10 @@ mod tests {
                 case_id: "edit-single-file".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
                 tool_denials: 0,
@@ -1448,6 +1594,10 @@ mod tests {
                 case_id: "multi-file-update".to_string(),
                 category: "multi-file".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 2,
                 retries: 0,
                 tool_denials: 0,

@@ -128,6 +128,7 @@ fn make_text_response(text: &str) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        compatibility: None,
     }
 }
 
@@ -142,6 +143,7 @@ fn make_tool_response(tool_calls: Vec<LlmToolCall>) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        compatibility: None,
     }
 }
 

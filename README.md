@@ -4,7 +4,7 @@ CodingBuddy is a terminal-native coding agent written in Rust. It combines chat,
 
 ## Highlights
 - **Agent intelligence**: Adaptive complexity (Simple/Medium/Complex), planning protocols, error recovery, stuck detection
-- **Explicit phase loop**: Complex tasks follow Explore→Plan→Execute→Verify with per-phase tool filtering
+- **Phase overlay for complex tasks**: Complex tasks stay in the tool-use loop but add Explore→Plan→Execute→Verify with per-phase tool filtering
 - **Post-edit validation**: LSP-like diagnostics (`cargo check`, `tsc`, `py_compile`, `go vet`) fed back to the LLM for self-correction
 - **Per-model system prompts**: Optimized prompts for DeepSeek chat/reasoner, Qwen (concise), and Gemini (methodical)
 - **Agent profiles**: Task-specialized tool filtering (build/explore/plan) — reduces decision space for weaker models
@@ -13,7 +13,8 @@ CodingBuddy is a terminal-native coding agent written in Rust. It combines chat,
 - **Per-turn retrieval**: Vector + BM25 code search with RRF fusion — fires every turn, not just the first
 - **Privacy scanning**: 3-layer secret detection (path/content/builtin patterns) with redaction on tool outputs
 - **Ghost text**: Local ML-powered inline completions in the TUI (Tab to accept, Alt+Right for one word)
-- **Provider support**: DeepSeek is fully supported today. OpenAI-compatible and Ollama support are planned as capability-gated providers rather than best-effort aliases.
+- **Provider compatibility boundary**: DeepSeek, OpenAI-compatible gateways, and Ollama are routed through capability-gated request/response shims instead of best-effort aliases
+- **Operator diagnostics**: `status` and `doctor` expose provider compatibility transforms plus live local-runtime queue/load state
 - **Model routing**: Automatically routes complex tasks to `deepseek-reasoner`, simple tasks to `deepseek-chat`
 - **Step snapshots**: Per-tool-call file snapshots with content hashing for fine-grained undo
 - **Default deny rules**: Built-in safety rules block dangerous operations (`rm -rf`, `git push --force`, `.env` edits)
@@ -68,7 +69,7 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 - The loop continues until the LLM responds without tool calls (task complete)
 - Thinking mode (`deepseek-reasoner`) can be enabled for complex reasoning
 - Adaptive complexity: Simple/Medium/Complex classification with thinking budget escalation (8K→64K)
-- Explicit phase loop: Complex tasks follow Explore→Plan→Execute→Verify with per-phase tool filtering
+- Explicit phase overlay: Complex tasks stay in the tool-use loop while adding Explore→Plan→Execute→Verify with per-phase tool filtering
 - Post-edit validation: LSP-like diagnostics after file edits, fed back to LLM for immediate self-correction
 - Agent profiles: task-type tool filtering (build/explore/plan) reduces the model's decision space
 - Doom loop detection: rolling hash window detects 3+ identical tool calls and injects corrective guidance
@@ -80,6 +81,8 @@ User → LLM (with tools) → Tool calls → Results → LLM → ... → Final r
 - Error recovery: automatic guidance injection on failures, stuck detection after repeated errors
 - Model routing: Complex+escalated tasks route to `deepseek-reasoner` automatically
 - Default deny rules: built-in safety rules for dangerous operations (rm -rf, force push, .env edits)
+
+This is a ReAct-style tool loop, not a hardcoded `Architect -> Editor -> Apply -> Verify` pipeline. For complex tasks, `Explore -> Plan -> Execute -> Verify` is an overlay on the same loop, not a separate runtime.
 
 ## Install
 
@@ -139,7 +142,7 @@ Run `codingbuddy --help` for full details. The most used commands are:
 - `codingbuddy review --diff|--staged|--pr <n>`: code review workflows
 - `codingbuddy exec "<command>"`: policy-enforced shell execution
 - `codingbuddy diff`, `codingbuddy apply`, `codingbuddy rewind`: patch/checkpoint lifecycle
-- `codingbuddy status`, `codingbuddy context`, `codingbuddy usage`: runtime and cost visibility
+- `codingbuddy status`, `codingbuddy doctor`, `codingbuddy context`, `codingbuddy usage`: runtime, provider compatibility, and cost visibility
 - `codingbuddy index build|update|status|watch|query`: local code index operations
 - `codingbuddy permissions show|set|dry-run`: safety policy inspection and tuning
 - `codingbuddy replay run|list`: deterministic replay tooling
@@ -268,3 +271,4 @@ cargo build --release --bin codingbuddy
 - **[Configuration Reference](docs/CONFIG_REFERENCE.md)** — all settings with types and defaults
 - **[Operations Playbook](docs/OPERATIONS.md)** — incident response, failure modes, rollback
 - **[Release Guide](docs/RELEASE.md)** — release process, artifacts, installers
+- **[Audit Closure Status](docs/AUDIT_CLOSURE_STATUS.md)** — tracked closure state for the three-codebase audit

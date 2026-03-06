@@ -166,6 +166,7 @@ fn test_compaction_validation_catches_empty_summary() {
             reasoning_content: String::new(),
             tool_calls: vec![],
             usage: None,
+            compatibility: None,
         },
     ]);
     let tool_host = Arc::new(MockToolHost::new(vec![], true));

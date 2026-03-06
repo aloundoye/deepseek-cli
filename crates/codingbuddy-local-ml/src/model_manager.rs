@@ -66,6 +66,27 @@ pub struct RuntimeLifecycleEvent {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RunnerLifecycleState {
+    Loading,
+    Warm,
+    Busy,
+    Reloading,
+    Expiring,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeSchedulerLiveSnapshot {
+    pub active_requests: usize,
+    pub queued_requests: usize,
+    pub loading_model: Option<String>,
+    pub loading_waiters: usize,
+    pub loaded_runners: Vec<String>,
+    pub updated_at_epoch_secs: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RuntimeLifecycleMetrics {
@@ -111,6 +132,10 @@ pub struct RuntimeLifecycleSnapshot {
     #[serde(default)]
     pub scheduler: RuntimeSchedulerPolicySnapshot,
     pub warm_models: Vec<String>,
+    #[serde(default)]
+    pub live: RuntimeSchedulerLiveSnapshot,
+    #[serde(default)]
+    pub runner_states: BTreeMap<String, RunnerLifecycleState>,
     pub metrics: RuntimeLifecycleMetrics,
     pub recent_events: Vec<RuntimeLifecycleEvent>,
 }
@@ -123,6 +148,10 @@ struct RuntimeStateFile {
     metrics: RuntimeLifecycleMetrics,
     #[serde(default)]
     scheduler_policy: RuntimeSchedulerPolicySnapshot,
+    #[serde(default)]
+    live: RuntimeSchedulerLiveSnapshot,
+    #[serde(default)]
+    runner_states: BTreeMap<String, RunnerLifecycleState>,
     #[serde(default)]
     recent_events: Vec<RuntimeLifecycleEvent>,
 }
@@ -145,6 +174,8 @@ pub struct ModelManager {
     statuses: BTreeMap<String, ModelStatus>,
     runtime_policy: LocalModelRuntimePolicy,
     runtime_scheduler_policy: RuntimeSchedulerPolicySnapshot,
+    runtime_live: RuntimeSchedulerLiveSnapshot,
+    runtime_runner_states: BTreeMap<String, RunnerLifecycleState>,
     runtime_slots: BTreeMap<String, RuntimeSlotState>,
     runtime_metrics: RuntimeLifecycleMetrics,
     runtime_events: Vec<RuntimeLifecycleEvent>,
@@ -182,6 +213,8 @@ impl ModelManager {
             statuses: BTreeMap::new(),
             runtime_policy,
             runtime_scheduler_policy,
+            runtime_live: persisted.live,
+            runtime_runner_states: persisted.runner_states,
             runtime_slots: persisted.runtime_slots,
             runtime_metrics: persisted.metrics,
             runtime_events: persisted.recent_events,
@@ -372,6 +405,8 @@ impl ModelManager {
             aggressive_eviction: self.runtime_policy.aggressive_eviction,
             scheduler: self.runtime_scheduler_policy.clone(),
             warm_models: self.warm_runtime_models(),
+            live: self.runtime_live.clone(),
+            runner_states: self.runtime_runner_states.clone(),
             metrics: self.runtime_metrics.clone(),
             recent_events: self.runtime_events.clone(),
         }
@@ -405,6 +440,54 @@ impl ModelManager {
             )),
         });
         self.persist_runtime_state();
+    }
+
+    /// Persist the scheduler live state for operator diagnostics.
+    pub fn record_runtime_live_snapshot(&mut self, mut snapshot: RuntimeSchedulerLiveSnapshot) {
+        snapshot.updated_at_epoch_secs = now_epoch_secs();
+        if self.runtime_live == snapshot {
+            return;
+        }
+        self.runtime_live = snapshot;
+        self.persist_runtime_state();
+    }
+
+    /// Record an explicit lifecycle state for a runner.
+    pub fn set_runner_state(
+        &mut self,
+        model_id: &str,
+        state: RunnerLifecycleState,
+        detail: Option<&str>,
+    ) {
+        if model_id.trim().is_empty() {
+            return;
+        }
+        if self.runtime_runner_states.get(model_id) == Some(&state) {
+            return;
+        }
+        self.runtime_runner_states
+            .insert(model_id.to_string(), state);
+        self.push_runtime_event(RuntimeLifecycleEvent {
+            kind: "runner_state".to_string(),
+            model_id: Some(model_id.to_string()),
+            at_epoch_secs: now_epoch_secs(),
+            detail: Some(match detail {
+                Some(detail) => format!("state={:?}; {}", state, compact_detail(detail)),
+                None => format!("state={:?}", state),
+            }),
+        });
+        self.persist_runtime_state();
+    }
+
+    /// Clear persisted state for a runner that has fully expired/unloaded.
+    pub fn clear_runner_state(&mut self, model_id: &str) {
+        if self.runtime_runner_states.remove(model_id).is_some() {
+            self.persist_runtime_state();
+        }
+    }
+
+    pub fn runner_state(&self, model_id: &str) -> Option<RunnerLifecycleState> {
+        self.runtime_runner_states.get(model_id).copied()
     }
 
     /// Record queue depth when a scheduler enqueues a request.
@@ -515,11 +598,23 @@ impl ModelManager {
         let victim = self
             .runtime_slots
             .iter()
-            .filter(|(candidate, _)| candidate.as_str() != target_model_id)
+            .filter(|(candidate, _)| {
+                candidate.as_str() != target_model_id && self.runner_is_evictable(candidate)
+            })
             .min_by_key(|(_, slot)| (slot.last_used_epoch_secs, slot.loaded_at_epoch_secs))
             .map(|(candidate, _)| candidate.clone())
-            .or_else(|| self.runtime_slots.keys().next().cloned())?;
+            .or_else(|| {
+                self.runtime_slots
+                    .keys()
+                    .find(|candidate| self.runner_is_evictable(candidate))
+                    .cloned()
+            })?;
         self.runtime_slots.remove(&victim);
+        self.set_runner_state(
+            &victim,
+            RunnerLifecycleState::Expiring,
+            Some("memory pressure eviction"),
+        );
         self.runtime_metrics.total_memory_pressure_evictions = self
             .runtime_metrics
             .total_memory_pressure_evictions
@@ -635,14 +730,26 @@ impl ModelManager {
             let victim = self
                 .runtime_slots
                 .iter()
-                .filter(|(candidate, _)| candidate.as_str() != model_id)
+                .filter(|(candidate, _)| {
+                    candidate.as_str() != model_id && self.runner_is_evictable(candidate)
+                })
                 .min_by_key(|(_, slot)| (slot.last_used_epoch_secs, slot.loaded_at_epoch_secs))
                 .map(|(candidate, _)| candidate.clone())
-                .or_else(|| self.runtime_slots.keys().next().cloned());
+                .or_else(|| {
+                    self.runtime_slots
+                        .keys()
+                        .find(|candidate| self.runner_is_evictable(candidate))
+                        .cloned()
+                });
             let Some(victim) = victim else {
                 break;
             };
             self.runtime_slots.remove(&victim);
+            self.set_runner_state(
+                &victim,
+                RunnerLifecycleState::Expiring,
+                Some("capacity eviction"),
+            );
             evicted.push(victim);
         }
 
@@ -673,8 +780,17 @@ impl ModelManager {
         }
         let threshold = now_epoch_secs.saturating_sub(keep_warm);
         let mut evicted = Vec::new();
+        let runner_states = self.runtime_runner_states.clone();
         self.runtime_slots.retain(|model_id, slot| {
-            let keep = slot.last_used_epoch_secs >= threshold;
+            let busy_or_loading = matches!(
+                runner_states.get(model_id),
+                Some(
+                    RunnerLifecycleState::Loading
+                        | RunnerLifecycleState::Busy
+                        | RunnerLifecycleState::Reloading
+                )
+            );
+            let keep = slot.last_used_epoch_secs >= threshold || busy_or_loading;
             if !keep {
                 evicted.push(model_id.clone());
             }
@@ -686,6 +802,11 @@ impl ModelManager {
                 .total_idle_evictions
                 .saturating_add(evicted.len() as u64);
             for victim in &evicted {
+                self.set_runner_state(
+                    victim,
+                    RunnerLifecycleState::Expiring,
+                    Some("idle eviction"),
+                );
                 self.push_runtime_event(RuntimeLifecycleEvent {
                     kind: "runner_evicted_idle".to_string(),
                     model_id: Some(victim.clone()),
@@ -696,6 +817,17 @@ impl ModelManager {
             self.persist_runtime_state();
         }
         evicted
+    }
+
+    fn runner_is_evictable(&self, model_id: &str) -> bool {
+        !matches!(
+            self.runtime_runner_states.get(model_id),
+            Some(
+                RunnerLifecycleState::Loading
+                    | RunnerLifecycleState::Busy
+                    | RunnerLifecycleState::Reloading
+            )
+        )
     }
 
     /// Ensure a model is downloaded and ready. Without `local-ml` feature,
@@ -993,6 +1125,8 @@ impl ModelManager {
             runtime_slots: self.runtime_slots.clone(),
             metrics: self.runtime_metrics.clone(),
             scheduler_policy: self.runtime_scheduler_policy.clone(),
+            live: self.runtime_live.clone(),
+            runner_states: self.runtime_runner_states.clone(),
             recent_events: self.runtime_events.clone(),
         };
         let path = self.runtime_state_path();

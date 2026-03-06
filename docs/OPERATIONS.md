@@ -13,7 +13,8 @@
 ## Common failure modes and responses
 - LLM outage / rate limit:
   - Verify `DEEPSEEK_API_KEY` or `llm.api_key` is configured and endpoint/provider/profile settings are correct.
-  - Confirm `llm.provider=deepseek`; unsupported providers fail fast.
+  - Confirm the selected provider entry under `llm.providers` has the right `base_url`, `models`, and optional `payload_options` for the gateway you are using.
+  - Use `codingbuddy status --json` or `codingbuddy doctor --json` to inspect active compatibility transforms and the last applied compatibility shim.
   - Increase retry/backoff in `[llm]`.
   - For non-urgent workloads, consider `[scheduling].off_peak=true` and `[scheduling].defer_non_urgent=true`.
 - Tool execution denied:
@@ -86,20 +87,25 @@
   - Builds `codingbuddy` artifacts for Linux, macOS, and Windows
   - Publishes `checksums.txt`
   - Creates the `vX.Y.Z` tag and GitHub release
+- `benchmark-live.yml`
+  - Runs ignored live benchmark suites on a manual or nightly path
+  - Produces DeepSeek live reports, optional reference-lane reports, and comparison artifacts when reference secrets are configured
 
 ## Production drill cadence
 - Weekly manual checks:
   - Run `cargo test --workspace --all-targets`
   - Run `./scripts/run_coding_quality_benchmark.sh`
+  - Review the latest live benchmark artifact from `benchmark-live.yml` when provider credentials are configured
   - On Linux, run:
     - `bash scripts/parity_regression_check.sh`
     - `bash scripts/runtime_conformance_scan.sh`
 - Before each release:
   - Ensure `ci.yml` is green on `main`
+  - Ensure `benchmark-live.yml` has a recent successful manual/nightly run if live provider credentials are configured
   - Confirm installer dry-runs either from CI artifacts/logs or locally:
     - `bash scripts/install.sh --dry-run --version vX.Y.Z --repo aloundoye/codingbuddy`
     - `./scripts/install.ps1 -DryRun -Version vX.Y.Z -Repo aloundoye/codingbuddy`
-  - If production API credentials are available, run a bounded manual smoke in a disposable workspace. No dedicated live-smoke workflow exists in this repo today.
+  - If production API credentials are available, run a bounded manual smoke in a disposable workspace. The live benchmark workflow is still non-blocking and does not replace a final release smoke.
 
 ## Telemetry policy
 - Telemetry is opt-in only (`[telemetry].enabled=false` by default).

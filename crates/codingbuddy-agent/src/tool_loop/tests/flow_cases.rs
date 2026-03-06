@@ -408,6 +408,7 @@ fn content_filter_returns_error() {
         reasoning_content: String::new(),
         tool_calls: vec![],
         usage: None,
+        compatibility: None,
     }]);
 
     let tool_host = Arc::new(MockToolHost::new(vec![], true));

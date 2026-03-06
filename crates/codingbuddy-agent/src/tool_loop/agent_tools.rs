@@ -247,6 +247,7 @@ pub(super) fn handle_extended_thinking(
         top_logprobs: None,
         thinking: None,
         images: vec![],
+        provider_options: Default::default(),
         response_format: None,
     };
     let response = tool_loop.llm.complete_chat(&request)?;

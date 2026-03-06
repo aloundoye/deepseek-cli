@@ -1,12 +1,16 @@
 use super::{GenOpts, LocalGenBackend};
 use crate::ModelManager;
 use crate::hardware;
-use crate::model_manager::RuntimeLifecycleSnapshot;
+use crate::model_manager::{
+    RunnerLifecycleState, RuntimeLifecycleSnapshot, RuntimeSchedulerLiveSnapshot,
+};
 use crate::model_registry;
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+const RECOVERY_BACKOFF_MS: u64 = 250;
 
 /// Factory trait for loading local generation backends on demand.
 pub trait BackendFactory: Send + Sync {
@@ -102,6 +106,11 @@ impl Drop for RequestPermit {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         mgr.record_runtime_queue_completed();
+        drop(mgr);
+        let scheduler = LocalRunnerLifecycleManager {
+            shared: Arc::clone(&self.shared),
+        };
+        scheduler.refresh_live_snapshot();
     }
 }
 
@@ -116,6 +125,11 @@ impl Drop for LoadLanePermit {
             lane.active_model = None;
             self.shared.load_lane_cv.notify_all();
         }
+        drop(lane);
+        let scheduler = LocalRunnerLifecycleManager {
+            shared: Arc::clone(&self.shared),
+        };
+        scheduler.refresh_live_snapshot();
     }
 }
 
@@ -227,8 +241,12 @@ impl LocalRunnerLifecycleManager {
         let _ = self.maintenance_tick();
 
         let backend = self.ensure_runner(model_id)?;
+        self.set_runner_state(model_id, RunnerLifecycleState::Busy, None);
         match backend.generate(prompt, opts) {
-            Ok(output) => Ok(output),
+            Ok(output) => {
+                self.set_runner_state(model_id, RunnerLifecycleState::Warm, None);
+                Ok(output)
+            }
             Err(first_error) => {
                 let first_detail = first_error.to_string();
                 {
@@ -239,9 +257,19 @@ impl LocalRunnerLifecycleManager {
                         .unwrap_or_else(|e| e.into_inner());
                     mgr.record_runtime_runner_reload(model_id, &first_detail);
                 }
+                self.set_runner_state(
+                    model_id,
+                    RunnerLifecycleState::Reloading,
+                    Some(&first_detail),
+                );
                 self.invalidate_runner(model_id);
                 let reloaded = self.ensure_runner(model_id)?;
-                reloaded.generate(prompt, opts).map_err(|retry_error| {
+                self.set_runner_state(model_id, RunnerLifecycleState::Busy, None);
+                let retry_result = reloaded.generate(prompt, opts);
+                if retry_result.is_ok() {
+                    self.set_runner_state(model_id, RunnerLifecycleState::Warm, None);
+                }
+                retry_result.map_err(|retry_error| {
                     let retry_detail = retry_error.to_string();
                     {
                         let mut mgr = self
@@ -251,6 +279,11 @@ impl LocalRunnerLifecycleManager {
                             .unwrap_or_else(|e| e.into_inner());
                         mgr.record_runtime_runner_load_failure(model_id, &retry_detail);
                     }
+                    self.set_runner_state(
+                        model_id,
+                        RunnerLifecycleState::Failed,
+                        Some(&retry_detail),
+                    );
                     anyhow!(
                         "generation failed for model '{model_id}': {first_detail}; reload retry failed: {retry_detail}"
                     )
@@ -310,6 +343,60 @@ impl LocalRunnerLifecycleManager {
         }
     }
 
+    fn refresh_live_snapshot(&self) {
+        let gate = self.shared.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let load_lane = self
+            .shared
+            .load_lane
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let active_requests = gate.active_requests;
+        let queued_requests = gate.queued_requests;
+        let loading_model = load_lane.active_model.clone();
+        let loading_waiters = load_lane.waiting_requests;
+        let loaded_runners = self
+            .shared
+            .runners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(gate);
+        drop(load_lane);
+        let mut mgr = self
+            .shared
+            .model_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        mgr.record_runtime_live_snapshot(RuntimeSchedulerLiveSnapshot {
+            active_requests,
+            queued_requests,
+            loading_model,
+            loading_waiters,
+            loaded_runners,
+            updated_at_epoch_secs: 0,
+        });
+    }
+
+    fn set_runner_state(&self, model_id: &str, state: RunnerLifecycleState, detail: Option<&str>) {
+        let mut mgr = self
+            .shared
+            .model_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        mgr.set_runner_state(model_id, state, detail);
+    }
+
+    fn clear_runner_state(&self, model_id: &str) {
+        let mut mgr = self
+            .shared
+            .model_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        mgr.clear_runner_state(model_id);
+    }
+
     fn acquire_request_permit(&self) -> Result<RequestPermit> {
         let queue_depth = {
             let mut gate = self.shared.gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -329,6 +416,8 @@ impl LocalRunnerLifecycleManager {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 mgr.record_runtime_queue_rejected(active, queued, max_concurrent, max_queue);
+                drop(mgr);
+                self.refresh_live_snapshot();
                 anyhow::bail!(
                     "local runtime queue is full (active={active}, queued={queued}, max_concurrent={max_concurrent}, max_queue_depth={max_queue})"
                 );
@@ -345,6 +434,7 @@ impl LocalRunnerLifecycleManager {
                 .unwrap_or_else(|e| e.into_inner());
             mgr.record_runtime_queue_enqueued(queue_depth);
         }
+        self.refresh_live_snapshot();
 
         let mut gate = self.shared.gate.lock().unwrap_or_else(|e| e.into_inner());
         let wait_started = Instant::now();
@@ -386,6 +476,8 @@ impl LocalRunnerLifecycleManager {
         }
         gate.queued_requests = gate.queued_requests.saturating_sub(1);
         gate.active_requests = gate.active_requests.saturating_add(1);
+        drop(gate);
+        self.refresh_live_snapshot();
 
         Ok(RequestPermit {
             shared: Arc::clone(&self.shared),
@@ -407,6 +499,7 @@ impl LocalRunnerLifecycleManager {
             .cloned()
         {
             self.touch_runtime(model_id);
+            self.set_runner_state(model_id, RunnerLifecycleState::Warm, None);
             return Ok(existing);
         }
 
@@ -421,6 +514,7 @@ impl LocalRunnerLifecycleManager {
             .cloned()
         {
             self.touch_runtime(model_id);
+            self.set_runner_state(model_id, RunnerLifecycleState::Warm, None);
             return Ok(existing);
         }
 
@@ -445,6 +539,7 @@ impl LocalRunnerLifecycleManager {
                     };
                     if let Some(evicted_model_id) = victim {
                         self.remove_runners(&[evicted_model_id]);
+                        std::thread::sleep(Duration::from_millis(RECOVERY_BACKOFF_MS));
                         available_mb = (self.shared.memory_probe)();
                         continue;
                     }
@@ -459,6 +554,15 @@ impl LocalRunnerLifecycleManager {
             }
         }
 
+        let current_state = self
+            .shared
+            .model_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runner_state(model_id);
+        if current_state != Some(RunnerLifecycleState::Reloading) {
+            self.set_runner_state(model_id, RunnerLifecycleState::Loading, None);
+        }
         let loaded = match self.shared.loader.load_backend(model_id) {
             Ok(backend) => backend,
             Err(err) => {
@@ -469,6 +573,8 @@ impl LocalRunnerLifecycleManager {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 mgr.record_runtime_runner_load_failure(model_id, &detail);
+                drop(mgr);
+                self.set_runner_state(model_id, RunnerLifecycleState::Failed, Some(&detail));
                 return Err(err);
             }
         };
@@ -485,6 +591,7 @@ impl LocalRunnerLifecycleManager {
         };
 
         self.touch_runtime(model_id);
+        self.set_runner_state(model_id, RunnerLifecycleState::Warm, None);
         Ok(runner)
     }
 
@@ -504,6 +611,7 @@ impl LocalRunnerLifecycleManager {
                 }
                 lane.active_model = Some(model_id.to_string());
                 drop(lane);
+                self.refresh_live_snapshot();
 
                 if let Some(blocker) = blocked_by {
                     let mut mgr = self
@@ -524,6 +632,13 @@ impl LocalRunnerLifecycleManager {
             if !recorded_wait {
                 lane.waiting_requests = lane.waiting_requests.saturating_add(1);
                 recorded_wait = true;
+                drop(lane);
+                self.refresh_live_snapshot();
+                lane = self
+                    .shared
+                    .load_lane
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
             }
             lane = self
                 .shared
@@ -553,10 +668,18 @@ impl LocalRunnerLifecycleManager {
     }
 
     fn invalidate_runner(&self, model_id: &str) {
-        self.remove_runners(&[model_id.to_string()]);
+        self.remove_runners_preserving_state(&[model_id.to_string()]);
     }
 
     fn remove_runners(&self, model_ids: &[String]) {
+        self.remove_runners_inner(model_ids, false);
+    }
+
+    fn remove_runners_preserving_state(&self, model_ids: &[String]) {
+        self.remove_runners_inner(model_ids, true);
+    }
+
+    fn remove_runners_inner(&self, model_ids: &[String], preserve_state: bool) {
         if model_ids.is_empty() {
             return;
         }
@@ -571,6 +694,13 @@ impl LocalRunnerLifecycleManager {
                 runner.cancel();
             }
         }
+        drop(runners);
+        if !preserve_state {
+            for model_id in model_ids {
+                self.clear_runner_state(model_id);
+            }
+        }
+        self.refresh_live_snapshot();
     }
 }
 

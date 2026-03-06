@@ -22,13 +22,13 @@ All assets are generated from `cargo build --release --bin codingbuddy`.
 Automated in this repo today:
 - `ci.yml`
 - `release.yml`
+- `benchmark-live.yml` (manual/nightly live benchmark lane, non-blocking)
 
 Not automated in this repo today:
 - SBOM generation
 - provenance attestation
 - Homebrew publishing
 - Winget publishing
-- dedicated live API smoke workflow
 - dedicated release-readiness/security workflow split
 
 ## Release steps
@@ -41,9 +41,10 @@ Not automated in this repo today:
    - generate `checksums.txt`
    - create tag `vX.Y.Z`
    - publish the GitHub release
-5. Validate release artifacts and checksums.
-6. Validate installer smoke checks.
-7. If you maintain package-manager distribution outside this repo, publish those updates manually.
+5. If provider credentials are configured, review or trigger `benchmark-live.yml` for a current live benchmark artifact and optional DeepSeek-vs-reference comparison.
+6. Validate release artifacts and checksums.
+7. Validate installer smoke checks.
+8. If you maintain package-manager distribution outside this repo, publish those updates manually.
 
 ## Installer smoke checks
 macOS/Linux:
@@ -61,6 +62,7 @@ Windows:
 ## Manual checks not automated by this repo
 - Live API smoke:
   - If `DEEPSEEK_API_KEY` is available, run a bounded manual smoke in a disposable workspace before announcing the release.
+  - `benchmark-live.yml` is a supporting signal, not a release gate replacement.
 - Package manager publishing:
   - No Homebrew or Winget workflow exists in this repo today.
   - Any package-manager distribution is a manual follow-up outside the current automation contract.

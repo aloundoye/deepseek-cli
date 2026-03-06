@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::UsageArgs;
 use crate::commands::operator_diagnostics::{
     provider_compatibility_diagnostics, runtime_operator_diagnostics,
+    summarize_applied_compatibility,
 };
 use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
 use crate::commands::tasks::{mission_control_payload, render_mission_control_lines};
@@ -148,6 +149,8 @@ pub(crate) fn current_ui_status(
         }
     };
     let provider_diagnostics = provider_compatibility_diagnostics(cfg, &selected_model);
+    let last_provider_diagnostics =
+        summarize_applied_compatibility(projection.last_provider_compatibility.as_ref());
     let capability_summary = cfg
         .llm
         .capability_resolution_for_model(&selected_model)
@@ -218,10 +221,17 @@ pub(crate) fn current_ui_status(
         failed_tasks,
         running_background_jobs,
         capability_summary,
-        provider_diagnostics_summary: provider_diagnostics
-            .as_ref()
-            .map(|value| value.summary.clone())
-            .unwrap_or_default(),
+        provider_diagnostics_summary: [
+            provider_diagnostics
+                .as_ref()
+                .map(|value| value.summary.clone())
+                .unwrap_or_default(),
+            last_provider_diagnostics.unwrap_or_default(),
+        ]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" | "),
         runtime_diagnostics_summary: runtime_diagnostics.summary,
         compaction_count,
         replay_count,
@@ -324,6 +334,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "compatibility": {
                     "base": base_model_diagnostics,
                     "reasoner": reasoner_model_diagnostics,
+                    "last_applied": projection.last_provider_compatibility,
                 },
             },
             "context_usage_percent": context_usage_pct,
@@ -343,6 +354,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "runtime": {
                     "summary": runtime_diagnostics.summary,
                     "highlights": runtime_diagnostics.highlights,
+                    "snapshot": runtime_snapshot,
                 }
             },
             "mcp_servers": mcp_servers.len(),
@@ -369,6 +381,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "compatibility": {
                     "base": base_model_diagnostics,
                     "reasoner": reasoner_model_diagnostics,
+                    "last_applied": serde_json::Value::Null,
                 },
             },
             "context_usage_percent": 0.0,
@@ -388,6 +401,7 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "runtime": {
                     "summary": runtime_diagnostics.summary,
                     "highlights": runtime_diagnostics.highlights,
+                    "snapshot": runtime_snapshot,
                 }
             },
             "mcp_servers": mcp_servers.len(),

@@ -147,6 +147,7 @@ fn privacy_router_redacts_in_tool_loop() {
                 arguments: r#"{"path": "secret.txt"}"#.to_string(),
             }],
             usage: Some(TokenUsage::default()),
+            compatibility: None,
         },
         // Second response: text reply
         text_response("Here is the info"),

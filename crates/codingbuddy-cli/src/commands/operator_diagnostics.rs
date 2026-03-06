@@ -1,6 +1,8 @@
-use codingbuddy_core::{AppConfig, ModelFamily, ProviderKind};
-use codingbuddy_local_ml::RuntimeLifecycleSnapshot;
+use codingbuddy_core::{AppConfig, AppliedCompatibility, ModelFamily, ProviderKind};
+use codingbuddy_local_ml::{RunnerLifecycleState, RuntimeLifecycleSnapshot};
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct ProviderCompatibilityDiagnostics {
@@ -14,6 +16,26 @@ pub(crate) struct ProviderCompatibilityDiagnostics {
 pub(crate) struct RuntimeOperatorDiagnostics {
     pub summary: String,
     pub highlights: Vec<String>,
+}
+
+pub(crate) fn summarize_applied_compatibility(
+    compatibility: Option<&AppliedCompatibility>,
+) -> Option<String> {
+    let compatibility = compatibility?;
+    if compatibility.transforms.is_empty() && compatibility.degraded_inputs.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !compatibility.transforms.is_empty() {
+        parts.push(format!("applied={}", compatibility.transforms.join(",")));
+    }
+    if !compatibility.degraded_inputs.is_empty() {
+        parts.push(format!(
+            "degraded={}",
+            compatibility.degraded_inputs.join(",")
+        ));
+    }
+    Some(parts.join(" "))
 }
 
 pub(crate) fn provider_compatibility_diagnostics(
@@ -72,6 +94,12 @@ pub(crate) fn runtime_operator_diagnostics(
     let warm = snapshot.warm_models.len();
     let cap = snapshot.max_loaded_models.max(1);
     let metrics = &snapshot.metrics;
+    let now_epoch_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let live_is_stale = snapshot.live.updated_at_epoch_secs == 0
+        || now_epoch_secs.saturating_sub(snapshot.live.updated_at_epoch_secs) > 10;
     let last_event = snapshot
         .recent_events
         .last()
@@ -80,8 +108,43 @@ pub(crate) fn runtime_operator_diagnostics(
             None => event.kind.clone(),
         })
         .unwrap_or_else(|| "none".to_string());
+    let active_requests = if live_is_stale {
+        0
+    } else {
+        snapshot.live.active_requests
+    };
+    let queued_requests = if live_is_stale {
+        0
+    } else {
+        snapshot.live.queued_requests
+    };
+    let loading_waiters = if live_is_stale {
+        0
+    } else {
+        snapshot.live.loading_waiters
+    };
 
     let mut highlights = Vec::new();
+    highlights.push(if live_is_stale {
+        "live=stale".to_string()
+    } else {
+        "live=fresh".to_string()
+    });
+    if let Some(model) = snapshot.live.loading_model.as_ref()
+        && !live_is_stale
+    {
+        highlights.push(format!("loading={model}"));
+    }
+    if queued_requests > 0 {
+        highlights.push(format!("queued={queued_requests}"));
+    }
+    if loading_waiters > 0 {
+        highlights.push(format!("load_waiters={loading_waiters}"));
+    }
+    if !snapshot.runner_states.is_empty() {
+        let counts = summarize_runner_states(&snapshot.runner_states);
+        highlights.extend(counts);
+    }
     if metrics.total_runner_load_waits > 0 {
         highlights.push(format!("load_waits={}", metrics.total_runner_load_waits));
     }
@@ -111,8 +174,16 @@ pub(crate) fn runtime_operator_diagnostics(
     }
 
     let summary = format!(
-        "warm={warm}/{cap} queue_peak={} load_waits={} last={last_event}",
-        metrics.max_observed_queue_depth, metrics.total_runner_load_waits
+        "warm={warm}/{cap} active={active_requests} queued={queued_requests} loading={} waiters={} live={} queue_peak={} load_waits={} last={last_event}",
+        snapshot
+            .live
+            .loading_model
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        loading_waiters,
+        if live_is_stale { "stale" } else { "fresh" },
+        metrics.max_observed_queue_depth,
+        metrics.total_runner_load_waits
     );
 
     RuntimeOperatorDiagnostics {
@@ -133,6 +204,36 @@ fn looks_like_litellm_proxy(base_url: &str, endpoint: &str) -> bool {
     let lower_base = base_url.to_ascii_lowercase();
     let lower_endpoint = endpoint.to_ascii_lowercase();
     lower_base.contains("litellm") || lower_endpoint.contains("litellm")
+}
+
+fn summarize_runner_states(states: &BTreeMap<String, RunnerLifecycleState>) -> Vec<String> {
+    let mut loading = 0usize;
+    let mut busy = 0usize;
+    let mut reloading = 0usize;
+    let mut failed = 0usize;
+    for state in states.values() {
+        match state {
+            RunnerLifecycleState::Loading => loading += 1,
+            RunnerLifecycleState::Busy => busy += 1,
+            RunnerLifecycleState::Reloading => reloading += 1,
+            RunnerLifecycleState::Failed => failed += 1,
+            RunnerLifecycleState::Warm | RunnerLifecycleState::Expiring => {}
+        }
+    }
+    let mut summary = Vec::new();
+    if loading > 0 {
+        summary.push(format!("loading_states={loading}"));
+    }
+    if busy > 0 {
+        summary.push(format!("busy_states={busy}"));
+    }
+    if reloading > 0 {
+        summary.push(format!("reloading_states={reloading}"));
+    }
+    if failed > 0 {
+        summary.push(format!("failed_states={failed}"));
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -169,12 +270,29 @@ mod tests {
 
     #[test]
     fn runtime_diagnostics_surface_pressure_signals() {
+        let now_epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
         let snapshot = RuntimeLifecycleSnapshot {
             max_loaded_models: 2,
             keep_warm_secs: 300,
             aggressive_eviction: false,
             scheduler: Default::default(),
             warm_models: vec!["model-a".to_string()],
+            live: codingbuddy_local_ml::RuntimeSchedulerLiveSnapshot {
+                active_requests: 1,
+                queued_requests: 2,
+                loading_model: Some("model-b".to_string()),
+                loading_waiters: 1,
+                loaded_runners: vec!["model-a".to_string()],
+                updated_at_epoch_secs: now_epoch_secs,
+            },
+            runner_states: BTreeMap::from([
+                ("model-a".to_string(), RunnerLifecycleState::Warm),
+                ("model-b".to_string(), RunnerLifecycleState::Loading),
+                ("model-c".to_string(), RunnerLifecycleState::Failed),
+            ]),
             metrics: RuntimeLifecycleMetrics {
                 total_runner_load_waits: 2,
                 total_memory_pressure_evictions: 1,
@@ -193,8 +311,23 @@ mod tests {
 
         let diagnostics = runtime_operator_diagnostics(&snapshot);
         assert!(diagnostics.summary.contains("warm=1/2"));
+        assert!(diagnostics.summary.contains("active=1"));
+        assert!(diagnostics.summary.contains("queued=2"));
+        assert!(diagnostics.summary.contains("loading=model-b"));
         assert!(diagnostics.summary.contains("queue_peak=3"));
         assert!(diagnostics.summary.contains("load_waits=2"));
+        assert!(
+            diagnostics
+                .highlights
+                .iter()
+                .any(|item| item == "live=fresh")
+        );
+        assert!(
+            diagnostics
+                .highlights
+                .iter()
+                .any(|item| item == "loading_states=1")
+        );
         assert!(
             diagnostics
                 .highlights

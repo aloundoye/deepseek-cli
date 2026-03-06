@@ -111,6 +111,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             }],
             finish_reason: "tool_calls".to_string(),
             usage: None,
+            compatibility: None,
         },
         // Turn 2: same call
         LlmResponse {
@@ -123,6 +124,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             }],
             finish_reason: "tool_calls".to_string(),
             usage: None,
+            compatibility: None,
         },
         // Turn 3: same call — should trigger doom loop gate and STOP
         LlmResponse {
@@ -135,6 +137,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             }],
             finish_reason: "tool_calls".to_string(),
             usage: None,
+            compatibility: None,
         },
         // Turn 4: should NEVER be reached — doom loop gate terminates the loop
         LlmResponse {
@@ -143,6 +146,7 @@ fn doom_loop_terminates_loop_as_blocking_gate() {
             tool_calls: vec![],
             finish_reason: "stop".to_string(),
             usage: None,
+            compatibility: None,
         },
     ];
 

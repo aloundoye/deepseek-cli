@@ -61,6 +61,7 @@ impl LlmClient for CapturingLlm {
             reasoning_content: String::new(),
             tool_calls: Vec::<LlmToolCall>::new(),
             usage: None,
+            compatibility: None,
         })
     }
 
