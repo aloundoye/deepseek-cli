@@ -23,7 +23,7 @@ All of this is **off by default**. No models are bundled — they're downloaded 
 ### 1. Enable local ML in your project config
 
 ```bash
-mkdir -p .deepseek
+mkdir -p .codingbuddy
 cat > .codingbuddy/settings.json << 'EOF'
 {
   "local_ml": {
@@ -50,7 +50,7 @@ This works without downloading anything. It's useful for privacy scanning and ba
 For semantic embeddings and code completion, compile with the `local-ml` feature:
 
 ```bash
-cargo build --release --bin deepseek --features local-ml
+cargo build --release --bin codingbuddy --features local-ml
 ```
 
 This pulls in Candle (Rust ML framework) and enables:
@@ -132,9 +132,9 @@ Scans tool outputs (file reads, command results) for sensitive content before se
 **CLI commands:**
 
 ```bash
-deepseek privacy scan              # Scan workspace for sensitive files
-deepseek privacy policy            # Show current privacy policy
-deepseek privacy redact-preview    # Preview what would be redacted
+codingbuddy privacy scan              # Scan workspace for sensitive files
+codingbuddy privacy policy            # Show current privacy policy
+codingbuddy privacy redact-preview    # Preview what would be redacted
 ```
 
 ### Ghost Text (Autocomplete)
@@ -165,20 +165,20 @@ With mock backends, ghost text is non-functional. With `--features local-ml`, it
 ```
 
 ```bash
-deepseek autocomplete enable       # Enable ghost text
-deepseek autocomplete disable      # Disable ghost text
-deepseek autocomplete model        # Show/change completion model
+codingbuddy autocomplete enable       # Enable ghost text
+codingbuddy autocomplete disable      # Disable ghost text
+codingbuddy autocomplete model        # Show/change completion model
 ```
 
 ### Index Management
 
 ```bash
-deepseek index build               # Build full-text + vector index
-deepseek index status              # Show index stats
-deepseek index --hybrid doctor     # Diagnose hybrid index issues
-deepseek index --hybrid clean      # Remove and rebuild index
-deepseek index query "search term" # Query the index directly
-deepseek index watch               # Watch for file changes and auto-update
+codingbuddy index build               # Build full-text + vector index
+codingbuddy index status              # Show index stats
+codingbuddy index --hybrid doctor     # Diagnose hybrid index issues
+codingbuddy index --hybrid clean      # Remove and rebuild index
+codingbuddy index query "search term" # Query the index directly
+codingbuddy index watch               # Watch for file changes and auto-update
 ```
 
 ---
@@ -240,17 +240,17 @@ The `local-ml` feature adds ~10MB to the binary and requires model downloads on 
 ## Troubleshooting
 
 **Retrieval returns irrelevant results:**
-- Rebuild the index: `deepseek index --hybrid clean && deepseek index build`
+- Rebuild the index: `codingbuddy index --hybrid clean && codingbuddy index build`
 - With mock embeddings, results are hash-based not semantic — enable `--features local-ml` for better quality
 
 **Ghost text not appearing:**
-- Verify config: `deepseek config show | grep -A5 local_ml`
+- Verify config: `codingbuddy config show | grep -A5 local_ml`
 - Must be in TUI mode (not `--json`)
 - Mock generator returns empty — need `--features local-ml` for real completions
 
 **Privacy false positives:**
 - Adjust patterns in `local_ml.privacy.path_globs` and `local_ml.privacy.content_patterns`
-- Preview with `deepseek privacy redact-preview`
+- Preview with `codingbuddy privacy redact-preview`
 
 **Model download fails:**
 - Check internet connectivity and `~/.cache/deepseek/` permissions

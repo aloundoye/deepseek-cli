@@ -11,6 +11,7 @@ pub(crate) mod fork;
 pub(crate) mod git;
 pub(crate) mod mcp;
 pub(crate) mod memory;
+pub(crate) mod operator_diagnostics;
 pub(crate) mod plan;
 pub(crate) mod privacy;
 pub(crate) mod replay;

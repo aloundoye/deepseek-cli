@@ -3,6 +3,19 @@
     "base_model": "deepseek-chat",
     "max_think_model": "deepseek-reasoner",
     "provider": "deepseek",
+    "providers": {
+      "deepseek": {
+        "kind": "deepseek",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "openai_compat_prefix": false,
+        "payload_options": null,
+        "models": {
+          "chat": "deepseek-chat",
+          "reasoner": "deepseek-reasoner"
+        }
+      }
+    },
     "profile": "v3_2",
     "context_window_tokens": 1000000,
     "temperature": 0.2,
@@ -18,15 +31,8 @@
     "stream": true
   },
   "agent_loop": {
-    "max_iterations": 6,
-    "architect_parse_retries": 2,
-    "editor_parse_retries": 2,
-    "max_files_per_iteration": 12,
-    "max_file_bytes": 200000,
-    "max_diff_bytes": 400000,
+    "tool_loop_max_turns": 50,
     "verify_timeout_seconds": 60,
-    "max_context_requests_per_iteration": 3,
-    "max_context_range_lines": 400,
     "context_bootstrap_enabled": true,
     "context_bootstrap_max_tree_entries": 120,
     "context_bootstrap_max_readme_bytes": 24000,
@@ -76,21 +82,21 @@
   "plugins": {
     "enabled": true,
     "search_paths": [
-      ".deepseek/plugins",
+      ".codingbuddy/plugins",
       ".plugins"
     ],
     "enable_hooks": false,
     "catalog": {
       "enabled": true,
-      "index_url": ".deepseek/plugins/catalog.json",
-      "signature_key": "deepseek-local-dev-key",
+      "index_url": ".codingbuddy/plugins/catalog.json",
+      "signature_key": "codingbuddy-local-dev-key",
       "refresh_hours": 24
     }
   },
   "skills": {
     "paths": [
-      ".deepseek/skills",
-      "~/.deepseek/skills"
+      ".codingbuddy/skills",
+      "~/.codingbuddy/skills"
     ],
     "hot_reload": true
   },
@@ -120,9 +126,12 @@
   },
   "ui": {
     "enable_tui": true,
-    "keybindings_path": "~/.deepseek/keybindings.json",
+    "keybindings_path": "~/.codingbuddy/keybindings.json",
     "reduced_motion": false,
     "statusline_mode": "minimal",
+    "thinking_visibility": "concise",
+    "phase_heartbeat_ms": 5000,
+    "mission_control_max_events": 400,
     "image_fallback": "open",
     "handoff_base_url": null
   },

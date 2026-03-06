@@ -47,6 +47,10 @@ pub struct UiStatus {
     #[serde(default)]
     pub capability_summary: String,
     #[serde(default)]
+    pub provider_diagnostics_summary: String,
+    #[serde(default)]
+    pub runtime_diagnostics_summary: String,
+    #[serde(default)]
     pub compaction_count: usize,
     #[serde(default)]
     pub replay_count: usize,

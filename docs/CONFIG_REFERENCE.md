@@ -7,7 +7,7 @@ CodingBuddy merges configuration from these sources (later entries win):
 3. Project config: `.codingbuddy/settings.json`
 4. Project-local overrides: `.codingbuddy/settings.local.json`
 
-Run `deepseek config show` to view the merged configuration. API keys are redacted in output.
+Run `codingbuddy config show` to view the merged configuration. API keys are redacted in output.
 
 ---
 
@@ -15,10 +15,11 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `base_model` | string | `"deepseek-chat"` | Default model for tool-use loop and Editor mode |
-| `max_think_model` | string | `"deepseek-reasoner"` | Thinking model for Architect mode, `/thinking`, and `think_deeply` tool |
+| `base_model` | string | `"deepseek-chat"` | Default model for normal tool-use turns |
+| `max_think_model` | string | `"deepseek-reasoner"` | Thinking model used for complex-task escalation, `/thinking`, and `think_deeply` |
 | `provider` | string | `"deepseek"` | LLM provider identifier |
 | `providers` | object | built-in map | Named provider definitions (`deepseek`, `openai-compatible`, `ollama`) |
+| `base_url` | string | `"https://api.deepseek.com"` | Legacy top-level provider base URL fallback |
 | `capability_overrides` | object | `{}` | Optional per-family/per-model capability overrides |
 | `profile` | string | `"v3_2"` | Active model profile |
 | `context_window_tokens` | int | `128000` | Maximum context window (raise for long-context use) |
@@ -32,6 +33,28 @@ Run `deepseek config show` to view the merged configuration. API keys are redact
 | `max_retries` | int | `3` | Maximum retry attempts |
 | `retry_base_ms` | int | `400` | Exponential backoff base |
 | `stream` | bool | `true` | Enable streaming responses |
+
+### `llm.providers.<id>`
+
+Each named provider entry has these fields:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `kind` | string | provider id | Provider family (`deepseek`, `openai-compatible`, `ollama`) |
+| `base_url` | string | none | Provider base URL used to construct chat/completions requests |
+| `api_key_env` | string | none | Environment variable used to read the provider API key |
+| `openai_compat_prefix` | bool | `false` | Add `/v1` prefix for SDK-compatible gateways |
+| `payload_options` | object/null | `null` | Provider-wide request payload shim merged before request-level provider namespaces |
+| `models.chat` | string | none | Chat/tool-use model id |
+| `models.reasoner` | string? | `null` | Optional higher-thinking model id |
+
+Payload merge order at request time:
+
+1. provider `payload_options`
+2. request `provider_options.default`
+3. request `provider_options.<active-provider>`
+4. request `provider_options.<model-family>`
+5. request `provider_options.<exact-model>`
 
 ### `llm.capability_overrides`
 
@@ -52,12 +75,15 @@ Override fields:
 
 ## `agent_loop` — Agent Loop
 
+Current runtime:
+- Default path: tool-use loop (`think -> act -> observe`)
+- Complex-task overlay: `Explore -> Plan -> Execute -> Verify` with per-phase tool filtering
+
+The older `Architect -> Editor -> Apply -> Verify` pipeline has been removed. Some config keys from that era are still accepted for backward-compatible parsing, but they do not define the primary runtime path anymore.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `tool_loop_max_turns` | int | `50` | Maximum LLM calls in the tool-use loop |
-| `max_files_per_iteration` | int | `12` | Maximum files per edit iteration |
-| `max_file_bytes` | int | `200000` | Maximum file size to include in context |
-| `max_diff_bytes` | int | `400000` | Maximum diff size |
 | `verify_timeout_seconds` | int | `60` | Timeout for verification commands |
 | `apply_strategy` | string | `"auto"` | Patch apply strategy (`auto` or `three_way`) |
 
@@ -88,6 +114,22 @@ Controls for automatic workspace context injection:
 | `context_bootstrap_max_manifest_bytes` | `16000` | Max package manifest bytes |
 | `context_bootstrap_max_repo_map_lines` | `80` | Max repo-map lines |
 | `context_bootstrap_max_audit_findings` | `20` | Max static analysis findings |
+
+### `agent_loop` legacy compatibility keys
+
+These keys remain in the schema so older configs still parse cleanly after the old pipeline removal. They are not the primary control surface for the current tool-use loop.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_iterations` | int | `6` | Legacy pipeline iteration cap; retained for compatibility |
+| `architect_parse_retries` | int | `2` | Legacy architect-step parse retry count; retained for compatibility |
+| `editor_parse_retries` | int | `2` | Legacy editor-step parse retry count; retained for compatibility |
+| `max_editor_apply_retries` | int | `3` | Legacy editor/apply retry cap; retained for compatibility |
+| `max_files_per_iteration` | int | `12` | Legacy per-iteration file cap from the removed pipeline |
+| `max_file_bytes` | int | `200000` | Legacy pipeline context/file-size cap |
+| `max_diff_bytes` | int | `400000` | Legacy pipeline diff-size cap |
+| `max_context_requests_per_iteration` | int | `3` | Legacy pipeline context-fetch cap |
+| `max_context_range_lines` | int | `400` | Legacy pipeline context line-range cap |
 
 ## `policy` — Permissions & Safety
 
@@ -175,7 +217,11 @@ template so it can be used in the active session.
 | `keybindings_path` | string | `"~/.codingbuddy/keybindings.json"` | Custom keybindings file |
 | `reduced_motion` | bool | `false` | Disable animations |
 | `statusline_mode` | string | `"minimal"` | Status line verbosity |
+| `thinking_visibility` | string | `"concise"` | TUI reasoning display mode (`concise`, `raw`) |
+| `phase_heartbeat_ms` | int | `5000` | Progress heartbeat interval while a phase is active |
+| `mission_control_max_events` | int | `400` | Maximum retained mission-control timeline entries |
 | `image_fallback` | string | `"open"` | Image display fallback (`open`, `path`, `none`) |
+| `handoff_base_url` | string? | `null` | Optional base URL for teleport handoff links |
 
 ## `budgets` — Resource Limits
 
@@ -197,7 +243,8 @@ template so it can be used in the active session.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable local ML features (retrieval, privacy, autocomplete) |
-| `cache_dir` | string | `"~/.cache/deepseek"` | Directory for model weights and index cache |
+| `device` | string | `"auto"` | Compute device (`auto`, `cpu`, `cuda`, `metal`) |
+| `cache_dir` | string | `".codingbuddy/models"` | Directory for cached model weights and runtime artifacts |
 
 ### `local_ml.embeddings`
 

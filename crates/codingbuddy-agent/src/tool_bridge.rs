@@ -4,7 +4,9 @@
 //! `ToolCall` (internal, dotted names like `fs.read`) and formats `ToolResult`
 //! back into `ChatMessage::Tool` for feeding to the next LLM turn.
 
-use codingbuddy_core::{ChatMessage, LlmToolCall, ToolCall, ToolDefinition, ToolName, ToolResult};
+use codingbuddy_core::{
+    ChatMessage, LlmToolCall, ToolCall, ToolDefinition, ToolName, ToolResult, repair_tool_api_name,
+};
 use codingbuddy_policy::output_scanner::{InjectionWarning, OutputScanner};
 
 /// Maximum characters for tool output before truncation.
@@ -51,35 +53,7 @@ pub fn llm_tool_call_to_internal(call: &LlmToolCall) -> ToolCall {
 ///
 /// Returns `Some(corrected_name)` if a match is found, `None` if no repair possible.
 pub fn repair_tool_name(api_name: &str, available_tools: &[ToolDefinition]) -> Option<String> {
-    let tool_names: Vec<&str> = available_tools
-        .iter()
-        .map(|t| t.function.name.as_str())
-        .collect();
-
-    // 1. Exact match — no repair needed
-    if tool_names.contains(&api_name) {
-        return Some(api_name.to_string());
-    }
-
-    // 2. Normalize: lowercase, replace hyphens with underscores
-    let normalized = api_name.to_lowercase().replace('-', "_");
-    if let Some(name) = tool_names
-        .iter()
-        .find(|n| n.to_lowercase().replace('-', "_") == normalized)
-    {
-        return Some(name.to_string());
-    }
-
-    // 3. Fuzzy match: Levenshtein distance ≤ 2
-    let mut best_match: Option<(&str, usize)> = None;
-    for name in &tool_names {
-        let dist = strsim::levenshtein(api_name, name);
-        if dist <= 2 && best_match.as_ref().is_none_or(|(_, d)| dist < *d) {
-            best_match = Some((name, dist));
-        }
-    }
-
-    best_match.map(|(name, _)| name.to_string())
+    repair_tool_api_name(api_name, available_tools)
 }
 
 /// Build an error message listing available tools when no repair is possible.
@@ -540,6 +514,15 @@ mod tests {
         assert_eq!(
             repair_tool_name("bash-run", &tools),
             Some("bash_run".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_dotted_internal_name() {
+        let tools = sample_tools();
+        assert_eq!(
+            repair_tool_name("fs.read", &tools),
+            Some("fs_read".to_string())
         );
     }
 

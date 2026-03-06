@@ -3,79 +3,83 @@
 ## Goals
 - Produce immutable binaries for Linux, macOS, and Windows.
 - Publish checksums for every artifact.
-- Generate SBOM per release.
-- Generate provenance attestation for release artifacts.
-- Publish package-manager update paths (Homebrew + Winget).
 - Keep downgrade path available through versioned release assets.
+- Be explicit about what is automated in this repo versus what is still manual.
 
 ## Artifact contract
-Each tagged release (`vX.Y.Z`) publishes:
-- `deepseek-x86_64-unknown-linux-gnu.tar.gz`
-- `deepseek-aarch64-unknown-linux-gnu.tar.gz`
-- `deepseek-x86_64-apple-darwin.tar.gz`
-- `deepseek-aarch64-apple-darwin.tar.gz`
-- `deepseek-x86_64-pc-windows-msvc.zip`
-- `deepseek-aarch64-pc-windows-msvc.zip`
+Each GitHub release created by `release.yml` currently publishes:
+- `codingbuddy-x86_64-unknown-linux-gnu.tar.gz`
+- `codingbuddy-aarch64-unknown-linux-gnu.tar.gz`
+- `codingbuddy-x86_64-apple-darwin.tar.gz`
+- `codingbuddy-aarch64-apple-darwin.tar.gz`
+- `codingbuddy-x86_64-pc-windows-msvc.zip`
+- `codingbuddy-aarch64-pc-windows-msvc.zip`
 - `checksums.txt`
-- `sbom.spdx.json`
-- provenance attestation (GitHub artifact attestation)
 
-All assets are generated from `cargo build --release --bin deepseek`.
+All assets are generated from `cargo build --release --bin codingbuddy`.
+
+## Current automation scope
+Automated in this repo today:
+- `ci.yml`
+- `release.yml`
+- `benchmark-live.yml` (manual/nightly live benchmark lane, non-blocking)
+
+Not automated in this repo today:
+- SBOM generation
+- provenance attestation
+- Homebrew publishing
+- Winget publishing
+- dedicated release-readiness/security workflow split
 
 ## Release steps
-1. Ensure CI is green on default branch (`ci.yml`, `replay-regression.yml`, `performance-gates.yml`, `security-gates.yml`).
+1. Ensure `ci.yml` is green on `main`.
 2. Bump version metadata as needed.
-3. Run manual release drill (`release-readiness.yml`) and confirm installer dry-runs + rollback rehearsal artifacts.
-4. Create and push tag:
-   - `git tag vX.Y.Z`
-   - `git push origin vX.Y.Z`
-5. GitHub Actions `release.yml` builds artifacts, SBOM, and provenance attestation, then creates the release.
-6. Validate checksums and run installer smoke checks.
-7. Homebrew tap update workflow (`homebrew.yml`) publishes formula update.
-8. Winget update workflow (`winget.yml`) publishes manifest update.
+3. Push the version bump to `main`.
+4. Let `release.yml`:
+   - verify the version is not already released
+   - build platform artifacts
+   - generate `checksums.txt`
+   - create tag `vX.Y.Z`
+   - publish the GitHub release
+5. If provider credentials are configured, review or trigger `benchmark-live.yml` for a current live benchmark artifact and optional DeepSeek-vs-reference comparison.
+6. Validate release artifacts and checksums.
+7. Validate installer smoke checks.
+8. If you maintain package-manager distribution outside this repo, publish those updates manually.
 
 ## Installer smoke checks
 macOS/Linux:
 
 ```bash
-bash scripts/install.sh --dry-run --version vX.Y.Z
+bash scripts/install.sh --dry-run --version vX.Y.Z --repo aloundoye/codingbuddy
 ```
 
 Windows:
 
 ```powershell
-./scripts/install.ps1 -DryRun -Version vX.Y.Z
+./scripts/install.ps1 -DryRun -Version vX.Y.Z -Repo aloundoye/codingbuddy
 ```
 
-## Live API readiness checks
-- Run `live-deepseek-smoke.yml` with `DEEPSEEK_API_KEY` secret configured.
-- Verify:
-  - `ask`, `plan`, and bounded `autopilot` commands succeed end-to-end.
-  - first-token streaming latency gate remains within budget.
-
-Package manager smoke checks:
-
-```bash
-brew install deepseek
-brew uninstall deepseek
-```
-
-```powershell
-winget install DeepSeek.DeepSeekCLI
-winget uninstall DeepSeek.DeepSeekCLI
-```
+## Manual checks not automated by this repo
+- Live API smoke:
+  - If `DEEPSEEK_API_KEY` is available, run a bounded manual smoke in a disposable workspace before announcing the release.
+  - `benchmark-live.yml` is a supporting signal, not a release gate replacement.
+- Package manager publishing:
+  - No Homebrew or Winget workflow exists in this repo today.
+  - Any package-manager distribution is a manual follow-up outside the current automation contract.
+- Supply-chain extras:
+  - SBOM and provenance are not produced by `release.yml` today.
 
 ## Manual local packaging (fallback)
 Linux/macOS:
 
 ```bash
-cargo build --release --bin deepseek
-cp target/release/deepseek dist/deepseek
+cargo build --release --bin codingbuddy
+cp target/release/codingbuddy dist/codingbuddy
 ```
 
 Windows:
 
 ```powershell
-cargo build --release --bin deepseek
-Copy-Item target/release/deepseek.exe dist/deepseek.exe
+cargo build --release --bin codingbuddy
+Copy-Item target/release/codingbuddy.exe dist/codingbuddy.exe
 ```

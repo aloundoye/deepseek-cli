@@ -93,6 +93,7 @@ pub fn scripted_text_response(text: &str) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        compatibility: None,
     }
 }
 
@@ -108,6 +109,7 @@ pub fn scripted_tool_response(calls: Vec<LlmToolCall>) -> LlmResponse {
             completion_tokens: 50,
             ..Default::default()
         }),
+        compatibility: None,
     }
 }
 
@@ -283,15 +285,27 @@ pub fn run_replay_smoke(workspace: &Path) -> Result<String> {
     )
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CodingBenchmarkCaseResult {
     pub case_id: String,
     pub category: String,
     pub passed: bool,
+    pub patch_applied: bool,
+    pub build_passed: bool,
+    pub tests_passed: bool,
     pub tool_invocations: usize,
+    pub verification_attempts: usize,
     pub retries: usize,
+    pub tool_denials: usize,
+    pub compaction_events: usize,
     pub completion_quality_score: f32,
     pub duration_ms: u128,
+    pub input_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated_cost_usd: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -302,10 +316,21 @@ pub struct CodingBenchmarkSummary {
     pub total_cases: usize,
     pub passed_cases: usize,
     pub pass_rate_pct: f32,
+    pub patch_applied_rate_pct: f32,
+    pub build_pass_rate_pct: f32,
+    pub test_pass_rate_pct: f32,
     pub avg_tool_invocations: f32,
+    pub avg_verification_attempts: f32,
     pub avg_retries: f32,
+    pub avg_tool_denials: f32,
+    pub avg_compaction_events: f32,
     pub avg_completion_quality_score: f32,
     pub avg_duration_ms: f32,
+    pub avg_input_tokens: f32,
+    pub avg_cache_hit_tokens: f32,
+    pub avg_cache_miss_tokens: f32,
+    pub avg_output_tokens: f32,
+    pub avg_estimated_cost_usd: f64,
     pub category_pass_rate_pct: BTreeMap<String, f32>,
     pub category_avg_quality_score: BTreeMap<String, f32>,
 }
@@ -314,6 +339,12 @@ pub struct CodingBenchmarkSummary {
 pub struct CodingBenchmarkReport {
     pub suite: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
     pub generated_at_epoch_secs: u64,
     pub cases: Vec<CodingBenchmarkCaseResult>,
     pub summary: CodingBenchmarkSummary,
@@ -335,6 +366,81 @@ pub struct CodingBenchmarkGateResult {
     pub baseline_avg_retries: f32,
     pub max_retry_increase: f32,
     pub retries_delta: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkCaseComparison {
+    pub case_id: String,
+    pub category: String,
+    pub current_passed: bool,
+    pub reference_passed: bool,
+    pub current_patch_applied: bool,
+    pub reference_patch_applied: bool,
+    pub current_build_passed: bool,
+    pub reference_build_passed: bool,
+    pub current_tests_passed: bool,
+    pub reference_tests_passed: bool,
+    pub tool_invocation_delta: isize,
+    pub verification_attempts_delta: isize,
+    pub retries_delta: isize,
+    pub quality_score_delta: f32,
+    pub duration_delta_ms: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CodingBenchmarkComparisonSummary {
+    pub comparable: bool,
+    pub suite_compatible: bool,
+    pub case_ids_compatible: bool,
+    pub case_categories_compatible: bool,
+    pub comparable_case_count: usize,
+    pub improved_case_count: usize,
+    pub regressed_case_count: usize,
+    pub current_only_cases: Vec<String>,
+    pub reference_only_cases: Vec<String>,
+    pub category_mismatch_cases: Vec<String>,
+    pub pass_rate_delta_pct: f32,
+    pub patch_applied_rate_delta_pct: f32,
+    pub build_pass_rate_delta_pct: f32,
+    pub test_pass_rate_delta_pct: f32,
+    pub avg_completion_quality_delta: f32,
+    pub avg_verification_attempts_delta: f32,
+    pub avg_retries_delta: f32,
+    pub avg_tool_denials_delta: f32,
+    pub avg_compaction_events_delta: f32,
+    pub avg_duration_delta_ms: f32,
+    pub avg_input_tokens_delta: f32,
+    pub avg_output_tokens_delta: f32,
+    pub avg_estimated_cost_delta_usd: f64,
+    pub category_pass_rate_delta_pct: BTreeMap<String, f32>,
+    pub category_avg_quality_delta: BTreeMap<String, f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodingBenchmarkComparisonReport {
+    pub suite: String,
+    pub current_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_lane: Option<String>,
+    pub reference_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_lane: Option<String>,
+    pub generated_at_epoch_secs: u64,
+    pub cases: Vec<CodingBenchmarkCaseComparison>,
+    pub summary: CodingBenchmarkComparisonSummary,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -360,12 +466,41 @@ impl CodingBenchmarkReport {
         model: &str,
         cases: Vec<CodingBenchmarkCaseResult>,
     ) -> Self {
+        Self::from_case_results_with_metadata(suite, model, None, None, None, cases)
+    }
+
+    pub fn from_case_results_with_metadata(
+        suite: &str,
+        model: &str,
+        provider: Option<String>,
+        profile: Option<String>,
+        lane: Option<String>,
+        cases: Vec<CodingBenchmarkCaseResult>,
+    ) -> Self {
         let total_cases = cases.len();
         let passed_cases = cases.iter().filter(|case| case.passed).count();
         let pass_rate_pct = if total_cases == 0 {
             0.0
         } else {
             passed_cases as f32 * 100.0 / total_cases as f32
+        };
+        let patch_applied_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().filter(|case| case.patch_applied).count() as f32 * 100.0
+                / total_cases as f32
+        };
+        let build_pass_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().filter(|case| case.build_passed).count() as f32 * 100.0
+                / total_cases as f32
+        };
+        let test_pass_rate_pct = if total_cases == 0 {
+            0.0
+        } else {
+            cases.iter().filter(|case| case.tests_passed).count() as f32 * 100.0
+                / total_cases as f32
         };
         let avg_tool_invocations = if total_cases == 0 {
             0.0
@@ -376,10 +511,37 @@ impl CodingBenchmarkReport {
                 .sum::<f32>()
                 / total_cases as f32
         };
+        let avg_verification_attempts = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.verification_attempts as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
         let avg_retries = if total_cases == 0 {
             0.0
         } else {
             cases.iter().map(|case| case.retries as f32).sum::<f32>() / total_cases as f32
+        };
+        let avg_tool_denials = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.tool_denials as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_compaction_events = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.compaction_events as f32)
+                .sum::<f32>()
+                / total_cases as f32
         };
         let avg_completion_quality_score = if total_cases == 0 {
             0.0
@@ -398,6 +560,51 @@ impl CodingBenchmarkReport {
                 .map(|case| case.duration_ms as f32)
                 .sum::<f32>()
                 / total_cases as f32
+        };
+        let avg_input_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.input_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_cache_hit_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.cache_hit_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_cache_miss_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.cache_miss_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_output_tokens = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.output_tokens as f32)
+                .sum::<f32>()
+                / total_cases as f32
+        };
+        let avg_estimated_cost_usd = if total_cases == 0 {
+            0.0
+        } else {
+            cases
+                .iter()
+                .map(|case| case.estimated_cost_usd)
+                .sum::<f64>()
+                / total_cases as f64
         };
         let mut category_stats: BTreeMap<String, (usize, usize, f32)> = BTreeMap::new();
         for case in &cases {
@@ -430,6 +637,9 @@ impl CodingBenchmarkReport {
         Self {
             suite: suite.to_string(),
             model: model.to_string(),
+            provider,
+            profile,
+            lane,
             generated_at_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -439,10 +649,21 @@ impl CodingBenchmarkReport {
                 total_cases,
                 passed_cases,
                 pass_rate_pct,
+                patch_applied_rate_pct,
+                build_pass_rate_pct,
+                test_pass_rate_pct,
                 avg_tool_invocations,
+                avg_verification_attempts,
                 avg_retries,
+                avg_tool_denials,
+                avg_compaction_events,
                 avg_completion_quality_score,
                 avg_duration_ms,
+                avg_input_tokens,
+                avg_cache_hit_tokens,
+                avg_cache_miss_tokens,
+                avg_output_tokens,
+                avg_estimated_cost_usd,
                 category_pass_rate_pct,
                 category_avg_quality_score,
             },
@@ -466,6 +687,167 @@ pub fn write_coding_benchmark_report(
 pub fn read_coding_benchmark_report(path: &Path) -> Result<CodingBenchmarkReport> {
     let raw = std::fs::read(path)?;
     Ok(serde_json::from_slice(&raw)?)
+}
+
+pub fn compare_coding_benchmark_reports(
+    current: &CodingBenchmarkReport,
+    reference: &CodingBenchmarkReport,
+) -> CodingBenchmarkComparisonReport {
+    let suite_compatible = current.suite == reference.suite;
+
+    let current_by_case: BTreeMap<&str, &CodingBenchmarkCaseResult> = current
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect();
+    let reference_by_case: BTreeMap<&str, &CodingBenchmarkCaseResult> = reference
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect();
+
+    let current_only_cases: Vec<String> = current_by_case
+        .keys()
+        .filter(|case_id| !reference_by_case.contains_key(**case_id))
+        .map(|case_id| (*case_id).to_string())
+        .collect();
+    let reference_only_cases: Vec<String> = reference_by_case
+        .keys()
+        .filter(|case_id| !current_by_case.contains_key(**case_id))
+        .map(|case_id| (*case_id).to_string())
+        .collect();
+    let case_ids_compatible = current_only_cases.is_empty() && reference_only_cases.is_empty();
+
+    let mut category_mismatch_cases = Vec::new();
+    let mut improved_case_count = 0usize;
+    let mut regressed_case_count = 0usize;
+    let mut cases = Vec::new();
+
+    for (case_id, current_case) in &current_by_case {
+        let Some(reference_case) = reference_by_case.get(case_id) else {
+            continue;
+        };
+
+        if current_case.category != reference_case.category {
+            category_mismatch_cases.push((*case_id).to_string());
+        }
+        if current_case.passed && !reference_case.passed {
+            improved_case_count = improved_case_count.saturating_add(1);
+        }
+        if !current_case.passed && reference_case.passed {
+            regressed_case_count = regressed_case_count.saturating_add(1);
+        }
+
+        cases.push(CodingBenchmarkCaseComparison {
+            case_id: (*case_id).to_string(),
+            category: current_case.category.clone(),
+            current_passed: current_case.passed,
+            reference_passed: reference_case.passed,
+            current_patch_applied: current_case.patch_applied,
+            reference_patch_applied: reference_case.patch_applied,
+            current_build_passed: current_case.build_passed,
+            reference_build_passed: reference_case.build_passed,
+            current_tests_passed: current_case.tests_passed,
+            reference_tests_passed: reference_case.tests_passed,
+            tool_invocation_delta: current_case.tool_invocations as isize
+                - reference_case.tool_invocations as isize,
+            verification_attempts_delta: current_case.verification_attempts as isize
+                - reference_case.verification_attempts as isize,
+            retries_delta: current_case.retries as isize - reference_case.retries as isize,
+            quality_score_delta: current_case.completion_quality_score
+                - reference_case.completion_quality_score,
+            duration_delta_ms: current_case.duration_ms as f32 - reference_case.duration_ms as f32,
+            current_note: current_case.note.clone(),
+            reference_note: reference_case.note.clone(),
+        });
+    }
+
+    let case_categories_compatible = category_mismatch_cases.is_empty();
+    let comparable = suite_compatible && case_ids_compatible && case_categories_compatible;
+    let comparable_case_count = cases.len();
+
+    let mut category_pass_rate_delta_pct = BTreeMap::new();
+    for (category, current_value) in &current.summary.category_pass_rate_pct {
+        if let Some(reference_value) = reference.summary.category_pass_rate_pct.get(category) {
+            category_pass_rate_delta_pct.insert(category.clone(), current_value - reference_value);
+        }
+    }
+
+    let mut category_avg_quality_delta = BTreeMap::new();
+    for (category, current_value) in &current.summary.category_avg_quality_score {
+        if let Some(reference_value) = reference.summary.category_avg_quality_score.get(category) {
+            category_avg_quality_delta.insert(category.clone(), current_value - reference_value);
+        }
+    }
+
+    CodingBenchmarkComparisonReport {
+        suite: current.suite.clone(),
+        current_model: current.model.clone(),
+        current_provider: current.provider.clone(),
+        current_profile: current.profile.clone(),
+        current_lane: current.lane.clone(),
+        reference_model: reference.model.clone(),
+        reference_provider: reference.provider.clone(),
+        reference_profile: reference.profile.clone(),
+        reference_lane: reference.lane.clone(),
+        generated_at_epoch_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+        cases,
+        summary: CodingBenchmarkComparisonSummary {
+            comparable,
+            suite_compatible,
+            case_ids_compatible,
+            case_categories_compatible,
+            comparable_case_count,
+            improved_case_count,
+            regressed_case_count,
+            current_only_cases,
+            reference_only_cases,
+            category_mismatch_cases,
+            pass_rate_delta_pct: current.summary.pass_rate_pct - reference.summary.pass_rate_pct,
+            patch_applied_rate_delta_pct: current.summary.patch_applied_rate_pct
+                - reference.summary.patch_applied_rate_pct,
+            build_pass_rate_delta_pct: current.summary.build_pass_rate_pct
+                - reference.summary.build_pass_rate_pct,
+            test_pass_rate_delta_pct: current.summary.test_pass_rate_pct
+                - reference.summary.test_pass_rate_pct,
+            avg_completion_quality_delta: current.summary.avg_completion_quality_score
+                - reference.summary.avg_completion_quality_score,
+            avg_verification_attempts_delta: current.summary.avg_verification_attempts
+                - reference.summary.avg_verification_attempts,
+            avg_retries_delta: current.summary.avg_retries - reference.summary.avg_retries,
+            avg_tool_denials_delta: current.summary.avg_tool_denials
+                - reference.summary.avg_tool_denials,
+            avg_compaction_events_delta: current.summary.avg_compaction_events
+                - reference.summary.avg_compaction_events,
+            avg_duration_delta_ms: current.summary.avg_duration_ms
+                - reference.summary.avg_duration_ms,
+            avg_input_tokens_delta: current.summary.avg_input_tokens
+                - reference.summary.avg_input_tokens,
+            avg_output_tokens_delta: current.summary.avg_output_tokens
+                - reference.summary.avg_output_tokens,
+            avg_estimated_cost_delta_usd: current.summary.avg_estimated_cost_usd
+                - reference.summary.avg_estimated_cost_usd,
+            category_pass_rate_delta_pct,
+            category_avg_quality_delta,
+        },
+    }
+}
+
+pub fn write_coding_benchmark_comparison_report(
+    output_root: &Path,
+    report: &CodingBenchmarkComparisonReport,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(output_root)?;
+    let suite = sanitize_slug(&report.suite);
+    let current_model = sanitize_slug(&report.current_model);
+    let reference_model = sanitize_slug(&report.reference_model);
+    let filename = format!("{suite}.{current_model}.vs.{reference_model}.comparison.json");
+    let path = output_root.join(filename);
+    std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
+    Ok(path)
 }
 
 pub fn evaluate_coding_benchmark_gate(
@@ -888,20 +1270,42 @@ mod tests {
                     case_id: "edit-single-file".to_string(),
                     category: "edit".to_string(),
                     passed: true,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 2,
                     retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
                     completion_quality_score: 1.0,
                     duration_ms: 12,
+                    input_tokens: 120,
+                    cache_hit_tokens: 20,
+                    cache_miss_tokens: 100,
+                    output_tokens: 32,
+                    estimated_cost_usd: 0.0012,
                     note: None,
                 },
                 CodingBenchmarkCaseResult {
                     case_id: "debug-bugfix".to_string(),
                     category: "debug".to_string(),
                     passed: false,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
                     tool_invocations: 1,
                     retries: 1,
+                    tool_denials: 1,
+                    compaction_events: 1,
                     completion_quality_score: 0.4,
                     duration_ms: 9,
+                    input_tokens: 180,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 180,
+                    output_tokens: 48,
+                    estimated_cost_usd: 0.0021,
                     note: Some("missing expected patch".to_string()),
                 },
             ],
@@ -910,6 +1314,8 @@ mod tests {
         assert_eq!(report.summary.passed_cases, 1);
         assert!((report.summary.pass_rate_pct - 50.0).abs() < f32::EPSILON);
         assert!(report.summary.avg_duration_ms > 0.0);
+        assert!(report.summary.avg_input_tokens > 0.0);
+        assert!(report.summary.avg_estimated_cost_usd > 0.0);
         assert!(report.summary.category_pass_rate_pct.contains_key("edit"));
         assert!(
             report
@@ -925,10 +1331,21 @@ mod tests {
                 case_id: "baseline".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 64,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 64,
+                output_tokens: 12,
+                estimated_cost_usd: 0.0004,
                 note: None,
             }],
         );
@@ -955,10 +1372,21 @@ mod tests {
                 case_id: "c1".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 10,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10,
+                output_tokens: 5,
+                estimated_cost_usd: 0.0001,
                 note: None,
             }],
         );
@@ -969,10 +1397,21 @@ mod tests {
                 case_id: "b1".to_string(),
                 category: "edit".to_string(),
                 passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
                 tool_invocations: 1,
                 retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
                 completion_quality_score: 1.0,
                 duration_ms: 1,
+                input_tokens: 10,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10,
+                output_tokens: 5,
+                estimated_cost_usd: 0.0001,
                 note: None,
             }],
         );
@@ -983,5 +1422,208 @@ mod tests {
         );
         assert!(!gate.passed);
         assert!(!gate.suite_model_compatible);
+    }
+
+    #[test]
+    fn benchmark_comparison_reports_case_and_category_deltas() {
+        let current = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "deepseek-coder",
+            vec![
+                CodingBenchmarkCaseResult {
+                    case_id: "edit-single-file".to_string(),
+                    category: "edit".to_string(),
+                    passed: true,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
+                    tool_invocations: 2,
+                    retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
+                    completion_quality_score: 1.0,
+                    duration_ms: 18,
+                    input_tokens: 200,
+                    cache_hit_tokens: 40,
+                    cache_miss_tokens: 160,
+                    output_tokens: 48,
+                    estimated_cost_usd: 0.0015,
+                    note: None,
+                },
+                CodingBenchmarkCaseResult {
+                    case_id: "debug-bugfix".to_string(),
+                    category: "debug".to_string(),
+                    passed: false,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
+                    tool_invocations: 3,
+                    retries: 1,
+                    tool_denials: 1,
+                    compaction_events: 1,
+                    completion_quality_score: 0.5,
+                    duration_ms: 27,
+                    input_tokens: 320,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 320,
+                    output_tokens: 80,
+                    estimated_cost_usd: 0.0035,
+                    note: Some("missed edge case".to_string()),
+                },
+            ],
+        );
+        let reference = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "claude-code",
+            vec![
+                CodingBenchmarkCaseResult {
+                    case_id: "edit-single-file".to_string(),
+                    category: "edit".to_string(),
+                    passed: false,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
+                    tool_invocations: 1,
+                    retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
+                    completion_quality_score: 0.4,
+                    duration_ms: 12,
+                    input_tokens: 140,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 140,
+                    output_tokens: 36,
+                    estimated_cost_usd: 0.0010,
+                    note: Some("patch incomplete".to_string()),
+                },
+                CodingBenchmarkCaseResult {
+                    case_id: "debug-bugfix".to_string(),
+                    category: "debug".to_string(),
+                    passed: true,
+                    patch_applied: true,
+                    build_passed: false,
+                    tests_passed: false,
+                    verification_attempts: 0,
+                    tool_invocations: 2,
+                    retries: 0,
+                    tool_denials: 0,
+                    compaction_events: 0,
+                    completion_quality_score: 1.0,
+                    duration_ms: 20,
+                    input_tokens: 260,
+                    cache_hit_tokens: 50,
+                    cache_miss_tokens: 210,
+                    output_tokens: 64,
+                    estimated_cost_usd: 0.0027,
+                    note: None,
+                },
+            ],
+        );
+
+        let comparison = compare_coding_benchmark_reports(&current, &reference);
+        assert!(comparison.summary.comparable);
+        assert!(comparison.summary.suite_compatible);
+        assert!(comparison.summary.case_ids_compatible);
+        assert!(comparison.summary.case_categories_compatible);
+        assert_eq!(comparison.summary.comparable_case_count, 2);
+        assert_eq!(comparison.summary.improved_case_count, 1);
+        assert_eq!(comparison.summary.regressed_case_count, 1);
+        assert!(comparison.summary.pass_rate_delta_pct.abs() < f32::EPSILON);
+        assert!(
+            comparison.summary.avg_completion_quality_delta > 0.0,
+            "current quality should be higher than reference aggregate"
+        );
+        assert!(comparison.summary.avg_estimated_cost_delta_usd > 0.0);
+        assert!(comparison.summary.avg_input_tokens_delta > 0.0);
+        assert_eq!(
+            comparison.summary.category_pass_rate_delta_pct.get("edit"),
+            Some(&100.0)
+        );
+        assert_eq!(
+            comparison.summary.category_pass_rate_delta_pct.get("debug"),
+            Some(&-100.0)
+        );
+        assert_eq!(comparison.cases.len(), 2);
+        assert_eq!(comparison.cases[0].case_id, "debug-bugfix");
+        assert_eq!(comparison.cases[0].retries_delta, 1);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path =
+            write_coding_benchmark_comparison_report(dir.path(), &comparison).expect("write");
+        let written = std::fs::read(&path).expect("read comparison report");
+        let round_trip: CodingBenchmarkComparisonReport =
+            serde_json::from_slice(&written).expect("deserialize comparison report");
+        assert_eq!(round_trip.current_model, "deepseek-coder");
+        assert_eq!(round_trip.reference_model, "claude-code");
+    }
+
+    #[test]
+    fn benchmark_comparison_flags_case_set_mismatch() {
+        let current = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "deepseek-coder",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "edit-single-file".to_string(),
+                category: "edit".to_string(),
+                passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
+                tool_invocations: 1,
+                retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                input_tokens: 10,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10,
+                output_tokens: 5,
+                estimated_cost_usd: 0.0001,
+                note: None,
+            }],
+        );
+        let reference = CodingBenchmarkReport::from_case_results(
+            "coding-quality-core",
+            "claude-code",
+            vec![CodingBenchmarkCaseResult {
+                case_id: "multi-file-update".to_string(),
+                category: "multi-file".to_string(),
+                passed: true,
+                patch_applied: true,
+                build_passed: false,
+                tests_passed: false,
+                verification_attempts: 0,
+                tool_invocations: 2,
+                retries: 0,
+                tool_denials: 0,
+                compaction_events: 0,
+                completion_quality_score: 1.0,
+                duration_ms: 1,
+                input_tokens: 12,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 12,
+                output_tokens: 7,
+                estimated_cost_usd: 0.0002,
+                note: None,
+            }],
+        );
+
+        let comparison = compare_coding_benchmark_reports(&current, &reference);
+        assert!(!comparison.summary.comparable);
+        assert!(!comparison.summary.case_ids_compatible);
+        assert_eq!(
+            comparison.summary.current_only_cases,
+            vec!["edit-single-file".to_string()]
+        );
+        assert_eq!(
+            comparison.summary.reference_only_cases,
+            vec!["multi-file-update".to_string()]
+        );
+        assert!(comparison.cases.is_empty());
     }
 }

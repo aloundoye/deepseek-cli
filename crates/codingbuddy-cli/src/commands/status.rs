@@ -9,6 +9,10 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::UsageArgs;
+use crate::commands::operator_diagnostics::{
+    provider_compatibility_diagnostics, runtime_operator_diagnostics,
+    summarize_applied_compatibility,
+};
 use crate::commands::plan::{current_plan_payload, plan_state_label, workflow_phase_label};
 use crate::commands::tasks::{mission_control_payload, render_mission_control_lines};
 use crate::output::*;
@@ -144,6 +148,9 @@ pub(crate) fn current_ui_status(
             active_provider.kind
         }
     };
+    let provider_diagnostics = provider_compatibility_diagnostics(cfg, &selected_model);
+    let last_provider_diagnostics =
+        summarize_applied_compatibility(projection.last_provider_compatibility.as_ref());
     let capability_summary = cfg
         .llm
         .capability_resolution_for_model(&selected_model)
@@ -177,6 +184,10 @@ pub(crate) fn current_ui_status(
             )
         })
         .unwrap_or_default();
+    let runtime_snapshot =
+        codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
+            .runtime_snapshot();
+    let runtime_diagnostics = runtime_operator_diagnostics(&runtime_snapshot);
 
     Ok(UiStatus {
         model: selected_model,
@@ -210,6 +221,18 @@ pub(crate) fn current_ui_status(
         failed_tasks,
         running_background_jobs,
         capability_summary,
+        provider_diagnostics_summary: [
+            provider_diagnostics
+                .as_ref()
+                .map(|value| value.summary.clone())
+                .unwrap_or_default(),
+            last_provider_diagnostics.unwrap_or_default(),
+        ]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" | "),
+        runtime_diagnostics_summary: runtime_diagnostics.summary,
         compaction_count,
         replay_count,
     })
@@ -270,6 +293,18 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
     let mcp_servers = McpManager::new(cwd)
         .and_then(|manager| manager.list_servers())
         .unwrap_or_default();
+    let runtime_snapshot =
+        codingbuddy_local_ml::ModelManager::new(std::path::PathBuf::from(&cfg.local_ml.cache_dir))
+            .runtime_snapshot();
+    let runtime_diagnostics = runtime_operator_diagnostics(&runtime_snapshot);
+    let base_model_diagnostics =
+        provider_compatibility_diagnostics(&cfg, &cfg.llm.active_base_model());
+    let reasoner_model = cfg.llm.active_reasoner_model();
+    let reasoner_model_diagnostics = if reasoner_model == cfg.llm.active_base_model() {
+        base_model_diagnostics.clone()
+    } else {
+        provider_compatibility_diagnostics(&cfg, &reasoner_model)
+    };
 
     let payload = if let Some(session) = session {
         let projection = store.rebuild_from_events(session.session_id)?;
@@ -295,6 +330,12 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "base": cfg.llm.active_base_model(),
                 "max_think": cfg.llm.active_reasoner_model(),
                 "thinking_mode": "auto",
+                "provider": cfg.llm.provider,
+                "compatibility": {
+                    "base": base_model_diagnostics,
+                    "reasoner": reasoner_model_diagnostics,
+                    "last_applied": projection.last_provider_compatibility,
+                },
             },
             "context_usage_percent": context_usage_pct,
             "pending_approvals": pending_approvals,
@@ -307,6 +348,14 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "approve_edits": cfg.policy.approve_edits,
                 "sandbox_mode": cfg.policy.sandbox_mode,
                 "allowlist_entries": cfg.policy.allowlist.len(),
+            },
+            "local_ml": {
+                "enabled": cfg.local_ml.enabled,
+                "runtime": {
+                    "summary": runtime_diagnostics.summary,
+                    "highlights": runtime_diagnostics.highlights,
+                    "snapshot": runtime_snapshot,
+                }
             },
             "mcp_servers": mcp_servers.len(),
             "autopilot": latest_autopilot.map(|run| json!({
@@ -328,6 +377,12 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "base": cfg.llm.active_base_model(),
                 "max_think": cfg.llm.active_reasoner_model(),
                 "thinking_mode": "auto",
+                "provider": cfg.llm.provider,
+                "compatibility": {
+                    "base": base_model_diagnostics,
+                    "reasoner": reasoner_model_diagnostics,
+                    "last_applied": serde_json::Value::Null,
+                },
             },
             "context_usage_percent": 0.0,
             "pending_approvals": 0,
@@ -340,6 +395,14 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 "approve_edits": cfg.policy.approve_edits,
                 "sandbox_mode": cfg.policy.sandbox_mode,
                 "allowlist_entries": cfg.policy.allowlist.len(),
+            },
+            "local_ml": {
+                "enabled": cfg.local_ml.enabled,
+                "runtime": {
+                    "summary": runtime_diagnostics.summary,
+                    "highlights": runtime_diagnostics.highlights,
+                    "snapshot": runtime_snapshot,
+                }
             },
             "mcp_servers": mcp_servers.len(),
             "autopilot": null,
@@ -382,6 +445,16 @@ pub(crate) fn run_status(cwd: &Path, json_mode: bool) -> Result<()> {
                 .as_u64()
                 .unwrap_or(0),
         );
+        if let Some(summary) = payload["model"]["compatibility"]["base"]["summary"].as_str()
+            && !summary.is_empty()
+        {
+            println!("provider compatibility {}", summary);
+        }
+        if let Some(summary) = payload["local_ml"]["runtime"]["summary"].as_str()
+            && !summary.is_empty()
+        {
+            println!("runtime {}", summary);
+        }
         if let Some(plan) = payload.get("plan").filter(|value| !value.is_null()) {
             println!(
                 "plan id={} state={} version={} steps={} goal={}",

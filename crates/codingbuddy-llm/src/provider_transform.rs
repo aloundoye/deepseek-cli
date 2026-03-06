@@ -1,37 +1,59 @@
 use anyhow::{Result, anyhow};
 use codingbuddy_core::{
-    ChatMessage, ChatRequest, LlmResponse, ModelCapabilities, ModelFamily, ProviderKind,
+    AppliedCompatibility, ChatMessage, ChatRequest, LlmResponse, ModelCapabilities, ModelFamily,
+    ProviderConfig, ProviderKind, ProviderOptions, ToolDefinition, repair_tool_api_name,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+
+#[derive(Debug, Default)]
+pub(crate) struct PreparedChatMessages {
+    pub messages: Vec<Value>,
+    pub transforms: Vec<String>,
+    pub degraded_inputs: Vec<String>,
+}
+
+impl Deref for PreparedChatMessages {
+    type Target = Vec<Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.messages
+    }
+}
+
+pub(crate) struct PreparedToolPayload {
+    pub tools: Vec<Value>,
+    pub shim_only: bool,
+}
 
 pub(crate) fn preflight_chat_messages(
     req: &ChatRequest,
     capabilities: &ModelCapabilities,
-) -> Result<Vec<Value>> {
-    if !req.images.is_empty() && !capabilities.supports_image_input {
-        return Err(anyhow!(
-            "model '{}' on provider '{}' does not support image input; choose a vision-capable model or remove images",
-            req.model,
-            capabilities.provider.as_key()
-        ));
-    }
-
+) -> Result<PreparedChatMessages> {
+    let mut prepared = PreparedChatMessages::default();
     let mut messages: Vec<Value> = Vec::new();
     let mut tool_call_id_map: HashMap<String, String> = HashMap::new();
     let mut declared_tool_call_ids: HashSet<String> = HashSet::new();
     let mut tool_call_seq: usize = 1;
+    let mut strict_filtered = false;
+    let mut normalized_tool_ids = false;
+    let mut repaired_tool_names = false;
+    let mut null_content_for_tool_calls = false;
+    let mut dropped_dangling_tool_messages = false;
 
     for message in &req.messages {
         match message {
             ChatMessage::System { content } => {
                 if capabilities.strict_empty_content_filtering && content.trim().is_empty() {
+                    strict_filtered = true;
                     continue;
                 }
                 messages.push(json!({"role": "system", "content": content}));
             }
             ChatMessage::User { content } => {
                 if capabilities.strict_empty_content_filtering && content.trim().is_empty() {
+                    strict_filtered = true;
                     continue;
                 }
                 messages.push(json!({"role": "user", "content": content}));
@@ -64,6 +86,7 @@ pub(crate) fn preflight_chat_messages(
                     if capabilities.strict_empty_content_filtering
                         && tool_call.name.trim().is_empty()
                     {
+                        strict_filtered = true;
                         tool_call_seq = tool_call_seq.saturating_add(1);
                         continue;
                     }
@@ -72,18 +95,26 @@ pub(crate) fn preflight_chat_messages(
                         tool_call_seq,
                         capabilities,
                     );
+                    if normalized_id != tool_call.id.trim() {
+                        normalized_tool_ids = true;
+                    }
                     tool_call_seq = tool_call_seq.saturating_add(1);
 
                     if !tool_call.id.trim().is_empty() {
                         tool_call_id_map.insert(tool_call.id.clone(), normalized_id.clone());
                     }
                     declared_tool_call_ids.insert(normalized_id.clone());
+                    let tool_name = repair_tool_api_name(&tool_call.name, &req.tools)
+                        .unwrap_or_else(|| tool_call.name.clone());
+                    if tool_name != tool_call.name {
+                        repaired_tool_names = true;
+                    }
 
                     normalized_tool_calls.push(json!({
                         "id": normalized_id,
                         "type": "function",
                         "function": {
-                            "name": tool_call.name,
+                            "name": tool_name,
                             "arguments": tool_call.arguments,
                         }
                     }));
@@ -96,11 +127,14 @@ pub(crate) fn preflight_chat_messages(
                         // Some strict OpenAI-compatible gateways require explicit
                         // assistant content=null when tool_calls are present.
                         msg["content"] = Value::Null;
+                        null_content_for_tool_calls = true;
                     }
                 }
 
                 if !capabilities.strict_empty_content_filtering || has_visible_content {
                     messages.push(msg);
+                } else {
+                    strict_filtered = true;
                 }
             }
             ChatMessage::Tool {
@@ -118,15 +152,20 @@ pub(crate) fn preflight_chat_messages(
                         )
                     });
                 if !tool_call_id_map.contains_key(tool_call_id) {
+                    if normalized_tool_call_id != tool_call_id.trim() {
+                        normalized_tool_ids = true;
+                    }
                     tool_call_seq = tool_call_seq.saturating_add(1);
                 }
 
                 if capabilities.strict_empty_content_filtering {
                     if content.trim().is_empty() || normalized_tool_call_id.trim().is_empty() {
+                        strict_filtered = true;
                         continue;
                     }
                     if !declared_tool_call_ids.contains(&normalized_tool_call_id) {
                         // Drop dangling tool messages that do not map to assistant tool calls.
+                        dropped_dangling_tool_messages = true;
                         continue;
                     }
                 }
@@ -141,28 +180,92 @@ pub(crate) fn preflight_chat_messages(
     }
 
     if !req.images.is_empty() {
-        attach_images_to_last_user_message(
+        let degraded = attach_images_to_last_user_message(
             &mut messages,
             &req.images,
+            capabilities.supports_image_input,
             capabilities.strict_empty_content_filtering,
-        );
+        )?;
+        if !degraded.is_empty() {
+            prepared.degraded_inputs.extend(degraded);
+        }
     }
-    repair_message_sequence_for_provider(&mut messages, capabilities);
+    if repair_message_sequence_for_provider(&mut messages, capabilities) {
+        prepared
+            .transforms
+            .push("mistral-message-sequence-repair".to_string());
+    }
 
-    Ok(messages)
+    if strict_filtered {
+        prepared
+            .transforms
+            .push("strict-empty-filtering".to_string());
+    }
+    if normalized_tool_ids {
+        prepared
+            .transforms
+            .push("tool-id-normalization".to_string());
+    }
+    if repaired_tool_names {
+        prepared.transforms.push("tool-name-repair".to_string());
+    }
+    if null_content_for_tool_calls {
+        prepared
+            .transforms
+            .push("strict-null-content-tool-calls".to_string());
+    }
+    if dropped_dangling_tool_messages {
+        prepared
+            .transforms
+            .push("drop-dangling-tool-messages".to_string());
+    }
+
+    prepared.messages = messages;
+    Ok(prepared)
 }
 
+#[cfg(test)]
 pub(crate) fn postprocess_chat_response(
+    response: LlmResponse,
+    capabilities: &ModelCapabilities,
+    available_tools: &[ToolDefinition],
+) -> LlmResponse {
+    postprocess_chat_response_with_compatibility(
+        response,
+        capabilities,
+        available_tools,
+        AppliedCompatibility::default(),
+    )
+}
+
+pub(crate) fn postprocess_chat_response_with_compatibility(
     mut response: LlmResponse,
     capabilities: &ModelCapabilities,
+    available_tools: &[ToolDefinition],
+    compatibility: AppliedCompatibility,
 ) -> LlmResponse {
+    let mut applied = compatibility;
     if response.text.trim().is_empty() && !response.reasoning_content.trim().is_empty() {
         response.text = response.reasoning_content.clone();
+        applied
+            .transforms
+            .push("reasoning->text-fallback".to_string());
     }
 
-    if capabilities.normalize_tool_call_ids {
-        for (idx, tool_call) in response.tool_calls.iter_mut().enumerate() {
-            tool_call.id = normalize_tool_call_id(&tool_call.id, idx + 1, true);
+    for (idx, tool_call) in response.tool_calls.iter_mut().enumerate() {
+        if let Some(repaired_name) = repair_tool_api_name(&tool_call.name, available_tools)
+            && repaired_name != tool_call.name
+        {
+            applied.transforms.push("tool-name-repair".to_string());
+            tool_call.name = repaired_name;
+        }
+
+        if capabilities.normalize_tool_call_ids {
+            let normalized = normalize_tool_call_id(&tool_call.id, idx + 1, true);
+            if normalized != tool_call.id {
+                applied.transforms.push("tool-id-normalization".to_string());
+                tool_call.id = normalized;
+            }
         }
     }
 
@@ -178,13 +281,82 @@ pub(crate) fn postprocess_chat_response(
         }
     }
 
+    applied.transforms.sort();
+    applied.transforms.dedup();
+    response.compatibility = if applied.transforms.is_empty() && applied.degraded_inputs.is_empty()
+    {
+        None
+    } else {
+        Some(applied)
+    };
     response
 }
 
+#[cfg(test)]
+pub(crate) fn prepare_chat_tools(
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+    provider_base_url: &str,
+    endpoint: &str,
+) -> Result<Option<PreparedToolPayload>> {
+    prepare_chat_tools_with_compatibility(
+        req,
+        capabilities,
+        provider_base_url,
+        endpoint,
+        &mut AppliedCompatibility::default(),
+    )
+}
+
+pub(crate) fn prepare_chat_tools_with_compatibility(
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+    provider_base_url: &str,
+    endpoint: &str,
+    applied: &mut AppliedCompatibility,
+) -> Result<Option<PreparedToolPayload>> {
+    let mut tools = serialize_tool_definitions(&req.tools)?;
+    if sanitize_tool_definitions_for_provider(&mut tools, capabilities) {
+        applied
+            .transforms
+            .push("gemini-schema-sanitize".to_string());
+    }
+
+    let shim_only = tools.is_empty()
+        && requires_placeholder_tool(req, capabilities, provider_base_url, endpoint);
+    if shim_only {
+        tools.push(placeholder_tool_definition());
+        applied
+            .transforms
+            .push("litellm-placeholder-tool".to_string());
+    }
+
+    if tools.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PreparedToolPayload { tools, shim_only }))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn apply_chat_payload_compatibility(
     payload: &mut Value,
     req: &ChatRequest,
     capabilities: &ModelCapabilities,
+) {
+    apply_chat_payload_compatibility_with_tracking(
+        payload,
+        req,
+        capabilities,
+        &mut AppliedCompatibility::default(),
+    );
+}
+
+pub(crate) fn apply_chat_payload_compatibility_with_tracking(
+    payload: &mut Value,
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+    applied: &mut AppliedCompatibility,
 ) {
     if capabilities.provider == ProviderKind::OpenAiCompatible
         && prefers_max_completion_tokens(&req.model)
@@ -194,6 +366,9 @@ pub(crate) fn apply_chat_payload_compatibility(
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("max_tokens");
         }
+        applied
+            .transforms
+            .push("max_tokens->max_completion_tokens".to_string());
     }
 
     if capabilities.provider == ProviderKind::OpenAiCompatible
@@ -209,6 +384,9 @@ pub(crate) fn apply_chat_payload_compatibility(
         if let Some(obj) = payload.as_object_mut() {
             obj.remove("thinking");
         }
+        applied
+            .transforms
+            .push("thinking->reasoning_effort".to_string());
     }
 
     if capabilities.provider == ProviderKind::OpenAiCompatible
@@ -218,6 +396,9 @@ pub(crate) fn apply_chat_payload_compatibility(
     {
         // Gemini-compatible OpenAI gateways often accept max_output_tokens.
         payload["max_output_tokens"] = max_tokens;
+        applied
+            .transforms
+            .push("max_tokens->max_output_tokens".to_string());
     }
 
     if capabilities.provider == ProviderKind::OpenAiCompatible
@@ -227,6 +408,7 @@ pub(crate) fn apply_chat_payload_compatibility(
     {
         // Strict OpenAI-compatible reasoning gateways commonly reject sampling
         // controls when reasoning_effort is active.
+        let mut stripped = false;
         for key in [
             "temperature",
             "top_p",
@@ -235,7 +417,12 @@ pub(crate) fn apply_chat_payload_compatibility(
             "logprobs",
             "top_logprobs",
         ] {
-            obj.remove(key);
+            stripped |= obj.remove(key).is_some();
+        }
+        if stripped {
+            applied
+                .transforms
+                .push("sampling-strip-on-reasoning".to_string());
         }
     }
 
@@ -245,6 +432,9 @@ pub(crate) fn apply_chat_payload_compatibility(
     {
         // Gemini gateways are inconsistent with required tool_choice.
         payload["tool_choice"] = json!("auto");
+        applied
+            .transforms
+            .push("required->auto-tool_choice".to_string());
     }
 
     if capabilities.provider == ProviderKind::Ollama
@@ -253,6 +443,9 @@ pub(crate) fn apply_chat_payload_compatibility(
         // Ollama accepts tool_choice but "required" is inconsistently supported
         // across model families and fronting gateways.
         payload["tool_choice"] = json!("auto");
+        applied
+            .transforms
+            .push("required->auto-tool_choice".to_string());
     }
 
     if capabilities.provider == ProviderKind::Ollama
@@ -263,7 +456,291 @@ pub(crate) fn apply_chat_payload_compatibility(
             payload["options"] = json!({});
         }
         payload["options"]["num_predict"] = max_tokens;
+        applied
+            .transforms
+            .push("max_tokens->options.num_predict".to_string());
     }
+}
+
+pub(crate) fn apply_provider_payload_options(
+    payload: &mut Value,
+    req: &ChatRequest,
+    provider: &ProviderConfig,
+    capabilities: &ModelCapabilities,
+    applied: &mut AppliedCompatibility,
+) {
+    apply_provider_payload_options_map(
+        payload,
+        &req.provider_options,
+        &req.model,
+        provider,
+        capabilities,
+        applied,
+    );
+}
+
+pub(crate) fn apply_provider_payload_options_map(
+    payload: &mut Value,
+    provider_options: &ProviderOptions,
+    model: &str,
+    provider: &ProviderConfig,
+    capabilities: &ModelCapabilities,
+    applied: &mut AppliedCompatibility,
+) {
+    let mut layers = Vec::new();
+    if provider.payload_options.is_object() {
+        layers.push(("config", &provider.payload_options));
+    }
+    if let Some(value) = provider_options.get("default") {
+        layers.push(("request:default", value));
+    }
+    if let Some(value) = provider_options.get(capabilities.provider.as_key()) {
+        layers.push(("request:provider", value));
+    }
+    if let Some(value) = provider_options.get(capabilities.family.as_key()) {
+        layers.push(("request:family", value));
+    }
+    if let Some(value) = provider_options.get(model) {
+        layers.push(("request:model", value));
+    }
+
+    for (label, layer) in layers {
+        let Some(obj) = layer.as_object() else {
+            continue;
+        };
+        if merge_payload_object(payload, obj) {
+            applied.transforms.push(format!("provider-options:{label}"));
+        }
+    }
+}
+
+fn merge_payload_object(payload: &mut Value, layer: &serde_json::Map<String, Value>) -> bool {
+    const PROTECTED_KEYS: &[&str] = &["model", "messages", "tools", "tool_choice", "stream"];
+    let Some(payload_obj) = payload.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in layer {
+        if PROTECTED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(dst) = payload_obj.get_mut(key) {
+            changed |= deep_merge_json(dst, value);
+        } else {
+            payload_obj.insert(key.clone(), value.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn deep_merge_json(target: &mut Value, overlay: &Value) -> bool {
+    match (target, overlay) {
+        (Value::Object(dst), Value::Object(src)) => {
+            let mut changed = false;
+            for (key, value) in src {
+                if let Some(existing) = dst.get_mut(key) {
+                    changed |= deep_merge_json(existing, value);
+                } else {
+                    dst.insert(key.clone(), value.clone());
+                    changed = true;
+                }
+            }
+            changed
+        }
+        (target, overlay) => {
+            if *target != *overlay {
+                *target = overlay.clone();
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
+    tools
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn sanitize_tool_definitions_for_provider(
+    tools: &mut [Value],
+    capabilities: &ModelCapabilities,
+) -> bool {
+    let mut changed = false;
+    if capabilities.provider == ProviderKind::OpenAiCompatible
+        && capabilities.family == ModelFamily::Gemini
+    {
+        for tool in tools {
+            if let Some(schema) = tool
+                .get_mut("function")
+                .and_then(Value::as_object_mut)
+                .and_then(|function| function.get_mut("parameters"))
+            {
+                changed |= sanitize_gemini_schema(schema);
+            }
+        }
+    }
+    changed
+}
+
+fn requires_placeholder_tool(
+    req: &ChatRequest,
+    capabilities: &ModelCapabilities,
+    provider_base_url: &str,
+    endpoint: &str,
+) -> bool {
+    if capabilities.provider != ProviderKind::OpenAiCompatible {
+        return false;
+    }
+    let lower_base = provider_base_url.to_ascii_lowercase();
+    let lower_endpoint = endpoint.to_ascii_lowercase();
+    let looks_like_litellm = lower_base.contains("litellm") || lower_endpoint.contains("litellm");
+    if !looks_like_litellm {
+        return false;
+    }
+    history_uses_tool_protocol(req)
+}
+
+fn history_uses_tool_protocol(req: &ChatRequest) -> bool {
+    req.messages.iter().any(|message| match message {
+        ChatMessage::Assistant { tool_calls, .. } => !tool_calls.is_empty(),
+        ChatMessage::Tool { .. } => true,
+        _ => false,
+    })
+}
+
+fn placeholder_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "_noop",
+            "description": "Placeholder tool for proxy compatibility when tool history exists but no active tools are needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn sanitize_gemini_schema(schema: &mut Value) -> bool {
+    let before = schema.clone();
+    match schema {
+        Value::Array(items) => {
+            for item in items {
+                sanitize_gemini_schema(item);
+            }
+        }
+        Value::Object(map) => {
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if key == "enum" {
+                    if let Some(enum_values) = map.get_mut(&key).and_then(Value::as_array_mut) {
+                        for value in enum_values {
+                            if !value.is_string() {
+                                let normalized = match value {
+                                    Value::Null => "null".to_string(),
+                                    Value::Bool(b) => b.to_string(),
+                                    Value::Number(n) => n.to_string(),
+                                    Value::String(s) => s.clone(),
+                                    Value::Array(_) | Value::Object(_) => value.to_string(),
+                                };
+                                *value = Value::String(normalized);
+                            }
+                        }
+                        if map
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|ty| ty == "integer" || ty == "number")
+                        {
+                            map.insert("type".to_string(), Value::String("string".to_string()));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(value) = map.get_mut(&key) {
+                    sanitize_gemini_schema(value);
+                }
+            }
+
+            let has_combiner = has_schema_combiner(map);
+            if map.get("type").and_then(Value::as_str) == Some("object") {
+                let property_names = map
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.keys().cloned().collect::<HashSet<String>>());
+                if let (Some(property_names), Some(required)) = (
+                    property_names,
+                    map.get_mut("required").and_then(Value::as_array_mut),
+                ) {
+                    required.retain(|field| {
+                        field
+                            .as_str()
+                            .is_some_and(|name| property_names.contains(name))
+                    });
+                }
+            }
+
+            if map.get("type").and_then(Value::as_str) == Some("array") && !has_combiner {
+                if !map.contains_key("items") || map.get("items").is_some_and(Value::is_null) {
+                    map.insert("items".to_string(), json!({}));
+                }
+                if let Some(items) = map.get_mut("items")
+                    && items.as_object().is_some_and(|obj| !has_schema_intent(obj))
+                {
+                    *items = json!({"type": "string"});
+                }
+            }
+
+            if map.contains_key("type")
+                && map
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| ty != "object")
+                && !has_combiner
+            {
+                map.remove("properties");
+                map.remove("required");
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    *schema != before
+}
+
+fn has_schema_combiner(map: &serde_json::Map<String, Value>) -> bool {
+    ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|key| map.get(*key).is_some_and(Value::is_array))
+}
+
+fn has_schema_intent(map: &serde_json::Map<String, Value>) -> bool {
+    if has_schema_combiner(map) {
+        return true;
+    }
+    [
+        "type",
+        "properties",
+        "items",
+        "prefixItems",
+        "enum",
+        "const",
+        "$ref",
+        "additionalProperties",
+        "patternProperties",
+        "required",
+        "not",
+        "if",
+        "then",
+        "else",
+    ]
+    .iter()
+    .any(|key| map.contains_key(*key))
 }
 
 fn provider_supports_reasoning_content(provider: ProviderKind) -> bool {
@@ -289,38 +766,67 @@ fn thinking_budget_to_reasoning_effort(budget_tokens: Option<u32>) -> &'static s
 fn attach_images_to_last_user_message(
     messages: &mut Vec<Value>,
     images: &[codingbuddy_core::ImageContent],
+    supports_image_input: bool,
     strict_filtering: bool,
-) {
-    if let Some(last_user) = messages.iter_mut().rev().find(|msg| msg["role"] == "user") {
-        let text = extract_user_text(last_user.get("content"));
-        let mut parts: Vec<Value> = Vec::new();
-        if !strict_filtering || !text.trim().is_empty() {
-            parts.push(json!({"type": "text", "text": text}));
+) -> Result<Vec<String>> {
+    let mut degraded_inputs = Vec::new();
+    let mut parts: Vec<Value> = Vec::new();
+    let mut existing_text = String::new();
+    let mut user_index: Option<usize> = None;
+    if let Some((idx, last_user)) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, msg)| msg["role"] == "user")
+    {
+        existing_text = extract_user_text(last_user.get("content"));
+        user_index = Some(idx);
+    }
+
+    if !strict_filtering || !existing_text.trim().is_empty() {
+        parts.push(json!({"type": "text", "text": existing_text}));
+    }
+
+    for image in images {
+        if image.mime.trim().is_empty() {
+            return Err(anyhow!("cannot encode image input with empty mime type"));
         }
-        for image in images {
+        if image.base64_data.trim().is_empty() {
+            degraded_inputs.push(format!("empty {} input", image.mime));
             parts.push(json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", image.mime, image.base64_data),
-                }
+                "type": "text",
+                "text": format!(
+                    "ERROR: A provided {} input is empty or corrupted. Explain this limitation to the user.",
+                    image.mime
+                ),
             }));
+            continue;
         }
-        last_user["content"] = json!(parts);
+        if !supports_image_input {
+            degraded_inputs.push(format!("unsupported {} input", image.mime));
+            parts.push(json!({
+                "type": "text",
+                "text": format!(
+                    "ERROR: This model does not support {} input. Explain this limitation to the user and continue without reading the image.",
+                    image.mime
+                ),
+            }));
+            continue;
+        }
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime, image.base64_data),
+            }
+        }));
+    }
+
+    if let Some(idx) = user_index {
+        messages[idx]["content"] = json!(parts);
     } else {
-        let mut parts: Vec<Value> = Vec::new();
-        if !strict_filtering {
-            parts.push(json!({"type": "text", "text": ""}));
-        }
-        for image in images {
-            parts.push(json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", image.mime, image.base64_data),
-                }
-            }));
-        }
         messages.push(json!({"role": "user", "content": parts}));
     }
+    Ok(degraded_inputs)
 }
 
 fn extract_user_text(content: Option<&Value>) -> String {
@@ -414,11 +920,12 @@ fn requires_mistral_tool_id_compat(capabilities: &ModelCapabilities) -> bool {
 fn repair_message_sequence_for_provider(
     messages: &mut Vec<Value>,
     capabilities: &ModelCapabilities,
-) {
+) -> bool {
     if !requires_mistral_tool_id_compat(capabilities) {
-        return;
+        return false;
     }
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut changed = false;
     for idx in 0..messages.len() {
         repaired.push(messages[idx].clone());
         let current_role = messages[idx].get("role").and_then(Value::as_str);
@@ -431,16 +938,19 @@ fn repair_message_sequence_for_provider(
                 "role": "assistant",
                 "content": "Done.",
             }));
+            changed = true;
         }
     }
     *messages = repaired;
+    changed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use codingbuddy_core::{
-        ChatMessage, ChatRequest, LlmToolCall, ProviderKind, ToolChoice, model_capabilities,
+        ChatMessage, ChatRequest, FunctionDefinition, LlmToolCall, ProviderKind, ToolChoice,
+        ToolDefinition, model_capabilities,
     };
 
     fn req_for(provider: ProviderKind, model: &str) -> (ChatRequest, ModelCapabilities) {
@@ -460,9 +970,22 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         (req, model_capabilities(provider, model))
+    }
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("Tool {name}"),
+                strict: None,
+                parameters: json!({}),
+            },
+        }
     }
 
     #[test]
@@ -544,10 +1067,22 @@ mod tests {
             base64_data: "AAAA".to_string(),
         }];
 
-        let err = preflight_chat_messages(&req, &caps).expect_err("should reject");
+        let prepared = preflight_chat_messages(&req, &caps).expect("should degrade");
+        assert_eq!(
+            prepared.degraded_inputs,
+            vec!["unsupported image/png input"]
+        );
         assert!(
-            err.to_string().contains("does not support image input"),
-            "unexpected error: {err}"
+            prepared.messages[0]["content"]
+                .as_array()
+                .expect("multipart content")
+                .iter()
+                .any(|part| part["type"] == "text"
+                    && part["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("does not support image/png input")),
+            "unexpected prepared payload: {prepared:?}"
         );
     }
 
@@ -586,9 +1121,10 @@ mod tests {
                 prompt_cache_miss_tokens: 100,
                 reasoning_tokens: 1,
             }),
+            compatibility: None,
         };
 
-        let normalized = postprocess_chat_response(response, &caps);
+        let normalized = postprocess_chat_response(response, &caps, &[]);
         assert_eq!(normalized.text, "thoughts");
         assert_eq!(normalized.tool_calls[0].id, "bad");
         assert_eq!(
@@ -607,6 +1143,72 @@ mod tests {
                 .prompt_cache_miss_tokens,
             0
         );
+    }
+
+    #[test]
+    fn response_postprocess_normalizes_built_in_tool_names_to_api_format() {
+        let (_, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        let response = LlmResponse {
+            text: String::new(),
+            finish_reason: "tool_calls".to_string(),
+            reasoning_content: String::new(),
+            tool_calls: vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "FS.Read".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            usage: None,
+            compatibility: None,
+        };
+
+        let normalized = postprocess_chat_response(response, &caps, &[]);
+        assert_eq!(normalized.tool_calls[0].name, "fs_read");
+    }
+
+    #[test]
+    fn response_postprocess_repairs_active_plugin_tool_names() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.tools = vec![tool_def("plugin__phase_c_plugin__review")];
+        let response = LlmResponse {
+            text: String::new(),
+            finish_reason: "tool_calls".to_string(),
+            reasoning_content: String::new(),
+            tool_calls: vec![LlmToolCall {
+                id: "call_1".to_string(),
+                name: "plugin__phase-c-plugin__review".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            usage: None,
+            compatibility: None,
+        };
+
+        let normalized = postprocess_chat_response(response, &caps, &req.tools);
+        assert_eq!(
+            normalized.tool_calls[0].name,
+            "plugin__phase_c_plugin__review"
+        );
+    }
+
+    #[test]
+    fn preflight_normalizes_historical_tool_call_names() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tool".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs.read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+        ];
+
+        let messages = preflight_chat_messages(&req, &caps).expect("messages");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "fs_read");
     }
 
     #[test]
@@ -843,5 +1445,114 @@ mod tests {
 
         apply_chat_payload_compatibility(&mut payload, &req, &caps);
         assert_eq!(payload["options"]["num_predict"], 2048);
+    }
+
+    #[test]
+    fn prepare_chat_tools_adds_placeholder_tool_for_litellm_tool_history() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+        req.messages = vec![
+            ChatMessage::User {
+                content: "run tools".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: "ok".to_string(),
+            },
+        ];
+
+        let prepared = prepare_chat_tools(
+            &req,
+            &caps,
+            "https://litellm.internal",
+            "https://litellm.internal/v1/chat/completions",
+        )
+        .expect("prepared")
+        .expect("placeholder");
+
+        assert!(prepared.shim_only);
+        assert_eq!(prepared.tools.len(), 1);
+        assert_eq!(prepared.tools[0]["function"]["name"], "_noop");
+    }
+
+    #[test]
+    fn prepare_chat_tools_skips_placeholder_without_tool_history() {
+        let (req, caps) = req_for(ProviderKind::OpenAiCompatible, "gpt-4o-mini");
+
+        let prepared = prepare_chat_tools(
+            &req,
+            &caps,
+            "https://litellm.internal",
+            "https://litellm.internal/v1/chat/completions",
+        )
+        .expect("prepared");
+
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn prepare_chat_tools_sanitizes_gemini_tool_schema() {
+        let (mut req, caps) = req_for(ProviderKind::OpenAiCompatible, "gemini-2.0-flash");
+        req.tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: codingbuddy_core::FunctionDefinition {
+                name: "pick_mode".to_string(),
+                description: "Pick a mode".to_string(),
+                strict: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "integer",
+                            "enum": [1, 2]
+                        },
+                        "items": {
+                            "type": "array",
+                            "items": {}
+                        },
+                        "status": {
+                            "type": "string",
+                            "properties": {
+                                "unused": { "type": "string" }
+                            },
+                            "required": ["unused"]
+                        }
+                    },
+                    "required": ["mode", "missing"]
+                }),
+            },
+        }];
+
+        let prepared = prepare_chat_tools(
+            &req,
+            &caps,
+            "https://api.openai.com",
+            "https://api.openai.com/v1/chat/completions",
+        )
+        .expect("prepared")
+        .expect("tools");
+
+        assert!(!prepared.shim_only);
+        let schema = &prepared.tools[0]["function"]["parameters"];
+        assert_eq!(schema["required"], json!(["mode"]));
+        assert_eq!(schema["properties"]["mode"]["type"], "string");
+        assert_eq!(schema["properties"]["mode"]["enum"], json!(["1", "2"]));
+        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
+        assert!(
+            schema["properties"]["status"].get("properties").is_none(),
+            "non-object schema members should not retain object-only keys"
+        );
+        assert!(
+            schema["properties"]["status"].get("required").is_none(),
+            "non-object schema members should not retain required"
+        );
     }
 }

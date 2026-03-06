@@ -867,6 +867,9 @@ fn status_summary_includes_all_fields() {
         session_turns: 5,
         working_directory: "/tmp".to_string(),
         pr_review_status: None,
+        provider_diagnostics_summary:
+            "thinking->reasoning_effort, max_tokens->max_completion_tokens".to_string(),
+        runtime_diagnostics_summary: "warm=1/2 queue_peak=3 load_waits=1".to_string(),
         ..Default::default()
     };
     shell.push_status_summary(&status);
@@ -879,6 +882,8 @@ fn status_summary_includes_all_fields() {
     assert!(all_text.contains("deepseek-reasoner"));
     assert!(all_text.contains("auto"));
     assert!(all_text.contains("running"));
+    assert!(all_text.contains("Provider compatibility:"));
+    assert!(all_text.contains("Runtime diagnostics:"));
 }
 
 #[test]

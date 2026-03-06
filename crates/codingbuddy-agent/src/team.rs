@@ -367,6 +367,7 @@ fn plan_files_via_llm(engine: &AgentEngine, prompt: &str) -> Result<Vec<String>>
         top_logprobs: None,
         thinking: None,
         images: vec![],
+        provider_options: Default::default(),
         response_format: None,
     };
     let response = engine.llm.complete_chat(&req)?;

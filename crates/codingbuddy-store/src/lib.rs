@@ -3490,17 +3490,23 @@ pub struct RebuildProjection {
     pub applied_patches: Vec<Uuid>,
     pub tool_invocations: Vec<Uuid>,
     pub approved_invocations: Vec<Uuid>,
+    pub denied_invocations: Vec<Uuid>,
     pub state: Option<SessionState>,
     pub plugin_events: Vec<String>,
     pub usage_input_tokens: u64,
     pub usage_cache_hit_tokens: u64,
     pub usage_cache_miss_tokens: u64,
     pub usage_output_tokens: u64,
+    pub cost_input_tokens: u64,
+    pub cost_output_tokens: u64,
+    pub estimated_cost_usd: f64,
     pub compaction_events: usize,
     pub autopilot_runs: Vec<Uuid>,
     pub permission_mode: Option<String>,
     pub task_ids: Vec<Uuid>,
     pub review_ids: Vec<Uuid>,
+    pub last_provider_model: Option<String>,
+    pub last_provider_compatibility: Option<codingbuddy_core::AppliedCompatibility>,
 }
 
 fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
@@ -3541,6 +3547,7 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
         }
         EventKind::ToolProposed { proposal } => proj.tool_invocations.push(proposal.invocation_id),
         EventKind::ToolApproved { invocation_id } => proj.approved_invocations.push(*invocation_id),
+        EventKind::ToolDenied { invocation_id, .. } => proj.denied_invocations.push(*invocation_id),
         EventKind::SessionStateChanged { to, .. } => proj.state = Some(to.clone()),
         EventKind::PluginInstalled { plugin_id, .. }
         | EventKind::PluginRemoved { plugin_id }
@@ -3562,6 +3569,15 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
                 .saturating_add(*cache_miss_tokens);
             proj.usage_output_tokens = proj.usage_output_tokens.saturating_add(*output_tokens);
         }
+        EventKind::CostUpdated {
+            input_tokens,
+            output_tokens,
+            estimated_cost_usd,
+        } => {
+            proj.cost_input_tokens = proj.cost_input_tokens.saturating_add(*input_tokens);
+            proj.cost_output_tokens = proj.cost_output_tokens.saturating_add(*output_tokens);
+            proj.estimated_cost_usd += *estimated_cost_usd;
+        }
         EventKind::ContextCompacted { .. } => {
             proj.compaction_events = proj.compaction_events.saturating_add(1)
         }
@@ -3569,6 +3585,20 @@ fn apply_projection(proj: &mut RebuildProjection, event: &EventEnvelope) {
         EventKind::PermissionModeChanged { to, .. } => proj.permission_mode = Some(to.clone()),
         EventKind::TaskCreated { task_id, .. } => proj.task_ids.push(*task_id),
         EventKind::ReviewStarted { review_id, .. } => proj.review_ids.push(*review_id),
+        EventKind::ProviderCompatibilityApplied {
+            model,
+            provider,
+            transforms,
+            degraded_inputs,
+        } => {
+            proj.last_provider_model = Some(model.clone());
+            proj.last_provider_compatibility = Some(codingbuddy_core::AppliedCompatibility {
+                provider: provider.clone(),
+                family: String::new(),
+                transforms: transforms.clone(),
+                degraded_inputs: degraded_inputs.clone(),
+            });
+        }
         _ => {}
     }
 }
@@ -3654,6 +3684,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::EnterPlanMode { .. } => "EnterPlanMode@v1",
         EventKind::ExitPlanMode { .. } => "ExitPlanMode@v1",
         EventKind::ProviderSelected { .. } => "ProviderSelected@v1",
+        EventKind::ProviderCompatibilityApplied { .. } => "ProviderCompatibilityApplied@v1",
         EventKind::IndexBuild { .. } => "IndexBuild@v1",
         EventKind::IndexUpdate { .. } => "IndexUpdate@v1",
         EventKind::IndexQueryEvent { .. } => "IndexQuery@v1",

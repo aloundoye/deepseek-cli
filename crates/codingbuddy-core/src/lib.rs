@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -17,6 +18,7 @@ pub use tool_metadata::{
 };
 
 pub type Result<T> = anyhow::Result<T>;
+pub type ProviderOptions = BTreeMap<String, serde_json::Value>;
 
 // DeepSeek API model constants.
 pub const CODINGBUDDY_V32_CHAT_MODEL: &str = "deepseek-chat";
@@ -522,6 +524,34 @@ impl ToolName {
     ];
 }
 
+fn normalize_tool_name_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace(['-', '.'], "_")
+}
+
+/// Canonicalize a built-in tool name to its underscored API form.
+///
+/// Accepts either underscored API names (`fs_read`) or dotted internal names
+/// (`fs.read`), plus common casing/hyphen variations. Returns `None` for
+/// unknown names such as MCP or plugin tools.
+#[must_use]
+pub fn canonical_tool_api_name(name: &str) -> Option<&'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(tool) = ToolName::from_api_name(trimmed) {
+        return Some(tool.as_api_name());
+    }
+
+    if let Some(tool) = ToolName::from_internal_name(trimmed) {
+        return Some(tool.as_api_name());
+    }
+
+    let normalized = normalize_tool_name_key(trimmed);
+    ToolName::from_api_name(&normalized).map(|tool| tool.as_api_name())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
@@ -1008,6 +1038,13 @@ pub enum EventKind {
     ExitPlanMode { session_id: Uuid },
     #[serde(alias = "ProviderSelectedV1")]
     ProviderSelected { provider: String, model: String },
+    #[serde(alias = "ProviderCompatibilityAppliedV1")]
+    ProviderCompatibilityApplied {
+        model: String,
+        provider: String,
+        transforms: Vec<String>,
+        degraded_inputs: Vec<String>,
+    },
     /// Vector/code index was built from scratch.
     #[serde(alias = "IndexBuildV1")]
     IndexBuild {
@@ -1146,7 +1183,7 @@ impl EventKind {
             | Self::TaskDeleted { .. } => "task",
 
             // Model/provider selection
-            Self::ProviderSelected { .. } => "model",
+            Self::ProviderSelected { .. } | Self::ProviderCompatibilityApplied { .. } => "model",
 
             // Patches (diff/apply)
             Self::PatchStaged { .. } | Self::PatchApplied { .. } => "patch",
@@ -1305,6 +1342,8 @@ pub struct LlmRequest {
     pub non_urgent: bool,
     #[serde(default)]
     pub images: Vec<ImageContent>,
+    #[serde(default)]
+    pub provider_options: ProviderOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1330,6 +1369,21 @@ pub struct LlmResponse {
     /// Token usage from the API response.
     #[serde(default)]
     pub usage: Option<TokenUsage>,
+    /// Provider compatibility transforms applied to this request/response path.
+    #[serde(default)]
+    pub compatibility: Option<AppliedCompatibility>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedCompatibility {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub transforms: Vec<String>,
+    #[serde(default)]
+    pub degraded_inputs: Vec<String>,
 }
 
 /// Token usage information from a DeepSeek API response.
@@ -1787,6 +1841,50 @@ pub struct FunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// Attempt to repair a tool call name to the active tool surface.
+///
+/// Built-in tools are canonicalized to their underscored API names even if the
+/// provider returns internal dotted names. For active tools, this also applies
+/// lowercase/hyphen normalization and a small Levenshtein repair window.
+#[must_use]
+pub fn repair_tool_api_name(api_name: &str, available_tools: &[ToolDefinition]) -> Option<String> {
+    let trimmed = api_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(canonical) = canonical_tool_api_name(trimmed) {
+        return Some(canonical.to_string());
+    }
+
+    let tool_names: Vec<&str> = available_tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect();
+
+    if tool_names.contains(&trimmed) {
+        return Some(trimmed.to_string());
+    }
+
+    let normalized = normalize_tool_name_key(trimmed);
+    if let Some(name) = tool_names
+        .iter()
+        .find(|name| normalize_tool_name_key(name) == normalized)
+    {
+        return Some((*name).to_string());
+    }
+
+    let mut best_match: Option<(&str, usize)> = None;
+    for name in &tool_names {
+        let dist = strsim::levenshtein(&normalized, &normalize_tool_name_key(name));
+        if dist <= 2 && best_match.as_ref().is_none_or(|(_, best)| dist < *best) {
+            best_match = Some((name, dist));
+        }
+    }
+
+    best_match.map(|(name, _)| name.to_string())
+}
+
 /// Controls how the model picks tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1841,6 +1939,7 @@ pub struct ChatRequest {
     pub thinking: Option<ThinkingConfig>,
     /// Optional images to include with the user message (multimodal).
     pub images: Vec<ImageContent>,
+    pub provider_options: ProviderOptions,
     /// Optional response format, e.g json_object
     pub response_format: Option<serde_json::Value>,
 }
@@ -2168,6 +2267,8 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub openai_compat_prefix: bool,
+    #[serde(default)]
+    pub payload_options: serde_json::Value,
     pub models: ProviderModels,
 }
 
@@ -2223,6 +2324,7 @@ impl LlmConfig {
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             openai_compat_prefix: self.openai_compat_prefix,
+            payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: self.base_model.clone(),
                 reasoner: Some(self.max_think_model.clone()),
@@ -2303,6 +2405,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.deepseek.com".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             openai_compat_prefix: false,
+            payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: CODINGBUDDY_V32_CHAT_MODEL.to_string(),
                 reasoner: Some(CODINGBUDDY_V32_REASONER_MODEL.to_string()),
@@ -2316,6 +2419,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "https://api.openai.com".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "gpt-4o-mini".to_string(),
                 reasoner: Some("o4-mini".to_string()),
@@ -2329,6 +2433,7 @@ fn default_providers() -> std::collections::HashMap<String, ProviderConfig> {
             base_url: "http://localhost:11434".to_string(),
             api_key_env: String::new(),
             openai_compat_prefix: true,
+            payload_options: serde_json::Value::Null,
             models: ProviderModels {
                 chat: "qwen2.5-coder:7b".to_string(),
                 reasoner: None,
@@ -3374,6 +3479,18 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    fn sample_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("Tool {name}"),
+                strict: None,
+                parameters: json!({}),
+            },
+        }
+    }
+
     fn model_alias_strategy() -> impl Strategy<Value = &'static str> {
         prop_oneof![
             Just("deepseek-chat"),
@@ -3542,6 +3659,45 @@ mod tests {
                 "from_internal_name roundtrip failed for {internal}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_tool_api_name_accepts_internal_and_variant_spellings() {
+        assert_eq!(canonical_tool_api_name("fs_read"), Some("fs_read"));
+        assert_eq!(canonical_tool_api_name("fs.read"), Some("fs_read"));
+        assert_eq!(canonical_tool_api_name("FS-READ"), Some("fs_read"));
+        assert_eq!(canonical_tool_api_name(" Git.Status "), Some("git_status"));
+        assert_eq!(canonical_tool_api_name("plugin__custom__tool"), None);
+    }
+
+    #[test]
+    fn repair_tool_api_name_repairs_known_and_active_tool_names() {
+        let tools = vec![
+            sample_tool("fs_read"),
+            sample_tool("fs_write"),
+            sample_tool("plugin__phase_c_plugin__review"),
+        ];
+
+        assert_eq!(
+            repair_tool_api_name("fs.read", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("FS-READ", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("fs_reaf", &tools),
+            Some("fs_read".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("plugin__phase-c-plugin__review", &tools),
+            Some("plugin__phase_c_plugin__review".to_string())
+        );
+        assert_eq!(
+            repair_tool_api_name("plugin__custom__unknown", &tools),
+            None
+        );
     }
 
     #[test]
@@ -4126,6 +4282,7 @@ mod tests {
                 base_url: "http://localhost:11434/v1".to_string(),
                 api_key_env: "OLLAMA_KEY".to_string(),
                 openai_compat_prefix: true,
+                payload_options: serde_json::Value::Null,
                 models: ProviderModels {
                     chat: "llama3".to_string(),
                     reasoner: None,

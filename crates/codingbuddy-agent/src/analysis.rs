@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
-use codingbuddy_core::{AppConfig, ChatMessage, ChatRequest, StreamCallback, ToolChoice};
+use codingbuddy_core::{
+    AppConfig, ChatMessage, ChatRequest, LlmResponse, StreamCallback, ToolChoice,
+};
 use codingbuddy_llm::LlmClient;
 use std::path::Path;
 
@@ -13,7 +15,7 @@ pub fn analyze(
     prompt: &str,
     options: &ChatOptions,
     stream_cb: Option<StreamCallback>,
-) -> Result<String> {
+) -> Result<LlmResponse> {
     let workspace = options.repo_root_override.as_deref().unwrap_or(workspace);
     let bootstrap = gather_context::gather_for_prompt(
         workspace,
@@ -91,6 +93,7 @@ pub fn analyze(
                 None
             },
             images: options.images.clone(),
+            provider_options: Default::default(),
             response_format: None,
         };
 
@@ -126,10 +129,17 @@ pub fn analyze(
             continue;
         }
 
-        return Ok(response.text);
+        return Ok(response);
     }
 
-    Ok(String::new())
+    Ok(LlmResponse {
+        text: String::new(),
+        finish_reason: "stop".to_string(),
+        reasoning_content: String::new(),
+        tool_calls: vec![],
+        usage: None,
+        compatibility: None,
+    })
 }
 
 fn build_system_prompt(

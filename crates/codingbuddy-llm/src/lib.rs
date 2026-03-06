@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use codingbuddy_core::{
-    CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig, LlmRequest, LlmResponse,
-    LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
+    AppliedCompatibility, CancellationToken, ChatMessage, ChatRequest, FimRequest, LlmConfig,
+    LlmRequest, LlmResponse, LlmToolCall, ProviderKind, StreamCallback, StreamChunk, ToolChoice,
     normalize_codingbuddy_model, normalize_codingbuddy_profile,
 };
 use reqwest::StatusCode;
@@ -12,10 +12,25 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::io::BufRead;
+use std::ops::Deref;
 use std::thread;
 use std::time::Duration;
 
 mod provider_transform;
+
+#[derive(Debug, Clone)]
+struct PreparedPayload {
+    payload: Value,
+    compatibility: AppliedCompatibility,
+}
+
+impl Deref for PreparedPayload {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
 
 /// Base delay for network/transport error retries (1s, 2s, 4s exponential backoff).
 const NETWORK_RETRY_BASE_MS: u64 = 1000;
@@ -172,7 +187,7 @@ impl ApiClient {
     }
 
     fn complete_inner(&self, req: &LlmRequest, api_key: Option<&str>) -> Result<LlmResponse> {
-        let payload = self.build_payload(req);
+        let prepared = self.build_payload(req);
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -183,7 +198,7 @@ impl ApiClient {
                         .post(self.resolved_endpoint(false, false, false)),
                     api_key,
                 )
-                .json(&payload)
+                .json(&prepared.payload)
                 .send();
 
             match response {
@@ -193,19 +208,22 @@ impl ApiClient {
                     let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text()?;
                     if status.is_success() {
-                        let parsed = if self.cfg.stream {
+                        let mut parsed = if self.cfg.stream {
                             parse_streaming_payload(&body)?
                         } else {
                             parse_non_streaming_payload(&body)?
                         };
+                        if !prepared.compatibility.transforms.is_empty()
+                            || !prepared.compatibility.degraded_inputs.is_empty()
+                        {
+                            parsed.compatibility = Some(prepared.compatibility.clone());
+                        }
                         return Ok(parsed);
                     }
 
-                    last_err = Some(format_api_error(
-                        status,
-                        &body,
-                        attempt,
-                        self.cfg.max_retries,
+                    last_err = Some(with_compatibility_context(
+                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
@@ -215,7 +233,10 @@ impl ApiClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(format_transport_error(&e));
+                    last_err = Some(with_compatibility_context(
+                        format_transport_error(&e),
+                        &prepared.compatibility,
+                    ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -229,10 +250,19 @@ impl ApiClient {
         Err(last_err.unwrap_or_else(|| anyhow!("deepseek request failed without detailed error")))
     }
 
-    fn build_payload(&self, req: &LlmRequest) -> Value {
-        let provider = self.provider_kind().unwrap_or(ProviderKind::Deepseek);
+    fn build_payload(&self, req: &LlmRequest) -> PreparedPayload {
+        let provider = self.provider_config();
+        let capabilities = self
+            .cfg
+            .capabilities_for_model(&req.model)
+            .unwrap_or_else(|| {
+                codingbuddy_core::model_capabilities(
+                    self.provider_kind().unwrap_or(ProviderKind::Deepseek),
+                    &req.model,
+                )
+            });
         let fast_mode = self.cfg.fast_mode;
-        let max_cap = max_output_tokens_for_model(provider, &req.model, false);
+        let max_cap = max_output_tokens_for_model(capabilities.provider, &req.model, false);
         if req.max_tokens > max_cap {
             eprintln!(
                 "warning: requested max_tokens ({}) exceeds model limit for {} ({}); capping",
@@ -259,11 +289,43 @@ impl ApiClient {
                 )
             }));
         }
+        let mut compatibility = AppliedCompatibility {
+            provider: capabilities.provider.as_key().to_string(),
+            family: capabilities.family.as_key().to_string(),
+            ..AppliedCompatibility::default()
+        };
+
         if req.images.is_empty() {
             messages.push(json!({"role": "user", "content": req.prompt}));
         } else {
             let mut parts = vec![json!({"type": "text", "text": req.prompt})];
             for img in &req.images {
+                if img.mime.trim().is_empty() {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": "ERROR: A provided image input is malformed (missing mime type). Explain this limitation to the user.",
+                    }));
+                    compatibility
+                        .degraded_inputs
+                        .push("malformed image input".to_string());
+                    continue;
+                }
+                if !capabilities.supports_image_input || img.base64_data.trim().is_empty() {
+                    let reason = if img.base64_data.trim().is_empty() {
+                        format!("empty {} input", img.mime)
+                    } else {
+                        format!("unsupported {} input", img.mime)
+                    };
+                    compatibility.degraded_inputs.push(reason);
+                    parts.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "ERROR: The current model cannot consume the provided {} input. Explain this limitation to the user and continue without reading the image.",
+                            img.mime
+                        ),
+                    }));
+                    continue;
+                }
                 parts.push(json!({
                     "type": "image_url",
                     "image_url": {"url": format!("data:{};base64,{}", img.mime, img.base64_data)}
@@ -272,19 +334,33 @@ impl ApiClient {
             messages.push(json!({"role": "user", "content": parts}));
         }
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
-        let model = if provider == ProviderKind::Deepseek {
+        let model = if capabilities.provider == ProviderKind::Deepseek {
             normalize_codingbuddy_model(&req.model).unwrap_or(req.model.as_str())
         } else {
             req.model.as_str()
         };
 
-        json!({
+        let mut payload = json!({
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "stream": self.cfg.stream,
             "max_tokens": max_tokens
-        })
+        });
+        provider_transform::apply_provider_payload_options_map(
+            &mut payload,
+            &req.provider_options,
+            &req.model,
+            &provider,
+            &capabilities,
+            &mut compatibility,
+        );
+        compatibility.transforms.sort();
+        compatibility.transforms.dedup();
+        PreparedPayload {
+            payload,
+            compatibility,
+        }
     }
 
     fn build_fim_payload(&self, req: &FimRequest) -> Value {
@@ -317,7 +393,8 @@ impl ApiClient {
         payload
     }
 
-    fn build_chat_payload(&self, req: &ChatRequest) -> Result<Value> {
+    fn build_chat_payload(&self, req: &ChatRequest) -> Result<PreparedPayload> {
+        let provider = self.provider_config();
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
                 "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
@@ -329,7 +406,13 @@ impl ApiClient {
             .as_ref()
             .is_some_and(|t| t.thinking_type == "enabled");
         let thinking_enabled = requested_thinking && capabilities.supports_thinking_config;
-        let messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
+        let prepared_messages = provider_transform::preflight_chat_messages(req, &capabilities)?;
+        let mut compatibility = AppliedCompatibility {
+            provider: capabilities.provider.as_key().to_string(),
+            family: capabilities.family.as_key().to_string(),
+            transforms: prepared_messages.transforms,
+            degraded_inputs: prepared_messages.degraded_inputs,
+        };
 
         // DeepSeek uses automatic server-side prefix caching — no client-side annotations needed.
 
@@ -341,7 +424,7 @@ impl ApiClient {
             } else {
                 &req.model
             },
-            "messages": messages,
+            "messages": prepared_messages.messages,
             "max_tokens": req.max_tokens.min(max_cap),
             "stream": false
         });
@@ -390,28 +473,55 @@ impl ApiClient {
         {
             payload["thinking"] = serde_json::to_value(thinking)?;
         }
-        if capabilities.supports_tool_calling && !req.tools.is_empty() {
-            payload["tools"] = serde_json::to_value(&req.tools)?;
-            if capabilities.supports_parallel_tool_calls
-                && matches!(
-                    capabilities.provider,
-                    ProviderKind::OpenAiCompatible | ProviderKind::Ollama
-                )
-            {
-                // OpenAI-compatible payload knob; omit for providers that do not
-                // advertise this field to avoid spurious 400s.
-                payload["parallel_tool_calls"] = json!(true);
-            }
-            if capabilities.supports_tool_choice {
-                payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
+        if capabilities.supports_tool_calling
+            && let Some(prepared_tools) = provider_transform::prepare_chat_tools_with_compatibility(
+                req,
+                &capabilities,
+                &provider.base_url,
+                &self.cfg.endpoint,
+                &mut compatibility,
+            )?
+        {
+            payload["tools"] = json!(prepared_tools.tools);
+            if !prepared_tools.shim_only {
+                if capabilities.supports_parallel_tool_calls
+                    && matches!(
+                        capabilities.provider,
+                        ProviderKind::OpenAiCompatible | ProviderKind::Ollama
+                    )
+                {
+                    // OpenAI-compatible payload knob; omit for providers that do not
+                    // advertise this field to avoid spurious 400s.
+                    payload["parallel_tool_calls"] = json!(true);
+                }
+                if capabilities.supports_tool_choice {
+                    payload["tool_choice"] = serde_json::to_value(&req.tool_choice)?;
+                }
             }
         }
-        provider_transform::apply_chat_payload_compatibility(&mut payload, req, &capabilities);
-        Ok(payload)
+        provider_transform::apply_provider_payload_options(
+            &mut payload,
+            req,
+            &provider,
+            &capabilities,
+            &mut compatibility,
+        );
+        provider_transform::apply_chat_payload_compatibility_with_tracking(
+            &mut payload,
+            req,
+            &capabilities,
+            &mut compatibility,
+        );
+        compatibility.transforms.sort();
+        compatibility.transforms.dedup();
+        Ok(PreparedPayload {
+            payload,
+            compatibility,
+        })
     }
 
     fn complete_chat_inner(&self, req: &ChatRequest, api_key: Option<&str>) -> Result<LlmResponse> {
-        let payload = self.build_chat_payload(req)?;
+        let prepared = self.build_chat_payload(req)?;
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
                 "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
@@ -427,7 +537,7 @@ impl ApiClient {
                     self.client.post(self.resolved_endpoint(true, false, false)),
                     api_key,
                 )
-                .json(&payload)
+                .json(&prepared.payload)
                 .send();
 
             match response {
@@ -438,16 +548,18 @@ impl ApiClient {
                     let body = resp.text()?;
                     if status.is_success() {
                         let response = parse_non_streaming_payload(&body)?;
-                        return Ok(provider_transform::postprocess_chat_response(
-                            response,
-                            &capabilities,
-                        ));
+                        return Ok(
+                            provider_transform::postprocess_chat_response_with_compatibility(
+                                response,
+                                &capabilities,
+                                &req.tools,
+                                prepared.compatibility.clone(),
+                            ),
+                        );
                     }
-                    last_err = Some(format_api_error(
-                        status,
-                        &body,
-                        attempt,
-                        self.cfg.max_retries,
+                    last_err = Some(with_compatibility_context(
+                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
@@ -457,7 +569,10 @@ impl ApiClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(format_transport_error(&e));
+                    last_err = Some(with_compatibility_context(
+                        format_transport_error(&e),
+                        &prepared.compatibility,
+                    ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -614,6 +729,7 @@ impl ApiClient {
                                 reasoning_content: String::new(),
                                 tool_calls: vec![],
                                 usage,
+                                compatibility: None,
                             });
                         }
                     } else {
@@ -656,15 +772,15 @@ impl ApiClient {
         api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut payload = self.build_chat_payload(req)?;
+        let mut prepared = self.build_chat_payload(req)?;
         let capabilities = self.cfg.capabilities_for_model(&req.model).ok_or_else(|| {
             anyhow!(
                 "unsupported llm.provider='{}' (supported: deepseek, openai-compatible, ollama)",
                 self.cfg.provider
             )
         })?;
-        payload["stream"] = json!(true);
-        payload["stream_options"] = json!({"include_usage": true});
+        prepared.payload["stream"] = json!(true);
+        prepared.payload["stream_options"] = json!({"include_usage": true});
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -674,7 +790,7 @@ impl ApiClient {
                     self.client.post(self.resolved_endpoint(true, false, false)),
                     api_key,
                 )
-                .json(&payload)
+                .json(&prepared.payload)
                 .send();
 
             match response {
@@ -828,19 +944,22 @@ impl ApiClient {
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
+                            compatibility: None,
                         };
-                        return Ok(provider_transform::postprocess_chat_response(
-                            response,
-                            &capabilities,
-                        ));
+                        return Ok(
+                            provider_transform::postprocess_chat_response_with_compatibility(
+                                response,
+                                &capabilities,
+                                &req.tools,
+                                prepared.compatibility.clone(),
+                            ),
+                        );
                     }
 
                     let body = resp.text().unwrap_or_default();
-                    last_err = Some(format_api_error(
-                        status,
-                        &body,
-                        attempt,
-                        self.cfg.max_retries,
+                    last_err = Some(with_compatibility_context(
+                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
@@ -850,7 +969,10 @@ impl ApiClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(format_transport_error(&e));
+                    last_err = Some(with_compatibility_context(
+                        format_transport_error(&e),
+                        &prepared.compatibility,
+                    ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -937,14 +1059,6 @@ impl ApiClient {
             resolution.applied_rules.join(", ")
         };
 
-        if !req.images.is_empty() && !caps.supports_image_input {
-            return Err(anyhow!(
-                "model '{}' does not support image input (capability rules: {}); remove images or switch to a vision-capable model",
-                req.model,
-                applied_rules
-            ));
-        }
-
         let has_assistant_tool_calls = req.messages.iter().any(|message| {
             matches!(
                 message,
@@ -1025,10 +1139,10 @@ impl ApiClient {
         api_key: Option<&str>,
         cb: StreamCallback,
     ) -> Result<LlmResponse> {
-        let mut payload = self.build_payload(req);
+        let mut prepared = self.build_payload(req);
         // Force streaming on for the HTTP request
-        payload["stream"] = json!(true);
-        payload["stream_options"] = json!({"include_usage": true});
+        prepared.payload["stream"] = json!(true);
+        prepared.payload["stream_options"] = json!({"include_usage": true});
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut attempt: u8 = 0;
@@ -1039,7 +1153,7 @@ impl ApiClient {
                         .post(self.resolved_endpoint(false, false, false)),
                     api_key,
                 )
-                .json(&payload)
+                .json(&prepared.payload)
                 .send();
 
             match response {
@@ -1170,21 +1284,26 @@ impl ApiClient {
                         } else {
                             reasoning_out.clone()
                         };
-                        return Ok(LlmResponse {
+                        let mut response = LlmResponse {
                             text,
                             finish_reason: finish_reason.unwrap_or_else(|| "stop".to_string()),
                             reasoning_content: reasoning_out,
                             tool_calls,
                             usage,
-                        });
+                            compatibility: None,
+                        };
+                        if !prepared.compatibility.transforms.is_empty()
+                            || !prepared.compatibility.degraded_inputs.is_empty()
+                        {
+                            response.compatibility = Some(prepared.compatibility.clone());
+                        }
+                        return Ok(response);
                     }
 
                     let body = resp.text().unwrap_or_default();
-                    last_err = Some(format_api_error(
-                        status,
-                        &body,
-                        attempt,
-                        self.cfg.max_retries,
+                    last_err = Some(with_compatibility_context(
+                        format_api_error(status, &body, attempt, self.cfg.max_retries),
+                        &prepared.compatibility,
                     ));
                     if should_retry_status(status) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(self.cfg.retry_base_ms, attempt, retry_after));
@@ -1194,7 +1313,10 @@ impl ApiClient {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(format_transport_error(&e));
+                    last_err = Some(with_compatibility_context(
+                        format_transport_error(&e),
+                        &prepared.compatibility,
+                    ));
                     if should_retry_transport_error(&e) && attempt < self.cfg.max_retries {
                         thread::sleep(retry_delay_ms(NETWORK_RETRY_BASE_MS, attempt, None));
                         attempt = attempt.saturating_add(1);
@@ -1488,6 +1610,30 @@ fn format_transport_error(err: &reqwest::Error) -> anyhow::Error {
     }
 }
 
+fn compatibility_error_context(compatibility: &AppliedCompatibility) -> String {
+    let mut parts = vec![format!(
+        "provider={} family={}",
+        compatibility.provider, compatibility.family
+    )];
+    if !compatibility.transforms.is_empty() {
+        parts.push(format!("transforms={}", compatibility.transforms.join(",")));
+    }
+    if !compatibility.degraded_inputs.is_empty() {
+        parts.push(format!(
+            "degraded_inputs={}",
+            compatibility.degraded_inputs.join(",")
+        ));
+    }
+    parts.join(" ")
+}
+
+fn with_compatibility_context(
+    err: anyhow::Error,
+    compatibility: &AppliedCompatibility,
+) -> anyhow::Error {
+    anyhow!("{err}. {}", compatibility_error_context(compatibility))
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -1582,6 +1728,7 @@ fn parse_fim_non_streaming_payload(body: &str) -> Result<LlmResponse> {
         reasoning_content: String::new(),
         tool_calls: vec![],
         usage,
+        compatibility: None,
     })
 }
 
@@ -1633,6 +1780,7 @@ fn parse_non_streaming_payload(body: &str) -> Result<LlmResponse> {
         reasoning_content,
         tool_calls,
         usage,
+        compatibility: None,
     })
 }
 
@@ -1756,6 +1904,7 @@ fn parse_streaming_payload(body: &str) -> Result<LlmResponse> {
             reasoning_content: reasoning_out,
             tool_calls,
             usage,
+            compatibility: None,
         })
     } else {
         parse_non_streaming_payload(body)
@@ -1924,6 +2073,7 @@ mod tests {
             max_tokens: 16_000,
             non_urgent: false,
             images: vec![],
+            provider_options: Default::default(),
         });
         assert_eq!(payload["max_tokens"], 2048);
     }
@@ -1938,6 +2088,7 @@ mod tests {
             max_tokens: 256,
             non_urgent: false,
             images: vec![],
+            provider_options: Default::default(),
         });
         assert_eq!(payload["model"], "deepseek-chat");
     }
@@ -1958,6 +2109,7 @@ mod tests {
                 max_tokens: 128,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect_err("truly unsupported provider should fail");
         assert!(err.to_string().contains("unsupported llm.provider"));
@@ -1979,6 +2131,7 @@ mod tests {
                 max_tokens: 128,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect_err("unsupported profile should fail");
         assert!(err.to_string().contains("unsupported llm.profile"));
@@ -1999,6 +2152,7 @@ mod tests {
                 max_tokens: 128,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect_err("unsupported model should fail");
         assert!(err.to_string().contains("unsupported model"));
@@ -2027,6 +2181,7 @@ mod tests {
             top_logprobs: None,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(4096)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let err = client
@@ -2061,6 +2216,7 @@ mod tests {
             top_logprobs: Some(5),
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(4096)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let err = client
@@ -2095,6 +2251,7 @@ mod tests {
             top_logprobs: None,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(2048)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         client
@@ -2125,6 +2282,7 @@ mod tests {
             top_logprobs: None,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(2048)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let err = client
@@ -2161,6 +2319,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let err = client
@@ -2215,6 +2374,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let err = client
@@ -2242,6 +2402,7 @@ mod tests {
             top_logprobs: Some(3),
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let err = client
@@ -2273,6 +2434,7 @@ mod tests {
             top_logprobs: None,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(4096)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2317,6 +2479,7 @@ mod tests {
             top_logprobs: Some(3),
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2366,6 +2529,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2403,6 +2567,7 @@ mod tests {
             top_logprobs: None,
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(16_384)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2441,6 +2606,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2511,6 +2677,7 @@ mod tests {
             top_logprobs: Some(3),
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(4096)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2549,6 +2716,7 @@ mod tests {
             top_logprobs: Some(3),
             thinking: Some(codingbuddy_core::ThinkingConfig::enabled(16_384)),
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2584,6 +2752,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2622,10 +2791,123 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
         assert_eq!(payload["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn litellm_proxy_with_tool_history_gets_placeholder_tool_payload() {
+        let mut cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        cfg.endpoint = "https://litellm.internal/v1/chat/completions".to_string();
+        cfg.providers
+            .get_mut("openai-compatible")
+            .expect("provider")
+            .base_url = "https://litellm.internal".to_string();
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![
+                ChatMessage::User {
+                    content: "run tool".to_string(),
+                },
+                ChatMessage::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![codingbuddy_core::LlmToolCall {
+                        id: "call_1".to_string(),
+                        name: "fs_read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                },
+                ChatMessage::Tool {
+                    tool_call_id: "call_1".to_string(),
+                    content: "ok".to_string(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: codingbuddy_core::ToolChoice::none(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            provider_options: Default::default(),
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        assert_eq!(payload["tools"][0]["function"]["name"], "_noop");
+        assert!(payload.get("parallel_tool_calls").is_none());
+        assert!(payload.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn gemini_payload_sanitizes_tool_schema_for_gateway_compatibility() {
+        let cfg = LlmConfig {
+            provider: "openai-compatible".to_string(),
+            ..LlmConfig::default()
+        };
+        let client = ApiClient::new(cfg).expect("client");
+        let req = ChatRequest {
+            model: "gemini-2.0-flash".to_string(),
+            messages: vec![ChatMessage::User {
+                content: "pick a mode".to_string(),
+            }],
+            tools: vec![codingbuddy_core::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: codingbuddy_core::FunctionDefinition {
+                    name: "pick_mode".to_string(),
+                    description: "Pick a mode".to_string(),
+                    strict: None,
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "integer",
+                                "enum": [1, 2]
+                            },
+                            "items": {
+                                "type": "array",
+                                "items": {}
+                            }
+                        },
+                        "required": ["mode", "missing"]
+                    }),
+                },
+            }],
+            tool_choice: codingbuddy_core::ToolChoice::auto(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            thinking: None,
+            images: vec![],
+            provider_options: Default::default(),
+            response_format: None,
+        };
+
+        let payload = client.build_chat_payload(&req).expect("build payload");
+        let schema = &payload["tools"][0]["function"]["parameters"];
+        assert_eq!(schema["required"], serde_json::json!(["mode"]));
+        assert_eq!(schema["properties"]["mode"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["1", "2"])
+        );
+        assert_eq!(schema["properties"]["items"]["items"]["type"], "string");
     }
 
     #[test]
@@ -2651,6 +2933,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
 
@@ -2693,6 +2976,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
 
@@ -2741,6 +3025,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
 
@@ -2792,6 +3077,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2821,6 +3107,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -2844,6 +3131,7 @@ mod tests {
                 max_tokens: 128,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect_err("missing API key should fail");
         assert!(err.to_string().contains("not set and llm.api_key is empty"));
@@ -2863,6 +3151,7 @@ mod tests {
             max_tokens: 128,
             non_urgent: false,
             images: vec![],
+            provider_options: Default::default(),
         });
         let messages = payload["messages"].as_array().expect("messages");
         assert_eq!(messages[0]["role"], "system");
@@ -2903,6 +3192,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let payload = client.build_chat_payload(&req).expect("build payload");
@@ -3041,6 +3331,7 @@ mod tests {
                 max_tokens: 64,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect("response should eventually succeed");
         assert_eq!(out.text, "ok-after-retry");
@@ -3083,6 +3374,7 @@ mod tests {
                 max_tokens: 64,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect_err("request should fail after retries are exhausted");
         assert!(err.to_string().contains("Rate limited (HTTP 429)"));
@@ -3125,6 +3417,7 @@ mod tests {
                 max_tokens: 64,
                 non_urgent: false,
                 images: vec![],
+                provider_options: Default::default(),
             })
             .expect_err("401 should fail without retrying");
 
@@ -3348,6 +3641,7 @@ mod tests {
                     max_tokens: 128,
                     non_urgent: false,
                     images: vec![],
+                    provider_options: Default::default(),
                 },
                 cb,
             )
@@ -3553,6 +3847,7 @@ mod tests {
             max_tokens: 100_000,
             non_urgent: false,
             images: vec![],
+            provider_options: Default::default(),
         };
         let payload = client.build_payload(&req);
         assert_eq!(payload["max_tokens"], 65536);
@@ -3572,6 +3867,7 @@ mod tests {
             max_tokens: 20_000,
             non_urgent: false,
             images: vec![],
+            provider_options: Default::default(),
         };
         let payload = client.build_payload(&req);
         assert_eq!(payload["max_tokens"], 8192);
@@ -3696,6 +3992,7 @@ mod tests {
             top_logprobs: None,
             thinking: None,
             images: vec![],
+            provider_options: Default::default(),
             response_format: None,
         };
         let result = client.build_chat_payload(&req);
